@@ -191,6 +191,9 @@ impl Respond for Deezer {
                 .and_then(|r| r.strip_suffix('-'))
                 .and_then(|n| n.parse::<usize>().ok());
             return match from {
+                Some(from) if !scenario.ignore_range && from >= total => {
+                    ResponseTemplate::new(416).insert_header("Content-Range", format!("bytes */{total}"))
+                }
                 Some(from) if !scenario.ignore_range => ResponseTemplate::new(206)
                     .insert_header("Content-Range", format!("bytes {from}-{}/{total}", total - 1))
                     .set_body_bytes(stored[from..].to_vec()),

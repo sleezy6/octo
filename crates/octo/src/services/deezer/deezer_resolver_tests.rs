@@ -58,10 +58,48 @@ async fn seeking_aligns_cdn_range_and_keeps_absolute_stripe_index() {
         assert_eq!(opened.content_length, Some(1898));
         assert_eq!(opened.content_range.as_deref(), Some("bytes 2301-4198/5000"));
         assert_eq!(read(opened).await, payload[2301..4199], "{ignore_cdn_range}");
+        // One connection: the seek asks for its stripe at once and reads the size from the
+        // answer, rather than opening the whole song first to learn it.
         assert_eq!(
-            fixture.seen.lock().cdn_ranges.last().map(String::as_str),
-            Some("bytes=2048-")
+            fixture.seen.lock().cdn_ranges,
+            ["bytes=2048-"],
+            "{ignore_cdn_range}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_seek_past_the_end_is_unsatisfiable_in_one_request() {
+    for range in ["bytes=6000-", "bytes=9000-"] {
+        let payload: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        let fixture = Fixture::new(Scenario {
+            payload,
+            ..Default::default()
+        })
+        .await;
+        let opened = fixture.open(Some(range)).await.expect("answered");
+        assert_eq!(opened.status_code, 416, "{range}");
+        assert_eq!(opened.content_range.as_deref(), Some("bytes */5000"), "{range}");
+        assert_eq!(fixture.seen.lock().cdn_ranges.len(), 1, "{range}");
+    }
+}
+
+#[tokio::test]
+async fn ranges_from_the_start_or_the_end_still_read_the_size_first() {
+    let payload: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+    for (range, expected, requests) in [
+        ("bytes=100-199", &payload[100..200], vec![""]),
+        ("bytes=-952", &payload[4048..], vec!["", "bytes=2048-"]),
+    ] {
+        let fixture = Fixture::new(Scenario {
+            payload: payload.clone(),
+            ..Default::default()
+        })
+        .await;
+        let opened = fixture.open(Some(range)).await.expect("the range opens");
+        assert_eq!(opened.status_code, 206, "{range}");
+        assert_eq!(read(opened).await, expected, "{range}");
+        assert_eq!(fixture.seen.lock().cdn_ranges, requests, "{range}");
     }
 }
 

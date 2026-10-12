@@ -619,14 +619,20 @@ impl DeezerResolver {
     }
 
     async fn send_stream(&self, url: &str, range_from: Option<u64>) -> anyhow::Result<reqwest::Response> {
+        Ok(self.send_stream_raw(url, range_from).await?.error_for_status()?)
+    }
+
+    /// [`Self::send_stream`] without turning an error status into an error, so a seek past the
+    /// end (416) can still be read for the song's size.
+    async fn send_stream_raw(&self, url: &str, range_from: Option<u64>) -> anyhow::Result<reqwest::Response> {
         let mut request = self.stream_client.get(url);
         if let Some(from) = range_from {
             request = request.header(reqwest::header::RANGE, format!("bytes={from}-"));
         }
-        let response = tokio::time::timeout(Self::HEADERS_TIMEOUT, request.send())
+        tokio::time::timeout(Self::HEADERS_TIMEOUT, request.send())
             .await
-            .map_err(|_| anyhow::anyhow!("Deezer CDN did not answer in time."))??;
-        Ok(response.error_for_status()?)
+            .map_err(|_| anyhow::anyhow!("Deezer CDN did not answer in time."))?
+            .map_err(Into::into)
     }
 
     async fn open_media(
@@ -634,11 +640,58 @@ impl DeezerResolver {
         media: &Media,
         range_header: Option<&str>,
     ) -> anyhow::Result<DeezerOpenStream> {
-        // Read headers first to learn total size, including for suffix ranges.
-        let mut response = self.send_stream(&media.url, None).await?;
-        let total = response.content_length();
+        let stripe = STRIPE as u64;
+        // A seek into the song asks the CDN for the stripe it falls in straight away, and learns
+        // the song's size from the answer's Content-Range: one connection, not one for the size
+        // and another for the bytes. The stripe start, because decryption starts at a stripe.
+        let seek_from = range_header
+            .and_then(parse_single_range)
+            .and_then(|range| match range {
+                ByteRange::From(from, _) => Some(from / stripe * stripe),
+                ByteRange::Suffix(_) => None,
+            })
+            .filter(|aligned| *aligned > 0);
+
+        let mut opened = None;
+        if let Some(aligned) = seek_from {
+            let response = self.send_stream_raw(&media.url, Some(aligned)).await?;
+            match response.status() {
+                reqwest::StatusCode::RANGE_NOT_SATISFIABLE => {
+                    if let Some(total) = content_range_total(&response) {
+                        return Ok(DeezerOpenStream::unsatisfiable(total, &media.format));
+                    }
+                    // No size given: ask for the whole song below.
+                }
+                reqwest::StatusCode::PARTIAL_CONTENT => {
+                    if content_range_start(&response) != Some(aligned) {
+                        anyhow::bail!("Deezer CDN returned an unexpected byte range.");
+                    }
+                    let total = content_range_total(&response)
+                        .ok_or_else(|| anyhow::anyhow!("Deezer CDN gave no size with a byte range."))?;
+                    opened = Some((response, Some(total), aligned / stripe, aligned));
+                }
+                // The whole song from its first byte, the range ignored: skip up to the start.
+                _ => {
+                    let response = response.error_for_status()?;
+                    let total = response.content_length();
+                    opened = Some((response, total, 0, 0));
+                }
+            }
+        }
+        // The whole song, or a range from its first stripe or counted from its end: the size
+        // comes first, from the whole song's headers.
+        let (response, total, start_stripe, from_byte) = match opened {
+            Some(opened) => opened,
+            None => {
+                let response = self.send_stream(&media.url, None).await?;
+                let total = response.content_length();
+                (response, total, 0, 0)
+            }
+        };
+
         let content_type = content_type(&media.format).to_string();
-        let mut start_stripe = 0u64;
+        let mut response = response;
+        let mut start_stripe = start_stripe;
         let mut skip = 0u64;
         let mut length = total;
         let mut status = 200u16;
@@ -653,13 +706,14 @@ impl DeezerResolver {
             length = Some(end - start + 1);
             status = 206;
             content_range = Some(format!("bytes {start}-{end}/{total}"));
-            let stripe = STRIPE as u64;
+            skip = start - from_byte;
             let aligned = start / stripe * stripe;
-            skip = start;
-            if aligned > 0 {
+            if from_byte == 0 && seek_from.is_none() && aligned > 0 {
+                // A range counted from the end: its start is known only now.
                 drop(response);
                 // Fetch to EOF so the final encrypted stripe is never truncated.
                 response = self.send_stream(&media.url, Some(aligned)).await?;
+                skip = start;
                 if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
                     if content_range_start(&response) != Some(aligned) {
                         anyhow::bail!("Deezer CDN returned an unexpected byte range.");
@@ -970,6 +1024,16 @@ fn content_range_start(response: &reqwest::Response) -> Option<u64> {
         .ok()?;
     let range = value.trim().strip_prefix("bytes")?.trim();
     range.split_once('-')?.0.trim().parse().ok()
+}
+
+/// The song's size from a `Content-Range: bytes from-to/total` or `bytes */total`.
+fn content_range_total(response: &reqwest::Response) -> Option<u64> {
+    let value = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?;
+    value.rsplit_once('/')?.1.trim().parse().ok()
 }
 
 #[cfg(test)]
