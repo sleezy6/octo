@@ -264,7 +264,13 @@ async fn try_serve_native_radio(
     };
     if dotnet::to_lower_invariant(&tail).ends_with("/tracks") {
         let mut songs = materialize_station(state, request.proxy, &station, request.parameters).await;
-        state.metadata_service.complete_song_lengths(&mut songs);
+        state
+            .metadata_service
+            .complete_song_lengths_within(
+                &mut songs,
+                crate::controllers::subsonic::playlists::STATION_LENGTH_WAIT,
+            )
+            .await;
         state
             .radio_queues
             .register(songs.iter().map(|song| song.id.clone()));

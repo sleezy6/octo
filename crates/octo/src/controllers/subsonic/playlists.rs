@@ -50,6 +50,11 @@ use tracing::info;
 /// How many songs of a family playlist are read at once.
 const FAMILY_SONGS_AT_ONCE: usize = 8;
 
+/// How long a station's answer waits for Deezer's lengths of songs it has none for, when
+/// outside songs play from Deezer. A client reads a station once and keeps what it got; one
+/// with no length shows `--:--` (NaviBeat, Splynt) until it is opened again.
+pub const STATION_LENGTH_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub async fn get_playlists(State(state): State<AppState>, req: Request) -> Response {
     let caller = family_caller(req.extensions()).cloned();
     let call = match SubsonicCall::read(&state, req).await {
@@ -777,7 +782,10 @@ async fn get_playlist_inner(state: &AppState, req: Request, aborted: &RequestAbo
 
     // Before the catalog swap below: these rows are this response's own, while a catalog
     // row is shared with every other response that serves it.
-    state.metadata_service.complete_song_lengths(&mut songs);
+    state
+        .metadata_service
+        .complete_song_lengths_within(&mut songs, STATION_LENGTH_WAIT)
+        .await;
 
     // A song this user's sync catalog also holds goes out as the catalog describes it:
     // same album, and filed under the library's own artist where there is one. A syncing

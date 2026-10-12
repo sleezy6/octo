@@ -1358,6 +1358,24 @@ impl IMusicMetadataService for SoulseekMetadataService {
         inner.warm_lengths(cold.into_iter().take(STATION_LENGTH_WARM_LIMIT));
     }
 
+    async fn complete_song_lengths_within(&self, songs: &mut [Song], budget: Duration) {
+        self.complete_song_lengths(songs);
+        let missing = |songs: &[Song]| {
+            songs
+                .iter()
+                .any(|song| !song.is_local && !song.id.is_empty() && song.duration.is_none_or(|d| d <= 0))
+        };
+        if !self.inner.lengths_from_deezer() || !missing(songs) {
+            return;
+        }
+        let warm = self.inner.last_length_warm.lock().clone();
+        if let Some(warm) = warm {
+            let _ = tokio::time::timeout(budget, warm).await;
+        }
+        // What came back in time is on the registry now; this pass queues nothing new.
+        self.complete_song_lengths(songs);
+    }
+
     async fn resolve_top_durations(&self, songs: &mut [Song], background: bool) {
         let inner = &self.inner;
         let tasks = songs

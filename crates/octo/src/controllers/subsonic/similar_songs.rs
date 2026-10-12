@@ -199,7 +199,10 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
 
     // Outside picks take the lengths already known for them; the rest are looked up in the
     // background for the next answer.
-    state.metadata_service.complete_song_lengths(&mut resolved_songs);
+    state
+        .metadata_service
+        .complete_song_lengths_within(&mut resolved_songs, super::playlists::STATION_LENGTH_WAIT)
+        .await;
 
     let local_count = resolved_songs.iter().filter(|song| song.is_local).count();
     info!(

@@ -2166,3 +2166,40 @@ async fn with_deezer_streams_a_song_deezer_lacks_goes_without_a_length() {
         fixture.requests()
     );
 }
+
+// ---- A station's answer waits a little for Deezer's lengths ----
+
+#[tokio::test]
+async fn with_deezer_streams_a_station_answer_waits_for_deezers_lengths() {
+    let fixture = LengthFixture::new().await;
+    let mut songs = vec![
+        fixture.search("Tyler, The Creator", "EARFQUAKE").await,
+        fixture.search("Kid Cudi", "GHOST!").await,
+    ];
+    assert_eq!(songs[0].duration, None);
+    fixture.deezer("Tyler, The Creator EARFQUAKE", 190);
+    fixture.deezer("Kid Cudi GHOST!", 213);
+    let service = fixture.service.clone().with_lengths_from_deezer(true);
+
+    service
+        .complete_song_lengths_within(&mut songs, Duration::from_secs(5))
+        .await;
+
+    assert_eq!(songs[0].duration, Some(190));
+    assert_eq!(songs[1].duration, Some(213));
+}
+
+#[tokio::test]
+async fn without_deezer_streams_a_station_answer_never_waits() {
+    let fixture = LengthFixture::new().await;
+    let mut songs = vec![fixture.search("Tyler, The Creator", "EARFQUAKE").await];
+    fixture.deezer("Tyler, The Creator EARFQUAKE", 190);
+
+    fixture
+        .service
+        .complete_song_lengths_within(&mut songs, Duration::from_secs(5))
+        .await;
+
+    assert_eq!(songs[0].duration, None);
+    fixture.service.last_length_warm().await;
+}
