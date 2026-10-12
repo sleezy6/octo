@@ -61,6 +61,12 @@ impl RouteSet {
             .route(&format!("/rest/{name}.view"), methods)
     }
 
+    /// A Subsonic endpoint whose methods include their own `.head(..)`.
+    pub fn subsonic_with_head(self, name: &str, methods: MethodRouter<AppState>) -> Self {
+        self.route_with_head(&format!("/rest/{name}"), methods.clone())
+            .route_with_head(&format!("/rest/{name}.view"), methods)
+    }
+
     pub fn merge(mut self, other: RouteSet) -> Self {
         self.routes.extend(other.routes);
         self

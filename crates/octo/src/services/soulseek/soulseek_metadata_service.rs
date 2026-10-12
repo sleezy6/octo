@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -70,6 +71,10 @@ struct ArtistWalk {
 
 struct Inner {
     youtube: Arc<YouTubeResolver>,
+    /// Outside songs play from Deezer (read once at startup, as the rows' format is). A row's
+    /// missing length is then Deezer's, never a YouTube video's: that is the audio that plays,
+    /// and with YouTube off there is no video to ask.
+    lengths_from_deezer: AtomicBool,
     id_registry: Arc<ExternalIdRegistry>,
     deezer: Arc<DeezerMetadataService>,
     cover_art: Arc<CoverArtAggregator>,
@@ -339,6 +344,7 @@ impl SoulseekMetadataService {
         SoulseekMetadataService {
             inner: Arc::new(Inner {
                 youtube,
+                lengths_from_deezer: AtomicBool::new(false),
                 id_registry,
                 deezer,
                 cover_art,
@@ -354,6 +360,13 @@ impl SoulseekMetadataService {
                 count_walks: InFlight::new(),
             }),
         }
+    }
+
+    /// Outside songs play from Deezer, so the lengths their rows lack are asked of Deezer
+    /// rather than of YouTube.
+    pub fn with_lengths_from_deezer(self, on: bool) -> Self {
+        self.inner.lengths_from_deezer.store(on, Ordering::Relaxed);
+        self
     }
 
     /// The most recent pass finishing a search's rows, for a test to wait on.
@@ -522,11 +535,36 @@ impl Inner {
             .remember_length(id, meta.duration, LengthSource::Deezer);
     }
 
+    fn lengths_from_deezer(&self) -> bool {
+        self.lengths_from_deezer.load(Ordering::Relaxed)
+    }
+
+    /// The song's length from Deezer's catalog, stored on its routing as Deezer's. `None` when
+    /// Deezer has no such song or no length for it.
+    async fn deezer_length(&self, id: &str, artist: &str, title: &str, background: bool) -> Option<i32> {
+        let meta = self.deezer.enrich_track(artist, title, false, background).await?;
+        let shown = meta.duration.filter(|&d| d > 0)?;
+        if !id.is_empty() {
+            self.reflect_on_routing(id, &meta);
+        }
+        Some(shown)
+    }
+
     /// One song's video and its length from the shim's quick lookup: the video is pinned on
     /// the routing for playback and its length remembered as the video's. `background`: the
     /// song is already with the client, so only the routing is written and a video a play
     /// pinned meanwhile is kept.
     async fn resolve_video_length(&self, song: &mut Song, background: bool) {
+        if self.lengths_from_deezer() {
+            if let Some(shown) = self
+                .deezer_length(&song.id, &song.artist, &song.title, background)
+                .await
+                && !background
+            {
+                song.duration = Some(shown);
+            }
+            return;
+        }
         let Some(hit) = self
             .find_video(&song.artist, &song.title, song.duration, background)
             .await
@@ -1400,6 +1438,18 @@ impl IMusicMetadataService for SoulseekMetadataService {
                             .lookup(&song.id)
                             .is_some_and(|r| r.lock().you_tube_id.as_deref().is_some_and(|y| !y.is_empty()))
                     {
+                        return;
+                    }
+                    if inner.lengths_from_deezer() {
+                        if let Some(shown) = inner
+                            .deezer_length(&song.id, &song.artist, &song.title, late)
+                            .await
+                        {
+                            let mut answer = answer.lock();
+                            if !answer.sent {
+                                answer.lengths.push((index, shown));
+                            }
+                        }
                         return;
                     }
                     let Some(hit) = inner

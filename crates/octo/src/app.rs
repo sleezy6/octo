@@ -1808,13 +1808,23 @@ impl SoulseekServices {
             port_check,
             share_switch,
             link: Arc::new(SoulseekLink::new(client.clone(), Arc::clone(settings))),
-            metadata: Arc::new(SoulseekMetadataService::new(
-                Arc::clone(&stores.you_tube_resolver),
-                Arc::clone(&stores.external_id_registry),
-                Arc::clone(&clients.deezer_metadata),
-                Arc::clone(&clients.cover_art_aggregator),
-                Some(Arc::clone(last_fm) as Arc<dyn LastFmTrackLengths>),
-            )),
+            metadata: Arc::new(
+                SoulseekMetadataService::new(
+                    Arc::clone(&stores.you_tube_resolver),
+                    Arc::clone(&stores.external_id_registry),
+                    Arc::clone(&clients.deezer_metadata),
+                    Arc::clone(&clients.cover_art_aggregator),
+                    Some(Arc::clone(last_fm) as Arc<dyn LastFmTrackLengths>),
+                )
+                // Read once, as the rows' declared format is: songs that play from Deezer show
+                // Deezer's length.
+                .with_lengths_from_deezer(
+                    settings
+                        .current()
+                        .deezer_stream_when(stores.you_tube_resolver.is_on())
+                        .is_some(),
+                ),
+            ),
             validator: Arc::new(SoulseekStartupValidator::new(settings, client.clone())),
             client,
         }

@@ -177,6 +177,79 @@ async fn streaming_an_outside_song_queues_its_download_only_from_the_first_byte(
     }
 }
 
+#[tokio::test]
+async fn head_of_an_outside_song_answers_its_headers_without_a_play_or_navidrome() {
+    let navidrome = ping_ok().await;
+    let downloads = Arc::new(FakeStreams::streaming(
+        "soulseek",
+        "track-id",
+        &[1, 2, 3],
+        "audio/flac",
+    ));
+    let library = Arc::new(FakeLibrary::with_external(
+        "external-track",
+        "soulseek",
+        "track-id",
+    ));
+    let state = state_with(playback_settings(&navidrome.uri(), false, true), |inner| {
+        inner.download_service = downloads.clone();
+        inner.local_library = library.clone();
+    });
+
+    for path in ["/rest/stream", "/rest/stream.view"] {
+        let response = send(
+            &app(&state),
+            Method::HEAD,
+            &format!("{path}?id=external-track&f=json&u=alice&t=good&s=salt&v=1.16.1&c=test"),
+            &[],
+            Body::empty(),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::OK, "{path}");
+        assert_eq!(response.header("content-type"), Some("audio/flac"), "{path}");
+        assert_eq!(response.header("content-length"), Some("3"), "{path}");
+        assert_eq!(response.header("accept-ranges"), Some("bytes"), "{path}");
+        assert!(response.body.is_empty(), "{path}");
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(state.track_acquisition_queue.waiting_plays(), 0);
+    let asked = navidrome.received_requests().await.unwrap_or_default();
+    assert!(
+        !asked.iter().any(|r| r.url.path().starts_with("/rest/stream")),
+        "{:?}",
+        asked.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn head_of_a_library_song_still_goes_to_navidrome() {
+    let navidrome = ping_ok().await;
+    let state = state_with(playback_settings(&navidrome.uri(), false, false), |_| {});
+
+    let response = send(
+        &app(&state),
+        Method::HEAD,
+        "/rest/stream?id=library-track&u=alice&t=good&s=salt&v=1.16.1&c=test",
+        &[],
+        Body::empty(),
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    let asked = navidrome.received_requests().await.unwrap_or_default();
+    assert!(
+        asked
+            .iter()
+            .any(|r| r.method.as_str() == "HEAD" && r.url.path() == "/rest/stream"),
+        "{:?}",
+        asked
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn only_a_request_from_the_first_byte_is_a_play() {
     for (method, range, play) in [

@@ -39,7 +39,10 @@ use crate::services::subsonic::subsonic_proxy_service::content_type_of;
 
 pub fn routes() -> RouteSet {
     RouteSet::new()
-        .subsonic("stream", get(stream).post(stream))
+        // HEAD too: a player asks it of an outside song for its length and type (Apple's
+        // player on iPhone does), and Navidrome, which the catch-all would ask, has no such
+        // song. A library song's HEAD still goes to Navidrome.
+        .subsonic_with_head("stream", get(stream).post(stream).head(stream_head))
         .subsonic("getCoverArt", get(get_cover_art).post(get_cover_art))
         .subsonic(
             "getTranscodeDecision",
@@ -139,6 +142,29 @@ pub async fn stream(State(state): State<AppState>, req: Request) -> AppResult {
             ))
         }
     }
+}
+
+/// HEAD of `stream`: an outside song is answered as its GET would be, headers only (no play
+/// is counted, and the body is never sent); anything else goes to the catch-all, which asks
+/// Navidrome as before.
+async fn stream_head(State(state): State<AppState>, req: Request) -> AppResult {
+    let id = req
+        .uri()
+        .query()
+        .map(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "id")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let (is_external, _, _) = state.local_library.parse_song_id(&id);
+    if is_blank(&id) || !is_external {
+        return Ok(crate::http::catch_all::catch_all(State(state), req).await);
+    }
+    let response = stream(State(state), req).await?;
+    let (parts, _) = response.into_parts();
+    Ok(Response::from_parts(parts, Body::empty()))
 }
 
 /// Queues the play, waits for a lossless copy when asked to, else serves the preview. An error

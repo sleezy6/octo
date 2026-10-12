@@ -2087,3 +2087,82 @@ async fn the_catalog_track_search_answers_its_rows_lookups() {
     assert_eq!(songs[0].album, "25");
     assert_eq!(h.calls("/search?"), 1);
 }
+
+// ---- Songs that play from Deezer show Deezer's length, never a video's ----
+
+#[tokio::test]
+async fn with_deezer_streams_a_rows_missing_length_is_deezers_and_no_video_is_asked() {
+    let fixture = LengthFixture::new().await;
+    fixture.video("Daft Punk Emotion", 417);
+    let mut songs = vec![fixture.search("Daft Punk", "Emotion").await];
+    assert_eq!(songs[0].duration, None);
+    fixture.deezer("Daft Punk Emotion", 421);
+    let service = fixture.service.clone().with_lengths_from_deezer(true);
+
+    service.resolve_top_durations(&mut songs, false).await;
+
+    assert_eq!(songs[0].duration, Some(421));
+    let routing = fixture.routing(&songs[0]);
+    assert_eq!(SongLength::shown(&routing), (Some(421), LengthSource::Deezer));
+    assert_eq!(routing.you_tube_id, None);
+    assert!(
+        !fixture.requests().iter().any(|r| r.starts_with("shim/")),
+        "{:?}",
+        fixture.requests()
+    );
+}
+
+#[tokio::test]
+async fn with_deezer_streams_a_search_waits_for_deezers_lengths() {
+    let fixture = LengthFixture::new().await;
+    let mut songs = vec![fixture.search("Sub Focus", "Tidal").await];
+    fixture.deezer("Sub Focus Tidal", 226);
+    let service = fixture.service.clone().with_lengths_from_deezer(true);
+
+    let rest = service
+        .resolve_top_durations_within(&mut songs, Duration::from_secs(2))
+        .await;
+
+    assert!(rest.is_none());
+    assert_eq!(songs[0].duration, Some(226));
+    assert!(
+        !fixture.requests().iter().any(|r| r.starts_with("shim/")),
+        "{:?}",
+        fixture.requests()
+    );
+}
+
+#[tokio::test]
+async fn with_deezer_streams_get_song_takes_deezers_length() {
+    let fixture = LengthFixture::new().await;
+    let row = fixture.search("Culture Shock", "Bunker").await;
+    fixture.deezer("Culture Shock Bunker", 251);
+    let service = fixture.service.clone().with_lengths_from_deezer(true);
+    let mut song = service.get_song("SOULSEEK", &row.id).await.expect("registered");
+
+    service.resolve_song_length(&mut song).await;
+
+    assert_eq!(song.duration, Some(251));
+    assert!(
+        !fixture.requests().iter().any(|r| r.starts_with("shim/")),
+        "{:?}",
+        fixture.requests()
+    );
+}
+
+#[tokio::test]
+async fn with_deezer_streams_a_song_deezer_lacks_goes_without_a_length() {
+    let fixture = LengthFixture::new().await;
+    fixture.video("Nobody Nothing", 200);
+    let mut songs = vec![fixture.search("Nobody", "Nothing").await];
+    let service = fixture.service.clone().with_lengths_from_deezer(true);
+
+    service.resolve_top_durations(&mut songs, false).await;
+
+    assert_eq!(songs[0].duration, None);
+    assert!(
+        !fixture.requests().iter().any(|r| r.starts_with("shim/")),
+        "{:?}",
+        fixture.requests()
+    );
+}
