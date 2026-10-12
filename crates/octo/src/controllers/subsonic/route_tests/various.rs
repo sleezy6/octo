@@ -601,7 +601,7 @@ async fn search3_rows_without_a_metadata_length_carry_one_in_the_next_response()
 }
 
 #[tokio::test]
-async fn get_playlist_station_rows_without_a_length_carry_one_in_the_next_response() {
+async fn get_playlist_station_rows_without_a_length_carry_one_in_the_first_response() {
     let fixture = length_fixture().await;
     fixture
         .upstream
@@ -649,7 +649,10 @@ async fn get_playlist_station_rows_without_a_length_carry_one_in_the_next_respon
 
     let first = playlist_lengths(&fixture).await;
     assert_eq!(first["Mr. Oizo|Positif"], Some(207));
-    assert_eq!(first["Justice|Genesis"], None);
+    // The answer waits a little for the lookups (STATION_LENGTH_WAIT): an iPhone player reads a
+    // station once and shows `--:--` for a song that came without a length.
+    assert_eq!(first["Justice|Genesis"], Some(234));
+    assert_eq!(first["Nobody|Nothing"], None);
     fixture.state.music_metadata.last_length_warm().await;
 
     let next = playlist_lengths(&fixture).await;

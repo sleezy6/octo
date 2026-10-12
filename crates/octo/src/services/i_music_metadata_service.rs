@@ -58,10 +58,9 @@ pub trait IMusicMetadataService: Send + Sync {
     /// with no length for now.
     fn complete_song_lengths(&self, _songs: &mut [Song]) {}
 
-    /// [`Self::complete_song_lengths`], then, when outside songs play from Deezer, up to
-    /// `budget` for the lookups it queued, so a list a client reads once (a station) goes out
-    /// with Deezer's lengths. Lookups run in list order; what is not back in time is the next
-    /// answer's.
+    /// [`Self::complete_song_lengths`], then up to `budget` for the lookups it queued, so a list
+    /// a client reads once (a station) goes out with lengths, whichever source plays the songs.
+    /// Lookups run in list order; what is not back in time is the next answer's.
     async fn complete_song_lengths_within(&self, songs: &mut [Song], _budget: Duration) {
         self.complete_song_lengths(songs);
     }

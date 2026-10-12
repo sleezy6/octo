@@ -1365,7 +1365,7 @@ impl IMusicMetadataService for SoulseekMetadataService {
                 .iter()
                 .any(|song| !song.is_local && !song.id.is_empty() && song.duration.is_none_or(|d| d <= 0))
         };
-        if !self.inner.lengths_from_deezer() || !missing(songs) {
+        if !missing(songs) {
             return;
         }
         let warm = self.inner.last_length_warm.lock().clone();

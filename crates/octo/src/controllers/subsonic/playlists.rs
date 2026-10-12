@@ -50,9 +50,9 @@ use tracing::info;
 /// How many songs of a family playlist are read at once.
 const FAMILY_SONGS_AT_ONCE: usize = 8;
 
-/// How long a station's answer waits for Deezer's lengths of songs it has none for, when
-/// outside songs play from Deezer. A client reads a station once and keeps what it got; one
-/// with no length shows `--:--` (NaviBeat, Splynt) until it is opened again.
+/// How long a station's answer waits for the lengths of songs it has none for. A client reads a
+/// station once and keeps what it got, and iPhone players (NaviBeat, Splynt) show `--:--` for a
+/// song with none, whether it streams from Deezer or YouTube.
 pub const STATION_LENGTH_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub async fn get_playlists(State(state): State<AppState>, req: Request) -> Response {
