@@ -391,6 +391,29 @@ impl RadioOutcomeStore {
             .collect()
     }
 
+    /// Forget what was learned about one listener, from the dashboard's history reset. True
+    /// when there was anything to forget.
+    pub fn forget_listener(&self, listener: &str) -> bool {
+        let listener = who(listener);
+        let forgotten = {
+            let mut inner = self.inner.lock();
+            let counted = inner.state.listeners.shift_remove(&listener).is_some();
+            let before = inner.served.len() + inner.open.len() + inner.swept.len();
+            inner.served.retain(|(of, _), _| *of != listener);
+            inner.open.retain(|(of, _), _| *of != listener);
+            inner.swept.retain(|(of, _), _| *of != listener);
+            let pending = before != inner.served.len() + inner.open.len() + inner.swept.len();
+            if counted {
+                inner.dirty = true;
+            }
+            counted || pending
+        };
+        if forgotten {
+            self.flush();
+        }
+        forgotten
+    }
+
     /// Forget everything learned, from the dashboard.
     pub fn forget(&self) {
         {

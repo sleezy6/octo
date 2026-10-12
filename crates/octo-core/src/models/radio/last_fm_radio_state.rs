@@ -55,6 +55,11 @@ pub struct LastFmRadioUserState {
     pub last_refresh_success_utc: Option<DateTime<Utc>>,
     pub last_refresh_error: Option<String>,
     pub refreshing: bool,
+    /// When the listener's radio history was last reset from the dashboard. A listener who was
+    /// reset starts from nothing: the starting profile from stars and albums is not learned
+    /// again. Written only once set, so a file from before it reads and writes as it was.
+    #[serde(with = "datetime::utc_option", skip_serializing_if = "Option::is_none")]
+    pub reset_utc: Option<DateTime<Utc>>,
 }
 
 impl Default for LastFmRadioUserState {
@@ -71,6 +76,7 @@ impl Default for LastFmRadioUserState {
             last_refresh_success_utc: None,
             last_refresh_error: None,
             refreshing: false,
+            reset_utc: None,
         }
     }
 }

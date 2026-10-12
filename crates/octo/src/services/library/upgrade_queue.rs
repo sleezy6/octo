@@ -12,7 +12,7 @@ use octo_core::common::Clock;
 use octo_core::common::acquisition_tracker::user_safe;
 use octo_core::common::dotnet;
 use octo_core::json::datetime;
-use octo_core::settings::{DownloadSource, LibraryAction, SettingsStore, SoulseekSettings};
+use octo_core::settings::{LibraryAction, SettingsStore, SoulseekSettings};
 use octo_core::soulseek::soulseek_link::SoulseekLinkState;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -728,13 +728,7 @@ impl UpgradeWorker {
                 );
             }
         }));
-        request.only_source = pick.as_ref().map(|only| {
-            if only.is_soulseek() {
-                DownloadSource::Soulseek
-            } else {
-                DownloadSource::Lidarr
-            }
-        });
+        request.only_source = pick.as_ref().map(|only| only.download_source());
         let outcome = (self.seams.apply)(request).await;
         // A pick the replacement never used (it joined another download, or found the song
         // needed nothing) is let go with the job, not left for a later download.

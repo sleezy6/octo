@@ -551,6 +551,13 @@ impl LastFmRadioStreamService {
             .await
     }
 
+    /// Whether radio stations are offered as continuous streams at all. The ready pools exist
+    /// only for those, so with radio or its streams switched off there is nothing to warm.
+    pub fn streams_offered(&self) -> bool {
+        let settings = self.shared.settings.current();
+        settings.last_fm.enable_radio && settings.last_fm.expose_radio_as_streams
+    }
+
     /// Warms persisted snapshots without a listener request. Startup has no user credentials by
     /// design, so it uses the registered external preview route; authenticated playback
     /// replenishment remains local-first.

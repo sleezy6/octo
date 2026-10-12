@@ -18,6 +18,9 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use super::*;
 use crate::services::common::test_fakes::FakeMetadata;
 use crate::services::common::{DownloadConcurrency, DownloadCore, DownloadServices};
+use crate::services::deezer::test_support::{
+    Fixture as Deezer, Scenario as DeezerScenario, deezer as deezer_account,
+};
 use crate::services::fingerprint::{AcoustIdClient, AcoustIdRateLimitHandler, AcoustIdRateLimiter};
 use crate::services::i_download_service::IDownloadService;
 use crate::services::local::DownloadHistoryService;
@@ -708,6 +711,8 @@ impl Respond for FakeSlskd {
 
 struct Walk {
     service: Arc<BaseDownloadService>,
+    /// The Soulseek half, which Find songs asks directly.
+    backend: Arc<SoulseekDownloadService>,
     registry: Arc<ExternalIdRegistry>,
     slskd: FakeSlskd,
     songs: Vec<Song>,
@@ -741,6 +746,32 @@ async fn build_with_soulseek(
     source: DownloadSource,
     soulseek_on: bool,
     answers: impl FnOnce(Vec<Song>) -> Answers,
+) -> Walk {
+    build_full(root, album_folders, source, soulseek_on, None, answers).await
+}
+
+/// `deezer`: Deezer as a source of audio, whether outside songs play from it, and its
+/// playback cache.
+async fn build_full(
+    root: &Root,
+    album_folders: bool,
+    source: DownloadSource,
+    soulseek_on: bool,
+    deezer: Option<(Arc<DeezerResolver>, bool, Option<Arc<DeezerAudioCache>>)>,
+    answers: impl FnOnce(Vec<Song>) -> Answers,
+) -> Walk {
+    build_served(root, album_folders, source, soulseek_on, deezer, answers, |_| {}).await
+}
+
+/// [`build_full`], with the download services changed by `extra` (a tracker, a write gate).
+async fn build_served(
+    root: &Root,
+    album_folders: bool,
+    source: DownloadSource,
+    soulseek_on: bool,
+    deezer: Option<(Arc<DeezerResolver>, bool, Option<Arc<DeezerAudioCache>>)>,
+    answers: impl FnOnce(Vec<Song>) -> Answers,
+    extra: impl FnOnce(&mut DownloadServices),
 ) -> Walk {
     let registry = Arc::new(ExternalIdRegistry::in_memory());
     let songs: Vec<Song> = TITLES
@@ -853,10 +884,11 @@ async fn build_with_soulseek(
         history: Arc::new(DownloadHistoryService::new(root.0.path().join("history.json"))),
         notifications: Arc::new(NotificationService::new(Vec::new(), Arc::clone(&settings), None)),
     };
-    let services = DownloadServices {
+    let mut services = DownloadServices {
         concurrency: Some(Arc::new(DownloadConcurrency::new(Arc::clone(&settings)))),
         ..Default::default()
     };
+    extra(&mut services);
     let verification = Arc::new(DownloadVerificationService::new(
         Arc::new(AudioFingerprinter::new()),
         Arc::new(AcoustIdClient::new(Arc::new(AcoustIdRateLimitHandler::new(
@@ -871,14 +903,18 @@ async fn build_with_soulseek(
         rejected_peers: Arc::new(RejectedPeerRegistry::in_memory()),
         verification,
         youtube: Arc::new(YouTubeResolver::with_base_url(Some(&server.uri()))),
+        stream_from_deezer: deezer.as_ref().is_some_and(|(_, stream, _)| *stream),
+        deezer_cache: deezer.as_ref().and_then(|(_, _, cache)| cache.clone()),
+        deezer: deezer.map(|(resolver, _, _)| resolver),
         id_registry: registry.clone(),
         soulseek_link: None,
         lidarr_imports: None,
         lidarr_fetcher: None,
     };
-    let (service, _) = SoulseekDownloadService::build(core, services, parts);
+    let (service, backend) = SoulseekDownloadService::build(core, services, parts);
     Walk {
         service,
+        backend,
         registry,
         slskd,
         songs,
@@ -1475,4 +1511,483 @@ async fn with_soulseek_off_a_soulseek_download_says_so_without_asking_slskd() {
     assert!(walk.slskd.searches().is_empty());
     let asked = walk._server.received_requests().await.expect("recording");
     assert!(!asked.iter().any(|r| r.url.path().starts_with("/api/")));
+}
+
+// ---- Deezer as a source ----------------------------------------------------------------------
+
+/// A mock Deezer whose one song is the walk's song `index`, stored as `payload`.
+async fn deezer_with(index: usize, payload: Vec<u8>) -> Deezer {
+    Deezer::new(DeezerScenario {
+        payload,
+        catalog_artist: "Drake".into(),
+        catalog_title: TITLES[index].0.into(),
+        ..Default::default()
+    })
+    .await
+}
+
+async fn stream_bytes(stream: crate::services::i_download_service::DirectStreamInfo) -> Vec<u8> {
+    use futures::TryStreamExt;
+    let chunks: Vec<bytes::Bytes> = stream.audio_stream.try_collect().await.expect("the song reads");
+    chunks.concat()
+}
+
+#[tokio::test]
+async fn a_deezer_heart_saves_the_flac_and_files_it_in_the_library() {
+    let root = Root::new("octo-deezer-");
+    let deezer = deezer_with(3, flac(TITLES[3].1 as u64)).await;
+    let walk = build_full(
+        &root,
+        false,
+        DownloadSource::Deezer,
+        true,
+        Some((deezer.resolver.clone(), false, None)),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+
+    let path = acquire(&walk, walk.songs[3].external_id.as_deref().expect("an id"), None)
+        .await
+        .expect("the Deezer copy lands");
+
+    assert!(
+        path.ends_with(".flac") && std::path::Path::new(&path).is_file(),
+        "{path}"
+    );
+    // Out of the staging folder, and nothing asked of Soulseek or YouTube.
+    assert!(!path.contains(INCOMING_FOLDER_NAME), "{path}");
+    assert!(walk.slskd.state.lock().searches.is_empty());
+    assert!(walk.slskd.state.lock().you_tube_downloads.is_empty());
+    let seen = deezer.seen.lock();
+    assert_eq!(seen.page_ids, ["42"]);
+    assert!(seen.media_bodies[0].contains("FLAC"));
+}
+
+/// A song that has to wait for a library job (the cover upgrade) before it can be filed says so
+/// on its downloads row, and is filed once the job ends.
+#[tokio::test]
+async fn a_song_waiting_for_a_library_job_says_so_and_lands_when_it_ends() {
+    use crate::services::common::acquisition_tracker::{AcquisitionState, AcquisitionTracker};
+    use crate::services::library::library_write_gate::LibraryWriteGate;
+
+    let root = Root::new("octo-deezer-");
+    let deezer = deezer_with(3, flac(TITLES[3].1 as u64)).await;
+    let tracker = Arc::new(AcquisitionTracker::new(None, octo_core::common::Clock::system()));
+    let gate = LibraryWriteGate::new();
+    let (row_tracker, row_gate) = (tracker.clone(), gate.clone());
+    let walk = build_served(
+        &root,
+        false,
+        DownloadSource::Deezer,
+        true,
+        Some((deezer.resolver.clone(), false, None)),
+        |_| Arc::new(|_: &str| Vec::new()),
+        move |services| {
+            services.tracker = Some(row_tracker);
+            services.write_gate = Some(row_gate);
+        },
+    )
+    .await;
+    let id = walk.songs[3].external_id.clone().expect("an id");
+    tracker.begin(
+        "soulseek",
+        &id,
+        None,
+        None,
+        Some("Drake"),
+        Some(TITLES[3].0),
+        None,
+    );
+
+    let job = gate
+        .begin_job("The cover upgrade")
+        .await
+        .expect("the gate is free");
+    let service = walk.service.clone();
+    let waiting_id = id.clone();
+    let download = tokio::spawn(async move {
+        service
+            .execute_acquisition(
+                "soulseek",
+                &waiting_id,
+                false,
+                true,
+                None,
+                &CancellationToken::new(),
+                None,
+                false,
+                None,
+            )
+            .await
+    });
+
+    let key = format!("soulseek:{id}");
+    let note = async {
+        loop {
+            if let Some(row) = tracker.detail(&key, None)
+                && row.note.as_deref() == Some("Waiting for the cover upgrade to finish")
+            {
+                return row.state;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let state = tokio::time::timeout(Duration::from_secs(30), note)
+        .await
+        .expect("the row says what it waits for");
+    assert_eq!(state, AcquisitionState::Importing);
+    assert!(!download.is_finished(), "it waits while the job runs");
+
+    drop(job);
+    let path = tokio::time::timeout(Duration::from_secs(30), download)
+        .await
+        .expect("it lands once the job ends")
+        .expect("joins")
+        .expect("filed");
+    assert!(
+        path.ends_with(".flac") && std::path::Path::new(&path).is_file(),
+        "{path}"
+    );
+}
+
+#[tokio::test]
+async fn a_deezer_heart_for_a_song_the_catalog_lacks_fails_and_leaves_nothing_behind() {
+    let root = Root::new("octo-deezer-");
+    // The catalog's one song is song 3; song 0 is asked for.
+    let deezer = deezer_with(3, flac(200)).await;
+    let walk = build_full(
+        &root,
+        false,
+        DownloadSource::Deezer,
+        true,
+        Some((deezer.resolver.clone(), false, None)),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+
+    let error = acquire(&walk, walk.songs[0].external_id.as_deref().expect("an id"), None)
+        .await
+        .expect_err("no such song at Deezer");
+
+    assert!(error.to_string().contains("No Deezer match"), "{error:#}");
+    assert!(deezer.seen.lock().page_ids.is_empty());
+    assert_eq!(placed_flacs(&root), 0);
+}
+
+/// Better quality replaces a song only with a lossless copy, so from Deezer it asks for a FLAC
+/// and nothing lesser: an account whose plan gives none fetches nothing.
+#[tokio::test]
+async fn a_better_quality_download_from_deezer_takes_a_flac_or_nothing() {
+    let root = Root::new("octo-deezer-");
+    let deezer = Deezer::new(DeezerScenario {
+        payload: vec![7; 5000],
+        catalog_artist: "Drake".into(),
+        catalog_title: TITLES[3].0.into(),
+        available_formats: vec!["MP3_128", "MP3_320"],
+        ..Default::default()
+    })
+    .await;
+    let walk = build_full(
+        &root,
+        false,
+        DownloadSource::Soulseek,
+        true,
+        Some((deezer.resolver.clone(), false, None)),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+    let id = walk.songs[3].external_id.clone().expect("an id");
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(60),
+        walk.service.execute_acquisition(
+            "soulseek",
+            &id,
+            false,
+            true,
+            Some(DownloadSource::Deezer),
+            &CancellationToken::new(),
+            None,
+            true,
+            None,
+        ),
+    )
+    .await
+    .expect("within a minute")
+    .expect_err("no lossless copy for this account");
+
+    assert!(error.to_string().contains("no lossless copy"), "{error:#}");
+    let seen = deezer.seen.lock();
+    assert!(
+        seen.media_bodies.iter().all(|body| !body.contains("MP3")),
+        "{:?}",
+        seen.media_bodies
+    );
+    assert!(seen.cdn_ranges.is_empty());
+    assert!(walk.slskd.state.lock().searches.is_empty());
+}
+
+/// Find songs lists Deezer's copy by the format the account is given and the file's size,
+/// without fetching the song.
+#[tokio::test]
+async fn find_songs_is_told_the_format_and_size_of_deezers_copy() {
+    let root = Root::new("octo-deezer-");
+    let song = flac(TITLES[3].1 as u64);
+    let size = song.len() as i64;
+    let deezer = deezer_with(3, song).await;
+    let walk = build_full(
+        &root,
+        false,
+        DownloadSource::Soulseek,
+        true,
+        Some((deezer.resolver.clone(), false, None)),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+
+    let copy = walk
+        .backend
+        .find_deezer_copy("Drake", TITLES[3].0, true)
+        .await
+        .expect("Deezer answers")
+        .expect("a copy");
+    assert_eq!((copy.track_id.as_str(), copy.format.as_str()), ("42", "FLAC"));
+    assert_eq!(copy.size, Some(size));
+
+    // A song the catalog lacks is no copy, and no account is an error that says so.
+    let none = walk.backend.find_deezer_copy("Drake", "No Such Song", true).await;
+    assert_eq!(none.expect("Deezer answers"), None);
+    deezer.settings.set(deezer_account(" ", None));
+    let error = walk
+        .backend
+        .find_deezer_copy("Drake", TITLES[3].0, true)
+        .await
+        .expect_err("no account");
+    assert_eq!(error.to_string(), DEEZER_NOT_SET_UP);
+}
+
+#[tokio::test]
+async fn a_deezer_heart_without_an_account_says_deezer_is_not_set_up() {
+    let root = Root::new("octo-deezer-");
+    let deezer = deezer_with(3, flac(200)).await;
+    deezer.settings.set(deezer_account(" ", None));
+    let walk = build_full(
+        &root,
+        false,
+        DownloadSource::Deezer,
+        true,
+        Some((deezer.resolver.clone(), false, None)),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+
+    let error = acquire(&walk, walk.songs[3].external_id.as_deref().expect("an id"), None)
+        .await
+        .expect_err("no account");
+
+    assert_eq!(error.to_string(), DEEZER_NOT_SET_UP);
+    assert!(deezer.seen.lock().auth_cookies.is_empty());
+}
+
+#[tokio::test]
+async fn a_play_comes_from_deezer_when_outside_songs_play_from_it() {
+    let root = Root::new("octo-deezer-");
+    let payload: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+    let deezer = deezer_with(0, payload.clone()).await;
+    let walk = build_full(
+        &root,
+        false,
+        DownloadSource::Soulseek,
+        true,
+        Some((deezer.resolver.clone(), true, None)),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+    let id = walk.songs[0].external_id.clone().expect("an id");
+
+    let stream = walk
+        .service
+        .get_direct_stream("soulseek", &id, Some("bytes=2301-"), &CancellationToken::new())
+        .await
+        .expect("no error")
+        .expect("a stream");
+
+    assert_eq!(stream.status_code, 206);
+    assert_eq!(stream.content_type, "audio/mpeg");
+    assert_eq!(stream.quality.as_deref(), Some("deezer-mp3_320"));
+    assert_eq!(stream.content_range.as_deref(), Some("bytes 2301-4999/5000"));
+    assert_eq!(stream_bytes(stream).await, payload[2301..]);
+    // YouTube was never asked, and no video was pinned.
+    let asked: Vec<String> = walk
+        ._server
+        .received_requests()
+        .await
+        .expect("recording")
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(asked.is_empty(), "{asked:?}");
+    assert!(
+        walk.registry
+            .lookup(&id)
+            .expect("known")
+            .snapshot()
+            .you_tube_id
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_play_deezer_cannot_serve_comes_from_you_tube() {
+    let root = Root::new("octo-deezer-");
+    // The catalog's one song is song 3; song 0 is played.
+    let deezer = deezer_with(3, vec![1, 2, 3]).await;
+    let walk = build_full(
+        &root,
+        false,
+        DownloadSource::Soulseek,
+        true,
+        Some((deezer.resolver.clone(), true, None)),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+    let id = walk.songs[0].external_id.clone().expect("an id");
+
+    let stream = walk
+        .service
+        .get_direct_stream("soulseek", &id, Some("bytes=0-1"), &CancellationToken::new())
+        .await
+        .expect("no error")
+        .expect("a stream");
+
+    assert_eq!(stream.quality.as_deref(), Some("youtube-m4a"));
+    assert_eq!(
+        walk.registry
+            .lookup(&id)
+            .expect("known")
+            .snapshot()
+            .you_tube_id
+            .as_deref(),
+        Some("vid123")
+    );
+}
+
+#[tokio::test]
+async fn a_play_stays_on_you_tube_while_outside_songs_do_not_play_from_deezer() {
+    let root = Root::new("octo-deezer-");
+    let deezer = deezer_with(0, vec![1, 2, 3]).await;
+    let walk = build_full(
+        &root,
+        false,
+        DownloadSource::Soulseek,
+        true,
+        Some((deezer.resolver.clone(), false, None)),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+    let id = walk.songs[0].external_id.clone().expect("an id");
+
+    let stream = walk
+        .service
+        .get_direct_stream("soulseek", &id, Some("bytes=0-1"), &CancellationToken::new())
+        .await
+        .expect("no error")
+        .expect("a stream");
+
+    assert_eq!(stream.quality.as_deref(), Some("youtube-m4a"));
+    assert!(deezer.seen.lock().auth_cookies.is_empty());
+}
+
+/// A playback cache in `root` over the mock Deezer, switched on.
+fn deezer_cache(deezer: &Deezer, root: &Root) -> Arc<DeezerAudioCache> {
+    let mut settings = (*deezer.settings.current()).clone();
+    settings.deezer.cache_enabled = true;
+    deezer.settings.set(settings);
+    Arc::new(DeezerAudioCache::with_root(
+        deezer.resolver.clone(),
+        deezer.settings.clone(),
+        std::path::Path::new(&root.path()).join("deezer-cache"),
+    ))
+}
+
+#[tokio::test]
+async fn a_second_play_reads_the_playback_cache_and_deezer_is_not_asked_again() {
+    let root = Root::new("octo-deezer-");
+    let cache_root = Root::new("octo-deezer-cache-");
+    let payload: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+    let deezer = deezer_with(0, payload.clone()).await;
+    let cache = deezer_cache(&deezer, &cache_root);
+    let walk = build_full(
+        &root,
+        false,
+        DownloadSource::Soulseek,
+        true,
+        Some((deezer.resolver.clone(), true, Some(cache.clone()))),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+    let id = walk.songs[0].external_id.clone().expect("an id");
+    let play = |range: Option<&'static str>| {
+        let (service, id) = (walk.service.clone(), id.clone());
+        async move {
+            service
+                .get_direct_stream("soulseek", &id, range, &CancellationToken::new())
+                .await
+                .expect("no error")
+                .expect("a stream")
+        }
+    };
+
+    assert_eq!(stream_bytes(play(None).await).await, payload);
+    for _ in 0..500 {
+        if cache.status().await.songs == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(cache.status().await.songs, 1);
+    let asked = deezer.seen.lock().cdn_ranges.len();
+    assert_eq!(asked, 1);
+
+    let seek = play(Some("bytes=2301-")).await;
+    assert_eq!(seek.status_code, 206);
+    assert_eq!(seek.content_range.as_deref(), Some("bytes 2301-4999/5000"));
+    assert_eq!(seek.quality.as_deref(), Some("deezer-mp3_320"));
+    assert_eq!(stream_bytes(seek).await, payload[2301..]);
+    assert_eq!(stream_bytes(play(None).await).await, payload);
+    assert_eq!(deezer.seen.lock().cdn_ranges.len(), asked);
+}
+
+#[tokio::test]
+async fn a_deezer_heart_takes_the_song_from_the_playback_cache_when_it_is_there() {
+    let root = Root::new("octo-deezer-");
+    let cache_root = Root::new("octo-deezer-cache-");
+    let song = flac(TITLES[3].1 as u64);
+    let deezer = deezer_with(3, song.clone()).await;
+    let cache = deezer_cache(&deezer, &cache_root);
+    // Cached as a FLAC, which is what a heart keeps.
+    let cached = cache.root().join("42.FLAC.flac");
+    std::fs::create_dir_all(cache.root()).expect("the folder");
+    std::fs::write(&cached, &song).expect("written");
+    let walk = build_full(
+        &root,
+        false,
+        DownloadSource::Deezer,
+        true,
+        Some((deezer.resolver.clone(), false, Some(cache.clone()))),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+
+    let path = acquire(&walk, walk.songs[3].external_id.as_deref().expect("an id"), None)
+        .await
+        .expect("the copy lands");
+
+    assert!(
+        path.ends_with(".flac") && std::path::Path::new(&path).is_file(),
+        "{path}"
+    );
+    // The song was never downloaded: Deezer's CDN was not asked, and the cache keeps its copy.
+    assert!(deezer.seen.lock().cdn_ranges.is_empty());
+    assert!(cached.is_file());
 }

@@ -446,7 +446,7 @@ fn why_off_names_the_first_missing_piece() {
     assert_eq!(QualityUpgradeWorker::acting_user(&on).as_deref(), Some("alice"));
     assert_eq!(
         QualityUpgradeWorker::why_off(&on, true, false),
-        Some("Better quality has no source set up: it needs slskd or Lidarr.")
+        Some("Better quality has no source set up: it needs Deezer, slskd or Lidarr.")
     );
     assert_eq!(
         QualityUpgradeWorker::why_off(&on, false, true),

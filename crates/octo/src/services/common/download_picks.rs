@@ -20,6 +20,10 @@ pub const SOULSEEK_SOURCE: &str = "Soulseek";
 /// The other source a copy can be picked from.
 pub const LIDARR_SOURCE: &str = "Lidarr";
 
+/// Deezer's copy of the song, from the account in the Deezer settings. It names no file: the
+/// download finds the song in Deezer's catalog again.
+pub const DEEZER_SOURCE: &str = "Deezer";
+
 /// One copy someone picked in Find songs: a Soulseek peer's file, or a Lidarr release. Kept as
 /// plain values, so an upgrade job waiting for its turn can carry it on disk. What is derived
 /// from them (whether it is Soulseek's, the Lidarr release) is never written, so the file holds
@@ -72,6 +76,23 @@ impl PickedCopy {
         dotnet::eq_ignore_case(&self.source, SOULSEEK_SOURCE)
     }
 
+    /// Deezer's copy.
+    pub fn is_deezer(&self) -> bool {
+        dotnet::eq_ignore_case(&self.source, DEEZER_SOURCE)
+    }
+
+    /// Where the download is to fetch this copy from.
+    pub fn download_source(&self) -> octo_core::settings::DownloadSource {
+        use octo_core::settings::DownloadSource;
+        if self.is_soulseek() {
+            DownloadSource::Soulseek
+        } else if self.is_deezer() {
+            DownloadSource::Deezer
+        } else {
+            DownloadSource::Lidarr
+        }
+    }
+
     /// Whether this is the same copy: the same peer's same file, or the same release.
     pub fn same_as(&self, other: Option<&PickedCopy>) -> bool {
         other.is_some_and(|other| {
@@ -104,7 +125,7 @@ impl PickedCopy {
     pub fn release(&self) -> Option<LidarrReleasePick> {
         let guid = self.release_guid.as_deref().filter(|g| !g.is_empty())?;
         let indexer_id = self.indexer_id?;
-        (!self.is_soulseek()).then(|| LidarrReleasePick {
+        (!self.is_soulseek() && !self.is_deezer()).then(|| LidarrReleasePick {
             guid: guid.to_string(),
             indexer_id,
             title: self.release_title.clone(),
@@ -114,6 +135,12 @@ impl PickedCopy {
 
     /// "FLAC 16-bit 44.1 kHz from someone", for the log and the upgrade queue.
     pub fn describe(&self) -> String {
+        if self.is_deezer() {
+            return match self.format.as_deref().filter(|f| !f.is_empty()) {
+                Some(format) => format!("Deezer's {}", dotnet::to_upper_invariant(format)),
+                None => "Deezer's copy".to_string(),
+            };
+        }
         if !self.is_soulseek() {
             return match self.release_title.as_deref().filter(|t| !t.is_empty()) {
                 Some(release) => format!("Lidarr release \"{release}\""),

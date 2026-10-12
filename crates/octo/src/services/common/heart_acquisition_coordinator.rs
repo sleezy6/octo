@@ -181,7 +181,8 @@ impl HeartAcquisitionCoordinator {
                 .soulseek
                 .as_ref()
                 .is_some_and(|link| link.hold_limit() > TimeDelta::zero());
-            if source == DownloadSource::YouTube || !holds {
+            // Only Soulseek is worth holding a play for: the other sources answer now.
+            if matches!(source, DownloadSource::YouTube | DownloadSource::Deezer) || !holds {
                 self.queue_play_download(
                     provider,
                     external_id,
@@ -267,10 +268,10 @@ impl HeartAcquisitionCoordinator {
                     provider,
                     external_id,
                     AcquisitionState::Queued,
-                    Some(if source == DownloadSource::YouTube {
-                        "YouTube"
-                    } else {
-                        "Soulseek"
+                    Some(match source {
+                        DownloadSource::YouTube => "YouTube",
+                        DownloadSource::Deezer => "Deezer",
+                        _ => "Soulseek",
                     }),
                     None,
                 );
@@ -753,6 +754,7 @@ impl HeartAcquisitionCoordinator {
 
     fn enabled_steps(&self, album_heart: bool) -> Vec<HeartDownloadSource> {
         let soulseek_off = self.extras.soulseek.as_ref().is_some_and(|link| link.is_off());
+        let you_tube_off = !self.settings.you_tube_enabled();
         self.settings
             .current()
             .subsonic
@@ -766,6 +768,7 @@ impl HeartAcquisitionCoordinator {
                 }
             })
             .filter(|step| !(soulseek_off && step.source == HeartDownloadSource::Soulseek))
+            .filter(|step| !(you_tube_off && step.source == HeartDownloadSource::YouTube))
             .map(|step| step.source)
             .collect()
     }
@@ -779,6 +782,8 @@ impl HeartAcquisitionCoordinator {
         let first = *sources.first()?;
         Some(if first == HeartDownloadSource::YouTube {
             DownloadSource::YouTube
+        } else if first == HeartDownloadSource::Deezer {
+            DownloadSource::Deezer
         } else if sources.contains(&HeartDownloadSource::YouTube) {
             DownloadSource::SoulseekThenYouTube
         } else {
@@ -806,6 +811,22 @@ impl HeartAcquisitionCoordinator {
         let Some((song, copy)) = owned.find_song_in(scope, provider, external_id).await else {
             return false;
         };
+        // A member who cannot see the shared library the copy is in does not have the song:
+        // favoriting it would be a favorite on a song they cannot play. The chain runs instead,
+        // the download finds the copy there and downloads nothing, and the family pool gives the
+        // member a copy of their own ([`FamilyPool::copy_shared_for`]).
+        if let LibraryScope::Viewer(member) = scope
+            && let Some(family) = self.family.get()
+            && family.pool.active()
+            && family.pool.is_shared_file(&copy.absolute_path)
+            && !family.pool.sees_shared_file(member, &copy.absolute_path)
+        {
+            info!(
+                "Hearted '{} - {}' is in a shared library {member} cannot see; they get a copy of their own",
+                song.artist, song.title
+            );
+            return false;
+        }
         let upgrading = owned.queue_upgrade_if_wanted(&copy, &song, requested_by);
         // Before the row closes, so the close never reads as a download that landed.
         if let Some(stars) = &self.extras.stars {
@@ -1021,7 +1042,8 @@ fn source_name(source: HeartDownloadSource) -> &'static str {
     match source {
         HeartDownloadSource::Lidarr => "Lidarr",
         HeartDownloadSource::YouTube => "YouTube",
-        _ => "Soulseek",
+        HeartDownloadSource::Deezer => "Deezer",
+        HeartDownloadSource::Soulseek => "Soulseek",
     }
 }
 
@@ -1033,6 +1055,7 @@ fn source_enum_name(source: HeartDownloadSource) -> &'static str {
 fn to_direct_source(source: HeartDownloadSource) -> DownloadSource {
     match source {
         HeartDownloadSource::YouTube => DownloadSource::YouTube,
+        HeartDownloadSource::Deezer => DownloadSource::Deezer,
         _ => DownloadSource::Soulseek,
     }
 }

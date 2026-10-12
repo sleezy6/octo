@@ -23,6 +23,7 @@ use octo_core::common::{dotnet, live_version};
 use octo_core::fingerprint::{InconclusiveReason, VerificationResult, VerificationVerdict};
 use octo_core::models::domain::{Album, Song};
 use octo_core::notifications::{NotificationEvent, NotificationEventType};
+use octo_core::settings::deezer::{DEEZER_FORMAT_FLAC, DEEZER_QUALITY_LOSSLESS_ONLY};
 use octo_core::settings::{DownloadSource, SoulseekSettings};
 use octo_core::soulseek::soulseek_client::{
     FIRST_BYTE_WAIT, WAITING_NOTE_AFTER, contains_ignore_case, normalize_extension,
@@ -55,6 +56,7 @@ use crate::services::common::{
     AcquisitionState, BaseDownloadService, DownloadBackend, DownloadCore, DownloadServices,
     OperationCanceled, TrackDownload,
 };
+use crate::services::deezer::{DeezerAudioCache, DeezerResolver};
 use crate::services::fingerprint::DownloadVerificationService;
 use crate::services::i_download_service::DirectStreamInfo;
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
@@ -89,6 +91,9 @@ pub struct InvalidOperationException(pub String);
 
 /// No copy found, or the copy found is gone. Reported as an `io::Error` of kind `NotFound`, which
 /// is how the library-action executor recognizes "no copy here".
+/// What a Deezer download says while no account is set.
+pub const DEEZER_NOT_SET_UP: &str = "Deezer is not set up (no ARL in the Deezer settings).";
+
 fn file_not_found(message: String) -> anyhow::Error {
     std::io::Error::new(std::io::ErrorKind::NotFound, message).into()
 }
@@ -160,12 +165,29 @@ pub enum ReserveChoice {
     DiscardNew,
 }
 
+/// Deezer's copy of a song as Find songs lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeezerCopy {
+    pub track_id: String,
+    /// "FLAC", "MP3_320" or "MP3_128".
+    pub format: String,
+    /// The whole file's size in bytes, when Deezer said.
+    pub size: Option<i64>,
+}
+
 /// What the service needs beyond the base's own services.
 pub struct SoulseekDownloadParts {
     pub slskd: SoulseekClient,
     pub rejected_peers: Arc<RejectedPeerRegistry>,
     pub verification: Arc<DownloadVerificationService>,
     pub youtube: Arc<YouTubeResolver>,
+    /// Deezer as a source of audio, when there is one. It serves nothing while no account is set.
+    pub deezer: Option<Arc<DeezerResolver>>,
+    /// The playback cache over it, when there is one. Off, it passes every play to Deezer.
+    pub deezer_cache: Option<Arc<DeezerAudioCache>>,
+    /// Outside songs play from Deezer (`AppSettings::deezer_stream`, read once at startup with
+    /// what the rows declare).
+    pub stream_from_deezer: bool,
     pub id_registry: Arc<ExternalIdRegistry>,
     /// The Soulseek link, when there is one.
     pub soulseek_link: Option<Arc<dyn ISoulseekLink>>,
@@ -189,6 +211,10 @@ pub struct SoulseekDownloadService {
     /// minimum size and the per-peer timeout are restart-only settings.
     settings: SoulseekSettings,
     youtube: Arc<YouTubeResolver>,
+    deezer: Option<Arc<DeezerResolver>>,
+    deezer_cache: Option<Arc<DeezerAudioCache>>,
+    /// Deliberately captured at construction: it must change together with what the rows declare.
+    stream_from_deezer: bool,
     id_registry: Arc<ExternalIdRegistry>,
     soulseek_link: Option<Arc<dyn ISoulseekLink>>,
     lidarr_imports: Option<Arc<LidarrImportHandoff>>,
@@ -220,6 +246,9 @@ impl SoulseekDownloadService {
             verification: parts.verification,
             settings: soulseek_settings,
             youtube: parts.youtube,
+            deezer: parts.deezer,
+            deezer_cache: parts.deezer_cache,
+            stream_from_deezer: parts.stream_from_deezer,
             id_registry: parts.id_registry,
             soulseek_link: parts.soulseek_link,
             lidarr_imports: parts.lidarr_imports,
@@ -552,6 +581,250 @@ impl SoulseekDownloadService {
             verdict.apply_tags_to(song);
         }
         song.verification = Some(Box::new(verdict));
+        Ok(path)
+    }
+
+    // =========================================================================
+    // Deezer
+    // =========================================================================
+
+    /// Deezer's copy of a song, for Find songs: the format the account would be given and the
+    /// file's size, read from the first bytes of the file and nothing more. `lossless_only`
+    /// asks for FLAC and nothing lesser. `Ok(None)` when the catalog has no such song or the
+    /// account is given no such copy; an error when no account is set.
+    pub async fn find_deezer_copy(
+        &self,
+        artist: &str,
+        title: &str,
+        lossless_only: bool,
+    ) -> anyhow::Result<Option<DeezerCopy>> {
+        let Some(deezer) = self.deezer.as_ref().filter(|deezer| deezer.is_configured()) else {
+            anyhow::bail!("{DEEZER_NOT_SET_UP}");
+        };
+        let Some(track_id) = deezer.track_id_for(artist, title, None).await else {
+            return Ok(None);
+        };
+        let quality = if lossless_only {
+            DEEZER_QUALITY_LOSSLESS_ONLY.to_string()
+        } else {
+            deezer.download_quality()
+        };
+        let Some(opened) = deezer.open_stream(&track_id, Some("bytes=0-1"), &quality).await else {
+            return Ok(None);
+        };
+        // "bytes 0-1/31415926": the whole file's size is after the slash.
+        let size = opened
+            .content_range
+            .as_deref()
+            .and_then(|range| range.rsplit('/').next())
+            .and_then(|total| total.trim().parse::<i64>().ok());
+        Ok(Some(DeezerCopy {
+            track_id,
+            format: opened.format,
+            size,
+        }))
+    }
+
+    /// The song's id in Deezer's catalog, or why there is none to ask Deezer for.
+    async fn deezer_track_id(&self, deezer: &DeezerResolver, r: &SoulseekRouting) -> Option<String> {
+        if !r.has_artist_title() {
+            return None;
+        }
+        let (artist, title) = names(r);
+        deezer.track_id_for(&artist, &title, r.isrc.as_deref()).await
+    }
+
+    /// An outside song played straight from Deezer, decrypted as it is read. `None` when no
+    /// account is set, the catalog has no such song, or no account is given it: the caller
+    /// plays it from YouTube then.
+    async fn deezer_direct_stream(
+        &self,
+        r: &SoulseekRouting,
+        range_header: Option<&str>,
+    ) -> Option<DirectStreamInfo> {
+        let deezer = self.deezer.as_ref().filter(|deezer| deezer.is_configured())?;
+        let (artist, title) = names(r);
+        let Some(track_id) = self.deezer_track_id(deezer, r).await else {
+            debug!("play of '{artist} - {title}': Deezer's catalog has no such song");
+            return None;
+        };
+        // Through the playback cache when there is one: a replay or a seek then reads the copy.
+        let quality = deezer.stream_quality();
+        let opened = match &self.deezer_cache {
+            Some(cache) => cache.open_stream(&track_id, range_header, &quality).await,
+            None => deezer.open_stream(&track_id, range_header, &quality).await,
+        }?;
+        info!(
+            "Deezer stream '{artist} - {title}' (track={track_id}, {}, status={}, {} bytes{})",
+            opened.format,
+            opened.status_code,
+            opened.content_length.map(|l| l.to_string()).unwrap_or_default(),
+            opened
+                .content_range
+                .as_deref()
+                .map(|range| format!(", range={range}"))
+                .unwrap_or_default()
+        );
+        Some(DirectStreamInfo {
+            audio_stream: opened.audio_stream,
+            content_type: opened.content_type,
+            content_length: opened.content_length,
+            quality: Some(format!("deezer-{}", opened.format.to_ascii_lowercase())),
+            status_code: opened.status_code,
+            content_range: opened.content_range,
+        })
+    }
+
+    // The song itself from Deezer, with the account in the Deezer settings: FLAC, or the best
+    // lesser format the account is given. The resolver writes <dest>.flac or .mp3 into the
+    // staging folder; the base's placement tags it and moves it into the library.
+    async fn download_via_deezer(
+        &self,
+        base: &BaseDownloadService,
+        routing: &SharedRouting,
+        download: &mut TrackDownload,
+        ct: &CancellationToken,
+    ) -> anyhow::Result<String> {
+        let download_path = base.download_path();
+        if download_path.is_empty() {
+            return Err(InvalidOperationException("DownloadPath is not configured".into()).into());
+        }
+        let Some(deezer) = self.deezer.as_ref().filter(|deezer| deezer.is_configured()) else {
+            return Err(InvalidOperationException(DEEZER_NOT_SET_UP.to_string()).into());
+        };
+
+        let provider = base.provider_name().to_string();
+        let track_key = download.song.external_id.clone().unwrap_or_default();
+        base.track(|t| {
+            t.stage(
+                &provider,
+                &track_key,
+                AcquisitionState::Searching,
+                Some("Deezer"),
+                None,
+            )
+        });
+
+        let r = routing.snapshot();
+        let (artist, title) = names(&r);
+        let Some(track_id) = or_canceled(ct, async { Ok(self.deezer_track_id(deezer, &r).await) }).await?
+        else {
+            return Err(file_not_found(format!(
+                "No Deezer match for '{artist} - {title}'"
+            )));
+        };
+        // Better quality replaces a song only with a lossless copy, so it asks for FLAC and
+        // nothing lesser: an account that is not given one fetches nothing.
+        let lossless_only = download.upgrade_search;
+        let quality = if lossless_only {
+            DEEZER_QUALITY_LOSSLESS_ONLY.to_string()
+        } else {
+            deezer.download_quality()
+        };
+        base.log_step(
+            &track_key,
+            acquisition_event_kinds::FOUND,
+            "Found it on Deezer",
+            Some(&format!("Track {track_id}, asked for as {quality}")),
+        );
+
+        // Staged, not written into the library: the base's placement names and moves it once
+        // the tags are settled. The resolver adds the extension of the format it was given.
+        let incoming = combine(&download_path, INCOMING_FOLDER_NAME);
+        sweep_incoming(&incoming);
+        let dest_without_ext = combine(&incoming, &format!("deezer-{track_id}-{}", new_guid()));
+
+        base.track(|t| t.transfer(&provider, &track_key, None, None, None, Some("Deezer")));
+        // A whole copy the playback cache already holds in the wanted format is the same bytes.
+        let cached = match &self.deezer_cache {
+            Some(cache) => {
+                let cached_as = if lossless_only {
+                    DEEZER_FORMAT_FLAC
+                } else {
+                    quality.as_str()
+                };
+                cache.copy_ready(&track_id, cached_as, &dest_without_ext).await
+            }
+            None => None,
+        };
+        let path = match cached {
+            Some(path) => {
+                base.log_step(
+                    &track_key,
+                    acquisition_event_kinds::NOTE,
+                    "Taken from the playback cache",
+                    None,
+                );
+                Some(path)
+            }
+            None => or_canceled(ct, deezer.download_as(&track_id, &dest_without_ext, &quality)).await?,
+        };
+        let Some(path) = path.filter(|p| !p.is_empty() && file_exists(p)) else {
+            return Err(file_not_found(format!(
+                "Deezer has no {} of '{artist} - {title}' this account can be given",
+                if lossless_only { "lossless copy" } else { "copy" }
+            )));
+        };
+        let format = Path::new(&path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_uppercase)
+            .unwrap_or_default();
+
+        if !download.suppress_notify {
+            base.notifications().notify(NotificationEvent {
+                artist: r.artist.clone(),
+                title: r.title.clone(),
+                album: r.album.clone(),
+                source: Some("Deezer".into()),
+                format: Some(format.clone()),
+                duration_seconds: r.duration,
+                ..NotificationEvent::new(NotificationEventType::DownloadStarted)
+            });
+        }
+        info!("Deezer {format} download complete: {path}");
+
+        // Identification only. The catalog named this track for this artist and title, and
+        // Deezer has no second copy to fall back to, so a disagreement is something to ask a
+        // person about (the Review playlist), never a reason to throw the song away.
+        base.track(|t| t.stage(&provider, &track_key, AcquisitionState::Verifying, None, None));
+        let song = &mut download.song;
+        let mut verdict = self
+            .verification
+            .verify(
+                &path,
+                r.artist.as_deref(),
+                r.title.as_deref(),
+                song.isrc.as_deref().or(r.isrc.as_deref()),
+                false,
+            )
+            .await;
+        if verdict.verdict == VerificationVerdict::Mismatch {
+            if verdict.r#match.is_none() && verdict.matched_title.as_deref().is_none_or(str::is_empty) {
+                // No decodable audio at all: a broken file, not a question.
+                let _ = std::fs::remove_file(&path);
+                return Err(InvalidOperationException(format!(
+                    "Deezer delivered no decodable audio for '{artist} - {title}'"
+                ))
+                .into());
+            }
+            warn!(
+                "AcoustID says the Deezer file for '{artist} - {title}' is {}; keeping it and asking about it",
+                verdict.describe()
+            );
+            base.log_step(
+                &track_key,
+                acquisition_event_kinds::CHECK,
+                &format!("AcoustID says this is {}", verdict.describe()),
+                Some("Deezer has no other copy, so it is kept and goes to your Review playlist"),
+            );
+            verdict.verdict = VerificationVerdict::Inconclusive;
+            verdict.reason = InconclusiveReason::SourceDisagreed;
+        } else {
+            verdict.apply_tags_to(song);
+        }
+        song.verification = Some(Box::new(verdict));
+        download.fetched_from = Some("Deezer".to_string());
         Ok(path)
     }
 
@@ -1978,6 +2251,19 @@ impl DownloadBackend for SoulseekDownloadService {
         };
 
         let r = routing.snapshot();
+        // Subsonic:StreamSource Deezer. A song Deezer cannot serve plays from YouTube below,
+        // which is a different format from the one its row declared; most players read the
+        // Content-Type of the answer and play it all the same.
+        if self.stream_from_deezer {
+            if let Some(stream) = self.deezer_direct_stream(&r, range_header).await {
+                return Ok(Some(stream));
+            }
+            warn!(
+                "Deezer could not serve '{} - {}'; playing it from YouTube",
+                r.artist.as_deref().unwrap_or(""),
+                r.title.as_deref().unwrap_or("")
+            );
+        }
         let mut video_id = r.you_tube_id.clone().filter(|v| !v.is_empty());
         if video_id.is_none() && r.has_artist_title() {
             let (artist, title) = names(&r);
@@ -2116,6 +2402,7 @@ impl DownloadBackend for SoulseekDownloadService {
         let source = match source {
             DownloadSource::SoulseekThenYouTube if !self.slskd.is_on() => DownloadSource::YouTube,
             DownloadSource::YouTube => DownloadSource::YouTube,
+            DownloadSource::Deezer => DownloadSource::Deezer,
             _ if !self.slskd.is_on() => {
                 return Err(
                     InvalidOperationException(super::soulseek_client::SOULSEEK_OFF.to_string()).into(),
@@ -2126,6 +2413,10 @@ impl DownloadBackend for SoulseekDownloadService {
         match source {
             DownloadSource::YouTube => {
                 self.download_via_you_tube(base, &routing, download, true, cancellation_token)
+                    .await
+            }
+            DownloadSource::Deezer => {
+                self.download_via_deezer(base, &routing, download, cancellation_token)
                     .await
             }
             DownloadSource::SoulseekThenYouTube => {

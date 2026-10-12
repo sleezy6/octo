@@ -14,7 +14,7 @@ use octo_media::tags::tag_writer_extras;
 use tracing::{debug, error, info, warn};
 
 use super::{BaseDownloadService, FileNotFoundException, RequestedIdentity, file_exists, get_extension};
-use crate::services::common::acquisition_tracker::{acquisition_event_kinds, key_of};
+use crate::services::common::acquisition_tracker::{AcquisitionState, acquisition_event_kinds, key_of};
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::library::{ReplacementHandoff, ReplacementRejectedException};
 use crate::services::lyrics::lyrics_sidecar_writer::LyricsJob;
@@ -134,9 +134,15 @@ impl BaseDownloadService {
         current_path: &str,
         root: Option<&str>,
     ) -> Placement {
-        // Never while a library job (the tidy, a re-tag) is rewriting or moving folders.
+        // Never while a library job (the tidy, a re-tag) is rewriting or moving folders. A song
+        // that waits says so: "Adding to library" alone looked like a download that had hung.
         let _share = match &self.services.write_gate {
-            Some(gate) => Some(gate.write().await),
+            Some(gate) => {
+                if let Some(job) = gate.job() {
+                    self.say_waiting_for(song, &job);
+                }
+                Some(gate.write().await)
+            }
             None => None,
         };
         match self.try_place(song, requested, current_path, root).await {
@@ -148,6 +154,29 @@ impl BaseDownloadService {
                 Placement::new(current_path, false)
             }
         }
+    }
+
+    /// Notes on the song's downloads row, and in the log, that it waits for `job` (a library
+    /// job holding the music folder) before it can be filed.
+    fn say_waiting_for(&self, song: &Song, job: &str) {
+        let note = format!("Waiting for {} to finish", job_in_sentence(job));
+        info!("'{} - {}': {note} before it is filed", song.artist, song.title);
+        let Some(external_id) = song.external_id.as_deref().filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let provider = song
+            .external_provider
+            .clone()
+            .unwrap_or_else(|| self.provider_name().to_string());
+        self.track(|t| {
+            t.stage(
+                &provider,
+                external_id,
+                AcquisitionState::Importing,
+                None,
+                Some(&note),
+            )
+        });
     }
 
     async fn try_place(
@@ -549,4 +578,13 @@ fn find_file(dir: &Path, prefix: &str) -> std::io::Result<Option<String>> {
         }
     }
     Ok(None)
+}
+
+/// A job's name as it reads inside a sentence: "The cover upgrade" becomes "the cover upgrade".
+/// Other names ("Tidy artists", "Explicit marking") are kept as they are.
+fn job_in_sentence(job: &str) -> String {
+    match job.strip_prefix("The ") {
+        Some(rest) => format!("the {rest}"),
+        None => job.to_string(),
+    }
 }

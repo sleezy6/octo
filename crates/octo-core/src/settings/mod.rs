@@ -6,6 +6,7 @@
 //! methods clamp at read time.
 
 pub mod admin;
+pub mod deezer;
 pub mod family;
 pub mod generated_playlist;
 pub mod genre;
@@ -32,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{BindWarning, ConfigTree, bind};
 
 pub use admin::AdminSettings;
+pub use deezer::DeezerSettings;
 pub use family::FamilySettings;
 pub use generated_playlist::GeneratedPlaylistSettings;
 pub use genre::{
@@ -54,7 +56,7 @@ pub use soulseek::SoulseekSettings;
 pub use store::{RawConfig, SettingsStore};
 pub use subsonic::{
     DownloadMode, DownloadSource, ExplicitFilter, FolderStructure, HeartDownloadSource, HeartDownloadStep,
-    StorageMode, SubsonicSettings,
+    StorageMode, StreamSource, SubsonicSettings,
 };
 pub use text::IgnoreCaseSet;
 pub use update::UpdateSettings;
@@ -68,6 +70,7 @@ pub struct AppSettings {
     pub subsonic: SubsonicSettings,
     pub soulseek: SoulseekSettings,
     pub lidarr: LidarrSettings,
+    pub deezer: DeezerSettings,
     pub last_fm: LastFmSettings,
     pub radio_sources: RadioSourceSettings,
     pub genre: GenreSettings,
@@ -84,14 +87,34 @@ pub struct AppSettings {
 }
 
 impl AppSettings {
+    /// What outside songs are declared as when they play from Deezer: `Subsonic:StreamSource`
+    /// is Deezer and an account is set. `None` while they play from YouTube. The app reads this
+    /// once, at startup: it decides what every row declares and where every play is asked for,
+    /// and the two must not part ways under a client that has cached its rows.
+    pub fn deezer_stream(&self) -> Option<crate::soulseek::stream_facts::DeclaredStream> {
+        self.deezer_stream_when(true)
+    }
+
+    /// [`Self::deezer_stream`] on a server where YouTube may be switched off: then outside songs
+    /// play from Deezer whatever `StreamSource` says, when an account is set, since YouTube
+    /// has nothing to play them from.
+    pub fn deezer_stream_when(
+        &self,
+        you_tube_on: bool,
+    ) -> Option<crate::soulseek::stream_facts::DeclaredStream> {
+        ((self.subsonic.stream_source == StreamSource::Deezer || !you_tube_on) && self.deezer.is_configured())
+            .then(|| self.deezer.declared_stream())
+    }
+
     /// The configuration section names, in registration order.
-    pub const SECTIONS: [&'static str; 16] = [
+    pub const SECTIONS: [&'static str; 17] = [
         "Genre",
         "LibraryActions",
         "GeneratedPlaylists",
         "Subsonic",
         "Soulseek",
         "Lidarr",
+        "Deezer",
         "LastFm",
         "RadioSources",
         "Notifications",
@@ -116,6 +139,7 @@ impl AppSettings {
             subsonic: bind_section(tree, "Subsonic", &mut warnings),
             soulseek: bind_section(tree, "Soulseek", &mut warnings),
             lidarr: bind_section(tree, "Lidarr", &mut warnings),
+            deezer: bind_section(tree, "Deezer", &mut warnings),
             last_fm: bind_section(tree, "LastFm", &mut warnings),
             radio_sources: bind_section(tree, "RadioSources", &mut warnings),
             notifications: bind_section(tree, "Notifications", &mut warnings),
@@ -167,6 +191,38 @@ pub fn bind_section<T: DeserializeOwned + Default>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With YouTube switched off, outside songs play from Deezer when an account is set, whatever
+    /// the stream source says; without an account there is nothing to play them from.
+    #[test]
+    fn with_you_tube_off_outside_songs_play_from_deezer_when_an_account_is_set() {
+        let mut settings = AppSettings::default();
+        assert_eq!(settings.subsonic.stream_source, StreamSource::YouTube);
+        assert!(settings.deezer_stream_when(false).is_none());
+        settings.deezer.arl = Some("arl".into());
+        assert!(settings.deezer_stream().is_none());
+        assert!(settings.deezer_stream_when(true).is_none());
+        assert!(settings.deezer_stream_when(false).is_some());
+        settings.subsonic.stream_source = StreamSource::Deezer;
+        assert!(settings.deezer_stream_when(true).is_some());
+    }
+
+    #[test]
+    fn you_tube_is_on_unless_switched_off() {
+        let store = SettingsStore::for_tests(AppSettings::default());
+        assert!(store.you_tube_enabled());
+        for (value, on) in [
+            ("false", false),
+            (" FALSE ", false),
+            ("0", false),
+            ("true", true),
+            ("", true),
+            ("no idea", true),
+        ] {
+            store.set_raw("YouTube:Enabled", Some(value));
+            assert_eq!(store.you_tube_enabled(), on, "{value:?}");
+        }
+    }
 
     #[test]
     fn navidromes_address_is_read_without_trailing_slashes_or_spaces() {

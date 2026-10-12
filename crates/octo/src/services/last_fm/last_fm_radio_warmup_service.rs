@@ -90,6 +90,14 @@ impl LastFmRadioWarmupService {
                 }
             };
             let Some(username) = username else { break };
+            // Nothing plays from the ready pools while radio streams are off, so nothing is
+            // fetched for them and nothing is reported as missing.
+            if !self.streams.streams_offered() {
+                self.queued
+                    .lock()
+                    .remove(&dotnet::ordinal_ignore_case_key(&username));
+                continue;
+            }
             match self.process(&username, &stopping).await {
                 Ok(result) if result.ready_station_count == result.station_count => info!(
                     "Radio cache warm for {username}: {}/{} stations, {} ready tracks",

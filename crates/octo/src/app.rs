@@ -54,6 +54,7 @@ use octo_media::cover::CoverArtService;
 use crate::services::charts::{AppleMusicPages, ChartsWarmWorker};
 use crate::services::common::TopSongsService;
 use crate::services::cover_art::{ArtworkHints, HintedArtwork};
+use crate::services::deezer::{DeezerAudioCache, DeezerResolver};
 use crate::services::family::LibraryWriteGate as FamilyWriteGate;
 use crate::services::family::request_service::{
     FamilyEvents, LiveRequestCatalog, LiveRequestFetcher, RequestParts, RequestService,
@@ -261,6 +262,8 @@ pub struct AppInner {
     pub deezer_client: Arc<DeezerRateLimitHandler>,
     /// `DeezerMetadataService`.
     pub deezer_metadata: Arc<DeezerMetadataService>,
+    pub deezer_resolver: Arc<DeezerResolver>,
+    pub deezer_cache: Arc<DeezerAudioCache>,
     /// `MusicBrainzClient` with its own HTTP client.
     pub music_brainz: Arc<MusicBrainzClient>,
     /// `AcoustIdRateLimiter`.
@@ -815,6 +818,14 @@ impl Acquisition {
                         rejected_peers: stores.rejected_peers.clone(),
                         verification: downloads.tagging.download_verification.clone(),
                         youtube: stores.you_tube_resolver.clone(),
+                        deezer: Some(clients.deezer_resolver.clone()),
+                        deezer_cache: Some(clients.deezer_cache.clone()),
+                        // Read once, as the response builder reads what the rows declare.
+                        // With YouTube off, outside songs play from Deezer whatever StreamSource says.
+                        stream_from_deezer: settings
+                            .current()
+                            .deezer_stream_when(stores.you_tube_resolver.is_on())
+                            .is_some(),
                         id_registry: stores.external_id_registry.clone(),
                         soulseek_link: Some(soulseek_link.clone()),
                         lidarr_imports: Some(lidarr_import_handoff.clone()),
@@ -1199,9 +1210,16 @@ impl Stores {
         let you_tube_resolver = Arc::new(YouTubeResolver::new(settings));
         // Every row the response builder sends without a size asks this to learn one.
         let warm_settings = settings.clone();
+        // What outside songs are declared as when they play from Deezer; read once, here. The
+        // size lookups ask YouTube about a stream that then never plays, so they are off.
+        let deezer_stream = settings.current().deezer_stream_when(you_tube_resolver.is_on());
+        let from_deezer = deezer_stream.is_some();
         let stream_size_warmer = Arc::new(
             StreamSizeWarmer::new(external_id_registry.clone(), you_tube_resolver.clone()).with_per_minute(
                 Arc::new(move || {
+                    if from_deezer {
+                        return 0;
+                    }
                     warm_settings
                         .current()
                         .subsonic
@@ -1220,10 +1238,10 @@ impl Stores {
                 config_dir.join("soulseek-holds.json"),
             ))),
             you_tube_resolver,
-            subsonic_response_builder: Arc::new(SubsonicResponseBuilder::new(
-                stream_size_warmer.clone(),
-                &settings.current().subsonic,
-            )),
+            subsonic_response_builder: Arc::new(
+                SubsonicResponseBuilder::new(stream_size_warmer.clone(), &settings.current().subsonic)
+                    .with_outside_stream(deezer_stream),
+            ),
             stream_size_warmer,
             external_id_registry,
             radio_queues: Arc::new(RadioQueueStore::new()),
@@ -1299,6 +1317,11 @@ struct MetadataClients {
     deezer_rate_limiter: Arc<DeezerRateLimiter>,
     deezer_client: Arc<DeezerRateLimitHandler>,
     deezer_metadata: Arc<DeezerMetadataService>,
+    /// Deezer as a source of audio, over the same catalog. It asks nothing until an account
+    /// is set.
+    deezer_resolver: Arc<DeezerResolver>,
+    /// The playback cache over it. Off unless `Deezer:CacheEnabled`.
+    deezer_cache: Arc<DeezerAudioCache>,
     music_brainz: Arc<MusicBrainzClient>,
     acoust_id_rate_limiter: Arc<AcoustIdRateLimiter>,
     acoust_id: Arc<AcoustIdClient>,
@@ -1329,6 +1352,14 @@ impl MetadataClients {
             }
             None => DeezerMetadataService::new(Arc::clone(&deezer_client), Arc::clone(settings)),
         });
+        let deezer_resolver = Arc::new(DeezerResolver::new(
+            Arc::clone(settings),
+            Arc::clone(&deezer_metadata),
+        ));
+        let deezer_cache = Arc::new(DeezerAudioCache::new(
+            Arc::clone(&deezer_resolver),
+            Arc::clone(settings),
+        ));
         let acoust_id_rate_limiter = Arc::new(AcoustIdRateLimiter::new());
         let acoust_id = Arc::new(AcoustIdClient::new(Arc::new(AcoustIdRateLimitHandler::new(
             Arc::clone(&acoust_id_rate_limiter),
@@ -1355,6 +1386,8 @@ impl MetadataClients {
             deezer_rate_limiter,
             deezer_client,
             deezer_metadata,
+            deezer_resolver,
+            deezer_cache,
             music_brainz: Arc::new(MusicBrainzClient::new()),
             acoust_id_rate_limiter,
             acoust_id,
@@ -2596,6 +2629,19 @@ impl AppState {
         stores.register_workers(&workers);
         lyrics.register_workers(&workers);
 
+        // The playback cache drops what an earlier run left half-downloaded, then sweeps its folder.
+        let deezer_cache = Arc::clone(&clients.deezer_cache);
+        workers.register("DeezerAudioCache", move |stopping| {
+            Arc::clone(&deezer_cache).run(stopping)
+        });
+
+        // An ARL expires without a word: the accounts are checked every half hour, and the log
+        // says when one stops signing in.
+        let deezer_accounts = Arc::clone(&clients.deezer_resolver);
+        workers.register("DeezerAccountWatch", move |stopping| {
+            Arc::clone(&deezer_accounts).watch_accounts(stopping)
+        });
+
         // The iTunes matches flush every 15 seconds, and once more on shutdown.
         let itunes = Arc::clone(&clients.itunes_cover_art);
         workers.register("ITunesCoverArtLookup", move |stopping| {
@@ -2847,6 +2893,8 @@ impl AppState {
             startup_validation: navidrome.startup_validation,
             deezer_rate_limiter: clients.deezer_rate_limiter,
             deezer_client: clients.deezer_client,
+            deezer_cache: clients.deezer_cache,
+            deezer_resolver: clients.deezer_resolver,
             deezer_metadata: clients.deezer_metadata,
             music_brainz: clients.music_brainz,
             acoust_id_rate_limiter: clients.acoust_id_rate_limiter,
@@ -3235,6 +3283,8 @@ impl AppState {
             startup_validation: navidrome.startup_validation,
             deezer_rate_limiter: clients.deezer_rate_limiter,
             deezer_client: clients.deezer_client,
+            deezer_cache: clients.deezer_cache,
+            deezer_resolver: clients.deezer_resolver,
             deezer_metadata: clients.deezer_metadata,
             music_brainz: clients.music_brainz,
             acoust_id_rate_limiter: clients.acoust_id_rate_limiter,

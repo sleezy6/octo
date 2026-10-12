@@ -7,24 +7,25 @@ use std::time::Duration;
 
 use axum::Extension;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use chrono::Utc;
 use octo_core::common::dotnet::is_blank;
-use octo_core::settings::HeartDownloadSource;
+use octo_core::settings::{HeartDownloadSource, StreamSource};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use super::json_body::bind_body;
 use super::json_body::{FromBody, Shape, text_record};
-use super::plumbing::{camel_case_value, object_result, ok};
+use super::plumbing::{camel_case_value, object_result, ok, query_value};
 use crate::app::AppState;
 use crate::http::error::json_ok;
 use crate::middleware::admin_sign_in_gate::{Caller, caller_of};
 use crate::services::admin::AdminCaller;
 use crate::services::admin::directory_browser::is_writable;
+use crate::services::deezer::deezer_account_report;
 use crate::services::http_client_factory::{connect_failure_message, timeout_message};
 use crate::services::soulseek::soulseek_link::ISoulseekLink;
 use crate::services::subsonic::subsonic_response_builder::acquisition_json;
@@ -266,7 +267,36 @@ async fn probe_lidarr(state: &AppState) -> ServiceProbe {
     )
 }
 
+/// Deezer as a source of audio: off until an ARL is set, and then whether an account signs in.
+/// Yellow means it was picked as a source without an account.
+async fn probe_deezer(state: &AppState) -> ServiceProbe {
+    let settings = state.settings.current();
+    let picked = settings.subsonic.stream_source == StreamSource::Deezer
+        || settings
+            .subsonic
+            .effective_heart_download_sources()
+            .iter()
+            .any(|step| {
+                step.source == HeartDownloadSource::Deezer
+                    && (step.song_enabled == Some(true) || step.album_enabled == Some(true))
+            });
+    if !settings.deezer.is_configured() {
+        return if picked {
+            ServiceProbe::new(true, "selected but no ARL is set").warning(true)
+        } else {
+            ServiceProbe::new(true, "Not set up. Optional.").unconfigured()
+        };
+    }
+    let (accounts, _) = state.deezer_resolver.account_health(false).await;
+    let streams = settings.subsonic.stream_source == StreamSource::Deezer;
+    let report = deezer_account_report::report(&accounts, &settings.deezer, streams);
+    ServiceProbe::new(report.ok, report.detail).warning(report.warning)
+}
+
 async fn probe_you_tube_shim(state: &AppState) -> ServiceProbe {
+    if !state.you_tube_resolver.is_on() {
+        return ServiceProbe::new(true, "Off. Optional.").unconfigured();
+    }
     let shim = state
         .settings
         .raw("YouTube:ShimUrl")
@@ -372,10 +402,11 @@ pub async fn get_status(State(state): State<AppState>, caller: Caller) -> Respon
 
 /// Every service's probe, by name. They run in parallel: the total is the slowest, not the sum.
 async fn probe_all(state: &AppState) -> serde_json::Map<String, serde_json::Value> {
-    let (navidrome, slskd, lidarr, shim, sonic, lastfm) = tokio::join!(
+    let (navidrome, slskd, lidarr, deezer, shim, sonic, lastfm) = tokio::join!(
         probe_navidrome(state),
         probe_slskd(state),
         probe_lidarr(state),
+        probe_deezer(state),
         probe_you_tube_shim(state),
         probe_sonic(state),
         probe_last_fm(state),
@@ -384,6 +415,7 @@ async fn probe_all(state: &AppState) -> serde_json::Map<String, serde_json::Valu
         ("navidrome", navidrome),
         ("slskd", slskd),
         ("lidarr", lidarr),
+        ("deezer", deezer),
         ("ytDlpShim", shim),
         ("sonic", sonic),
         ("lastfm", lastfm),
@@ -414,8 +446,8 @@ impl AnonymousStatusCache {
     }
 }
 
-/// Before a sign-in, status says only whether each service is up: enough for install.sh and for
-/// the app to tell this is Octo, and nothing about addresses or errors. Kept ten seconds, because
+/// Before a sign-in, status says only whether each service is up: enough for the update helper and
+/// for the app to tell this is Octo, and nothing about addresses or errors. Kept ten seconds, because
 /// the Last.fm probe spends the API key and this answers anyone. One probe round at a time: a
 /// caller arriving meanwhile waits for it and gets its answer.
 async fn anonymous_status(state: &AppState) -> serde_json::Value {
@@ -470,6 +502,62 @@ impl FromBody for LidarrConnectionTestRequest {
         "baseUrl",
         "apiKey"
     );
+}
+
+/// `GET /api/admin/deezer/account`: the Deezer accounts as a sign-in finds them: whether each
+/// signs in, why not, the plan it is on and what that plan gives, with what to do about it.
+/// `?fresh=true` signs in again now; otherwise an answer up to five minutes old is reused.
+/// The ARL itself is never in the answer.
+pub async fn get_deezer_account(State(state): State<AppState>, RawQuery(query): RawQuery) -> Response {
+    let settings = state.settings.current();
+    if !settings.deezer.is_configured() {
+        return json_ok(&json!({ "configured": false, "accounts": [], "notes": [] }));
+    }
+    let fresh =
+        query_value(query.as_deref(), "fresh").is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    let (accounts, checked) = state.deezer_resolver.account_health(fresh).await;
+    let streams = settings.subsonic.stream_source == StreamSource::Deezer;
+    let report = deezer_account_report::report(&accounts, &settings.deezer, streams);
+    let rows: Vec<Value> = accounts
+        .iter()
+        .enumerate()
+        .map(|(index, account)| {
+            json!({
+                "name": if index == 0 { "ARL" } else { "Fallback ARL" },
+                "signedIn": account.signed_in,
+                "problem": account.problem,
+                "offer": account.offer,
+                "country": account.country,
+                "lossless": account.lossless,
+                "highQuality": account.high_quality,
+            })
+        })
+        .collect();
+    json_ok(&json!({
+        "configured": true,
+        "checkedUtc": octo_core::json::datetime::format_utc(&checked),
+        "ok": report.ok,
+        "warning": report.warning,
+        "detail": report.detail,
+        "notes": report.notes,
+        "accounts": rows,
+    }))
+}
+
+/// `GET /api/admin/deezer/cache`: what the Deezer playback cache holds.
+pub async fn get_deezer_cache(State(state): State<AppState>) -> Response {
+    json_ok(&state.deezer_cache.status().await)
+}
+
+/// `DELETE /api/admin/deezer/cache`: removes every cached song. Songs in the library are not
+/// in the cache and are not touched.
+pub async fn clear_deezer_cache(State(state): State<AppState>, caller: Caller) -> Response {
+    let removed = state.deezer_cache.clear().await;
+    info!(
+        "{} cleared the Deezer playback cache ({removed} songs)",
+        AdminCaller::describe(caller_of(&caller))
+    );
+    json_ok(&json!({ "removed": removed, "cache": state.deezer_cache.status().await }))
 }
 
 /// `POST /api/admin/lidarr/test`: tests entered credentials without saving them.

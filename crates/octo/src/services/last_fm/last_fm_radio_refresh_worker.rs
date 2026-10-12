@@ -11,7 +11,7 @@ use octo_core::common::{SingleFlight, dotnet};
 use octo_core::last_fm::last_fm_radio_refresh_policy::{
     is_stale, should_schedule_periodic_refresh, startup_jitter,
 };
-use octo_core::models::radio::LastFmRadioStation;
+use octo_core::models::radio::{LastFmRadioStation, LastFmRadioStationKind};
 use octo_core::settings::{AppSettings, LastFmSettings, SettingsStore};
 use parking_lot::Mutex;
 use tokio::sync::watch;
@@ -252,9 +252,16 @@ impl LastFmRadioRefreshWorker {
         // An empty build normally means the provider failed, and replacing a user's stations with
         // nothing is worse than keeping a stale snapshot. Switching every station kind off is the
         // one empty build that is a choice, so it is the only one excused here.
+        // So is switching Starter Radio off for a listener who had nothing else.
+        let existing = self.state.get_user(&job.username).stations;
+        let only_a_starter_switched_off = !settings.enable_starter_radio
+            && existing
+                .iter()
+                .all(|station| station.kind == LastFmRadioStationKind::Starter);
         if stations.is_empty()
-            && !self.state.get_user(&job.username).stations.is_empty()
+            && !existing.is_empty()
             && !settings.stations_explicitly_empty()
+            && !only_a_starter_switched_off
         {
             anyhow::bail!("Provider returned no usable replacement stations");
         }
@@ -276,6 +283,7 @@ fn personalized_shape(settings: &LastFmSettings) -> String {
     [
         dotnet_bool(settings.enable_personalized_stations).to_string(),
         dotnet_bool(settings.enable_your_mix).to_string(),
+        dotnet_bool(settings.enable_starter_radio).to_string(),
         dotnet_bool(settings.enable_discovery_mix).to_string(),
         settings.effective_artist_station_count().to_string(),
         settings.effective_genre_station_count().to_string(),
@@ -427,6 +435,53 @@ mod tests {
         assert!(!user.refreshing);
     }
 
+    /// Switching Starter Radio off empties a listener who had nothing but one: that empty build
+    /// is a choice, not a provider failing, so the old snapshot is not kept.
+    #[tokio::test]
+    async fn a_starter_switched_off_is_removed_and_not_kept_as_a_stale_snapshot() {
+        let fixture = fixture(
+            LastFmSettings {
+                enable_radio: true,
+                enable_starter_radio: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let starter = LastFmRadioStation {
+            id: station_id("alice", "starter"),
+            key: "starter".into(),
+            name: "Starter Radio".into(),
+            owner: "alice".into(),
+            kind: LastFmRadioStationKind::Starter,
+            tracks: vec![LastFmRadioTrack {
+                artist: "A".into(),
+                title: "T".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        fixture.state.replace_stations("alice", &[starter]);
+        fixture.state.record_play(
+            "alice",
+            LastFmRadioPlay {
+                artist: "A".into(),
+                title: "T".into(),
+                ..Default::default()
+            },
+        );
+
+        fixture
+            .worker
+            .process(&LastFmRadioRefreshJob::new("alice"))
+            .await
+            .expect("an empty build is taken");
+
+        let user = fixture.state.get_user("alice");
+        assert!(user.stations.is_empty());
+        assert!(user.last_refresh_error.is_none());
+    }
+
     #[tokio::test]
     async fn definition_change_queues_only_the_changed_pinned_definition() {
         let fixture = fixture(
@@ -555,7 +610,15 @@ mod tests {
         assert_eq!(job.station_definition_id, None);
         assert_eq!(
             personalized_shape(&LastFmSettings::default()),
-            "True|True|True|2|3"
+            "True|True|True|True|2|3"
+        );
+        // Starter Radio is one of the kinds: switching it off is a rebuild like any other.
+        assert_ne!(
+            personalized_shape(&LastFmSettings {
+                enable_starter_radio: false,
+                ..Default::default()
+            }),
+            personalized_shape(&LastFmSettings::default())
         );
     }
 

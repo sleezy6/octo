@@ -34,7 +34,11 @@ impl YouTubeMusicClient {
     /// Reads `YouTube:ShimUrl` once, like YouTubeResolver: the shim's address changes only with a
     /// restart.
     pub fn new(settings: &SettingsStore) -> Self {
-        Self::with_shim_url(settings.raw("YouTube:ShimUrl").as_deref())
+        // With YouTube switched off there is no shim to ask: the client is not configured.
+        let shim = settings
+            .raw("YouTube:ShimUrl")
+            .filter(|_| settings.you_tube_enabled());
+        Self::with_shim_url(shim.as_deref())
     }
 
     pub fn with_shim_url(shim_url: Option<&str>) -> Self {

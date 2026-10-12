@@ -107,11 +107,14 @@ pub enum NoticeKind {
 /// Where Better quality looks for a lossless copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 pub enum UpgradeSourceChoice {
-    /// Every source that is set up: Soulseek first, then Lidarr for what Soulseek cannot find.
+    /// Every source that is set up: Deezer first, then Soulseek, then Lidarr, each for what the
+    /// one before cannot find.
     #[default]
     Auto,
     Soulseek,
     Lidarr,
+    /// A Deezer account whose plan gives FLAC.
+    Deezer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -262,8 +265,8 @@ pub struct LibraryActionSettings {
     pub upgrade_per_week: i32,
 
     /// Where Better quality looks for a lossless copy (default: Auto). Auto uses every source that
-    /// is set up, Soulseek first and then Lidarr for what Soulseek cannot find; Soulseek or Lidarr
-    /// uses only that one.
+    /// is set up, Deezer first, then Soulseek, then Lidarr, each for what the one before cannot
+    /// find; Soulseek, Lidarr or Deezer uses only that one.
     /// Environment variable: LIBRARY_ACTIONS_UPGRADE_SOURCE
     pub upgrade_source: UpgradeSourceChoice,
 }

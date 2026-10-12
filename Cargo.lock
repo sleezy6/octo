@@ -254,6 +254,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blowfish"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62ce3946557b35e71d1bbe07ec385073ce9eda05043f95de134eb578fcf1a298"
+dependencies = [
+ "byteorder",
+ "cipher",
+]
+
+[[package]]
 name = "brotli"
 version = "8.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1646,6 +1656,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "blowfish",
  "brotli",
  "bytes",
  "chacha20poly1305",

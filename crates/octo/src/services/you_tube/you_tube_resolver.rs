@@ -59,6 +59,10 @@ pub struct YouTubeResolver {
     music_lookups: InFlight<Option<Vec<YtmRow>>>,
     /// YouTube Music searches sent to the shim at once: the shim's own YTM_MAX_CONCURRENT.
     music_gate: Arc<Semaphore>,
+    /// `YouTube:Enabled`, captured at startup. Off, nothing is ever sent to the shim: every
+    /// lookup finds nothing and every stream and download is unavailable, as when the shim
+    /// does not answer.
+    enabled: bool,
 }
 
 /// How busy the shim is, from its `/health`.
@@ -109,7 +113,24 @@ impl YouTubeResolver {
     /// Reads `YouTube:ShimUrl` once: the address is deliberately captured at startup (it is a
     /// restart-only setting; see RestartTracker).
     pub fn new(settings: &SettingsStore) -> Self {
-        Self::with_base_url(settings.raw("YouTube:ShimUrl").as_deref())
+        let resolver = Self::with_base_url(settings.raw("YouTube:ShimUrl").as_deref());
+        if settings.you_tube_enabled() {
+            resolver
+        } else {
+            resolver.switched_off()
+        }
+    }
+
+    /// The same resolver with YouTube switched off: it never calls the shim.
+    pub fn switched_off(mut self) -> Self {
+        self.enabled = false;
+        self.music = Arc::new(YouTubeMusicClient::with_shim_url(None));
+        self
+    }
+
+    /// Whether YouTube is switched on.
+    pub fn is_on(&self) -> bool {
+        self.enabled
     }
 
     /// A resolver on the given shim address (blank → the compose service name).
@@ -136,6 +157,7 @@ impl YouTubeResolver {
             music: Arc::new(YouTubeMusicClient::with_shim_url(shim)),
             music_lookups: InFlight::new(),
             music_gate: Arc::new(Semaphore::new(Self::MUSIC_AT_ONCE)),
+            enabled: true,
         }
     }
 
@@ -143,6 +165,9 @@ impl YouTubeResolver {
     /// [`Self::HEALTH_TIMEOUT`] or answers something else. One answer, either way, is reused
     /// for [`Self::BUSY_CACHE`].
     pub async fn busy(&self) -> Option<ShimBusy> {
+        if !self.enabled {
+            return None;
+        }
         let mut cache = self.busy_cache.lock().await;
         if let Some((at, busy)) = *cache
             && at.elapsed() < Self::BUSY_CACHE
@@ -224,7 +249,7 @@ impl YouTubeResolver {
         duration_hint: Option<i32>,
         background: bool,
     ) -> Option<YouTubeHit> {
-        if query.trim().is_empty() {
+        if !self.enabled || query.trim().is_empty() {
             return None;
         }
         let url = self.query_url("search", query, duration_hint, background);
@@ -328,7 +353,7 @@ impl YouTubeResolver {
         duration_hint: Option<i32>,
         background: bool,
     ) -> Option<YouTubeHit> {
-        if query.trim().is_empty() {
+        if !self.enabled || query.trim().is_empty() {
             return None;
         }
         let url = self.query_url("meta", query, duration_hint, background);
@@ -348,7 +373,7 @@ impl YouTubeResolver {
     /// exact size. The shim resolves the video when it has not yet (as /stream would, so a play
     /// after this is a cache hit). None when the shim could not.
     pub async fn facts(&self, video_id: &str, background: bool) -> Option<StreamFacts> {
-        if video_id.trim().is_empty() {
+        if !self.enabled || video_id.trim().is_empty() {
             return None;
         }
         let mut url = format!("{}/facts?id={}", self.base_url, escape(video_id));
@@ -382,7 +407,7 @@ impl YouTubeResolver {
     ///
     /// None on failure. The caller owns the returned response.
     pub async fn open_stream(&self, video_id: &str, range_header: Option<&str>) -> Option<ShimStream> {
-        if video_id.trim().is_empty() {
+        if !self.enabled || video_id.trim().is_empty() {
             return None;
         }
         let url = format!("{}/stream?id={}", self.base_url, escape(video_id));
@@ -434,7 +459,7 @@ impl YouTubeResolver {
         artist: Option<&str>,
         title: Option<&str>,
     ) -> Option<String> {
-        if video_id.trim().is_empty() || dest_without_ext.trim().is_empty() {
+        if !self.enabled || video_id.trim().is_empty() || dest_without_ext.trim().is_empty() {
             return None;
         }
         let mut url = format!(
@@ -548,6 +573,46 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ---- YouTube switched off -----------------------------------------------------------
+
+    /// Switched off, the resolver never asks the shim: every lookup finds nothing and every
+    /// stream and download is unavailable, without a request.
+    #[tokio::test]
+    async fn switched_off_it_never_asks_the_shim() {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let store = SettingsStore::for_tests(Default::default());
+        store.set_raw("YouTube:ShimUrl", Some(&server.uri()));
+        assert!(YouTubeResolver::new(&store).is_on());
+        store.set_raw("YouTube:Enabled", Some(" False "));
+        let resolver = YouTubeResolver::new(&store);
+        assert!(!resolver.is_on());
+
+        assert!(
+            resolver
+                .search("Artist - Title", Some(200), false)
+                .await
+                .is_none()
+        );
+        assert!(resolver.meta("Artist - Title", None, true).await.is_none());
+        assert!(resolver.music_song("Artist", "Title", Some(200)).await.is_none());
+        resolver.prefetch_music_song("Artist", "Title");
+        assert!(resolver.facts("abc", false).await.is_none());
+        assert!(resolver.open_stream("abc", None).await.is_none());
+        assert!(
+            resolver
+                .download("abc", "/tmp/nowhere/x", None, None)
+                .await
+                .is_none()
+        );
+        assert!(resolver.busy().await.is_none());
+        // `expect(0)` is checked when the server drops.
+    }
 
     // ---- The shim's base URL ------------------------------------------------------------
 

@@ -82,6 +82,22 @@ pub enum DownloadSource {
     /// album-oriented, so a track heart acquires the track's full album. Non-heart
     /// permanent downloads continue to use Soulseek.
     Lidarr,
+
+    /// The song itself from Deezer, with the account in the `Deezer` settings: FLAC, or the
+    /// best lesser format the account is given. Added last, so the numbers of the others stand.
+    Deezer,
+}
+
+/// Where an outside song is played from before it is in the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+pub enum StreamSource {
+    /// The yt-dlp shim's stream (default).
+    #[default]
+    YouTube,
+
+    /// Deezer, with the account in the `Deezer` settings. A song Deezer cannot serve, and every
+    /// song while no account is set, still plays from YouTube.
+    Deezer,
 }
 
 /// A source that can participate in the ordered heart-acquisition chain.
@@ -91,14 +107,17 @@ pub enum HeartDownloadSource {
     Soulseek,
     YouTube,
     Lidarr,
+    /// Added last, so the numbers of the others stand.
+    Deezer,
 }
 
 impl HeartDownloadSource {
     /// `Enum.GetValues<HeartDownloadSource>()`, in declaration order.
-    pub const ALL: [HeartDownloadSource; 3] = [
+    pub const ALL: [HeartDownloadSource; 4] = [
         HeartDownloadSource::Soulseek,
         HeartDownloadSource::YouTube,
         HeartDownloadSource::Lidarr,
+        HeartDownloadSource::Deezer,
     ];
 }
 
@@ -341,6 +360,12 @@ pub struct SubsonicSettings {
     /// (FLAC with MP3 fallback), or "Lidarr" (heart-only, full album).
     pub download_source: DownloadSource,
 
+    /// Where an outside song is played from (default: YouTube).
+    /// Environment variable: SUBSONIC__STREAMSOURCE
+    /// Values: "YouTube" or "Deezer". Deezer needs an account in the Deezer settings, and a
+    /// song it cannot serve plays from YouTube.
+    pub stream_source: StreamSource,
+
     /// Ordered sources for explicit track and album hearts. Empty keeps older
     /// DOWNLOAD_SOURCE configurations working; Lidarr remains last by default.
     pub heart_download_sources: Vec<HeartDownloadStep>,
@@ -386,6 +411,7 @@ impl Default for SubsonicSettings {
             lidarr_album_on_play: false,
             folder_structure: FolderStructure::Flat,
             download_source: DownloadSource::Soulseek,
+            stream_source: StreamSource::YouTube,
             heart_download_sources: Vec::new(),
             use_local_staging: false,
         }
@@ -445,14 +471,21 @@ impl SubsonicSettings {
         }
 
         match self.download_source {
-            DownloadSource::YouTube => self.default_heart_sources(false, true, false),
-            DownloadSource::SoulseekThenYouTube => self.default_heart_sources(true, true, false),
-            DownloadSource::Lidarr => self.default_heart_sources(false, false, true),
-            _ => self.default_heart_sources(true, false, false),
+            DownloadSource::YouTube => self.default_heart_sources(false, true, false, false),
+            DownloadSource::SoulseekThenYouTube => self.default_heart_sources(true, true, false, false),
+            DownloadSource::Lidarr => self.default_heart_sources(false, false, true, false),
+            DownloadSource::Deezer => self.default_heart_sources(false, false, false, true),
+            DownloadSource::Soulseek => self.default_heart_sources(true, false, false, false),
         }
     }
 
-    fn default_heart_sources(&self, soulseek: bool, youtube: bool, lidarr: bool) -> Vec<HeartDownloadStep> {
+    fn default_heart_sources(
+        &self,
+        soulseek: bool,
+        youtube: bool,
+        lidarr: bool,
+        deezer: bool,
+    ) -> Vec<HeartDownloadStep> {
         let step = |source, on: bool| HeartDownloadStep {
             source,
             enabled: None,
@@ -463,6 +496,7 @@ impl SubsonicSettings {
             step(HeartDownloadSource::Soulseek, soulseek),
             step(HeartDownloadSource::YouTube, youtube),
             step(HeartDownloadSource::Lidarr, lidarr),
+            step(HeartDownloadSource::Deezer, deezer),
         ]
     }
 }
@@ -480,7 +514,7 @@ mod tests {
 
         let steps = settings.effective_heart_download_sources();
 
-        assert_eq!(steps.len(), 3);
+        assert_eq!(steps.len(), 4);
         assert_eq!(steps[0].source, HeartDownloadSource::Soulseek);
         assert_eq!(
             (steps[0].song_enabled, steps[0].album_enabled),
@@ -496,6 +530,27 @@ mod tests {
             (steps[2].song_enabled, steps[2].album_enabled),
             (Some(false), Some(false))
         );
+    }
+
+    #[test]
+    fn deezer_as_the_legacy_source_is_the_only_step_switched_on() {
+        let settings = SubsonicSettings {
+            download_source: DownloadSource::Deezer,
+            ..Default::default()
+        };
+        let steps = settings.effective_heart_download_sources();
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[3].source, HeartDownloadSource::Deezer);
+        for step in &steps {
+            let on = step.source == HeartDownloadSource::Deezer;
+            assert_eq!(
+                (step.song_enabled, step.album_enabled),
+                (Some(on), Some(on)),
+                "{:?}",
+                step.source
+            );
+        }
+        assert_eq!(SubsonicSettings::default().stream_source, StreamSource::YouTube);
     }
 
     #[test]
@@ -518,7 +573,7 @@ mod tests {
 
         let steps = settings.effective_heart_download_sources();
 
-        assert_eq!(steps.len(), 3);
+        assert_eq!(steps.len(), 4);
         assert_eq!(steps[0].source, HeartDownloadSource::Lidarr);
         assert_eq!(steps[1].source, HeartDownloadSource::YouTube);
         assert_eq!(steps[2].source, HeartDownloadSource::Soulseek);
@@ -547,7 +602,7 @@ mod tests {
             ..Default::default()
         };
         let steps = settings.effective_heart_download_sources();
-        assert_eq!(steps.len(), 3);
+        assert_eq!(steps.len(), 4);
         assert_eq!(
             (steps[0].song_enabled, steps[0].album_enabled),
             (Some(true), Some(false))

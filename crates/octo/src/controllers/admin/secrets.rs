@@ -22,6 +22,8 @@ pub const SECRET_FIELDS: &[(&str, &str, &str)] = &[
     ("Soulseek", "AcoustIdUserApiKey", "AcoustID user key"),
     ("Lidarr", "ApiKey", "Lidarr API key"),
     ("Lidarr", "WebhookSecret", "Lidarr webhook password"),
+    ("Deezer", "Arl", "Deezer ARL"),
+    ("Deezer", "ArlFallback", "Deezer fallback ARL"),
     ("LastFm", "ApiKey", "Last.fm API key"),
     ("LastFm", "ApiSecret", "Last.fm shared secret"),
     ("Notifications", "NtfyToken", "ntfy token"),
@@ -247,6 +249,13 @@ pub fn running_secrets(state: &AppState) -> JsonObject {
         n_obj([
             ("ApiKey", optional(&current.lidarr.api_key)),
             ("WebhookSecret", optional(&current.lidarr.webhook_secret)),
+        ]),
+    );
+    secrets.insert(
+        "Deezer".into(),
+        n_obj([
+            ("Arl", optional(&current.deezer.arl)),
+            ("ArlFallback", optional(&current.deezer.arl_fallback)),
         ]),
     );
     secrets.insert(

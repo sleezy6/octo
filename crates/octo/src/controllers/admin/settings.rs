@@ -172,6 +172,7 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
             // These two are rendered by the dashboard but were missing here, so their fields
             // never pre-filled with the saved value.
             ("DownloadSource", name(subsonic.download_source)),
+            ("StreamSource", name(subsonic.stream_source)),
             (
                 "HeartDownloadSources",
                 Node::Array(
@@ -302,12 +303,29 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
             ),
         ]),
     );
+    let deezer = &current.deezer;
+    doc.insert(
+        "Deezer".into(),
+        n_obj([
+            ("Arl", n_str(&mask_secret(deezer.arl.as_deref()))),
+            ("ArlFallback", n_str(&mask_secret(deezer.arl_fallback.as_deref()))),
+            ("Quality", n_str(&deezer.quality)),
+            ("StreamQuality", n_str(&deezer.stream_quality)),
+            ("CacheEnabled", Node::Bool(deezer.cache_enabled)),
+            ("CachePath", n_str(&deezer.cache_path)),
+            ("CacheMaxGiB", n_num(deezer.cache_max_gi_b)),
+            ("CacheRetentionDays", n_num(deezer.cache_retention_days)),
+        ]),
+    );
     doc.insert(
         "YouTube".into(),
-        n_obj([(
-            "ShimUrl",
-            n_str(&state.settings.raw("YouTube:ShimUrl").unwrap_or_default()),
-        )]),
+        n_obj([
+            ("Enabled", Node::Bool(state.settings.you_tube_enabled())),
+            (
+                "ShimUrl",
+                n_str(&state.settings.raw("YouTube:ShimUrl").unwrap_or_default()),
+            ),
+        ]),
     );
     // Radio's other sources and their weights (multi-source radio).
     let radio = &current.radio_sources;
@@ -360,6 +378,7 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
                 Node::Bool(lastfm.enable_personalized_stations),
             ),
             ("EnableYourMix", Node::Bool(lastfm.enable_your_mix)),
+            ("EnableStarterRadio", Node::Bool(lastfm.enable_starter_radio)),
             ("EnableDiscoveryMix", Node::Bool(lastfm.enable_discovery_mix)),
             ("ArtistStationCount", n_num(lastfm.artist_station_count)),
             ("GenreStationCount", n_num(lastfm.genre_station_count)),

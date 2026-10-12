@@ -37,7 +37,7 @@ use crate::services::admin::{AdminCaller, AdminCallerKind, BrowseSessionStore, S
 use crate::services::subsonic::{CredentialVerdict, IncomingRequest, navidrome_admin_role};
 
 /// The admin endpoints that answer without a sign-in: signing in and out, who is signed in, and a
-/// bare status for `install.sh` and the app's Octo check.
+/// bare status for the update helper and the app's Octo check.
 pub const OPEN_ENDPOINTS: &[(Method, &str)] = &[
     (Method::POST, "/api/admin/auth/recovery"),
     (Method::POST, "/api/admin/browse/auth"),

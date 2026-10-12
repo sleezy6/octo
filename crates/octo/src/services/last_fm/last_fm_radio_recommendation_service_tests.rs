@@ -201,6 +201,16 @@ async fn sparse_history_produces_deterministic_starter_and_local_pinned_fallback
             .collect::<Vec<_>>()
     };
     assert_eq!(tracks(&first), tracks(&second));
+
+    // With Starter Radio switched off the same few plays make no mix of the listener's own;
+    // the pinned station is untouched.
+    let mut off = (*fixture.settings.current()).clone();
+    off.last_fm.enable_starter_radio = false;
+    fixture.settings.set(off);
+    let without = build(&fixture.service).await;
+    assert!(!without.iter().any(|s| s.kind == LastFmRadioStationKind::Starter));
+    assert!(!without.iter().any(|s| s.kind == LastFmRadioStationKind::YourMix));
+    assert!(without.iter().any(|s| s.kind == LastFmRadioStationKind::Pinned));
 }
 
 #[tokio::test]

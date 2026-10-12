@@ -395,7 +395,7 @@ impl QualityUpgradeWorker {
         }
         // Every try would fail and be stamped as tried for four weeks.
         else if !source_ready {
-            Some("Better quality has no source set up: it needs slskd or Lidarr.")
+            Some("Better quality has no source set up: it needs Deezer, slskd or Lidarr.")
         } else if !settings.enabled {
             Some("Library actions are off.")
         } else if !settings

@@ -58,6 +58,12 @@ pub struct LastFmSettings {
     /// Environment variable: LASTFM_ENABLE_YOUR_MIX
     pub enable_your_mix: bool,
 
+    /// Give a listener Starter Radio before `MinimumPlays` plays have been learned from
+    /// (default: true). Off, a listener has no mix of their own until Your Mix is earned: one
+    /// or two plays, or a few songs picked at random from the library, make no station.
+    /// Environment variable: LASTFM_ENABLE_STARTER_RADIO
+    pub enable_starter_radio: bool,
+
     /// Build the Discovery Mix, seeded from the listener's top tags.
     /// Environment variable: LASTFM_ENABLE_DISCOVERY_MIX
     pub enable_discovery_mix: bool,
@@ -120,6 +126,7 @@ impl Default for LastFmSettings {
             radio_cache_duration_hours: 24,
             enable_personalized_stations: true,
             enable_your_mix: true,
+            enable_starter_radio: true,
             enable_discovery_mix: true,
             artist_station_count: 2,
             genre_station_count: 3,

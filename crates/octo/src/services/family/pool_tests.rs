@@ -55,6 +55,36 @@ async fn two_members_one_file() {
     assert_eq!(world.pool.store().get(&pooled).expect("recorded").refs.len(), 2);
 }
 
+/// A member brought in from an existing Navidrome account keeps that account's spelling, capital
+/// letters and all, while their folder and library are the lower-case name. They are a member
+/// like any other: their link lands in that folder, and letting go removes it from there.
+#[tokio::test]
+async fn a_member_adopted_under_a_capitalised_name_gets_links_in_their_lower_case_folder() {
+    use crate::services::family::test_support::member;
+    use octo_core::family::abilities::Preset;
+
+    let world = World::new(None);
+    world.family.upsert_member(member("Richard", Preset::Member, 5));
+    let pooled = world.pool_file(SONG, 1_000);
+
+    let link = world.pool.link(&pooled, "Richard").await.expect("linked");
+
+    assert_eq!(link, format!("{}/richard/{SONG}", world.members()));
+    assert!(is_link(&link));
+    assert_eq!(
+        world.pool.member_root("richard"),
+        world.pool.member_root("Richard")
+    );
+    assert_eq!(world.pool.link_path(&pooled, "RICHARD"), Some(link.clone()));
+    assert_eq!(
+        world.pool.store().get(&pooled).expect("recorded").refs,
+        ["Richard"]
+    );
+
+    world.pool.let_go(&pooled, "Richard").await;
+    assert!(std::fs::symlink_metadata(&link).is_err());
+}
+
 #[tokio::test]
 async fn link_is_relative() {
     let world = World::new(None);

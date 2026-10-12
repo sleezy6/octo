@@ -582,7 +582,7 @@ impl LibraryActionExecutor {
             if sources.is_empty() {
                 return Ok(LibraryActionOutcome::said(
                     LibraryActionState::Failed,
-                    "Better quality has no source set up: it needs slskd or Lidarr.",
+                    "Better quality has no source set up: it needs Deezer, slskd or Lidarr.",
                 ));
             }
         }
@@ -1063,7 +1063,7 @@ impl LibraryActionExecutor {
             }
 
             // In order, and on to the next when one finds nothing or its copy fails the checks:
-            // Soulseek first, then Lidarr, for Better quality with both set up.
+            // Deezer first, then Soulseek, then Lidarr, for Better quality with all of them set up.
             let sources = self.sources_for(request.action, request.only_source).await;
             let upgrade_search = request.action == LibraryAction::BetterQuality;
             let requested_by = self

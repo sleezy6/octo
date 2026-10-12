@@ -2281,6 +2281,10 @@ fn year_prefix(release_date: &str) -> Option<i32> {
 mod explicit;
 #[path = "deezer_metadata_service_tempo.rs"]
 mod tempo;
+// The catalog's id for a song, for playing and keeping it from Deezer.
+#[path = "deezer_metadata_service_playable.rs"]
+mod playable;
+pub use playable::recording_matches;
 
 pub use tempo::DeezerPublishedTempo;
 use tempo::{tempo_key, tempo_of};

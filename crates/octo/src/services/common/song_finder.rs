@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::acquisition_tracker::{AcquisitionState, AcquisitionTracker, acquisition_kinds, key_of};
-use super::download_picks::{DownloadPicks, LIDARR_SOURCE, PickedCopy, SOULSEEK_SOURCE};
+use super::download_picks::{DEEZER_SOURCE, DownloadPicks, LIDARR_SOURCE, PickedCopy, SOULSEEK_SOURCE};
 use super::track_acquisition_queue::TrackAcquisitionQueue;
 use crate::services::common::AcquisitionTarget;
 use crate::services::family::LibraryWriteGate;
@@ -223,6 +223,7 @@ pub struct SongFinderSeams {
     pub resolve: ResolveFn,
     pub search_soulseek: SearchFn,
     pub search_lidarr: SearchFn,
+    pub search_deezer: SearchFn,
     pub sources_for: SourcesFn,
     pub fetch: FetchFn,
 }
@@ -407,6 +408,13 @@ impl SongFinder {
                     async move { search_lidarr(&services, &target, &ct).await }.boxed()
                 })
             },
+            search_deezer: {
+                let services = services.clone();
+                Arc::new(move |target, _ct| {
+                    let services = services.clone();
+                    async move { search_deezer(&services, &target).await }.boxed()
+                })
+            },
             sources_for: {
                 let services = services.clone();
                 Arc::new(move |target| default_sources(&services, target))
@@ -498,7 +506,7 @@ impl SongFinder {
         } else if state.sources.iter().all(|s| s.state == find_states::OFF) {
             state.state = find_states::FAILED.to_string();
             state.error = Some(
-                "None of your download sources can search: Soulseek or Lidarr has to be set up and switched on for hearts."
+"None of your download sources can search: Deezer, Soulseek or Lidarr has to be set up and switched on for hearts."
                     .to_string(),
             );
         }
@@ -624,6 +632,8 @@ impl SongFinder {
             let seams = self.seams.lock();
             if source == SOULSEEK_SOURCE {
                 seams.search_soulseek.clone()
+            } else if source == DEEZER_SOURCE {
+                seams.search_deezer.clone()
             } else {
                 seams.search_lidarr.clone()
             }
@@ -748,10 +758,11 @@ impl SongFinder {
         if is_lossless(target.owned_format.as_deref()) {
             return Some("Your copy is already lossless, so nothing would be better.".to_string());
         }
-        if copy.pick.is_soulseek() && !is_lossless(copy.shown.format.as_deref()) {
+        if (copy.pick.is_soulseek() || copy.pick.is_deezer()) && !is_lossless(copy.shown.format.as_deref()) {
             return Some("Only a lossless copy can take the place of the one in your library.".to_string());
         }
         if !copy.pick.is_soulseek()
+            && !copy.pick.is_deezer()
             && copy.pick.release().is_some()
             && !is_lossless(first_word(copy.shown.format.as_deref()))
         {
@@ -1034,15 +1045,17 @@ impl SongFinder {
     }
 }
 
-/// Where a copy goes on the list: each source's own first choices, then the rest, Soulseek
-/// before Lidarr where they tie.
+/// Where a copy goes on the list: each source's own first choices, then the rest; where they
+/// tie, Deezer, then Soulseek, then Lidarr.
 fn place(copy: &FoundCopy) -> (i32, i32) {
     (
         copy.shown.rank.unwrap_or(i32::MAX),
-        if copy.shown.source == SOULSEEK_SOURCE {
+        if copy.shown.source == DEEZER_SOURCE {
             0
-        } else {
+        } else if copy.shown.source == SOULSEEK_SOURCE {
             1
+        } else {
+            2
         },
     )
 }
@@ -1227,11 +1240,7 @@ fn fetch(services: &SongFinderServices, target: &FindTarget, copy: &FoundCopy, u
         true,
         false,
         true,
-        Some(if copy.pick.is_soulseek() {
-            DownloadSource::Soulseek
-        } else {
-            DownloadSource::Lidarr
-        }),
+        Some(copy.pick.download_source()),
         true,
         Some(user),
         false,
@@ -1337,7 +1346,10 @@ fn default_sources(services: &SongFinderServices, target: &FindTarget) -> Vec<(S
     let lidarr_up = current
         .as_ref()
         .is_some_and(|c| UpgradeSources::lidarr_set_up(&c.lidarr));
-    let (soulseek_used, lidarr_used) = if target.library_id.is_some() {
+    let deezer_up = current
+        .as_ref()
+        .is_some_and(|c| UpgradeSources::deezer_set_up(&c.deezer));
+    let (soulseek_used, lidarr_used, deezer_used) = if target.library_id.is_some() {
         let wanted = services
             .upgrade_sources
             .as_ref()
@@ -1345,6 +1357,7 @@ fn default_sources(services: &SongFinderServices, target: &FindTarget) -> Vec<(S
         (
             wanted.contains(&DownloadSource::Soulseek),
             wanted.contains(&DownloadSource::Lidarr),
+            wanted.contains(&DownloadSource::Deezer),
         )
     } else {
         let steps = current
@@ -1358,13 +1371,23 @@ fn default_sources(services: &SongFinderServices, target: &FindTarget) -> Vec<(S
             steps
                 .iter()
                 .any(|step| step.source == HeartDownloadSource::Lidarr && step.song_enabled == Some(true)),
+            steps
+                .iter()
+                .any(|step| step.source == HeartDownloadSource::Deezer && step.song_enabled == Some(true)),
         )
     };
-    vec![
+    let mut sources = vec![
         (
             SOULSEEK_SOURCE.to_string(),
             if !soulseek_up {
-                Some("Soulseek is not set up on this server".to_string())
+                Some(
+                    if current.as_ref().is_some_and(|c| !c.soulseek.enabled) {
+                        "Soulseek is switched off on this server"
+                    } else {
+                        "Soulseek is not set up on this server"
+                    }
+                    .to_string(),
+                )
             } else if !soulseek_used {
                 Some("Soulseek is not one of your download sources".to_string())
             } else {
@@ -1381,7 +1404,75 @@ fn default_sources(services: &SongFinderServices, target: &FindTarget) -> Vec<(S
                 None
             },
         ),
-    ]
+    ];
+    // Deezer is listed only where an account is set: a server without one looks as it did.
+    if deezer_up {
+        sources.insert(
+            0,
+            (
+                DEEZER_SOURCE.to_string(),
+                (!deezer_used).then(|| "Deezer is not one of your download sources".to_string()),
+            ),
+        );
+    }
+    sources
+}
+
+/// Deezer's copy of the song: the one its catalog names for this artist and title, in the format
+/// the account is given. A library song is only replaced by a lossless copy, so for one of those
+/// a FLAC is asked for and nothing lesser.
+async fn search_deezer(services: &SongFinderServices, target: &FindTarget) -> anyhow::Result<SearchAnswer> {
+    let Some(soulseek) = &services.soulseek else {
+        anyhow::bail!("Deezer is not available on this server.");
+    };
+    let lossless_only = target.library_id.is_some();
+    let asked = format!("{} - {}", target.artist, target.title);
+    let Some(found) = soulseek
+        .find_deezer_copy(&target.artist, &target.title, lossless_only)
+        .await?
+    else {
+        return Ok((
+            Vec::new(),
+            vec![asked],
+            Some(
+                if lossless_only {
+                    "Deezer has no lossless copy of this song your account is given"
+                } else {
+                    "Deezer has no copy of this song your account is given"
+                }
+                .to_string(),
+            ),
+        ));
+    };
+    let format = if found.format == "FLAC" { "flac" } else { "mp3" };
+    let bit_rate = match found.format.as_str() {
+        "MP3_320" => Some(320),
+        "MP3_128" => Some(128),
+        _ => None,
+    };
+    let copy = FoundCopy::new(
+        AcquisitionCandidate {
+            source: DEEZER_SOURCE.to_string(),
+            file: Some(asked.clone()),
+            format: Some(format.to_string()),
+            bit_rate,
+            size: found.size,
+            rank: Some(1),
+            title: Some(target.title.clone()),
+            album: target.album.clone(),
+            note: Some(format!("Deezer's own file, track {}", found.track_id)),
+            ..Default::default()
+        },
+        PickedCopy {
+            source: DEEZER_SOURCE.to_string(),
+            file: Some(found.track_id.clone()),
+            format: Some(format.to_string()),
+            bit_rate,
+            size: found.size.unwrap_or(0),
+            ..Default::default()
+        },
+    );
+    Ok((vec![copy], vec![asked], Some("1 copy".to_string())))
 }
 
 async fn search_soulseek(

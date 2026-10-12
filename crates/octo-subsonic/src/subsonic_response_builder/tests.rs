@@ -340,6 +340,47 @@ fn external_song_declares_lossless_when_waiting_for_lossless() {
     assert!(!row.contains_key("bitRate"));
 }
 
+/// Played from Deezer, the row says the format Deezer is asked for, with no size and no rate
+/// it does not know.
+#[test]
+fn external_song_declares_the_deezer_format_when_outside_songs_play_from_deezer() {
+    use octo_core::settings::DeezerSettings;
+    let mp3 = builder_with(false).with_outside_stream(Some(DeezerSettings::default().declared_stream()));
+    let row = mp3.convert_song_to_json(&external_song());
+    assert_eq!(row["suffix"], "mp3");
+    assert_eq!(row["contentType"], "audio/mpeg");
+    assert_eq!(row["bitRate"], 320);
+    assert!(!row.contains_key("size"));
+    assert_eq!(row["isExternal"], true);
+
+    let flac = builder_with(false).with_outside_stream(Some(
+        DeezerSettings {
+            stream_quality: "FLAC".into(),
+            ..Default::default()
+        }
+        .declared_stream(),
+    ));
+    let row = flac.convert_song_to_json(&external_song());
+    assert_eq!(row["suffix"], "flac");
+    assert_eq!(row["contentType"], "audio/flac");
+    assert!(!row.contains_key("bitRate"));
+}
+
+/// A library song is declared as the file it is, whatever outside songs play from.
+#[test]
+fn a_library_song_keeps_its_own_format_when_outside_songs_play_from_deezer() {
+    use octo_core::settings::DeezerSettings;
+    let builder = builder_with(false).with_outside_stream(Some(DeezerSettings::default().declared_stream()));
+    let song = Song {
+        is_local: true,
+        suffix: Some("flac".into()),
+        ..external_song()
+    };
+    let row = builder.convert_song_to_json(&song);
+    assert_eq!(row["suffix"], "flac");
+    assert_eq!(row["contentType"], "audio/flac");
+}
+
 /// `TestIds` that also knows the stream of some songs, and notes the ones asked about.
 #[derive(Default)]
 struct StreamIds {

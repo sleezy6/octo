@@ -31,7 +31,7 @@ use octo_core::models::domain::{Album, Artist, Song, explicit_status};
 use octo_core::models::radio::LastFmRadioStation;
 use octo_core::models::subsonic::ExternalPlaylist;
 use octo_core::settings::SubsonicSettings;
-use octo_core::soulseek::{RoutingKind, SoulseekRouting, StreamFacts};
+use octo_core::soulseek::{DeclaredStream, RoutingKind, SoulseekRouting, StreamFacts};
 use serde_json::{Map, Number, Value, json};
 
 use crate::xml::{XElement, XValue};
@@ -144,6 +144,10 @@ pub struct SubsonicResponseBuilder {
     /// a client that has already cached those rows. The setting is restart-required.
     externals_are_lossless: bool,
 
+    /// What an outside song is declared as when outside songs play from Deezer, and `None`
+    /// while they play from YouTube. Fixed at construction for the same reason.
+    outside_stream: Option<DeclaredStream>,
+
     /// The clock, for the `created` of album rows. A seam for tests.
     clock: Clock,
 }
@@ -162,8 +166,21 @@ impl SubsonicResponseBuilder {
         Self {
             id_registry,
             externals_are_lossless: subsonic.wait_for_lossless_on_play,
+            outside_stream: None,
             clock: Clock::system(),
         }
+    }
+
+    /// The same builder declaring outside songs as `declared`: the format they play in from
+    /// Deezer (`AppSettings::deezer_stream`). `None` keeps the YouTube declaration.
+    pub fn with_outside_stream(mut self, declared: Option<DeclaredStream>) -> Self {
+        self.outside_stream = declared;
+        self
+    }
+
+    /// What outside songs are declared as when they play from Deezer.
+    pub fn outside_stream(&self) -> Option<&DeclaredStream> {
+        self.outside_stream.as_ref()
     }
 
     /// The same builder reading `clock` for "now".
@@ -874,6 +891,16 @@ impl SubsonicResponseBuilder {
             // A FLAC's rate is a guess until it is fetched; the 128 of the AAC stream is real.
             let size = if lossless_external {
                 fields.shift_remove("bitRate");
+                None
+            } else if let Some(declared) = &self.outside_stream {
+                // From Deezer: the format is the one asked for, whatever YouTube stream the
+                // song may have had pinned, and nothing is asked of YouTube about it.
+                fields.insert("suffix".into(), declared.suffix.clone().into());
+                fields.insert("contentType".into(), declared.content_type.clone().into());
+                match declared.bit_rate {
+                    Some(rate) => fields.insert("bitRate".into(), rate.into()),
+                    None => fields.shift_remove("bitRate"),
+                };
                 None
             } else {
                 self.declare_outside_stream(&mut fields, &song.id)

@@ -237,6 +237,8 @@ impl IRadioTuneInSelector for FixedTuneIn {
 struct RadioUpstream {
     relayed_scrobble_ids: Arc<Mutex<Vec<String>>>,
     return_no_local_matches: Arc<std::sync::atomic::AtomicBool>,
+    /// The listener has starred songs, which a starting profile is learned from.
+    has_stars: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn ok_json(fields: &str) -> String {
@@ -324,6 +326,9 @@ impl Respond for RadioUpstream {
                     r#""searchResult3":{{"song":[{{"id":"{id}","artist":"{artist}","title":"{title}","album":"Album","duration":180}}]}}"#
                 )))
             }
+            "rest/getstarred2" if self.has_stars.load(Ordering::SeqCst) => json(&ok_json(
+                r#""starred2":{"song":[{"id":"star-1","artist":"Starred Artist","title":"Starred Song","album":"Album","duration":200},{"id":"star-2","artist":"Starred Artist","title":"Another Starred Song","album":"Album","duration":210}]}"#,
+            )),
             "rest/getplaylists" => {
                 if xml {
                     reply(
@@ -1473,4 +1478,43 @@ async fn discovery_mix_fills_from_library_songs_when_the_reserve_runs_out() {
     assert_eq!(library_ids(&entries).len(), 5, "{titles:?}");
     assert_eq!(titles[6], "Tune E", "{titles:?}");
     assert_eq!(titles[8], "Song Four", "{titles:?}");
+}
+
+/// The dashboard's "Reset this listener's Radio history" used to do nothing a listener could
+/// see: the next time one of their apps listed playlists, the starting profile was learned
+/// again from their stars, as for a listener seen for the first time.
+#[tokio::test]
+async fn a_reset_history_is_not_learned_again_from_stars_at_the_next_playlist_listing() {
+    let fixture = RadioFixture::new(Options::default()).await;
+    fixture.upstream.has_stars.store(true, Ordering::SeqCst);
+    let radio = &fixture.state.last_fm_radio_state;
+    let list = "/rest/getPlaylists?u=alice&t=token&s=salt&f=json";
+
+    // A listener seen for the first time gets a starting profile from their stars.
+    assert_eq!(fixture.get(list).await.status, StatusCode::OK);
+    let learned = radio.get_user("alice").plays;
+    assert_eq!(learned.len(), 2);
+    assert!(learned.iter().all(|play| play.source == "bootstrap-star"));
+
+    assert!(radio.reset("alice"));
+    assert!(radio.get_user("alice").plays.is_empty());
+
+    // Listing playlists and stations again, as every app keeps doing, brings nothing back.
+    assert_eq!(fixture.get(list).await.status, StatusCode::OK);
+    fixture
+        .station_list("/rest/getInternetRadioStations?u=alice&t=token&s=salt&f=json")
+        .await;
+    assert!(radio.get_user("alice").plays.is_empty());
+
+    // What they play from now on is learned as before.
+    assert!(radio.record_play(
+        "alice",
+        octo_core::models::radio::LastFmRadioPlay {
+            artist: "New Artist".into(),
+            title: "New Song".into(),
+            learned_signal: true,
+            ..Default::default()
+        },
+    ));
+    assert_eq!(radio.get_user("alice").plays.len(), 1);
 }

@@ -15,7 +15,7 @@ services:
   # ghcr.io), build octo-source, at the end of this file. Octo is written in Rust; the
   # environment below and the config folder are the ones the C# Octo read, unchanged.
   octo:
-    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-2026.10.10}
+    image: ghcr.io/sleezy6/octo:${OCTO_IMAGE_TAG:-2026.10.10}
     container_name: octo
     restart: unless-stopped
     logging: *logging
@@ -29,9 +29,8 @@ services:
 
       # ----- Subsonic / Navidrome upstream -----
       # Your Navidrome server, reachable from THIS container (a LAN IP or service
-      # name, not localhost). With the navidrome profile below (the starter stack)
-      # this is http://navidrome:4533. Left blank, Octo looks for a server on the
-      # network at first start and reports clearly if it finds none.
+      # name, not localhost). Left blank, Octo looks for a server on the network at
+      # first start and reports clearly if it finds none.
       Subsonic__Url: ${SUBSONIC_URL:-}
       # Optional Navidrome admin login. Lets Octo detect the music folder and run
       # authenticated rescans on its own. Leave blank to have Octo learn an admin
@@ -61,6 +60,8 @@ services:
       Subsonic__LidarrAlbumOnPlay: ${LIDARR_ALBUM_ON_PLAY:-false}
       Subsonic__FolderStructure: ${FOLDER_STRUCTURE:-Flat}
       Subsonic__DownloadSource: ${DOWNLOAD_SOURCE:-Soulseek}
+      # Where a song you do not own plays from: YouTube, or Deezer with the account below.
+      Subsonic__StreamSource: ${STREAM_SOURCE:-YouTube}
       Subsonic__UseLocalStaging: ${USE_LOCAL_STAGING:-false}
       Subsonic__ExplicitFilter: ${EXPLICIT_FILTER:-All}
       Subsonic__CacheDurationHours: ${CACHE_DURATION_HOURS:-1}
@@ -81,8 +82,17 @@ services:
 
       # ----- yt-dlp shim sidecar (internal stream-preview source) -----
       YouTube__ShimUrl: http://yt-dlp-shim:8080
+      # YOUTUBE_ENABLED=false: Octo never asks the yt-dlp shim or YouTube Music. Outside songs
+      # then play from Deezer (an ARL is needed, or they do not play), hearts skip YouTube, and
+      # YouTube Music leaves radio. The shim still starts with this file; to not run it at all,
+      # delete the yt-dlp-shim service and octo's depends_on line for it.
+      YouTube__Enabled: ${YOUTUBE_ENABLED:-true}
 
       # ----- slskd (Soulseek) sidecar -----
+      # SOULSEEK_ENABLED=false: Octo never contacts slskd, and hearts, Better quality and Find
+      # songs use the other sources. slskd itself still starts with this file; to not run it
+      # at all, delete the slskd service below and octo's depends_on line for it.
+      Soulseek__Enabled: ${SOULSEEK_ENABLED:-true}
       Soulseek__BaseUrl: http://slskd:5030
       Soulseek__Username: ${SLSKD_USERNAME:-slskd}
       Soulseek__Password: ${SLSKD_PASSWORD:-slskd}
@@ -141,6 +151,20 @@ services:
       Lidarr__CompletionMode: ${LIDARR_COMPLETION_MODE:-Accepted}
       Lidarr__ImportTimeoutSeconds: ${LIDARR_IMPORT_TIMEOUT_SECONDS:-1800}
 
+      # ----- your own Deezer account (optional source for playing and hearts) -----
+      # The arl cookie of deezer.com while signed in. Blank keeps Deezer off.
+      Deezer__Arl: ${DEEZER_ARL:-}
+      Deezer__ArlFallback: ${DEEZER_ARL_FALLBACK:-}
+      # FLAC, MP3_320 or MP3_128; each takes the next one down when the account is not given it.
+      Deezer__Quality: ${DEEZER_QUALITY:-FLAC}
+      Deezer__StreamQuality: ${DEEZER_STREAM_QUALITY:-MP3_320}
+      # Keep a copy of each song played from Deezer, outside the library, so a replay or a
+      # seek does not ask Deezer again. The folder is the volume below.
+      Deezer__CacheEnabled: ${DEEZER_CACHE_ENABLED:-false}
+      Deezer__CachePath: /app/cache/deezer
+      Deezer__CacheMaxGiB: ${DEEZER_CACHE_MAX_GIB:-20}
+      Deezer__CacheRetentionDays: ${DEEZER_CACHE_RETENTION_DAYS:-7}
+
       # ----- Last.fm radio (core Octo feature; no separate Radio service) -----
       LastFm__ApiKey: ${LASTFM_API_KEY:-}
       LastFm__ApiSecret: ${LASTFM_API_SECRET:-}
@@ -149,6 +173,9 @@ services:
       LastFm__RadioCacheDurationHours: ${LASTFM_RADIO_CACHE_HOURS:-24}
       LastFm__EnablePersonalizedStations: ${LASTFM_ENABLE_PERSONALIZED_STATIONS:-true}
       LastFm__EnableYourMix: ${LASTFM_ENABLE_YOUR_MIX:-true}
+      # Off here: a listener gets no mix of their own until Your Mix is earned (10 plays).
+      # true gives Starter Radio from the first play, as upstream Octo does.
+      LastFm__EnableStarterRadio: ${LASTFM_ENABLE_STARTER_RADIO:-false}
       LastFm__EnableDiscoveryMix: ${LASTFM_ENABLE_DISCOVERY_MIX:-true}
       LastFm__ArtistStationCount: ${LASTFM_ARTIST_STATION_COUNT:-2}
       LastFm__GenreStationCount: ${LASTFM_GENRE_STATION_COUNT:-3}
@@ -305,8 +332,8 @@ services:
       # Ask GitHub every 6 hours whether a newer Octo release is out, and say so on
       # the dashboard. With the update helper on the host, the dashboard can also
       # install it (see "Updating" in the README).
-      Updates__Check: ${UPDATES_CHECK:-true}
-      Updates__Repo: ${UPDATES_REPO:-winters27/octo}
+      Updates__Check: ${UPDATES_CHECK:-false}
+      Updates__Repo: ${UPDATES_REPO:-sleezy6/octo}
       # ----- Dashboard sign-in -----
       # A Navidrome admin account signs in to the dashboard. off only behind a proxy
       # that signs people in itself. ADMIN_PORT gives the dashboard a port of its own.
@@ -328,6 +355,9 @@ services:
       Logging__LogLevel__System.Net.Http.HttpClient: ${LOG_LEVEL_HTTPCLIENT:-Warning}
     volumes:
       - ${DOWNLOAD_PATH:-./downloads}:/music
+      # The Deezer playback cache (Deezer__CacheEnabled). Outside DOWNLOAD_PATH on purpose:
+      # Navidrome must not list what is only cached.
+      - ${DEEZER_CACHE_HOST_PATH:-./octo-cache/deezer}:/app/cache/deezer
       # Only for keeping members' music somewhere other than next to your library: mount
       # that folder here and on navidrome at the same path, then choose "Somewhere else"
       # with that path when you turn Family on.
@@ -348,7 +378,7 @@ services:
   # Pulled, not built, like Octo, and at the same tag, so the two always match.
   # Without access to ghcr.io, build it from this folder with yt-dlp-shim-source (below).
   yt-dlp-shim:
-    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.10}
+    image: ghcr.io/sleezy6/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.10}
     container_name: yt-dlp-shim
     restart: unless-stopped
     logging: *logging
@@ -404,7 +434,7 @@ services:
   # Pulled, not built, like the shim: compiling it (Rust and FFmpeg) takes minutes and more
   # memory than a small machine has. octo-sonic-source (below) builds it from this folder.
   octo-sonic:
-    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.10}
+    image: ghcr.io/sleezy6/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.10}
     container_name: octo-sonic
     restart: unless-stopped
     logging: *logging
@@ -493,63 +523,24 @@ services:
       # The same library again, read-only, for sharing.
       - ${DOWNLOAD_PATH:-./downloads}:/share:ro
 
-  # The starter stack's music server, for anyone without a Navidrome of their own.
-  # Off unless the navidrome profile is on: install.sh turns it on by writing
-  # COMPOSE_PROFILES=navidrome to .env, or run `docker compose --profile navidrome up -d`.
-  # It reads the same music folder Octo writes to, so a kept song shows up in the
-  # library as soon as Octo asks for a scan.
-  # Named navidrome-starter, not navidrome: a Navidrome of your own defined in an
-  # override file as "navidrome" would otherwise merge with this one, take on its
-  # profile, and leave nothing for Octo to start. Octo still reaches it as
-  # http://navidrome:4533 through the alias below.
-  navidrome-starter:
-    image: deluan/navidrome:latest
-    container_name: navidrome
-    restart: unless-stopped
-    logging: *logging
-    profiles: ["navidrome"]
-    networks:
-      default:
-        aliases: [navidrome]
-    ports:
-      # Navidrome's own pages: add the people who listen, change passwords, and
-      # its web player. Music apps go to Octo on 5274, never here.
-      - "${NAVIDROME_PORT:-4533}:4533"
-    environment:
-      ND_MUSICFOLDER: /music
-      ND_DATAFOLDER: /data
-      ND_LOGLEVEL: info
-      # Creates the user "admin" with this password the first time Navidrome
-      # starts, so there is no setup page to click through. Navidrome runs this
-      # only once, on an empty data folder, and never changes an existing
-      # password. Octo signs in with the same login (SUBSONIC_ADMIN_* above).
-      ND_DEVAUTOCREATEADMINPASSWORD: ${NAVIDROME_ADMIN_PASSWORD:-}
-    volumes:
-      - ${DOWNLOAD_PATH:-./downloads}:/music
-      # Only for keeping members' music somewhere other than next to your library: the
-      # same folder octo mounts, at the same path.
-      # - ${MEMBERS_DIR:-./members}:/members
-      - ${NAVIDROME_DATA_DIR:-./navidrome-data}:/data
-
   # Octo and the sidecars built from this folder instead of pulled: for changes of your own,
   # or a machine that cannot reach ghcr.io. They never run; a build gives the image the name
   # the service above runs, so `docker compose up -d` then uses it:
   #   docker compose --profile source build octo-source && docker compose up -d
-  # A later `docker compose pull` puts the published image back. The update helper and
-  # install.sh build them by themselves when a pull fails, and install.sh also when the
-  # folder changed since its release. In a profile so a plain `docker compose build` builds
+  # A later `docker compose pull` puts the published image back. The update helper builds
+  # them by itself when a pull fails. In a profile so a plain `docker compose build` builds
   # nothing, which is what an older update helper runs; that keeps even the update to this
   # release from compiling anything.
   octo-source:
-    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-2026.10.10}
+    image: ghcr.io/sleezy6/octo:${OCTO_IMAGE_TAG:-2026.10.10}
     build: .
     profiles: ["source"]
   yt-dlp-shim-source:
-    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.10}
+    image: ghcr.io/sleezy6/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.10}
     build: ./yt-dlp-shim
     profiles: ["source"]
   octo-sonic-source:
-    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.10}
+    image: ghcr.io/sleezy6/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.10}
     build: ./sonic
     profiles: ["source"]
 

@@ -388,7 +388,7 @@ async fn status_tells_anyone_only_whether_each_service_is_up() {
     let factory = SignInFactory::new().await;
     let reply = get(&factory.app, "/api/admin/status").await;
     assert_eq!(reply.status, StatusCode::OK);
-    // The shape install.sh greps for.
+    // The bare shape callers without a sign-in read.
     assert!(reply.text().contains(r#""navidrome":{"ok":"#), "{}", reply.text());
     let document = reply.json();
     assert!(document.get("octo").is_some());

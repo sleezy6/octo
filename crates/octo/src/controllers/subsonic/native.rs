@@ -501,7 +501,9 @@ fn native_song_object(state: &AppState, song: &Song) -> Value {
     // always absent while waiting for lossless, whose bytes are not known until the FLAC lands).
     // The suffix and bit rate follow the format the stream is served in, when known.
     let lossless = state.settings.current().subsonic.wait_for_lossless_on_play;
-    let facts = if lossless {
+    // Played from Deezer, the format is the one Deezer is asked for and YouTube is not asked.
+    let from_deezer = state.subsonic_response_builder.outside_stream().cloned();
+    let facts = if lossless || from_deezer.is_some() {
         StreamFacts::default()
     } else {
         state
@@ -509,13 +511,13 @@ fn native_song_object(state: &AppState, song: &Song) -> Value {
             .stream_facts(&song.id)
             .unwrap_or_default()
     };
-    if !lossless {
+    if !lossless && from_deezer.is_none() {
         state.stream_size_warmer.outside_listed(&song.id);
         if facts.size.is_none() {
             state.stream_size_warmer.size_wanted(&song.id);
         }
     }
-    let declared = facts.declared();
+    let declared = from_deezer.or_else(|| facts.declared());
     let suffix = match &declared {
         _ if lossless => "flac".to_string(),
         Some(declared) => declared.suffix.clone(),

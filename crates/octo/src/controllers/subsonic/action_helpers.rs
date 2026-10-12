@@ -418,7 +418,8 @@ fn personalized_station_visible(state: &AppState, station: &LastFmRadioStation) 
         return false;
     }
     match station.kind {
-        LastFmRadioStationKind::Starter | LastFmRadioStationKind::YourMix => last_fm.enable_your_mix,
+        LastFmRadioStationKind::Starter => last_fm.enable_your_mix && last_fm.enable_starter_radio,
+        LastFmRadioStationKind::YourMix => last_fm.enable_your_mix,
         LastFmRadioStationKind::Discovery => last_fm.enable_discovery_mix,
         LastFmRadioStationKind::Artist => last_fm.effective_artist_station_count() > 0,
         LastFmRadioStationKind::Genre => last_fm.effective_genre_station_count() > 0,
@@ -524,6 +525,7 @@ fn bootstrap_songs(body: &[u8], container: &str, learned: bool) -> Vec<(Song, bo
 
 /// The first time a listener lists playlists or stations, Octo learns a starting profile
 /// from what they starred, played often or recently, or failing that a few random songs.
+/// Not after their history was reset from the dashboard: that listener starts from nothing.
 pub async fn bootstrap_radio_profile(
     state: &AppState,
     proxy: &SubsonicProxyService,
@@ -536,6 +538,7 @@ pub async fn bootstrap_radio_profile(
         || !last_fm.enable_radio
         || !last_fm.enable_personalized_stations
         || !state.last_fm_radio_state.get_user(username).plays.is_empty()
+        || state.last_fm_radio_state.was_reset(username)
     {
         return;
     }
@@ -637,7 +640,8 @@ pub async fn bootstrap_radio_profile(
         seeds.extend(fetch_album_signals(proxy, authenticated_parameters, "frequent").await);
         seeds.extend(fetch_album_signals(proxy, authenticated_parameters, "recent").await);
     }
-    if seeds.is_empty() {
+    // Songs picked at random are not learned from: all they can make is Starter Radio.
+    if seeds.is_empty() && last_fm.enable_starter_radio {
         seeds = fetch(
             proxy,
             authenticated_parameters,

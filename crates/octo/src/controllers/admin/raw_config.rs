@@ -127,6 +127,7 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "Subsonic:DownloadOnPlay",
     "Subsonic:LidarrAlbumOnPlay",
     "Subsonic:DownloadSource",
+    "Subsonic:StreamSource",
     "Subsonic:AutoDetectDownloadPath",
     "Subsonic:LibraryPath",
     "Subsonic:FolderStructure",
@@ -211,6 +212,15 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "Lidarr:CompletionMode",
     "Lidarr:ImportTimeoutSeconds",
     "Lidarr:WebhookSecret",
+    "Deezer:Arl",
+    "Deezer:ArlFallback",
+    "Deezer:Quality",
+    "Deezer:StreamQuality",
+    "Deezer:CacheEnabled",
+    "Deezer:CachePath",
+    "Deezer:CacheMaxGiB",
+    "Deezer:CacheRetentionDays",
+    "YouTube:Enabled",
     "YouTube:ShimUrl",
     "LastFm:ApiKey",
     "LastFm:ApiSecret",
@@ -223,6 +233,7 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "LastFm:RadioLoudnessTargetLufs",
     "LastFm:EnablePersonalizedStations",
     "LastFm:EnableYourMix",
+    "LastFm:EnableStarterRadio",
     "LastFm:EnableDiscoveryMix",
     "LastFm:ArtistStationCount",
     "LastFm:GenreStationCount",
@@ -311,12 +322,20 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
 
 /// Whether a config-sources key names a secret: a password, an API key, a secret, a token
 /// (ntfy tokens are credentials outright) or a webhook URL (a Discord webhook URL embeds its
-/// token, so the whole URL is the secret).
+/// token, so the whole URL is the secret), or a Deezer ARL (the cookie that signs the account in).
 fn is_secret_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    ["password", "apikey", "secret", "token", "webhookurl"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
+    [
+        "password",
+        "apikey",
+        "secret",
+        "token",
+        "webhookurl",
+        ":arl",
+        ":arlfallback",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
 }
 
 /// What a set secret reads as on the config-sources page: always the same eight bullets, so the

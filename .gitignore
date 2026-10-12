@@ -95,3 +95,4 @@ __pycache__/
 
 # Parity harness runs: the writable library copies and the box reports.
 parity/.run/
+/octo-cache/

@@ -6,6 +6,7 @@ pub mod admin;
 pub mod charts;
 pub mod common;
 pub mod cover_art;
+pub mod deezer;
 pub mod family;
 pub mod fingerprint;
 pub mod framework;

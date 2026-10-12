@@ -103,6 +103,11 @@ pub fn admin_controller_routes() -> RouteSet {
         .route("/api/admin/charts", get(charts::get_charts))
         .route("/api/admin/lidarr/options", get(system::get_lidarr_options))
         .route("/api/admin/lidarr/test", post(system::test_lidarr_connection))
+        .route("/api/admin/deezer/account", get(system::get_deezer_account))
+        .route(
+            "/api/admin/deezer/cache",
+            get(system::get_deezer_cache).delete(system::clear_deezer_cache),
+        )
         .route("/api/admin/restart", post(system::restart))
         .route(
             "/api/admin/soulseek/rejected-peers/clear",

@@ -26,7 +26,7 @@ on:
     # Dated releases (2026.07.29) as well as any future v-prefixed ones. Without the
     # second pattern a dated tag pushes silently and never builds an image.
     tags: ['v*', '[0-9][0-9][0-9][0-9].*']
-    branches: [main]
+    branches: [main, feat/deezer-backend]
   # No pull_request trigger. A merge already arrives here as a push to main, so
   # building on `closed` too meant every merge built the same commit twice.
 
@@ -85,9 +85,11 @@ jobs:
             echo "::error::docker-compose.yml pulls images tagged $stale, but VERSION says $version. Bump the OCTO_IMAGE_TAG defaults with it."
             exit 1
           fi
+          # The owner is this repo's, so a fork's compose pulls the fork's own images.
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
           for image in octo octo-yt-dlp-shim octo-sonic; do
-            if ! grep -Fq "image: ghcr.io/winters27/$image:\${OCTO_IMAGE_TAG:-$version}" docker-compose.yml; then
-              echo "::error::docker-compose.yml does not pull ghcr.io/winters27/$image at \${OCTO_IMAGE_TAG:-$version}."
+            if ! grep -Fq "image: ghcr.io/$owner/$image:\${OCTO_IMAGE_TAG:-$version}" docker-compose.yml; then
+              echo "::error::docker-compose.yml does not pull ghcr.io/$owner/$image at \${OCTO_IMAGE_TAG:-$version}."
               exit 1
             fi
           done
@@ -126,11 +128,12 @@ jobs:
           - name: octo-sonic
             context: ./sonic
             suffix: -sonic
+        # amd64 only on this private fork: GitHub's arm64 runners are free for public
+        # repositories only, and the server it runs on is amd64. Add the arm64 line back
+        # (arch: arm64, runner: ubuntu-24.04-arm) and set PLATFORMS to 2 below for both.
         platform:
           - arch: amd64
             runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
 
     permissions:
       contents: read
@@ -253,11 +256,12 @@ jobs:
         working-directory: ${{ runner.temp }}/digests
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image.suffix }}
+          PLATFORMS: 1
         run: |
           refs=()
           for digest in *; do refs+=("$IMAGE@sha256:$digest"); done
-          if [ "${#refs[@]}" != 2 ]; then
-            echo "::error::Expected an amd64 and an arm64 image of $IMAGE, found ${#refs[@]}."
+          if [ "${#refs[@]}" != "$PLATFORMS" ]; then
+            echo "::error::Expected $PLATFORMS platform image(s) of $IMAGE, found ${#refs[@]}."
             exit 1
           fi
           mapfile -t tags < <(jq -r '.tags[] | "-t", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")

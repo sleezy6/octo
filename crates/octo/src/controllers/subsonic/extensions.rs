@@ -136,7 +136,7 @@ fn upgrade_ready(state: &AppState) -> bool {
     state.upgrade_sources.ready()
 }
 
-/// Where Better quality looks, in words: "Soulseek", "Lidarr", or "Soulseek or Lidarr".
+/// Where Better quality looks, in words: "Soulseek", "Lidarr", "Soulseek or Lidarr", "Deezer or Soulseek or Lidarr".
 fn upgrade_source_name(state: &AppState) -> String {
     state.upgrade_sources.name()
 }

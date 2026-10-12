@@ -19,13 +19,22 @@ pub struct RestartTracker {
 impl RestartTracker {
     /// Keys whose consumers capture the value when they are constructed. Keep in step with the
     /// dashboard's data-restart markers, which name the same settings as "Section.Key".
-    pub const KEYS: [&'static str; 15] = [
+    pub const KEYS: [&'static str; 21] = [
         "Library:DownloadPath", // BaseDownloadService, LocalLibraryService, PlaylistSyncService
         "YouTube:ShimUrl",      // YouTubeResolver
+        "YouTube:Enabled",      // YouTubeResolver and YouTubeMusicClient, captured with the address
         "Subsonic:Url",         // live in most places; a restart is still the safe advice
         "Subsonic:LibraryPath", //
         "Subsonic:WaitForLosslessOnPlay", // SubsonicResponseBuilder, deliberately
-        "Soulseek:BaseUrl",     // SoulseekClient and SoulseekDownloadService read it at startup
+        // Where outside songs play from and what their rows declare, read together at startup
+        // (AppSettings::deezer_stream). A new ARL alone plays at once; it is listed because the
+        // first one is what turns Deezer playback on.
+        "Subsonic:StreamSource",
+        "Deezer:StreamQuality",
+        "Deezer:Arl",
+        "Deezer:CachePath", // DeezerAudioCache finds its copies by where it put them
+        "Soulseek:Enabled", // captured at startup with BaseUrl: on or off for the whole run
+        "Soulseek:BaseUrl", // SoulseekClient and SoulseekDownloadService read it at startup
         "Soulseek:Username",
         "Soulseek:Password",
         "Soulseek:SearchWaitSeconds",

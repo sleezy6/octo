@@ -298,6 +298,50 @@ fn listeners_are_one_person_whatever_the_case() {
     );
 }
 
+/// The dashboard's history reset for one listener: their counts and what was still open go,
+/// everyone else's stay.
+#[test]
+fn forgetting_one_listener_leaves_the_others() {
+    let f = Fixture::new();
+    let store = f.store(true);
+    for listener in ["Alice", "bob"] {
+        served(&store, listener, &[("a", LAST_FM), ("b", LAST_FM)], t0(), true);
+        play(
+            &store,
+            listener,
+            "a",
+            t0() + minutes(1.0),
+            Some(t0() + minutes(2.0)),
+        );
+    }
+    let now = t0() + minutes(3.0);
+    assert_eq!(store.multipliers(Some("alice"), Some(now)).len(), 1);
+
+    assert!(store.forget_listener(" ALICE "));
+
+    assert!(store.multipliers(Some("alice"), Some(now)).is_empty());
+    assert_eq!(store.multipliers(Some("bob"), Some(now)).len(), 1);
+    assert!(!store.state().listeners.contains_key("alice"));
+    // A song served before the reset teaches nothing after it.
+    play(
+        &store,
+        "alice",
+        "b",
+        t0() + minutes(4.0),
+        Some(t0() + minutes(5.0)),
+    );
+    assert!(
+        store
+            .multipliers(Some("alice"), Some(t0() + minutes(6.0)))
+            .is_empty()
+    );
+    // It is written down, and there is nothing to forget twice.
+    let again = f.store(true);
+    assert!(!again.state().listeners.contains_key("alice"));
+    assert!(again.state().listeners.contains_key("bob"));
+    assert!(!store.forget_listener("alice"));
+}
+
 #[test]
 fn a_station_refetch_does_not_renew_the_window() {
     let f = Fixture::new();

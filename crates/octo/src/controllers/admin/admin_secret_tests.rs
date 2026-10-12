@@ -21,9 +21,12 @@ use crate::app::{AppState, TestServices};
 /// What a credential is called. A webhook address carries its own token.
 fn is_credential(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
+    // A Deezer ARL is the cookie that signs the account in.
     ["password", "secret", "token", "apikey", "sessionkey", "webhook"]
         .iter()
         .any(|word| lower.contains(word))
+        || lower == "arl"
+        || lower == "arlfallback"
 }
 
 /// The settings with one listener in each per-listener map, so the walk sees what an entry holds.

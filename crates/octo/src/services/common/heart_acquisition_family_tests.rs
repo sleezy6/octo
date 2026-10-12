@@ -47,6 +47,12 @@ struct Chain {
 /// A coordinator over the world. The library holds "Song 1" by Artist only in Alex's own
 /// library (the file `<members>/alex/Artist/Album/1.flac`).
 fn chain(world: World) -> Chain {
+    let alex_copy = format!("{}/alex/Artist/Album/1.flac", world.members());
+    chain_holding(world, alex_copy)
+}
+
+/// A coordinator over the world, whose library holds "Song 1" by Artist as the file `copy`.
+fn chain_holding(world: World, copy: String) -> Chain {
     let metadata = Arc::new(FakeMetadata::default());
     metadata.songs.lock().insert(
         ("test".into(), "1".into()),
@@ -58,7 +64,7 @@ fn chain(world: World) -> Chain {
             ..Default::default()
         },
     );
-    let alex_copy = format!("{}/alex/Artist/Album/1.flac", world.members());
+    let alex_copy = copy;
     write_file(&alex_copy, 10);
     let ownership = LibraryOwnership::new(world.settings.clone(), None, world.library.clone());
     ownership.set_search(search_from(Some(vec![Candidate {
@@ -330,4 +336,65 @@ async fn family_turned_off_never_counts_a_members_own_copy_as_the_librarys() {
     assert_eq!(request.external_id, "1");
     assert_eq!(request.place(), AcquisitionPlace::default());
     owner.abort();
+}
+
+/// The owner's library is private: a member who is not given it hearts a song that is in it.
+/// It used to be favorited "instead of downloading", on a song the member cannot play, and
+/// nothing reached their library. Now the chain runs for them, so the pool gives them a copy.
+#[tokio::test]
+async fn a_member_who_cannot_see_the_shared_library_is_not_told_they_have_its_song() {
+    use crate::services::family::family_store::SharedLibraries;
+
+    let world = World::new(None);
+    configure(&world, &[HeartDownloadSource::YouTube], false);
+    let mut alex = member("alex", Preset::Member, 3);
+    alex.shared_libraries = SharedLibraries::Ids(Vec::new());
+    world.family.upsert_member(alex);
+    let shared_copy = format!("{}/Artist/Album/1.flac", world.music());
+    let chain = chain_holding(world, shared_copy.clone());
+
+    let coordinator = chain.coordinator.clone();
+    let running = tokio::spawn(async move {
+        coordinator
+            .acquire_track_outcome(
+                "test",
+                "1",
+                Some("alex"),
+                None,
+                &AcquisitionTarget::Member("alex".into()),
+            )
+            .await
+    });
+    let request = next_queued(&chain.queue)
+        .await
+        .expect("queued: the shared library's copy is not Alex's to play");
+    assert_eq!(request.pool_destination(), Some(vec!["alex".to_string()]));
+    request.completion.try_set_result(&shared_copy);
+    assert_eq!(
+        running.await.expect("joins").expect("ran"),
+        TrackOutcome::Landed(shared_copy)
+    );
+}
+
+/// A member who is given the shared library has its songs: their heart is a favorite.
+#[tokio::test]
+async fn a_member_who_sees_the_shared_library_has_its_song_already() {
+    let world = World::new(None);
+    configure(&world, &[HeartDownloadSource::YouTube], false);
+    let shared_copy = format!("{}/Artist/Album/1.flac", world.music());
+    let chain = chain_holding(world, shared_copy);
+
+    let outcome = chain
+        .coordinator
+        .acquire_track_outcome(
+            "test",
+            "1",
+            Some("alex"),
+            None,
+            &AcquisitionTarget::Member("alex".into()),
+        )
+        .await
+        .expect("ran");
+    assert_eq!(outcome, TrackOutcome::AlreadyThere);
+    assert!(next_queued(&chain.queue).await.is_none());
 }

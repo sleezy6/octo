@@ -200,7 +200,9 @@ impl LastFmRadioRecommendationService {
                 .sum();
             let learned = learned >= f64::from(settings.effective_minimum_plays());
             let mix_key = if learned { "your-mix" } else { "starter" };
-            if settings.enable_your_mix {
+            // Starter Radio is the mix before enough was learned; with it switched off the
+            // listener's own mix waits for Your Mix.
+            if settings.enable_your_mix && (learned || settings.enable_starter_radio) {
                 let mut mix_candidates = self
                     .tracks_from_seeds(username, &track_seeds[..track_seeds.len().min(6)], 12, &budget)
                     .await;

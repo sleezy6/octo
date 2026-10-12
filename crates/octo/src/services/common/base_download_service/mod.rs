@@ -1597,7 +1597,7 @@ impl BaseDownloadService {
             Some(sources) => sources.ready(),
             None => matches!(
                 source_override.unwrap_or(self.settings.current().subsonic.download_source),
-                DownloadSource::Soulseek | DownloadSource::SoulseekThenYouTube
+                DownloadSource::Soulseek | DownloadSource::SoulseekThenYouTube | DownloadSource::Deezer
             ),
         }
     }

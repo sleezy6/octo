@@ -725,6 +725,7 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
         .settings
         .set_raw("Soulseek:Password", Some("a-password-longer-than-sixteen"));
     state.settings.set_raw("Lidarr:ApiKey", Some("abc"));
+    state.settings.set_raw("Deezer:Arl", Some("0123abcd"));
     let body = get(&app, "/api/admin/config-sources").await.json();
     let rows = body["keys"].as_array().expect("rows");
     let row = |key: &str| rows.iter().find(|r| r["Key"] == key).cloned().expect(key);
@@ -742,8 +743,18 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // country mixes' four: :CountryMixes, :Countries, :MaxCountryPlaylists and
     // :CountryLookupsPerRefresh, Lidarr:WebhookSecret, Soulseek:Enabled,
     // RadioSources:ListenBrainzRadioMode, Subsonic:StreamSizeWarmPerMinute,
-    // Subsonic:SearchDurationWaitMs and Subsonic:SearchLastFmWaitMs.
-    assert_eq!(rows.len(), 192);
+    // Subsonic:SearchDurationWaitMs and Subsonic:SearchLastFmWaitMs, and Deezer's five:
+    // Subsonic:StreamSource, Deezer:Arl, :ArlFallback, :Quality and :StreamQuality, and the
+    // playback cache's four: Deezer:CacheEnabled, :CachePath, :CacheMaxGiB and
+    // :CacheRetentionDays.
+    assert_eq!(rows.len(), 203);
+    assert_eq!(row("Deezer:CacheEnabled")["IsSecret"], false);
+    // An ARL signs the account in, so it is masked like a password.
+    assert_eq!(row("Deezer:Arl")["Value"], "\u{2022}".repeat(8));
+    assert_eq!(row("Deezer:Arl")["IsSecret"], true);
+    assert_eq!(row("Deezer:ArlFallback")["IsSecret"], true);
+    assert_eq!(row("Deezer:Quality")["IsSecret"], false);
+    assert_eq!(row("Subsonic:StreamSource")["IsSecret"], false);
     assert_eq!(row("Subsonic:StreamSizeWarmPerMinute")["IsSecret"], false);
     assert_eq!(row("Subsonic:SearchDurationWaitMs")["IsSecret"], false);
     assert_eq!(row("Subsonic:SearchLastFmWaitMs")["IsSecret"], false);
@@ -834,7 +845,7 @@ async fn radio_refresh_and_reset_refuse_a_missing_user() {
     .await;
     assert_eq!(
         reply.text(),
-        r#"{"ok":false,"user":"admin","removedPlays":0,"removedStations":0,"message":"Radio history and generated snapshots were removed. Downloaded music was untouched."}"#
+        r#"{"ok":false,"user":"admin","removedPlays":0,"removedStations":0,"message":"This listener has no radio history to remove."}"#
     );
 }
 
@@ -892,6 +903,23 @@ async fn status_says_a_switched_off_soulseek_is_off_and_optional() {
     assert_eq!(body["services"]["slskd"]["warning"], false);
 }
 
+/// With no ARL saved the account health says so, and Deezer is never asked.
+#[tokio::test]
+async fn deezer_account_health_without_an_arl_says_none_is_set() {
+    let (_, app) = factory();
+    for path in [
+        "/api/admin/deezer/account",
+        "/api/admin/deezer/account?fresh=true",
+    ] {
+        let body = get(&app, path).await.json();
+        assert_eq!(
+            body,
+            serde_json::json!({"configured": false, "accounts": [], "notes": []}),
+            "{path}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn status_reports_each_service() {
     // A port that refuses at once: the status probes wait out a timeout on one that does not.
@@ -909,6 +937,10 @@ async fn status_reports_each_service() {
     );
     assert_eq!(body["services"]["lidarr"]["detail"], "Not set up. Optional.");
     assert_eq!(body["services"]["lidarr"]["configured"], false);
+    // No ARL and not picked as a source: off, and Deezer is never asked.
+    assert_eq!(body["services"]["deezer"]["detail"], "Not set up. Optional.");
+    assert_eq!(body["services"]["deezer"]["configured"], false);
+    assert_eq!(body["services"]["deezer"]["warning"], false);
     assert_eq!(
         body["services"]["ytDlpShim"]["detail"],
         format!("Could not connect to {address}: the connection was refused.")

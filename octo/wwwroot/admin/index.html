@@ -77,6 +77,10 @@
             <svg class="icon brand" aria-hidden="true"><use href="#b-lidarr"/></svg>
             <span>Lidarr</span>
           </button>
+          <button class="sidebar-nav-item" data-tab="deezer">
+            <svg class="icon brand" aria-hidden="true"><use href="#b-deezer"/></svg>
+            <span>Deezer</span>
+          </button>
           <button class="sidebar-nav-item" data-tab="notifications">
             <svg class="icon" aria-hidden="true"><use href="#i-bell"/></svg>
             <span>Notifications</span>
@@ -282,6 +286,15 @@
             <div class="status-card-body">Checking…</div>
             <div class="status-card-foot">Optional, whole albums</div>
           </article>
+          <article class="status-card" data-svc="deezer">
+            <div class="status-card-head">
+              <span class="status-card-mark"><svg class="icon brand" aria-hidden="true"><use href="#b-deezer"/></svg></span>
+              <span class="status-card-title">Deezer</span>
+              <span class="status-dot pending"></span>
+            </div>
+            <div class="status-card-body">Checking…</div>
+            <div class="status-card-foot">Optional, your own account</div>
+          </article>
           <article class="status-card" data-svc="ytDlpShim">
             <div class="status-card-head">
               <span class="status-card-mark"><svg class="icon brand" aria-hidden="true"><use href="#b-youtube"/></svg></span>
@@ -459,18 +472,40 @@
             <div class="set-row playback-source-row">
               <div class="set-info">
                 <div class="set-info-t">When a song is missing</div>
-                <div class="set-info-d">YouTube starts at once. Soulseek waits for a lossless copy, then plays.</div>
+                <div class="set-info-d">YouTube and Deezer start at once. Soulseek waits for a lossless copy, then plays.</div>
+                <div class="set-info-more">Deezer plays the song itself from your own Deezer account, and a song Deezer cannot serve plays from YouTube.</div>
               </div>
               <div class="set-ctrl">
                 <div class="seg" data-seg-for="f-playback-source"><span class="seg-thumb"></span></div>
                 <select id="f-playback-source" class="seg-src" hidden aria-label="Primary missing-track playback source">
                   <option value="YouTube">YouTube stream</option>
+                  <option value="Deezer">Deezer stream</option>
                   <option value="Lossless">Soulseek download</option>
                 </select>
               </div>
               <input type="checkbox" id="f-wait-for-lossless-on-play" name="Subsonic.WaitForLosslessOnPlay" data-restart="true" hidden />
+              <select id="f-stream-source" name="Subsonic.StreamSource" data-restart="true" hidden aria-hidden="true" tabindex="-1">
+                <option value="YouTube">YouTube</option>
+                <option value="Deezer">Deezer</option>
+              </select>
             </div>
-            <div class="set-row stack" data-stream-source="YouTube">
+            <div class="set-row stack" data-stream-source="Deezer" hidden>
+              <div class="set-info">
+                <div class="set-info-t"><svg class="icon brand" aria-hidden="true"><use href="#b-deezer"/></svg>Deezer account</div>
+                <div class="set-info-d">Deezer plays with the account set up on its own page. Until one is set, songs keep playing from YouTube.</div>
+              </div>
+              <div>
+                <button type="button" class="btn btn-ghost" data-open-tab="deezer"><svg class="icon brand" aria-hidden="true"><use href="#b-deezer"/></svg><span>Open Deezer settings</span></button>
+              </div>
+            </div>
+            <div class="set-row" data-stream-source="YouTube Deezer">
+              <div class="set-info">
+                <div class="set-info-t"><svg class="icon brand" aria-hidden="true"><use href="#b-youtube"/></svg>Use YouTube</div>
+                <div class="set-info-d">Off, Octo never asks YouTube: outside songs play from Deezer (an ARL is needed, or they do not play), hearts skip YouTube, and YouTube Music leaves radio. <code>YOUTUBE_ENABLED</code> in <code>.env</code>.</div>
+              </div>
+              <label class="switch"><input type="checkbox" name="YouTube.Enabled" data-restart="true" data-restart-label="Use YouTube" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack" data-stream-source="YouTube Deezer">
               <div class="set-info">
                 <div class="set-info-t"><svg class="icon brand" aria-hidden="true"><use href="#b-youtube"/></svg>YouTube shim URL</div>
                 <div class="set-info-d">The yt-dlp helper that finds and streams the song. The default works inside Docker's network.</div>
@@ -494,7 +529,7 @@
               </div>
               <input class="set-input" id="f-lossless-wait-timeout" name="Subsonic.LosslessWaitTimeoutSeconds" type="number" min="0" />
             </div>
-            <div class="set-row" data-stream-source="YouTube">
+            <div class="set-row" data-stream-source="YouTube Deezer">
               <div class="set-info">
                 <div class="set-info-t">Keep what is played</div>
                 <div class="set-info-d">Downloads each song played from outside your library, radio included, from the first source in Heart download priority that Octo fetches itself.</div>
@@ -530,7 +565,7 @@
               <div class="set-info">
                 <div class="set-info-t">Skip songs you already have</div>
                 <div class="set-info-d">A heart, an album or a play never downloads a second copy of a song in your library. On by default.</div>
-                <div class="set-info-more">An MP3 or other lossy copy is kept and queued for a higher quality one, when Soulseek or Lidarr can look for it and Better quality is on for you. This holds for hearts through Lidarr too: the album's songs you already have are taken back out of what Lidarr brought. The same song means the same artist and title in the same version, and a length within 8 seconds or the same album.</div>
+                <div class="set-info-more">An MP3 or other lossy copy is kept and queued for a higher quality one, when Deezer, Soulseek or Lidarr can look for it and Better quality is on for you. This holds for hearts through Lidarr too: the album's songs you already have are taken back out of what Lidarr brought. The same song means the same artist and title in the same version, and a length within 8 seconds or the same album.</div>
               </div>
               <label class="switch"><input type="checkbox" id="f-skip-owned-songs" name="Subsonic.SkipOwnedSongs" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
@@ -859,6 +894,10 @@
               <label class="switch"><input type="checkbox" name="LastFm.EnableYourMix" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Starter Radio</div><div class="set-info-d">The listener's mix before enough plays were learned from. Off, a listener has no mix of their own until Your Mix is earned, so one or two plays never make a station.</div></div>
+              <label class="switch"><input type="checkbox" name="LastFm.EnableStarterRadio" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
               <div class="set-info"><div class="set-info-t">Discovery Mix</div><div class="set-info-d">One station of less-familiar music, seeded from the listener's most-played tags.</div></div>
               <label class="switch"><input type="checkbox" name="LastFm.EnableDiscoveryMix" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
@@ -961,7 +1000,7 @@
               <div class="set-ctrl"><select class="set-input" id="radio-user" aria-label="Radio listener" hidden></select></div>
             </div>
             <div id="radio-status" class="radio-status" aria-live="polite">Loading radio status…</div>
-            <div class="set-row radio-reset-row"><div class="set-info"><div class="set-info-t">Reset this listener's Radio history</div><div class="set-info-d">Removes learned signals and station snapshots only. Downloaded music is untouched.</div></div><button class="btn btn-ghost" id="radio-reset" type="button" disabled>Reset history</button></div>
+            <div class="set-row radio-reset-row"><div class="set-info"><div class="set-info-t">Reset this listener's Radio history</div><div class="set-info-d">Removes what radio learned from this listener's plays and stars, and their station snapshots. Radio starts over from what they play next. Downloaded music is untouched.</div></div><button class="btn btn-ghost" id="radio-reset" type="button" disabled>Reset history</button></div>
           </div>
         </div>
       </section>
@@ -1643,6 +1682,13 @@
             <p class="set-desc">How Octo reaches slskd.</p>
           </div>
           <form data-section="soulseek-conn" class="set-card">
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Use Soulseek</div>
+                <div class="set-info-d">Off, Octo never contacts slskd, and hearts, Better quality and Find songs use your other sources. <code>SOULSEEK_ENABLED</code> in <code>.env</code>.</div>
+              </div>
+              <label class="switch"><input type="checkbox" name="Soulseek.Enabled" data-restart="true" data-restart-label="Use Soulseek" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
             <div class="set-row stack">
               <div class="set-info">
                 <div class="set-info-t">Base URL</div>
@@ -2306,7 +2352,7 @@
             </div>
             <details class="cover-how">
               <summary>How it works</summary>
-              <p>Each song goes through Better quality, exactly as the action playlist does it: a lossless copy is looked for, checked to be the same recording and really lossless, and put in the original's place, so the song keeps its plays, favorites and playlist places. The original waits in quarantine until its replacement passes. A song with no lossless copy on any of them stays as it is and is not looked for again by the weekly upgrade for 4 weeks. Copies come from the sources named above, Soulseek first and then Lidarr; while every one of them is out, songs wait.</p>
+              <p>Each song goes through Better quality, exactly as the action playlist does it: a lossless copy is looked for, checked to be the same recording and really lossless, and put in the original's place, so the song keeps its plays, favorites and playlist places. The original waits in quarantine until its replacement passes. A song with no lossless copy on any of them stays as it is and is not looked for again by the weekly upgrade for 4 weeks. Copies come from the sources named above, Deezer first, then Soulseek, then Lidarr; while every one of them is out, songs wait.</p>
             </details>
           </div>
         </div>
@@ -2519,11 +2565,12 @@
               <input class="set-input" name="LibraryActions.UpgradePerWeek" type="number" min="0" max="500" data-number="true" aria-label="Songs to upgrade a week" />
             </div>
             <div class="set-row stack">
-              <div class="set-info"><div class="set-info-t">Where to look for a higher quality copy</div><div class="set-info-d"><strong>Automatic</strong> asks Soulseek first, then Lidarr for what Soulseek cannot find, using whichever of the two is set up.</div><div class="set-info-more">Lidarr fetches whole albums, so Octo borrows the album: it copies out the one song, deletes the other files that search brought in, and puts the album's monitoring back as it was. A song Lidarr already manages is left to Lidarr. While Soulseek is offline, Lidarr is asked alone.</div></div>
+              <div class="set-info"><div class="set-info-t">Where to look for a higher quality copy</div><div class="set-info-d"><strong>Automatic</strong> asks Deezer first, then Soulseek, then Lidarr, each for what the one before cannot find, using whichever of them is set up. Deezer is asked for a FLAC and nothing less, so an account whose plan gives no FLAC is passed over.</div><div class="set-info-more">Lidarr fetches whole albums, so Octo borrows the album: it copies out the one song, deletes the other files that search brought in, and puts the album's monitoring back as it was. A song Lidarr already manages is left to Lidarr. While Soulseek is offline, Lidarr is asked alone.</div></div>
               <select class="set-input" name="LibraryActions.UpgradeSource">
                 <option value="Auto">Automatic</option>
                 <option value="Soulseek">Soulseek only</option>
                 <option value="Lidarr">Lidarr only</option>
+                <option value="Deezer">Deezer only</option>
               </select>
             </div>
           </form>
@@ -2671,6 +2718,140 @@
             </div>
             <div class="set-row stack">
               <div class="set-info-d" id="lidarr-options-status" role="status" aria-live="polite"></div>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <!-- ─── DEEZER ─────────────────────────────────────────── -->
+      <section data-pane="deezer">
+        <header class="page-header">
+          <div>
+            <h1>Deezer</h1>
+            <p>Play and keep songs from your own Deezer account. Octo already reads album and song facts from Deezer without one.</p>
+          </div>
+        </header>
+
+        <div class="notice">
+          <strong>This uses your account outside Deezer's own apps.</strong> Octo signs in with the account's cookie and reads the songs the way the Deezer web player does, which Deezer's terms of use do not allow. FLAC needs a plan with HiFi; other paid plans are given MP3 at 320 kbps.
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Account</h3>
+            <p class="set-desc">Octo signs in to check it every half hour, and the log says when it stops working.</p>
+          </div>
+          <form data-section="deezer-account" class="set-card" id="deezer-account-form">
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Account health</div>
+                <div class="set-info-d" id="deezer-account-status" role="status" aria-live="polite">Checking…</div>
+                <div class="set-info-d" id="deezer-account-checked"></div>
+              </div>
+              <button class="btn btn-ghost" type="button" id="deezer-account-check">Check now</button>
+            </div>
+            <div class="notice notice-warn" id="deezer-account-notes" hidden></div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <label class="set-info-t" for="f-deezer-arl">ARL</label>
+                <div class="set-info-d">The <code>arl</code> cookie of deezer.com while you are signed in: a long run of letters and digits.</div>
+                <div class="set-info-more">In a browser signed in to deezer.com, open the developer tools, then Application (Chrome) or Storage (Firefox), then Cookies, and copy the value of <code>arl</code>. It lasts a few months; when it expires the Status page turns red and songs play from YouTube until you paste a new one.</div>
+              </div>
+              <input class="set-input" id="f-deezer-arl" name="Deezer.Arl" type="password" autocomplete="new-password" data-restart="true" data-restart-label="Deezer ARL (only when Deezer playback is switched on with it)" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <label class="set-info-t" for="f-deezer-arl-fallback">Fallback ARL <span class="set-opt">optional</span></label>
+                <div class="set-info-d">A second account, tried when the first cannot be given a song: another country's catalog, say.</div>
+              </div>
+              <input class="set-input" id="f-deezer-arl-fallback" name="Deezer.ArlFallback" type="password" autocomplete="new-password" />
+            </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Quality</h3>
+            <p class="set-desc">Each asks for the format named and takes the next one down when the account is not given it.</p>
+          </div>
+          <form data-section="deezer-quality" class="set-card" id="deezer-quality-form">
+            <div class="set-row stack">
+              <div class="set-info">
+                <label class="set-info-t" for="f-deezer-quality">Songs you keep</label>
+                <div class="set-info-d">The copy a heart saves to your library when Deezer is switched on in Heart download priority.</div>
+              </div>
+              <select class="set-input" id="f-deezer-quality" name="Deezer.Quality">
+                <option value="FLAC">FLAC</option>
+                <option value="MP3_320">MP3, 320 kbps</option>
+                <option value="MP3_128">MP3, 128 kbps</option>
+              </select>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <label class="set-info-t" for="f-deezer-stream-quality">Songs you play</label>
+                <div class="set-info-d">A song played from Deezer before it is in your library. MP3 plays and seeks in every app.</div>
+                <div class="set-info-more">Apps are told this format before the song plays. With FLAC, a song the account is only given as MP3 arrives in a format the app was not told, and some apps then refuse to play it.</div>
+              </div>
+              <select class="set-input" id="f-deezer-stream-quality" name="Deezer.StreamQuality" data-restart="true">
+                <option value="MP3_320">MP3, 320 kbps</option>
+                <option value="MP3_128">MP3, 128 kbps</option>
+                <option value="FLAC">FLAC</option>
+              </select>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Where Deezer is used</div>
+                <div class="set-info-d">Playing songs you don't own, and Heart download priority, are both on Streams &amp; hearts.</div>
+              </div>
+              <div>
+                <button type="button" class="btn btn-ghost" data-open-tab="downloads"><span>Open Streams &amp; hearts</span></button>
+              </div>
+            </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Playback cache</h3>
+            <p class="set-desc">Keeps a copy of each song played from Deezer, outside your library, so playing it again or seeking in it does not ask Deezer again.</p>
+          </div>
+          <form data-section="deezer-cache" class="set-card" id="deezer-cache-form">
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Keep played songs</div>
+                <div class="set-info-d">The first play downloads the whole song while it plays. Later plays read the copy.</div>
+                <div class="set-info-more">Copies are not part of your library and never show up in Navidrome. A heart on a song already cached in the quality you keep is copied from here.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="f-deezer-cache-enabled" name="Deezer.CacheEnabled" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <label class="set-info-t" for="f-deezer-cache-max">Size limit <span class="set-opt">GiB</span></label>
+                <div class="set-info-d">Past this, the songs played longest ago are removed first.</div>
+              </div>
+              <input class="set-input" id="f-deezer-cache-max" name="Deezer.CacheMaxGiB" type="number" min="0" step="0.5" data-number="true" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <label class="set-info-t" for="f-deezer-cache-days">Keep for <span class="set-opt">days since last played</span></label>
+                <div class="set-info-d">0 keeps songs until the size limit removes them.</div>
+              </div>
+              <input class="set-input" id="f-deezer-cache-days" name="Deezer.CacheRetentionDays" type="number" min="0" step="1" data-number="true" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <label class="set-info-t" for="f-deezer-cache-path">Folder</label>
+                <div class="set-info-d">Inside Octo's container. Keep it outside your music folder, or Navidrome lists every played song.</div>
+                <div class="set-info-more">The bundled compose file mounts <code>./octo-cache/deezer</code> on the host here. Octo only ever removes files it named itself, so a wrong folder loses nothing.</div>
+              </div>
+              <input class="set-input" id="f-deezer-cache-path" name="Deezer.CachePath" data-restart="true" placeholder="/app/cache/deezer" />
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">In the cache now</div>
+                <div class="set-info-d" id="deezer-cache-status" role="status" aria-live="polite">Checking…</div>
+              </div>
+              <button class="btn btn-ghost" type="button" id="deezer-cache-clear">Empty the cache</button>
             </div>
           </form>
         </div>

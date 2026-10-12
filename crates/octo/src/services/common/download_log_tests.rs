@@ -732,6 +732,82 @@ async fn a_look_searches_every_source_that_is_on_and_orders_the_copies() {
     assert!(finder.get(&started.id, "bob").is_none());
 }
 
+/// Deezer is searched like the other sources, and where first choices tie its copy leads.
+#[tokio::test]
+async fn deezers_copy_leads_the_first_choices() {
+    let finder = new_finder(Some(target("Air", "Sexy Boy", Some("Moon Safari"), Some(298))));
+    finder.seams(|s| {
+        s.sources_for = sources(&["Deezer", "Soulseek", "Lidarr"]);
+        s.search_soulseek = searching(|| answer(vec![copy("Soulseek", Some(1), "best.flac")]));
+        s.search_lidarr = searching(|| answer(vec![copy("Lidarr", Some(1), "Lidarr's choice")]));
+        s.search_deezer = searching(|| answer(vec![copy("Deezer", Some(1), "Air - Sexy Boy")]));
+    });
+
+    let started = finder
+        .start("id", "alice", &CancellationToken::new())
+        .await
+        .expect("a look");
+    let done = finder.wait(&started.id, TEN).await.expect("the look");
+
+    assert_eq!(done.state, find_states::DONE);
+    assert_eq!(
+        files(&done.copies),
+        ["Air - Sexy Boy", "best.flac", "Lidarr's choice"]
+    );
+    assert_eq!(done.sources.len(), 3);
+}
+
+/// A picked Deezer copy is fetched from Deezer, names no Soulseek file and no Lidarr release,
+/// and replaces a library song only when it is lossless.
+#[test]
+fn a_deezer_pick_goes_to_deezer_and_must_be_lossless_to_replace_a_song() {
+    let pick = PickedCopy {
+        source: "Deezer".into(),
+        file: Some("42".into()),
+        format: Some("flac".into()),
+        release_guid: Some("g".into()),
+        indexer_id: Some(1),
+        ..Default::default()
+    };
+    assert!(pick.is_deezer() && !pick.is_soulseek());
+    assert_eq!(pick.download_source(), DownloadSource::Deezer);
+    assert!(pick.to_hit().is_none() && pick.release().is_none());
+    assert_eq!(pick.describe(), "Deezer's FLAC");
+    assert_eq!(
+        PickedCopy {
+            source: "Lidarr".into(),
+            ..Default::default()
+        }
+        .download_source(),
+        DownloadSource::Lidarr
+    );
+    assert_eq!(PickedCopy::default().download_source(), DownloadSource::Soulseek);
+
+    let owned = FindTarget {
+        library_id: Some("nd-1".into()),
+        owned_format: Some("mp3".into()),
+        ..target("Air", "Sexy Boy", None, None)
+    };
+    let shown = |format: &str| {
+        FoundCopy::new(
+            AcquisitionCandidate {
+                source: "Deezer".into(),
+                format: Some(format.into()),
+                ..Default::default()
+            },
+            pick.clone(),
+        )
+    };
+    assert_eq!(
+        SongFinder::replace_refusal(&owned, &shown("flac"), None, None, false),
+        None
+    );
+    assert_eq!(
+        SongFinder::replace_refusal(&owned, &shown("mp3"), None, None, false).as_deref(),
+        Some("Only a lossless copy can take the place of the one in your library.")
+    );
+}
+
 #[tokio::test]
 async fn a_source_that_fails_says_so_and_the_other_still_answers() {
     let finder = new_finder(Some(target("Air", "Sexy Boy", None, None)));

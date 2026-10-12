@@ -18,7 +18,7 @@ Search any song and play it right away. Keep the ones you love as files on your 
 
 Octo gives a home server what a streaming app has: search that reaches past your own library, songs that play the moment you pick them, and radio that learns what you like. When a song is worth keeping, Octo downloads the best copy it can find, tags it and files it in your library, where it stays with no subscription.
 
-It runs on [Navidrome](https://www.navidrome.org/), the open-source music server. If you already run Navidrome, Octo sits in front of it and your library stays as it is. If you don't, the installer starts one for you.
+It runs on [Navidrome](https://www.navidrome.org/), the open-source music server. Octo sits in front of your Navidrome and your library stays as it is.
 
 ![Searching Fleetwood Mac in the Octo desktop app, playing "Go Your Own Way" from Rumours, pressing + and watching Octo download it into the library](docs/images/demo.gif)
 
@@ -33,29 +33,37 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 - **Apps for every device.** [Octo's own apps](#octos-own-apps) for Windows, Linux and Android, and [any Subsonic app](#compatible-apps) on iPhone, Mac and everywhere else.
 - **Yours to run.** The files are on your disk, everyone in the house gets their own login and their own stations, and there is nothing to pay each month.
 
-> If you pay for Qobuz, Deezer or Yandex Music and want that catalog in your library, [V1ck3s/octo-fiesta](https://github.com/V1ck3s/octo-fiesta) fits better, since it downloads from those services directly. Octo needs no paid streaming account.
+> If you pay for Qobuz or Yandex Music and want that catalog in your library, [V1ck3s/octo-fiesta](https://github.com/V1ck3s/octo-fiesta) fits better, since it downloads from those services directly. Octo needs no paid streaming account; a Deezer account is an [optional extra source](#your-own-deezer-account).
 
 ## Get started
 
 You need a computer that stays on, such as a home server, a NAS or a Raspberry Pi, with [Docker](https://docs.docker.com/engine/install/) installed.
 
+You also need a [Navidrome](https://www.navidrome.org/) server, already running, that Octo can reach by a LAN address or a Docker service name (not `localhost`).
+
 ```bash
 git clone https://github.com/winters27/octo.git
 cd octo
-./install.sh
+cp .env.example .env
 ```
 
-The installer asks a few questions, starts everything, and prints where to go next:
+Edit `.env`. The ones that matter first:
 
-- **Do you already run Navidrome?** Answer **no** and Octo starts its own Navidrome beside it, with an admin login made for you. Answer **yes** and give its address (a LAN IP, not `localhost`), and Octo sits in front of your server.
-- **A free [Last.fm API key](https://www.last.fm/api/account/create)** powers radio and discovery. It's optional, but without it search only finds your own music.
-- **A free [Soulseek account](https://www.slsknet.org/news/node/1)** lets Octo download the songs you keep. Also optional; an existing [Lidarr](https://github.com/Lidarr/Lidarr) with working indexers can do the downloading instead.
+- **`SUBSONIC_URL`**: your Navidrome's address as Octo's container sees it, and `SUBSONIC_ADMIN_USERNAME` / `SUBSONIC_ADMIN_PASSWORD` for a Navidrome admin login.
+- **`DOWNLOAD_PATH`**: the music folder Navidrome reads, on this machine.
+- **`LASTFM_API_KEY`**: a free [Last.fm API key](https://www.last.fm/api/account/create) powers radio and discovery. Optional, but without it search only finds your own music.
+- **Sources for the songs you keep**, all optional: `DEEZER_ARL` (your own [Deezer account](#your-own-deezer-account)), `SLSKD_SOULSEEK_USERNAME` / `SLSKD_SOULSEEK_PASSWORD` (a free [Soulseek account](https://www.slsknet.org/news/node/1)), or an existing [Lidarr](https://github.com/Lidarr/Lidarr). Switch off what you don't use with `SOULSEEK_ENABLED=false` or `YOUTUBE_ENABLED=false`.
+
+Then start it:
+
+```bash
+docker compose up -d
+```
 
 When it finishes:
 
 - Point your music apps at `http://<your-host>:5274` and sign in with your Navidrome login. Not Navidrome's own address: an app pointed there gets your library and nothing from Octo.
 - Open the dashboard at **`http://<your-host>:5274/admin`** to manage every setting from the browser, signed in with a Navidrome admin account. See [Admin dashboard](#admin-dashboard).
-- On the starter stack, add the people who listen in Navidrome's own pages at `http://<your-host>:4533`.
 - If an app says the server is unreachable, Octo is telling you setup isn't finished, and its answer says what to fix (usually the Navidrome address).
 
 <details>
@@ -70,8 +78,6 @@ When it finishes:
 ```
 
 Your apps talk to Octo. Octo adds search, radio and previews, and passes everything else to Navidrome, so any Subsonic app works unchanged. Downloads land in the music folder Navidrome reads, and Octo asks it to rescan.
-
-On the starter stack Navidrome runs from the same `docker-compose.yml`, turned on by `COMPOSE_PROFILES=navidrome` in `.env`. To set it up by hand instead of with the installer, copy `.env.example` to `.env`, fill in its starter stack section, and run `docker compose up -d`.
 
 </details>
 
@@ -154,7 +160,7 @@ Octo checks GitHub every 6 hours for a newer release. When one is out, the dashb
 
 ### From the dashboard
 
-On Linux with systemd, the installer offers a small update helper. With it, **About → Update now** installs the new release: the helper fetches it, pulls the Octo, yt-dlp shim and octo-sonic images published for it, and restarts them, and the dashboard shows each step. Nothing is compiled.
+On Linux with systemd, a small update helper (`scripts/updater/install-updater.sh`, below) can do it for you. With it, **About → Update now** installs the new release: the helper fetches it, pulls the Octo, yt-dlp shim and octo-sonic images published for it, and restarts them, and the dashboard shows each step. Nothing is compiled.
 
 - Octo itself never gets access to Docker. It can only ask, by writing a file in its config folder, and only for the newest published release.
 - The helper pulls the new release before it stops anything, so a failed pull leaves Octo running as it was. If the new release will not stay up, the helper goes back to the old one.
@@ -184,11 +190,11 @@ docker compose pull octo yt-dlp-shim octo-sonic || docker compose --profile sour
 docker compose up -d
 ```
 
-Octo, the yt-dlp shim and octo-sonic are pulled, already built, for the release you have checked out; the part after `||` builds them from the folder only when the pull fails, for example with no network to `ghcr.io`. Re-running `./install.sh` also works: it does the same, and keeps your answers and every other line in `.env`, including ones you added or changed by hand.
+Octo, the yt-dlp shim and octo-sonic are pulled, already built, for the release you have checked out; the part after `||` builds them from the folder only when the pull fails, for example with no network to `ghcr.io`.
 
 Up to 2026.10.05 the last step was `docker compose build octo`. Octo is pulled now, so that builds nothing; if you changed Octo's own files and want them running, build it with `docker compose --profile source build octo-source && docker compose up -d` (see [Published images](#published-images)).
 
-If you track `main` instead of releases, `git checkout main && git pull && ./install.sh` still works.
+If you track `main` instead of releases: `git checkout main && git pull`, then the same two `docker compose` commands.
 
 To turn the release check off, set `UPDATES_CHECK=false`, or switch off **Look for new releases** under **About**.
 
@@ -199,7 +205,7 @@ Releases are dated, so `2026.07.29` is the release cut on that day. Your running
 To pin to a release instead of tracking `main`:
 
 ```bash
-git checkout 2026.07.29 && ./install.sh
+git checkout 2026.07.29 && docker compose pull && docker compose up -d
 ```
 
 ### Published images
@@ -208,9 +214,9 @@ Every release publishes three images on GitHub's container registry, each for am
 
 | Image | What it is |
 | --- | --- |
-| `ghcr.io/winters27/octo` | Octo itself |
-| `ghcr.io/winters27/octo-yt-dlp-shim` | the yt-dlp shim beside it |
-| `ghcr.io/winters27/octo-sonic` | octo-sonic, which reads each song for Sounds alike and transition profiles |
+| `ghcr.io/sleezy6/octo` | Octo itself |
+| `ghcr.io/sleezy6/octo-yt-dlp-shim` | the yt-dlp shim beside it |
+| `ghcr.io/sleezy6/octo-sonic` | octo-sonic, which reads each song for Sounds alike and transition profiles |
 
 `docker-compose.yml` pulls all three, tagged with the release the folder holds, so no install compiles anything. `OCTO_IMAGE_TAG` in `.env` picks another tag for all three, such as `latest`.
 
@@ -220,7 +226,7 @@ To build one from the folder instead (changes of your own, or no network to `ghc
 docker compose --profile source build octo-source && docker compose up -d
 ```
 
-`octo-source` is Octo itself; `yt-dlp-shim-source` and `octo-sonic-source` are the sidecars. A later `docker compose pull`, or Update now, puts the published image back. The update helper and `install.sh` build an image that will not pull by themselves, and `install.sh` also builds one whose folder changed since its release (on `main`, or with changes of your own), and says so.
+`octo-source` is Octo itself; `yt-dlp-shim-source` and `octo-sonic-source` are the sidecars. A later `docker compose pull`, or Update now, puts the published image back. The update helper builds an image that will not pull by itself.
 
 An override from 2026.10.05 or earlier that made Octo pulled (`build: !reset null` and `image:` under `octo` in `docker-compose.override.yml`) is no longer needed. It does no harm; delete it when you like.
 
@@ -309,11 +315,11 @@ tell you a starred track landed, or quietly settled for a lossy copy.
 
 ### Is Octo a self-hosted Spotify alternative?
 
-Yes, that's what it's for. Octo adds the parts of Spotify that a library player lacks: search across music you don't own, songs that play the moment you pick them, and radio that learns your taste. Navidrome stores and serves your library underneath, and the installer can set it up for you. The difference from Spotify is what happens when you like a song: Octo downloads it as a real file into your library instead of renting it.
+Yes, that's what it's for. Octo adds the parts of Spotify that a library player lacks: search across music you don't own, songs that play the moment you pick them, and radio that learns your taste. Navidrome stores and serves your library underneath. The difference from Spotify is what happens when you like a song: Octo downloads it as a real file into your library instead of renting it.
 
 ### Does this work with Plex / Plexamp?
 
-No. Octo speaks the Subsonic API, not the Plex API. If you're a Plex user looking for a self-hosted service with discovery, the move is Octo with Navidrome (the installer sets up both) and a Subsonic app such as Octo's own, Feishin or Arpeggi.
+No. Octo speaks the Subsonic API, not the Plex API. If you're a Plex user looking for a self-hosted service with discovery, the move is Octo with Navidrome and a Subsonic app such as Octo's own, Feishin or Arpeggi.
 
 ### How is this different from Navidrome's built-in radio?
 
@@ -338,7 +344,11 @@ Yes. Every image is published for amd64 and arm64, so a Pi pulls Octo, the yt-dl
 
 ### What if I don't want to use Soulseek?
 
-You can use YouTube or an existing Lidarr server, or disable automatic acquisition entirely.
+You can use your Deezer account, YouTube or an existing Lidarr server, or disable automatic acquisition entirely.
+
+YouTube is optional the same way: `YOUTUBE_ENABLED=false` (or **Use YouTube** on Streams & hearts) and a restart, and Octo never asks the yt-dlp shim or YouTube Music. Outside songs then play from your Deezer account whatever the stream source says (without a Deezer ARL they do not play at all), hearts skip YouTube, and YouTube Music leaves radio. The `yt-dlp-shim` service still starts with the bundled compose file; delete it and octo's `- yt-dlp-shim` `depends_on` line to not run it.
+
+To switch Soulseek off completely, set `SOULSEEK_ENABLED=false` in `.env` (or **Soulseek → Use Soulseek** on the dashboard) and restart Octo. Octo then never contacts slskd: hearts skip it, and Better quality and Find songs use your other sources. slskd itself still starts with the bundled compose file; to not run it at all, delete the `slskd` service and the `- slskd` line under octo's `depends_on`.
 
 Use **Streams & hearts → Heart download priority** in the admin UI to order Soulseek, YouTube, and Lidarr and independently choose whether each handles song hearts, album hearts, or both. Octo tries eligible sources from top to bottom and stops at the first success. `DOWNLOAD_SOURCE`, `DOWNLOAD_ON_STAR`, and `DOWNLOAD_ALBUM_ON_STAR` remain migration defaults for existing and env-only installations.
 
@@ -376,7 +386,7 @@ Octo's earliest commits descended from [V1ck3s/octo-fiesta](https://github.com/V
 
 Different audience. If you pay for streaming and want every play to enrich your library, octo-fiesta is the right tool. If you don't pay for streaming and want discovery + selective FLAC ownership, Octo is the right tool.
 
-Other practical differences in Octo: a real admin UI, multi-peer Soulseek retry, HTTP Range support for iOS clients, Last.fm-driven discovery and radio, an interactive installer.
+Other practical differences in Octo: a real admin UI, multi-peer Soulseek retry, HTTP Range support for iOS clients, Last.fm-driven discovery and radio.
 
 
 ### Background
@@ -648,7 +658,10 @@ Each kind of dynamic station is configured on its own, so a listener can keep Yo
 without collecting an artist radio per favorite band. `LASTFM_ENABLE_YOUR_MIX` and
 `LASTFM_ENABLE_DISCOVERY_MIX` (both default true) switch those two stations,
 `LASTFM_ARTIST_STATION_COUNT` (default 2) and `LASTFM_GENRE_STATION_COUNT` (default 3)
-say how many of each to build, and 0 builds none. The defaults are what Octo has always
+say how many of each to build, and 0 builds none. `LASTFM_ENABLE_STARTER_RADIO` decides
+whether a listener gets Starter Radio before `LASTFM_MINIMUM_PLAYS` plays were learned from;
+the bundled compose file sets it to false, so nobody gets a mix of their own from one or two
+plays (true is what Octo has always done). The other defaults are what Octo has always
 produced. All four take effect without a restart, and switching one off removes those
 stations from clients on the next request.
 
@@ -787,6 +800,26 @@ A heart through Lidarr keeps the same promises as one through Soulseek. Lidarr b
 
 A heart waits for Lidarr's import, up to `LIDARR_IMPORT_TIMEOUT_SECONDS` (default 1800), and any song that did not land (Lidarr found nothing in time, or the file failed a check) goes to the next source in **Heart download priority**, which skips the songs that did. The wait never blocks playback or later hearts. `LIDARR_COMPLETION_MODE=Accepted` (default) sends a notice when Lidarr accepts the search and one for the album when an album heart lands; `Imported` also sends one when a track heart's album lands, and one when an import fails or times out.
 
+### Your own Deezer account
+
+Optional, and off until you set it up. Octo already reads album and song facts from Deezer's public catalog with no account. With an account's ARL cookie it can also fetch the songs themselves, in two places you switch on separately:
+
+- **Playing songs you don't own.** On the dashboard's **Streams & hearts** page, set *When a song is missing* to **Deezer stream** (`STREAM_SOURCE=Deezer`). A song then plays from Deezer as an MP3 (or FLAC, see below) in place of the YouTube preview. A song Deezer cannot serve still plays from YouTube, so the yt-dlp shim stays in the stack. Restart Octo after changing it: apps are told a song's format before it plays, and the two change together.
+- **Hearts.** Switch **Deezer** on in *Heart download priority* and drag it where you want it among Soulseek, YouTube and Lidarr (or set `DOWNLOAD_SOURCE=Deezer`). A hearted song is saved in the quality you chose, checked against AcoustID, tagged and filed like any other download.
+
+Setting it up, on the dashboard's **Deezer** page or in `.env`:
+
+| Setting | `.env` | Default | |
+|---|---|---|---|
+| ARL | `DEEZER_ARL` | empty | The `arl` cookie of deezer.com while you are signed in (browser developer tools, Cookies). It lasts a few months. Octo signs in with it every half hour and warns in the log when it stops working; the Deezer page shows the plan, whether it gives FLAC, and what to do when it does not. |
+| Fallback ARL | `DEEZER_ARL_FALLBACK` | empty | A second account, tried when the first cannot be given a song. |
+| Songs you keep | `DEEZER_QUALITY` | `FLAC` | `FLAC`, `MP3_320` or `MP3_128`. Each takes the next one down when the account is not given it; FLAC needs a plan with HiFi. |
+| Songs you play | `DEEZER_STREAM_QUALITY` | `MP3_320` | The same choices. MP3 plays and seeks in every app. |
+
+**Playback cache.** Off by default (`DEEZER_CACHE_ENABLED=true`, or the switch on the Deezer page). With it on, the first play of a song downloads the whole song while it plays and keeps the copy outside your library; playing it again or seeking in it reads the copy and does not ask Deezer. Several people playing the same song share one download, and a download carries on when the player that started it leaves. A seek past what has arrived so far is answered by Deezer directly. Copies not played for `DEEZER_CACHE_RETENTION_DAYS` (7) are removed, and past `DEEZER_CACHE_MAX_GIB` (20) the ones played longest ago go first. The copies live in `DEEZER_CACHE_HOST_PATH` (`./octo-cache/deezer`), mounted at `/app/cache/deezer`; keep it outside your music folder, or Navidrome lists every played song. A heart on a song already cached in the quality you keep is copied from the cache.
+
+The Status page shows whether the account signs in. Octo signs in with your cookie outside Deezer's own apps and decrypts the songs the way the web player does, which Deezer's terms of use do not allow; the account you use carries that risk. The Deezer code is ported from [am-yy/octo](https://github.com/am-yy/octo), which adapted it from [V1ck3s/octo-fiesta](https://github.com/V1ck3s/octo-fiesta).
+
 ### Playback and acquisition
 
 Tracks already in your library play locally through Navidrome. Missing external results stream from YouTube. Playback does not acquire a permanent copy unless one of the two settings below is on; heart the song or album to run the configured source priority.
@@ -882,7 +915,7 @@ When a song is starred, Octo:
 
 Around 30 to 50% of Soulseek peer requests get rejected ("overwhelmed", queue full, banned). Single-peer-try downloads were too fragile; multi-peer is the difference between "downloads sometimes work" and "downloads reliably work."
 
-Before any of that, Octo checks whether the song is already in your library (Navidrome's own search, the same artist and title in the same version, a length within 8 seconds or the same album). A lossless copy is kept and nothing is downloaded; a lossy one is kept and queued for a higher quality copy when Soulseek or Lidarr can look for one and Better quality is on for you (`SKIP_OWNED_SONGS`, on by default). A heart through Lidarr follows the same rule: Lidarr brings the whole album, and the songs you already have are deleted from what it brought.
+Before any of that, Octo checks whether the song is already in your library (Navidrome's own search, the same artist and title in the same version, a length within 8 seconds or the same album). A lossless copy is kept and nothing is downloaded; a lossy one is kept and queued for a higher quality copy when Deezer, Soulseek or Lidarr can look for one and Better quality is on for you (`SKIP_OWNED_SONGS`, on by default). A heart through Lidarr follows the same rule: Lidarr brings the whole album, and the songs you already have are deleted from what it brought.
 
 Each Soulseek download lands in a hidden folder of its own (`.octo-incoming/slskd/<id>` in slskd's downloads folder), so Octo always finds exactly its own file. Once slskd has shown it honours that folder, up to `SLSKD_PARALLEL_DOWNLOADS` (default 3, at most 6) downloads transfer at once; moving files into your library stays one at a time. An slskd without batch downloads, or one whose download subfolder setting is `{}`, keeps Octo at one at a time.
 
@@ -892,13 +925,13 @@ When slskd is up but not logged in to the Soulseek network (Soulseek's server ha
 
 The dashboard's **Better quality** page lists every song in your library that is not lossless, including the ones Octo got from YouTube, and finds a higher quality copy of the ones you pick, several at a time. Octo's apps offer the same as **Find higher quality** on a song or an album. Both go through the Better quality library action, so they need library actions on, the Better quality action on, you on the allowed list, and rehearsal mode off.
 
-Copies come from Soulseek, from Lidarr, or from both: **Library actions → Where to look for a higher quality copy** (`LIBRARY_ACTIONS_UPGRADE_SOURCE`). Automatic, the default, asks Soulseek first and Lidarr for what Soulseek cannot find, using whichever is set up, and asks Lidarr alone while Soulseek is offline. Lidarr only fetches whole albums, so Octo borrows the album: it copies out the one song, which then goes through the same checks and the same in-place swap as a Soulseek copy, deletes the other files that search brought in, and puts the album's monitoring back as it was. A song whose file Lidarr itself manages is left to Lidarr, which upgrades it in place when its quality profile asks for lossless.
+Copies come from Deezer, from Soulseek, from Lidarr, or from all of them: **Library actions → Where to look for a higher quality copy** (`LIBRARY_ACTIONS_UPGRADE_SOURCE`: `Auto`, `Deezer`, `Soulseek` or `Lidarr`). Automatic, the default, asks Deezer first when an account is set (for a FLAC and nothing less, so an account whose plan gives no FLAC is passed over), then Soulseek, then Lidarr, each for what the one before cannot find, and leaves Soulseek out while it is offline. Lidarr only fetches whole albums, so Octo borrows the album: it copies out the one song, which then goes through the same checks and the same in-place swap as a Soulseek copy, deletes the other files that search brought in, and puts the album's monitoring back as it was. A song whose file Lidarr itself manages is left to Lidarr, which upgrades it in place when its quality profile asks for lossless.
 
 > **A heart is "fetch" for a song you do not have, and "favorite" for one you do.** Octo checks your library first. A song you already have, even the copy Octo found outside your library, becomes your favorite in Navidrome straight away and downloads nothing (an MP3 is queued for Better quality). A song you do not have is downloaded and nothing more: once it is in your library, heart it there to make it a favorite. `STAR_DOWNLOADS_FOR_REQUESTER` makes Octo favorite downloads when they land instead. Octo's own apps are left out of both, since their heart means Add.
 
 ### Sharing back on Soulseek
 
-Soulseek only works because people share. Many users will not send files to someone who shares nothing. So Octo can have slskd share your music library back, and it is your choice: **Share my library on Soulseek**, a switch on the dashboard's **Soulseek** page, turns it on or off within seconds, with no restart and no editing. The installer asks, suggesting yes, and `SLSKD_SHARE_LIBRARY` in `.env` sets where the switch starts (`.env.example` has it on). Left out of `.env` it is off, so updating an existing install never starts sharing by itself. Off means nothing is shared at all: slskd forgets your folders, and uploads still waiting or under way are cancelled.
+Soulseek only works because people share. Many users will not send files to someone who shares nothing. So Octo can have slskd share your music library back, and it is your choice: **Share my library on Soulseek**, a switch on the dashboard's **Soulseek** page, turns it on or off within seconds, with no restart and no editing. `SLSKD_SHARE_LIBRARY` in `.env` sets where the switch starts (`.env.example` has it on). Left out of `.env` it is off, so updating an existing install never starts sharing by itself. Off means nothing is shared at all: slskd forgets your folders, and uploads still waiting or under way are cancelled.
 
 How the switch works: Octo signs in to slskd as its administrator and writes the share list into slskd's own settings file, `slskd-state/slskd.yml`, in a part marked as Octo's, through slskd's API. The compose file's `SLSKD_REMOTE_CONFIGURATION: "true"` allows that, and slskd keeps the old file as `slskd.yml.bak`. slskd picks the new file up by itself; Octo waits until slskd reports the new list, then has slskd look through the folders again. Every 10 minutes Octo checks that slskd still matches the switch. A `shares:` section you wrote in `slskd.yml` yourself, or shares set on the slskd container's environment, are yours: Octo leaves them alone, and the card says the switch stands aside.
 

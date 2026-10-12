@@ -279,7 +279,100 @@ fn the_store_keeps_keys_and_finds_them_ignoring_case() {
         "{written}"
     );
     assert!(fixture.store.reset("BRANDON"));
+    // Reset, not removed: the listener is kept, under the name as it was written, but is not
+    // listed until they play again.
+    assert_eq!(fixture.store.get_user("brandon").username, "Brandon");
     assert!(fixture.store.known_users().is_empty());
+}
+
+fn mix(owner: &str) -> LastFmRadioStation {
+    LastFmRadioStation {
+        id: station_id(owner, "mix"),
+        name: "Mix".into(),
+        owner: owner.into(),
+        tracks: vec![LastFmRadioTrack {
+            artist: "A".into(),
+            title: "T".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// A reset empties the listener and marks them, so the starting profile is not learned again
+/// the next time one of their apps lists playlists.
+#[test]
+fn a_reset_empties_the_listener_and_marks_them_as_reset() {
+    let fixture = StateFixture::new(None, None);
+    assert!(fixture.store.record_play("alice", play("A", "One", None)));
+    assert!(fixture.store.record_play("alice", play("B", "Two", None)));
+    fixture.store.replace_stations("alice", &[mix("alice")]);
+    assert!(!fixture.store.was_reset("alice"));
+
+    assert!(fixture.store.reset(" Alice "));
+
+    let user = fixture.store.get_user("alice");
+    assert_eq!(user.username, "alice");
+    assert!(user.plays.is_empty() && user.stations.is_empty());
+    assert!(user.radio_bans.is_empty() && user.unavailable_tracks.is_empty());
+    assert_eq!(user.new_plays_since_refresh, 0);
+    assert!(user.reset_utc.is_some());
+    assert!(fixture.store.was_reset("ALICE"));
+    let written = std::fs::read_to_string(&fixture.path).unwrap();
+    assert!(written.contains("\"ResetUtc\": \""), "{written}");
+
+    // It survives a restart, and a play after it is learned as usual.
+    let restarted = LastFmRadioStateStore::new(
+        fixture.path.clone(),
+        settings_store(LastFmSettings::default()),
+        Arc::new(ExternalIdRegistry::in_memory()),
+    );
+    assert!(restarted.was_reset("alice"));
+    // Until then they are in no list: not the dashboard's, not the refresh worker's.
+    assert!(restarted.known_users().is_empty());
+    assert!(restarted.get_summaries().is_empty());
+    assert!(restarted.record_play("alice", play("C", "Three", None)));
+    assert_eq!(restarted.get_user("alice").plays.len(), 1);
+    assert_eq!(restarted.known_users(), ["alice"]);
+    assert_eq!(restarted.get_summaries().len(), 1);
+}
+
+#[test]
+fn a_listener_nobody_knows_has_nothing_to_reset() {
+    let fixture = StateFixture::new(None, None);
+    assert!(!fixture.store.reset("nobody"));
+    assert!(!fixture.store.was_reset("nobody"));
+    assert!(fixture.store.known_users().is_empty());
+}
+
+/// A listener who was never reset is written without the field, so files from before it are
+/// unchanged.
+#[test]
+fn a_listener_never_reset_is_written_without_the_reset_time() {
+    let fixture = StateFixture::new(None, None);
+    fixture.store.record_play("alice", play("A", "One", None));
+    let written = std::fs::read_to_string(&fixture.path).unwrap();
+    assert!(!written.contains("ResetUtc"), "{written}");
+}
+
+/// A refresh that was running when the history was reset built its stations from the plays
+/// that were just forgotten: they are not written back. A refresh started afterwards is.
+#[test]
+fn a_refresh_running_at_the_reset_writes_nothing_back() {
+    let fixture = StateFixture::new(None, None);
+    fixture.store.record_play("alice", play("A", "One", None));
+    fixture.store.mark_refreshing("alice");
+    assert!(fixture.store.reset("alice"));
+
+    fixture.store.replace_stations("alice", &[mix("alice")]);
+    let user = fixture.store.get_user("alice");
+    assert!(user.stations.is_empty());
+    assert!(user.last_refresh_success_utc.is_none());
+
+    fixture.store.mark_refreshing("alice");
+    fixture.store.replace_stations("alice", &[mix("alice")]);
+    assert_eq!(fixture.store.get_user("alice").stations.len(), 1);
+    assert!(!fixture.store.get_user("alice").refreshing);
 }
 
 /// Two keys that differ only in case fail the load, so it starts clean.

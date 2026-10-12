@@ -435,6 +435,33 @@ async fn nothing_playable_ends_the_stream_with_the_reason() {
     assert_eq!(error.to_string(), "Radio station is no longer available");
 }
 
+/// With radio streams switched off there is nothing to warm, and the warm-up worker is told so
+/// instead of finding every station empty and reporting it each minute.
+#[tokio::test]
+async fn nothing_is_offered_to_warm_while_radio_streams_are_off() {
+    let fixture = fixture(0).await;
+    assert!(fixture.service.streams_offered());
+
+    let mut off = (*fixture.service.shared.settings.current()).clone();
+    off.last_fm.expose_radio_as_streams = false;
+    fixture.service.shared.settings.set(off);
+    assert!(!fixture.service.streams_offered());
+    // What the worker used to do anyway: a station, and never a track ready for it.
+    let result = fixture
+        .service
+        .warm_stored_stations("alice", &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!((result.station_count, result.ready_station_count), (1, 0));
+    assert!(fixture.downloads.asked.lock().is_empty());
+
+    let mut no_radio = (*fixture.service.shared.settings.current()).clone();
+    no_radio.last_fm.expose_radio_as_streams = true;
+    no_radio.last_fm.enable_radio = false;
+    fixture.service.shared.settings.set(no_radio);
+    assert!(!fixture.service.streams_offered());
+}
+
 #[tokio::test]
 async fn the_ready_pool_rotates_from_the_tune_in_start_and_the_warm_uses_external_routes() {
     let fixture = fixture(0).await;

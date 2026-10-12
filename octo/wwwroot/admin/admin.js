@@ -996,6 +996,7 @@ const heartSourceMeta = {
   Soulseek: { title: 'Soulseek', detail: 'Lossless FLAC from slskd peers', mark: 'b-slskd' },
   YouTube: { title: 'YouTube', detail: 'Lossy MP3 from the yt-dlp shim', mark: 'b-youtube' },
   Lidarr: { title: 'Lidarr', detail: 'Album automation through your Lidarr server', mark: 'b-lidarr' },
+  Deezer: { title: 'Deezer', detail: 'FLAC or MP3 from your own Deezer account', mark: 'b-deezer' },
 };
 let heartSourceSteps = [];
 let draggedHeartSourceRow = null;
@@ -1016,7 +1017,7 @@ function normalizeHeartSourceSteps(steps) {
       AlbumEnabled: Boolean(step?.AlbumEnabled ?? step?.albumEnabled ?? legacyEnabled),
     });
   });
-  ['Soulseek', 'YouTube', 'Lidarr'].forEach(source => {
+  ['Soulseek', 'YouTube', 'Lidarr', 'Deezer'].forEach(source => {
     if (!seen.has(source)) normalized.push({
       Source: source,
       SongEnabled: source === 'Soulseek',
@@ -1075,24 +1076,34 @@ function renderHeartSourceOrder(steps = heartSourceSteps) {
 
 function updateStreamSettings() {
   const waitForLossless = document.getElementById('f-wait-for-lossless-on-play')?.checked;
-  const activeSource = waitForLossless ? 'Lossless' : 'YouTube';
+  const fromDeezer = document.getElementById('f-stream-source')?.value === 'Deezer';
+  const activeSource = waitForLossless ? 'Lossless' : fromDeezer ? 'Deezer' : 'YouTube';
+  // A row names every source it belongs to, separated by spaces.
   document.querySelectorAll('[data-stream-source]').forEach(section => {
-    section.hidden = section.dataset.streamSource !== activeSource;
+    section.hidden = !section.dataset.streamSource.split(' ').includes(activeSource);
   });
 }
 
 function syncPlaybackSourceControl() {
   const control = document.getElementById('f-playback-source');
   const wait = document.getElementById('f-wait-for-lossless-on-play');
+  const stream = document.getElementById('f-stream-source');
   if (!control || !wait) return;
-  control.value = wait.checked ? 'Lossless' : 'YouTube';
+  control.value = wait.checked ? 'Lossless' : stream?.value === 'Deezer' ? 'Deezer' : 'YouTube';
 }
 
 document.getElementById('f-playback-source')?.addEventListener('change', event => {
   const wait = document.getElementById('f-wait-for-lossless-on-play');
+  const stream = document.getElementById('f-stream-source');
   if (!wait) return;
   wait.checked = event.target.value === 'Lossless';
   wait.dispatchEvent(new Event('input', { bubbles: true }));
+  // Waiting for Soulseek leaves the stream source as it was: it is what plays when the wait
+  // runs out.
+  if (stream && event.target.value !== 'Lossless') {
+    stream.value = event.target.value === 'Deezer' ? 'Deezer' : 'YouTube';
+    stream.dispatchEvent(new Event('input', { bubbles: true }));
+  }
   updateStreamSettings();
 });
 
@@ -3221,8 +3232,9 @@ async function loadRadioStatus() {
 }
 document.getElementById('radio-user')?.addEventListener('change', loadRadioStatus);
 document.getElementById('radio-reset')?.addEventListener('click', async event => {
-  const user = document.getElementById('radio-user')?.value; if (!user || !(await askConfirm(`Reset Radio history for “${user}”?`, 'Downloaded music is not removed.', 'Reset history', true))) return;
+  // Read before the first await: once the click has been handled, event.currentTarget is null.
   const button = event.currentTarget;
+  const user = document.getElementById('radio-user')?.value; if (!user || !(await askConfirm(`Reset Radio history for “${user}”?`, 'Downloaded music is not removed.', 'Reset history', true))) return;
   button.disabled = true;
   try { const response = await api(`/api/admin/lastfm/radio/history?user=${encodeURIComponent(user)}`, { method: 'DELETE' }); const data = await response.json();
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`); toast(data.message || 'Radio history reset.'); await loadRadioStatus();
@@ -5132,6 +5144,7 @@ function heartSourceReachable() {
     if (source === 'Soulseek') return services.slskd?.ok && !services.slskd?.warning;
     if (source === 'YouTube') return services.ytDlpShim?.ok;
     if (source === 'Lidarr') return services.lidarr?.ok && services.lidarr?.configured !== false && !services.lidarr?.warning;
+    if (source === 'Deezer') return services.deezer?.ok && services.deezer?.configured !== false;
     return false;
   });
   return reachable.length
@@ -6002,11 +6015,12 @@ function renderLossy() {
   if (tally.length) parts.push(`Queue: ${tally.join(', ')}.`);
   if (view?.source) parts.push(`Copies come from ${view.source}.`);
   if (view) parts.push(`${view.why}`);
-  // Soulseek's state matters only while Soulseek is one of the sources, and with Lidarr beside
-  // it an outage just means Lidarr is asked alone.
+  // Soulseek's state matters only while Soulseek is one of the sources, and with another source
+  // beside it an outage just means the others are asked without it.
   const plan = view?.plan || ['Soulseek'];
+  const others = plan.filter(source => source !== 'Soulseek');
   if (view?.soulseek?.warning && plan.includes('Soulseek'))
-    parts.push(plan.includes('Lidarr') ? `${view.soulseek.detail} Lidarr is asked alone until it is back.` : view.soulseek.detail);
+    parts.push(others.length ? `${view.soulseek.detail} ${others.join(' and ')} ${others.length > 1 ? 'are' : 'is'} asked without it until it is back.` : view.soulseek.detail);
   document.getElementById('lossy-status').textContent = parts.join(' ');
 
   const closed = lossyGateClosed();
@@ -6976,12 +6990,13 @@ function renderTrickle() {
 }
 
 impEl('imp-connect')?.addEventListener('click', async event => {
+  const button = event.currentTarget;
   // Opened before the answer, inside the click, so the browser does not block the new tab.
   const tab = window.open('', '_blank');
   const { ok, answer } = await impPost('/api/admin/imports/spotify/connect', {}, null);
   if (!ok || !answer.url) {
     tab?.close();
-    note(event.currentTarget, answer.message || 'Spotify could not be opened.', 'error');
+    note(button, answer.message || 'Spotify could not be opened.', 'error');
     return;
   }
   if (tab) tab.location.href = answer.url; else location.href = answer.url;
@@ -7014,8 +7029,9 @@ impEl('imp-read')?.addEventListener('click', async event => {
 });
 
 impEl('imp-disconnect')?.addEventListener('click', async event => {
+  const button = event.currentTarget;
   if (!(await askConfirm('Disconnect Spotify?', 'Your lists, playlists and fetched songs stay. Octo stops reading your Spotify.', 'Disconnect'))) return;
-  await impPost('/api/admin/imports/spotify/disconnect', {}, event.currentTarget);
+  await impPost('/api/admin/imports/spotify/disconnect', {}, button);
   await loadImports();
 });
 
@@ -7288,7 +7304,7 @@ function healthWhyNot(check, fixes) {
   const can = healthReport.can || {};
   if (can.why || fixes.all) return '';
   if (check.check === 'duplicates' && !can.remove) return 'Removing a copy needs the Delete action, which is off. Turn it on under Library actions to fix these here.';
-  if (check.check === 'noLength' && !can.upgrade) return 'Finding a higher quality copy needs the Better quality action and Soulseek or Lidarr. Turn it on under Library actions.';
+  if (check.check === 'noLength' && !can.upgrade) return 'Finding a higher quality copy needs the Better quality action and Deezer, Soulseek or Lidarr. Turn it on under Library actions.';
   if (check.check === 'noCover' && !can.addCover) return 'This server cannot look covers up.';
   if (['noYear', 'noGenre', 'noAlbumArtist'].includes(check.check) && can.edit && !check.fixAllLabel)
     return 'No song here has an album that agrees on it, so they can only be looked up.';
@@ -8028,3 +8044,94 @@ ready.then(() => {
   loadUpdate();
   renderSlskdOpen();
 });
+
+// ────────────────────────────────────────────────────────────────
+// Deezer: what the playback cache holds, and emptying it
+// ────────────────────────────────────────────────────────────────
+const cacheGiB = bytes => `${(bytes / 1073741824).toFixed(bytes >= 107374182400 ? 0 : 1)} GiB`;
+async function loadDeezerCache() {
+  const out = document.getElementById('deezer-cache-status');
+  const clear = document.getElementById('deezer-cache-clear');
+  if (!out) return;
+  try {
+    const response = await api('/api/admin/deezer/cache', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const cache = await response.json();
+    const songs = `${cache.songs.toLocaleString()} song${cache.songs === 1 ? '' : 's'}`;
+    const filling = cache.filling ? `, ${cache.filling} downloading now` : '';
+    out.textContent = cache.enabled
+      ? `${songs}, ${cacheGiB(cache.bytes)} of ${cacheGiB(cache.maxBytes)}${filling}.`
+      : cache.songs
+        ? `Off. ${songs} (${cacheGiB(cache.bytes)}) from when it was on are still in the folder.`
+        : 'Off.';
+    if (clear) clear.disabled = cache.songs === 0;
+  } catch (error) {
+    out.textContent = `Could not read the cache: ${error.message}`;
+  }
+}
+document.getElementById('deezer-cache-clear')?.addEventListener('click', async event => {
+  // Read before the first await: once the click has been handled, event.currentTarget is null.
+  const button = event.currentTarget;
+  if (!(await askConfirm('Empty the Deezer playback cache?', 'Songs in your library are not in the cache and stay where they are. Cached songs are downloaded again the next time they play.', 'Empty the cache', true))) return;
+  button.disabled = true;
+  try {
+    const response = await api('/api/admin/deezer/cache', { method: 'DELETE' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    toast(`Removed ${data.removed.toLocaleString()} cached song${data.removed === 1 ? '' : 's'}.`);
+  } catch (error) { toast(`Could not empty the cache: ${error.message}`, 'error'); }
+  await loadDeezerCache();
+});
+// ────────────────────────────────────────────────────────────────
+// Deezer: whether each account signs in, the plan it is on, and what to do when it does not
+// ────────────────────────────────────────────────────────────────
+function deezerAccountLine(account) {
+  if (!account.signedIn) {
+    return `${account.name}: ${account.problem === 'refused' ? 'refused or expired' : 'Deezer did not answer'}`;
+  }
+  const gives = account.lossless === true ? 'FLAC'
+    : account.highQuality === true ? 'MP3 up to 320 kbps, no FLAC'
+    : account.highQuality === false ? 'MP3 at 128 kbps only'
+    : account.lossless === false ? 'no FLAC' : '';
+  const facts = [account.offer, account.country, gives].filter(Boolean).join(', ');
+  return `${account.name}: signed in${facts ? ` (${facts})` : ''}`;
+}
+async function loadDeezerAccount(fresh = false) {
+  const out = document.getElementById('deezer-account-status');
+  const checked = document.getElementById('deezer-account-checked');
+  const notes = document.getElementById('deezer-account-notes');
+  if (!out) return;
+  try {
+    const response = await api(`/api/admin/deezer/account${fresh ? '?fresh=true' : ''}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (!data.configured) {
+      out.textContent = 'No ARL is saved yet.';
+      if (checked) checked.textContent = '';
+      if (notes) notes.hidden = true;
+      return;
+    }
+    out.innerHTML = (data.accounts || []).map(account => escapeHtml(deezerAccountLine(account))).join('<br>');
+    if (checked) checked.textContent = data.checkedUtc ? `Checked ${new Date(data.checkedUtc).toLocaleTimeString()}.` : '';
+    if (notes) {
+      notes.hidden = !(data.notes || []).length;
+      notes.innerHTML = (data.notes || []).map(note => escapeHtml(note)).join('<br>');
+    }
+  } catch (error) {
+    out.textContent = `Could not check the account: ${error.message}`;
+  }
+}
+document.getElementById('deezer-account-check')?.addEventListener('click', async event => {
+  // Read before the first await: once the click has been handled, event.currentTarget is null.
+  const button = event.currentTarget;
+  button.disabled = true;
+  try { await loadDeezerAccount(true); } finally { button.disabled = false; }
+});
+document.querySelector('.sidebar-nav-item[data-tab="deezer"]')?.addEventListener('click', () => loadDeezerAccount());
+// A saved ARL is checked afresh once the settings have caught up with the file.
+document.getElementById('deezer-account-form')?.addEventListener('submit', () => setTimeout(() => loadDeezerAccount(true), 1500));
+ready.then(() => loadDeezerAccount());
+
+document.querySelector('.sidebar-nav-item[data-tab="deezer"]')?.addEventListener('click', loadDeezerCache);
+document.getElementById('deezer-cache-form')?.addEventListener('submit', () => setTimeout(loadDeezerCache, 1500));
+ready.then(loadDeezerCache);

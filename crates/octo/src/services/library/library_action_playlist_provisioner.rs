@@ -1,8 +1,13 @@
 //! One provisioner per request, over that request's proxy, so its once-per-boot set is once per
 //! request in practice. A caller builds it with `new(request's proxy, settings)`.
+//!
+//! What stops two listings at once from both creating the same playlist is [`CREATED`], which
+//! every instance shares: an app that asks for its playlists twice at startup, or two devices
+//! signing in together, each saw the playlist missing and each created it, so the person had two.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 use octo_core::common::dotnet;
@@ -14,6 +19,34 @@ use octo_core::family::abilities::{AddToLibrary, RequestQuality};
 
 use crate::services::family::FamilyStore;
 use crate::services::subsonic::SubsonicProxyService;
+
+/// The action playlists created lately, by Navidrome server, user and title (ignoring case), with
+/// when. Shared by every provisioner: a title created here in the last [`CREATED_FOR`] is not
+/// created again, whatever an older listing said.
+static CREATED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How long a playlist just created is trusted to be there. Long enough for every listing that
+/// started before it existed to pass; after it, the listing says whether it is there.
+const CREATED_FOR: Duration = Duration::from_secs(10 * 60);
+
+/// Claims `title` for `username` on `server`: true when nobody created it in the last
+/// [`CREATED_FOR`], and then it is this caller's to create.
+fn claim(server: &str, username: &str, title: &str) -> bool {
+    let key = format!(
+        "{}\0{}\0{}",
+        dotnet::ordinal_ignore_case_key(server.trim()),
+        dotnet::ordinal_ignore_case_key(username.trim()),
+        dotnet::ordinal_ignore_case_key(title)
+    );
+    let now = Instant::now();
+    let mut created = CREATED.lock();
+    created.retain(|_, at| now.duration_since(*at) < CREATED_FOR);
+    if created.contains_key(&key) {
+        return false;
+    }
+    created.insert(key, now);
+    true
+}
 
 /// Makes sure an allowed user has a playlist for each enabled action.
 ///
@@ -100,7 +133,11 @@ impl LibraryActionPlaylistProvisioner {
             return;
         }
 
+        let server = current.subsonic.url.clone().unwrap_or_default();
         for title in wanted {
+            if !claim(&server, username, &title) {
+                continue;
+            }
             // The user's own credentials, so the playlist belongs to them. Drop anything that
             // would make this look like an edit of an existing playlist. Keys compare ignoring
             // case.
@@ -309,6 +346,59 @@ mod family_tests {
                     .map(|(_, v)| v.into_owned())
             })
             .collect()
+    }
+
+    /// Two listings at once (an app asking twice at startup, or two devices) each see the
+    /// playlist missing; it is still created once.
+    #[tokio::test]
+    async fn two_listings_at_once_create_each_playlist_once() {
+        let navidrome = MockServer::start().await;
+        Mock::given(path("/rest/createPlaylist"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"subsonic-response":{"status":"ok"}}"#, "application/json")
+                    .set_delay(std::time::Duration::from_millis(100)),
+            )
+            .mount(&navidrome)
+            .await;
+        let mut app = AppSettings {
+            subsonic: SubsonicSettings {
+                url: Some(navidrome.uri()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        app.family.enabled = true;
+        let settings = Arc::new(SettingsStore::for_tests(app));
+        let family = Arc::new(FamilyStore::in_memory());
+        family.upsert_member(member("Richard", Preset::Member, 3));
+        let auth: IndexMap<String, String> = [("u", "Richard"), ("t", "tok"), ("s", "salt")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        // One provisioner per request, as the playlist listing builds them.
+        let first = LibraryActionPlaylistProvisioner::new(
+            SubsonicProxyService::new(settings.clone()),
+            settings.clone(),
+        )
+        .with_family(family.clone());
+        let second = LibraryActionPlaylistProvisioner::new(
+            SubsonicProxyService::new(settings.clone()),
+            settings.clone(),
+        )
+        .with_family(family.clone());
+        tokio::join!(
+            first.ensure("Richard", &[], &auth),
+            second.ensure("richard", &[], &auth)
+        );
+        // A third listing a moment later, still from before the playlist showed up.
+        LibraryActionPlaylistProvisioner::new(SubsonicProxyService::new(settings.clone()), settings)
+            .with_family(family)
+            .ensure("Richard", &[], &auth)
+            .await;
+
+        let created = navidrome.received_requests().await.expect("recorded").len();
+        assert_eq!(created, 1, "one Remove from my library, not {created}");
     }
 
     #[tokio::test]

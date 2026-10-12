@@ -185,6 +185,18 @@ impl SettingsStore {
         self.inner.tree.load().raw(key)
     }
 
+    /// `YouTube:Enabled` (`YOUTUBE_ENABLED`): whether Octo uses YouTube at all, through the
+    /// yt-dlp shim and YouTube Music. Read raw like the rest of the YouTube section; anything
+    /// but `false` (or `0`) is on, so a server that never set it keeps YouTube.
+    pub fn you_tube_enabled(&self) -> bool {
+        !matches!(
+            self.raw("YouTube:Enabled")
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("false" | "0")
+        )
+    }
+
     /// One configuration section, as a node tree for [`crate::config::bind`].
     pub fn section_tree(&self, name: &str) -> ConfigNode {
         self.inner.tree.load().section(name)

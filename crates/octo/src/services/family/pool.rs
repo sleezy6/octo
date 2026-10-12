@@ -499,13 +499,27 @@ impl Places {
 
     /// A member's own folder.
     fn member_root(&self, name: &str) -> String {
-        format!("{}/{name}", self.members)
+        format!("{}/{}", self.members, folder_name(name))
     }
 
     /// Where `name`'s library has the pool file at `relative`.
     fn under(&self, name: &str, relative: &str) -> String {
-        format!("{}/{name}/{relative}", self.members)
+        format!("{}/{}/{relative}", self.members, folder_name(name))
     }
+}
+
+/// The name of a member's own folder: their username in lower case. A member made in Octo has a
+/// lower-case username already. One brought in from an existing Navidrome account keeps that
+/// account's spelling ("Richard"), while the folder made for them, and the library Navidrome
+/// reads, is the lower-case one ("richard"); on a file system that tells the two apart, every
+/// path to their library has to be built from this.
+pub fn folder_name(username: &str) -> String {
+    username.trim().to_lowercase()
+}
+
+/// Whether a member's folder name is one plain folder name (see [`valid_username`]).
+fn valid_folder(username: &str) -> bool {
+    valid_username(&folder_name(username))
 }
 
 /// The family pool. See the module comment.
@@ -698,7 +712,7 @@ impl FamilyPool {
 
     /// A member's own folder, `<members>/<user>` (their name as Octo keeps it).
     pub fn member_root(&self, user: &str) -> String {
-        format!("{}/{}", self.members_root(), self.member_name(user))
+        format!("{}/{}", self.members_root(), folder_name(&self.member_name(user)))
     }
 
     /// A pool file's path inside the pool (`Artist/Album/01 Song.flac`).
@@ -1024,7 +1038,7 @@ impl FamilyPool {
     fn member_named(&self, user: &str) -> Result<Member, PoolError> {
         self.family
             .member(user)
-            .filter(|member| valid_username(&member.username))
+            .filter(|member| valid_folder(&member.username))
             .ok_or_else(|| PoolError::NotMember(user.to_string()))
     }
 
@@ -1146,7 +1160,7 @@ impl FamilyPool {
     async fn let_go_now(&self, pool_path: &str, name: &str) {
         let name = name.to_string();
         let _claim = self.claims.claim(&[pool_path]).await;
-        if valid_username(&name) {
+        if valid_folder(&name) {
             self.remove_link_claimed(pool_path, &name).await;
         }
         let left = {
@@ -1306,7 +1320,7 @@ impl FamilyPool {
             .members()
             .into_iter()
             .map(|member| member.username)
-            .filter(|name| valid_username(name))
+            .filter(|name| valid_folder(name))
             .collect();
         let (places, path, quarantine) = (self.places(), pool_path.to_string(), Arc::clone(&self.quarantine));
         let outcome = on_disk(move || trash_unless_linked(&places, &names, &path, &quarantine)).await;
