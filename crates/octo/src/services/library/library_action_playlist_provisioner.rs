@@ -23,7 +23,28 @@ use crate::services::subsonic::SubsonicProxyService;
 /// The action playlists created lately, by Navidrome server, user and title (ignoring case), with
 /// when. Shared by every provisioner: a title created here in the last [`CREATED_FOR`] is not
 /// created again, whatever an older listing said.
+#[cfg(not(test))]
 static CREATED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// Tests run side by side in one process, and wiremock hands a later test a server at an address
+// an earlier one used, so one shared record let a test's claim keep another's playlist from
+// being made. Each test has its own (a `#[tokio::test]` runs on its own thread).
+#[cfg(test)]
+thread_local! {
+    static CREATED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+}
+
+/// Runs `f` on the record of action playlists created lately.
+fn with_created<R>(f: impl FnOnce(&mut HashMap<String, Instant>) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        f(&mut CREATED.lock())
+    }
+    #[cfg(test)]
+    {
+        CREATED.with(|created| f(&mut created.lock()))
+    }
+}
 
 /// How long a playlist just created is trusted to be there. Long enough for every listing that
 /// started before it existed to pass; after it, the listing says whether it is there.
@@ -39,13 +60,14 @@ fn claim(server: &str, username: &str, title: &str) -> bool {
         dotnet::ordinal_ignore_case_key(title)
     );
     let now = Instant::now();
-    let mut created = CREATED.lock();
-    created.retain(|_, at| now.duration_since(*at) < CREATED_FOR);
-    if created.contains_key(&key) {
-        return false;
-    }
-    created.insert(key, now);
-    true
+    with_created(|created| {
+        created.retain(|_, at| now.duration_since(*at) < CREATED_FOR);
+        if created.contains_key(&key) {
+            return false;
+        }
+        created.insert(key, now);
+        true
+    })
 }
 
 /// Makes sure an allowed user has a playlist for each enabled action.
