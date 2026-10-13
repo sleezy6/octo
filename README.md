@@ -104,7 +104,7 @@ Any Subsonic app works with Octo. Its own apps for desktop and Android are made 
 <tr><td width="33%"><img src="docs/images/players/phone-search.webp" alt="Search in the Octo Android app"></td><td width="33%"><img src="docs/images/players/phone-album.webp" alt="An album in the Octo Android app"></td><td width="33%"><img src="docs/images/players/phone-player.webp" alt="The player in the Octo Android app"></td></tr>
 </table>
 
-The desktop app runs on Windows and Linux, and the Android app on Android 10 and newer. They need Octo 2026.09.29 or newer, and they work as regular players with Navidrome too. Download them from [Octo for Windows and Linux](https://github.com/winters27/octo/releases/tag/desktop-v1.5.0) and [Octo for Android](https://github.com/winters27/octo/releases/tag/android-v1.5.0), or add [Octo's F-Droid repository](https://winters27.github.io/octo/fdroid/) so the Android app updates through F-Droid, Droid-ify or Neo Store. The source is at [winters27/octo-player](https://github.com/winters27/octo-player).
+The desktop app runs on Windows and Linux, and the Android app on Android 10 and newer. They need Octo 2026.09.29 or newer, and they work as regular players with Navidrome too. Download them from [Octo for Windows and Linux](https://github.com/winters27/octo/releases/tag/desktop-v1.6.0) and [Octo for Android](https://github.com/winters27/octo/releases/tag/android-v1.6.0), or add [Octo's F-Droid repository](https://winters27.github.io/octo/fdroid/) so the Android app updates through F-Droid, Droid-ify or Neo Store. The source is at [winters27/octo-player](https://github.com/winters27/octo-player).
 
 ## Compatible apps
 
@@ -152,6 +152,13 @@ choose between them based on whether *you* browse by tags or by folders, not on 
 version, so a folder-browsing user talks `search2`. Both formats are supported too: some
 clients speak JSON, some (DSub) only XML.
 
+**Amperfy** hides any song that has no file size. A song you don't own has none until Octo
+learns the size of its stream, in the background or on the first play, so Amperfy is sent
+a stand-in size of 1 until then and every song shows at once. Other apps get no size until
+the real one is known. The list of apps treated this way is under **Playing songs you
+don't own → Apps that hide songs without a size** in the admin dashboard
+(`SIZE_FLAG_CLIENTS`, `Amperfy` by default).
+
 </details>
 
 ## Updating
@@ -185,7 +192,7 @@ scripts/updater/install-updater.sh --remove
 Without the helper, **About** shows the command for the new release. From the Octo folder:
 
 ```bash
-git fetch --tags && git checkout --detach 2026.10.10
+git fetch --tags && git checkout --detach 2026.10.13
 docker compose pull octo yt-dlp-shim octo-sonic || docker compose --profile source build octo-source yt-dlp-shim-source octo-sonic-source
 docker compose up -d
 ```
@@ -336,6 +343,8 @@ Yes. Every download is identified before it is filed: the fingerprint service's 
 ### Can it run on a Raspberry Pi?
 
 Yes. Every image is published for amd64 and arm64, so a Pi pulls Octo, the yt-dlp shim and octo-sonic instead of compiling them (see [Published images](#published-images)). The yt-dlp sidecar does most of the CPU work; a Pi 4 or Pi 5 handles a single household's listening fine.
+
+On a small disk, mind the cover copies: Octo keeps each library cover it has shown in its config folder (`cover-cache/`), up to 1024 MB by default. Set `COVER_CACHE_MB` in `.env` to a smaller number of megabytes, or to 0 to keep none.
 
 ---
 

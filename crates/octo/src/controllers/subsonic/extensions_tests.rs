@@ -489,7 +489,7 @@ async fn get_open_subsonic_extensions_adds_octo_acquisitions_to_navidromes_list(
     assert_eq!(envelope["status"], "ok");
     assert_eq!(envelope["openSubsonic"], true);
     let extensions = extensions_of(&envelope);
-    assert_eq!(extension(&extensions, "octoAcquisitions"), Some(&vec![1, 2]));
+    assert_eq!(extension(&extensions, "octoAcquisitions"), Some(&vec![1, 2, 3]));
     assert!(extension(&extensions, "formPost").is_some());
     assert!(extension(&extensions, "songLyrics").is_some());
 }
@@ -513,7 +513,7 @@ async fn get_open_subsonic_extensions_adds_it_in_xml_too() {
         .filter(|e| e.name == "versions")
         .map(XElement::value)
         .collect();
-    assert_eq!(versions, ["1", "2"]);
+    assert_eq!(versions, ["1", "2", "3"]);
 }
 
 // ---- Version 2: the downloads drawer --------------------------------------------------------
@@ -749,6 +749,153 @@ async fn find_songs_starts_a_look_that_get_found_songs_follows_and_pick_found_so
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].kind, "pick");
     assert_eq!(rows[0].note.as_deref(), Some("Getting FLAC from peer1"));
+}
+
+/// A look for a library song held as FLAC, whose one copy is FLAC too, run as alice, who may
+/// replace songs.
+async fn a_look_at_a_flac_library_song(t: &AcquisitionApp) -> (String, String) {
+    use futures::FutureExt;
+
+    use crate::services::common::PickedCopy;
+    use crate::services::common::song_finder::{FindTarget, FoundCopy};
+
+    let finder = t.state.song_finder.clone();
+    finder.seams(|seams| {
+        seams.resolve = std::sync::Arc::new(|_, _| {
+            async {
+                Some(FindTarget {
+                    library_id: Some("nd-1".into()),
+                    owned_format: Some("flac".into()),
+                    owned_quality: Some("FLAC 16-bit 44.1 kHz".into()),
+                    owned_path: Some("/music/Massive Attack/Mezzanine/03 Teardrop.flac".into()),
+                    ..FindTarget::new("Massive Attack", "Teardrop", Some("Mezzanine"), Some(331), "nd-1")
+                })
+            }
+            .boxed()
+        });
+        seams.sources_for = std::sync::Arc::new(|_| vec![("Soulseek".to_string(), None)]);
+        seams.search_soulseek = std::sync::Arc::new(|_, _| {
+            async {
+                Ok((
+                    vec![FoundCopy::new(
+                        octo_core::models::download::AcquisitionCandidate {
+                            source: "Soulseek".into(),
+                            peer: Some("peer1".into()),
+                            file: Some("03 Teardrop.flac".into()),
+                            format: Some("flac".into()),
+                            size: Some(40_000_000),
+                            length: Some(331),
+                            rank: Some(1),
+                            ..Default::default()
+                        },
+                        PickedCopy {
+                            source: "Soulseek".into(),
+                            peer: Some("peer1".into()),
+                            file: Some(r"Music\Mezzanine\03 Teardrop.flac".into()),
+                            size: 40_000_000,
+                            format: Some("flac".into()),
+                            length: Some(331),
+                            ..Default::default()
+                        },
+                    )],
+                    Vec::new(),
+                    None,
+                ))
+            }
+            .boxed()
+        });
+    });
+    let started = get(
+        &t.app,
+        &format!("/rest/findSongs.view?{}&id=nd-1", acq_auth("alice")),
+    )
+    .await
+    .envelope();
+    let search = started["foundSongs"]["id"].as_str().expect("an id").to_string();
+    let found = finder
+        .wait(&search, std::time::Duration::from_secs(10))
+        .await
+        .expect("the look");
+    assert_eq!(found.state, "done", "{:?}", found.error);
+    (search, found.copies[0].id.clone())
+}
+
+fn may_replace(settings: &mut AppSettings) {
+    settings.library_actions = LibraryActionSettings {
+        enabled: true,
+        dry_run: false,
+        allowed_users: vec!["alice".into()],
+        actions: vec![LibraryActionDefinition {
+            action: LibraryAction::BetterQuality,
+            enabled: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    settings.soulseek.username = Some("u".into());
+    settings.soulseek.password = Some("p".into());
+}
+
+async fn pick_as_alice(t: &AcquisitionApp, search: &str, copy: &str, extra: &str) -> Value {
+    get(
+        &t.app,
+        &format!(
+            "/rest/pickFoundSong.view?{}&search={search}&copy={copy}{extra}",
+            acq_auth("alice")
+        ),
+    )
+    .await
+    .envelope()["pick"]
+        .clone()
+}
+
+#[tokio::test]
+async fn pick_found_song_asks_before_replacing_with_a_copy_no_better_and_replaces_on_anyway() {
+    let t = AcquisitionApp::new(may_replace).await;
+    let (search, copy) = a_look_at_a_flac_library_song(&t).await;
+    // An app that cannot ask hears the refusal it always did.
+    let old = pick_as_alice(&t, &search, &copy, "").await;
+    assert_eq!(old["state"], "skipped");
+    assert_eq!(
+        old["detail"],
+        "Your copy is already lossless, so nothing would be better."
+    );
+
+    let asked = pick_as_alice(&t, &search, &copy, "&anyway=false").await;
+    assert_eq!(asked["state"], "confirm");
+    assert_eq!(
+        asked["detail"],
+        "This copy is FLAC like yours, so it is not better. Replace yours anyway?"
+    );
+    assert_eq!(asked["compare"]["yours"]["quality"], "FLAC");
+    assert_eq!(asked["compare"]["yours"]["length"], 331);
+    assert_eq!(asked["compare"]["copy"]["quality"], "FLAC");
+    assert!(asked["compare"]["copy"]["take"].is_null());
+    // The list said so before anything was picked.
+    let listed = get(
+        &t.app,
+        &format!("/rest/getFoundSongs.view?{}&search={search}", acq_auth("alice")),
+    )
+    .await
+    .envelope();
+    let copy_json = &listed["foundSongs"]["candidate"][0];
+    assert_eq!(copy_json["vsYours"], "same");
+    assert_eq!(copy_json["vsYoursText"], "Same as yours");
+    assert!(listed["foundSongs"]["song"]["take"].is_null());
+    assert!(t.state.upgrade_queue.snapshot().is_empty());
+
+    let replaced = pick_as_alice(&t, &search, &copy, "&anyway=true").await;
+    assert_eq!(replaced["state"], "queued", "{replaced}");
+    let jobs = t.state.upgrade_queue.snapshot();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].requested_by, "alice");
+    let anyway = jobs[0]
+        .pick
+        .as_ref()
+        .and_then(|p| p.anyway.clone())
+        .expect("replaced anyway");
+    assert_eq!(anyway.title, "Teardrop");
+    assert_eq!(anyway.length, Some(331));
 }
 
 #[tokio::test]

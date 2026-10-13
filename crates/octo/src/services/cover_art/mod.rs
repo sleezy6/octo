@@ -13,6 +13,7 @@ pub mod download_cover_resolver;
 pub mod i_cover_art_source;
 pub mod itunes_cover_art_lookup;
 pub mod last_fm_cover_art_lookup;
+pub mod local_cover_cache;
 
 pub use album_cover_finder::{
     AlbumCoverFinder, AlbumCoverQuery, FoundCover, IAlbumCoverFinder, RejectedCovers,
@@ -30,3 +31,4 @@ pub use download_cover_resolver::{CoverChoice, CoversOnHand, DownloadCoverResolv
 pub use i_cover_art_source::ICoverArtSource;
 pub use itunes_cover_art_lookup::ITunesCoverArtLookup;
 pub use last_fm_cover_art_lookup::LastFmCoverArtLookup;
+pub use local_cover_cache::LocalCoverCache;

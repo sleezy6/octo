@@ -47,6 +47,13 @@ impl QuarantineResult {
     }
 }
 
+/// What one sweep deleted for good: how many files, and the Navidrome ids their notes named.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Swept {
+    pub files: i32,
+    pub navidrome_ids: Vec<String>,
+}
+
 /// What is written next to a quarantined file so a restore works without the journal. Its
 /// `Action` is the enum's name. Sidecars are the song's own files that went with it (its
 /// lyrics), put back with it; Mappings the outside songs Octo knew the file as, which a removal
@@ -372,24 +379,30 @@ impl LibraryActionQuarantine {
     }
 
     /// The only code in this feature that really deletes, and it goes on age rather than on
-    /// which action produced the file. Retention 0 means never sweep.
+    /// which action produced the file. Retention 0 means never sweep. Answers how many files went.
     pub fn sweep(&self, music_root: &str) -> i32 {
+        self.sweep_gone(music_root).files
+    }
+
+    /// [`Self::sweep`], also answering the Navidrome ids the deleted files' notes named: songs
+    /// that can no longer be put back, which Navidrome still keeps as missing.
+    pub fn sweep_gone(&self, music_root: &str) -> Swept {
         let days = self
             .settings
             .current()
             .library_actions
             .effective_quarantine_retention_days();
         if days <= 0 {
-            return 0;
+            return Swept::default();
         }
 
         let root = self.root_for(music_root);
         if !Path::new(&root).is_dir() {
-            return 0;
+            return Swept::default();
         }
 
         let cutoff = Utc::now() - TimeDelta::days(i64::from(days));
-        let mut removed = 0;
+        let mut swept = Swept::default();
         let mut attempt = || -> io::Result<()> {
             for dated in std::fs::read_dir(&root)? {
                 let dated = dated?;
@@ -405,8 +418,15 @@ impl LibraryActionQuarantine {
                 }
 
                 let count = count_files(&dated.path())?;
+                let mut ids = Vec::new();
+                noted_ids(&dated.path(), &mut ids);
                 std::fs::remove_dir_all(dated.path())?;
-                removed += count;
+                swept.files += count;
+                for id in ids {
+                    if !swept.navidrome_ids.contains(&id) {
+                        swept.navidrome_ids.push(id);
+                    }
+                }
                 info!("Library action quarantine swept {name} ({count} file(s))");
             }
             Ok(())
@@ -414,7 +434,7 @@ impl LibraryActionQuarantine {
         if let Err(e) = attempt() {
             warn!("Library action quarantine sweep failed: {e}");
         }
-        removed
+        swept
     }
 
     /// One sidecar into the trash beside its song. False, and left where it is, when it is
@@ -662,6 +682,39 @@ fn count_files(dir: &Path) -> io::Result<i32> {
         }
     }
     Ok(count)
+}
+
+/// The Navidrome ids named by the notes under `dir`, each once. A note that cannot be read names
+/// nothing.
+fn noted_ids(dir: &Path, ids: &mut Vec<String>) {
+    let Ok(items) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for item in items.flatten() {
+        let path = item.path();
+        if item.file_type().is_ok_and(|kind| kind.is_dir()) {
+            noted_ids(&path, ids);
+            continue;
+        }
+        if !item
+            .file_name()
+            .to_string_lossy()
+            .ends_with(LibraryActionQuarantine::MANIFEST_SUFFIX)
+        {
+            continue;
+        }
+        let Some(manifest) = state_file::read_text(&path)
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<QuarantineManifest>(&text).ok())
+        else {
+            continue;
+        };
+        let id = manifest.navidrome_id.trim();
+        if !id.is_empty() && !ids.iter().any(|known| known == id) {
+            ids.push(id.to_string());
+        }
+    }
 }
 
 /// Joins two paths: `b` when it is rooted, otherwise joined with one separator.

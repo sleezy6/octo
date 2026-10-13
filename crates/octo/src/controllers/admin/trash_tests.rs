@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use axum::http::{Method, StatusCode};
 use chrono::{TimeDelta, Utc};
 use octo_core::settings::{AppSettings, LibraryAction, LibraryActionSettings};
+use octo_media::tags::TagFile;
 
 use crate::app::{AppState, TestServices};
 use crate::controllers::admin::test_app::{Reply, app, send};
@@ -192,4 +193,194 @@ async fn while_dry_run_is_on_put_back_only_says_what_it_would_do() {
     assert_eq!(restored["state"], "rehearsed");
     assert!(trashed.exists());
     assert!(!original.exists());
+}
+
+// ---- Put back for a replacement --------------------------------------------------------------
+
+/// An MP3 of twenty silent MPEG-1 Layer III frames, titled and on an album.
+fn mp3_titled(path: &Path, title: &str, album: &str) {
+    let mut bytes = vec![0u8; 417 * 20];
+    for frame in 0..20 {
+        bytes[frame * 417..frame * 417 + 4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("folders");
+    }
+    std::fs::write(path, bytes).expect("written");
+    let mut file = TagFile::open(path).expect("an MP3");
+    file.set_title(Some(title));
+    file.set_album(Some(album));
+    file.set_album_artists(&["Massive Attack".to_string()]);
+    file.save().expect("saved");
+}
+
+fn title_of(path: &Path) -> Option<String> {
+    TagFile::open(path).ok().and_then(|file| file.title())
+}
+
+/// A song another file replaced: the old file (`old_title`) in the trash with its manifest, the
+/// new one (`new_title`) at the song's path, and the replacement's journal entry.
+fn replaced(
+    root: &Path,
+    id: &str,
+    old_title: &str,
+    new_title: &str,
+) -> (LibraryActionEntry, PathBuf, PathBuf) {
+    let song = root
+        .join("Massive Attack")
+        .join("Mezzanine")
+        .join(format!("{id}.mp3"));
+    let trash_dir = root.join(".octo-trash").join("2026-10-10");
+    let old = trash_dir
+        .join("Massive Attack")
+        .join("Mezzanine")
+        .join(format!("{id}.mp3"));
+    mp3_titled(&old, old_title, "Mezzanine");
+    mp3_titled(&song, new_title, "Mezzanine");
+    let manifest = QuarantineManifest {
+        original_path: song.to_string_lossy().into_owned(),
+        navidrome_id: id.to_string(),
+        action: "BetterQuality".to_string(),
+        username: "alice".to_string(),
+        at_utc: Utc::now(),
+        sidecars: None,
+        mappings: None,
+    };
+    let mut manifest_path = old.clone().into_os_string();
+    manifest_path.push(".octo-action.json");
+    std::fs::write(&manifest_path, octo_core::json::to_string(&manifest)).expect("written");
+    let entry = LibraryActionEntry {
+        key: LibraryActionJournal::make_key(LibraryAction::BetterQuality, id, "1:2"),
+        action: LibraryAction::BetterQuality,
+        navidrome_id: id.to_string(),
+        username: "alice".to_string(),
+        title: "Teardrop".to_string(),
+        artist: "Massive Attack".to_string(),
+        album: "Mezzanine".to_string(),
+        source_path: Some(song.to_string_lossy().into_owned()),
+        quarantine_path: Some(old.to_string_lossy().into_owned()),
+        resolution: Some(PathSource::NativeApi),
+        state: LibraryActionState::Applied,
+        detail: Some("Replaced with nd.mp3.".to_string()),
+        dry_run: false,
+        at_utc: Utc::now() - TimeDelta::hours(1),
+        history_kept: Some(true),
+        revealed_path: Some(song.to_string_lossy().into_owned()),
+        copy: false,
+        download_allowed: false,
+    };
+    (entry, song, old)
+}
+
+async fn put_back(dash: &Dashboard, id: &str) -> serde_json::Value {
+    dash.call(
+        Method::POST,
+        "/api/admin/trash/restore",
+        Some(&format!(r#"{{"id":"{id}"}}"#)),
+    )
+    .await
+    .json()
+}
+
+#[tokio::test]
+async fn a_replacement_is_listed_with_both_files_and_put_back_swaps_them_again_and_again() {
+    let dash = Dashboard::new(true, false);
+    let (entry, song, old) = replaced(&dash.root, "nd-7", "Teardrop", "Teardrop");
+    dash.state.library_action_journal.record(entry);
+
+    let list = dash.call(Method::GET, "/api/admin/trash", None).await.json();
+    let songs = list["songs"].as_array().expect("songs");
+    assert_eq!(songs.len(), 1, "{list}");
+    assert_eq!(songs[0]["kind"], "replaced");
+    assert_eq!(songs[0]["was"], "MP3 128 kbps");
+    assert_eq!(songs[0]["now"], "MP3 128 kbps");
+    assert_eq!(songs[0]["blocksDownloads"], false);
+    let old_bytes = std::fs::read(&old).expect("the old file");
+
+    let first = put_back(&dash, "nd-7").await;
+    assert_eq!(first["state"], "applied", "{first}");
+    assert_eq!(
+        first["detail"],
+        "Put back your old copy. The one that replaced it is in Recently removed."
+    );
+    assert_eq!(
+        std::fs::read(&song).expect("the song"),
+        old_bytes,
+        "the old file is back"
+    );
+    assert!(!old.exists());
+    // The newer file is in the trash now, so the swap can be made again.
+    let again = dash.call(Method::GET, "/api/admin/trash", None).await.json();
+    let songs = again["songs"].as_array().expect("songs");
+    assert_eq!(songs.len(), 1, "{again}");
+    assert_eq!(songs[0]["kind"], "replaced");
+
+    let second = put_back(&dash, "nd-7").await;
+    assert_eq!(second["state"], "applied", "{second}");
+    assert!(song.exists());
+    let third = dash.call(Method::GET, "/api/admin/trash", None).await.json();
+    assert_eq!(third["songs"].as_array().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn putting_back_after_a_forced_replace_brings_back_the_old_names_at_the_same_path() {
+    let dash = Dashboard::new(true, false);
+    // The live take was replaced anyway and the new file renamed to the plain song.
+    let (entry, song, _old) = replaced(&dash.root, "nd-8", "Teardrop (Live)", "Teardrop");
+    dash.state.library_action_journal.record(entry);
+
+    let answer = put_back(&dash, "nd-8").await;
+
+    assert_eq!(answer["state"], "applied", "{answer}");
+    assert_eq!(title_of(&song).as_deref(), Some("Teardrop (Live)"));
+    let journal = dash.state.library_action_journal.recent(10);
+    let swap = journal
+        .iter()
+        .find(|e| e.key.contains("putback"))
+        .expect("the put back's own entry");
+    assert_eq!(
+        swap.revealed_path.as_deref(),
+        Some(song.to_string_lossy().as_ref())
+    );
+    let newer = swap.quarantine_path.clone().expect("the newer file's place");
+    assert_eq!(title_of(Path::new(&newer)).as_deref(), Some("Teardrop"));
+}
+
+#[tokio::test]
+async fn a_missing_old_file_says_why_and_touches_nothing() {
+    let dash = Dashboard::new(true, false);
+    let (entry, song, old) = replaced(&dash.root, "nd-9", "Teardrop", "Teardrop");
+    dash.state.library_action_journal.record(entry);
+    std::fs::remove_file(&old).expect("gone");
+
+    let answer = put_back(&dash, "nd-9").await;
+
+    assert_eq!(answer["state"], "failed");
+    assert_eq!(
+        answer["detail"],
+        "The old file is no longer in the server's trash."
+    );
+    assert!(song.exists());
+    let list = dash.call(Method::GET, "/api/admin/trash", None).await.json();
+    assert_eq!(list["songs"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn with_replaced_files_not_kept_there_is_nothing_to_put_back() {
+    let dash = Dashboard::new(true, false);
+    let mut settings = (*dash.state.settings.current()).clone();
+    settings.library_actions.keep_replaced_originals = false;
+    dash.state.settings.set(settings);
+    let (entry, song, old) = replaced(&dash.root, "nd-10", "Teardrop", "Teardrop");
+    dash.state.library_action_journal.record(entry);
+    std::fs::remove_file(&old).expect("deleted once replaced");
+
+    let answer = put_back(&dash, "nd-10").await;
+
+    assert_eq!(answer["state"], "skipped");
+    assert_eq!(
+        answer["detail"],
+        "Your old copy was not kept on this server, so there is nothing to put back."
+    );
+    assert!(song.exists());
 }

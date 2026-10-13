@@ -29,6 +29,17 @@ pub struct ReplacementHandoff {
     /// Called with the new path right after the replacement moved in, so the library
     /// action can record the swap before anything else that could fail runs.
     pub on_revealed: Option<OnRevealed>,
+
+    /// The replacement's own title and album, as the download tagged it, read just before the
+    /// original's identity was written over them.
+    arrived: Mutex<Option<ArrivedTags>>,
+}
+
+/// A replacement's own title and album, before it took the original's identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArrivedTags {
+    pub title: Option<String>,
+    pub album: Option<String>,
 }
 
 impl ReplacementHandoff {
@@ -44,7 +55,17 @@ impl ReplacementHandoff {
             before_reveal,
             revealed_path: Mutex::new(None),
             on_revealed,
+            arrived: Mutex::new(None),
         }
+    }
+
+    /// The replacement's own title and album, once the download has read them.
+    pub fn arrived(&self) -> Option<ArrivedTags> {
+        self.arrived.lock().clone()
+    }
+
+    pub fn set_arrived(&self, tags: ArrivedTags) {
+        *self.arrived.lock() = Some(tags);
     }
 
     pub fn revealed_path(&self) -> Option<String> {

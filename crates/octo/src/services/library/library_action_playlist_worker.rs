@@ -14,7 +14,10 @@ use tracing::{debug, error, info, warn};
 
 use super::library_action_executor::{LibraryActionExecutor, LibraryActionRequest};
 use super::library_action_journal::action_name;
-use super::{LibraryActionJournal, LibraryActionQuarantine, NavidromePlaylistApi, NavidromeSongPathResolver};
+use super::{
+    LibraryActionJournal, LibraryActionQuarantine, MissingRows, NavidromePlaylistApi,
+    NavidromeSongPathResolver,
+};
 use crate::services::subsonic::NavidromeIdentityService;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +47,8 @@ pub struct LibraryActionPlaylistWorker {
     /// The library action settings. `Enabled`, `PlaylistsEnabled` and the poll interval are
     /// decided once, when the worker starts; the sweep reads the rest live.
     settings: Arc<SettingsStore>,
+    /// Removes the Navidrome rows of trashed songs once the trash deletes them for good.
+    missing_rows: Option<Arc<MissingRows>>,
 }
 
 impl LibraryActionPlaylistWorker {
@@ -64,7 +69,14 @@ impl LibraryActionPlaylistWorker {
             identity,
             api,
             settings,
+            missing_rows: None,
         }
+    }
+
+    /// Has each sweep remove from Navidrome the rows of songs the trash deleted for good.
+    pub fn with_missing_rows(mut self, missing_rows: Arc<MissingRows>) -> Self {
+        self.missing_rows = Some(missing_rows);
+        self
     }
 
     /// The worker loop, until the host stops.
@@ -147,7 +159,12 @@ impl LibraryActionPlaylistWorker {
 
         let music_root = self.resolver.music_root();
         let quarantine = self.quarantine.clone();
-        let _ = tokio::task::spawn_blocking(move || quarantine.sweep(&music_root)).await;
+        let swept = tokio::task::spawn_blocking(move || quarantine.sweep_gone(&music_root))
+            .await
+            .unwrap_or_default();
+        if let Some(missing_rows) = &self.missing_rows {
+            missing_rows.forget(swept.navidrome_ids).await;
+        }
     }
 
     async fn apply_playlist(

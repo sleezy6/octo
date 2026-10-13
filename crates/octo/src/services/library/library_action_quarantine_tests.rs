@@ -197,6 +197,62 @@ fn sweep_removes_only_folders_past_the_retention_window() {
     assert!(exists(&format!("{recent}/kept.flac")));
 }
 
+/// The sweep names the Navidrome ids of what it deleted for good, each once, from the notes in
+/// every folder it removed; a note that names none, or cannot be read, adds nothing, and what
+/// stays in the trash is not named.
+#[test]
+fn sweep_gone_names_the_navidrome_ids_of_the_files_it_deleted() {
+    let f = Fixture::new();
+    let quarantine = quarantine(LibraryActionSettings {
+        quarantine_retention_days: 30,
+        ..Default::default()
+    });
+    let root = quarantine.root_for(&f.root);
+    let day = |ago: i64| (Utc::now() - TimeDelta::days(ago)).format("%Y-%m-%d").to_string();
+    let note =
+        |id: &str| format!(r#"{{"OriginalPath":"/music/x.flac","NavidromeId":"{id}","Action":"Delete"}}"#);
+    let put = |file: &str, body: &str| {
+        let path = format!("{root}/{file}");
+        std::fs::create_dir_all(Path::new(&path).parent().expect("folder")).expect("folders");
+        std::fs::write(path, body).expect("written");
+    };
+    put(&format!("{}/A - One.flac", day(40)), "audio");
+    put(
+        &format!("{}/A - One.flac.octo-action.json", day(40)),
+        &note("nd-one"),
+    );
+    put(&format!("{}/Album/02 - Two.flac", day(40)), "audio");
+    put(
+        &format!("{}/Album/02 - Two.flac.octo-action.json", day(40)),
+        &note("nd-two"),
+    );
+    put(
+        &format!("{}/Album/03 - Again.flac.octo-action.json", day(40)),
+        &note("nd-one"),
+    );
+    put(
+        &format!("{}/B - Blank.flac.octo-action.json", day(50)),
+        &note(" "),
+    );
+    put(
+        &format!("{}/B - Broken.flac.octo-action.json", day(50)),
+        "not json",
+    );
+    put(&format!("{}/C - Kept.flac", day(2)), "audio");
+    put(
+        &format!("{}/C - Kept.flac.octo-action.json", day(2)),
+        &note("nd-kept"),
+    );
+
+    let swept = quarantine.sweep_gone(&f.root);
+
+    let mut ids = swept.navidrome_ids.clone();
+    ids.sort();
+    assert_eq!(ids, ["nd-one", "nd-two"]);
+    assert_eq!(swept.files, 2);
+    assert!(exists(&format!("{root}/{}/C - Kept.flac", day(2))));
+}
+
 /// Retention 0 means never sweep, for anyone who would rather manage the space by hand.
 #[test]
 fn sweep_retention_zero_deletes_nothing_ever() {

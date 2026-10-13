@@ -316,8 +316,10 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "Imports:SongsPerHour",
     "Imports:RefreshHours",
     "Subsonic:StreamSizeWarmPerMinute",
+    "Subsonic:CoverCacheMb",
     "Subsonic:SearchDurationWaitMs",
     "Subsonic:SearchLastFmWaitMs",
+    "Subsonic:SizeFlagClients",
 ];
 
 /// Whether a config-sources key names a secret: a password, an API key, a secret, a token

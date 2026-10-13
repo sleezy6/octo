@@ -11,11 +11,13 @@
 //!    is not signed in.
 //! 7. [`cors`]: CORS with the default policy.
 //! 8. [`exception`]: the panic handler, inside CORS so error responses keep the CORS headers.
-//! 9. Path canonicalization.
-//! 10. [`family_gate`]: with Family on, who is asking, members signed in to Navidrome with
+//! 9. [`size_flag`]: a size on every song in the answers to the apps that hide songs without
+//!    one, read from the finished answer so the family rules and every handler came first.
+//! 10. Path canonicalization.
+//! 11. [`family_gate`]: with Family on, who is asking, members signed in to Navidrome with
 //!     their hidden passwords, and the family rules. With Family off it hands every request
 //!     on untouched.
-//! 11. The routes (static files are routes too), falling back to the catch-all.
+//! 12. The routes (static files are routes too), falling back to the catch-all.
 //!
 //! There is no raw-body layer: an axum handler that needs the raw body extracts it as `Bytes`
 //! and parses the form or JSON from those bytes itself, so the bytes are still there for the
@@ -34,3 +36,4 @@ pub mod family_gate;
 mod family_reading_tests;
 pub mod forwarded;
 pub mod request_log;
+pub mod size_flag;

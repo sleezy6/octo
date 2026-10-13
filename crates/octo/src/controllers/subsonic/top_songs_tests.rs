@@ -306,7 +306,8 @@ async fn get_playlists_lists_the_chart_lists_read_only() {
     assert_eq!(popular["readonly"], true);
     assert_eq!(popular["public"], false);
     assert_eq!(popular["songCount"], 5);
-    assert_eq!(popular["coverArt"], popular_id().as_str());
+    let version = octo_media::cover::CoverBook::shipped().version;
+    assert_eq!(popular["coverArt"], format!("{}_{version}c5", popular_id()));
     // The Octo apps put "Popular" on its cover; the other charts keep their names.
     assert_eq!(popular["octoCoverTitle"], "Popular");
     assert!(rows[1].get("octoCoverTitle").is_none());
@@ -317,6 +318,23 @@ async fn get_playlists_lists_the_chart_lists_read_only() {
     assert_eq!(
         rows[1]["comment"],
         "The best new songs of the week, made by Octo. Songs you have play from your library."
+    );
+
+    // The cover id the row names draws the chart's own cover; Navidrome is never asked for it.
+    let cover_id = popular["coverArt"].as_str().expect("a cover id");
+    let cover = get(
+        &h.app,
+        &format!("/rest/getCoverArt?{ALICE}&id={cover_id}&size=300"),
+    )
+    .await;
+    assert!(cover.status.is_success(), "{}", cover.status);
+    assert_eq!(cover.media_type().as_deref(), Some("image/jpeg"));
+    let asked = h.navidrome.received_requests().await.unwrap_or_default();
+    assert!(
+        !asked
+            .iter()
+            .any(|r| r.url.path().ends_with("getCoverArt") && r.url.as_str().contains(&popular_id())),
+        "Navidrome was asked for the chart's cover"
     );
 }
 

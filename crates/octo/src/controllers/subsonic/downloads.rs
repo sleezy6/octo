@@ -1,12 +1,13 @@
-//! octoAcquisitions version 2, the apps' downloads drawer. One download's whole log, clearing
-//! finished ones, and Find songs (a search run again by hand, every copy listed, one picked).
+//! octoAcquisitions version 3, the apps' downloads drawer. One download's whole log, clearing
+//! finished ones, and Find songs (a search run again by hand, every copy listed, one picked, and
+//! a library song replaced anyway once the person says so).
 //! Always JSON, and every call is checked with a ping to Navidrome as getAcquisitions is. Each
 //! person sees and picks only their own.
 
 use axum::extract::{Request, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use octo_core::common::dotnet::is_blank;
+use octo_core::common::dotnet::{self, is_blank};
 use tokio_util::sync::CancellationToken;
 
 use super::action_helpers::int_try_parse;
@@ -161,6 +162,11 @@ pub async fn get_found_songs(State(state): State<AppState>, req: Request) -> App
 
 /// Fetches exactly one copy a Find songs search listed, by its id there (copy). The copy's place
 /// on the list (candidate) still works for older apps, once the search has ended.
+///
+/// `anyway` (octoAcquisitions version 3): an app that sends it can ask the person. With
+/// `anyway=false`, a copy that would replace a library song but is no better than it, or is the
+/// plain song in place of another take, answers `confirm` with the words to ask; picking it
+/// again with `anyway=true` replaces the song anyway. Without it the pick is refused as before.
 pub async fn pick_found_song(State(state): State<AppState>, req: Request) -> AppResult {
     let caller = family_caller(req.extensions()).cloned();
     let call = match SubsonicCall::read(&state, req).await {
@@ -174,6 +180,9 @@ pub async fn pick_found_song(State(state): State<AppState>, req: Request) -> App
     let search = trimmed(&call, "search");
     let copy = trimmed(&call, "copy");
     let index = call.param_opt("candidate").and_then(int_try_parse);
+    let anyway = call
+        .param_opt("anyway")
+        .map(|anyway| dotnet::eq_ignore_case(anyway.trim(), "true"));
     if search.is_empty() || (copy.is_empty() && index.is_none()) {
         return Ok(builder
             .create_error(FORMAT, 10, "Required parameter is missing: search and copy")
@@ -204,10 +213,13 @@ pub async fn pick_found_song(State(state): State<AppState>, req: Request) -> App
     let outcome = if copy.is_empty() {
         state
             .song_finder
-            .pick_at(&search, index.unwrap_or(-1), &username)
+            .pick_place(&search, index.unwrap_or(-1), &username, anyway)
             .await
     } else {
-        state.song_finder.pick_by_id(&search, &copy, &username).await
+        state
+            .song_finder
+            .pick_copy(&search, &copy, &username, anyway)
+            .await
     };
     Ok(builder.create_pick_response(&outcome).into_response())
 }

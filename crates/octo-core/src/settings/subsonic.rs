@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::dotnet::{is_blank, ordinal_ignore_case_key};
+
 /// Download mode for tracks
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 pub enum DownloadMode {
@@ -262,6 +264,24 @@ pub struct SubsonicSettings {
     /// Environment variable: STREAM_SIZE_WARM_PER_MINUTE
     pub stream_size_warm_per_minute: i32,
 
+    /// How many megabytes of library covers Octo keeps on disk, so each cover is read from
+    /// Navidrome once and every size an app asks for is cut from that copy (default: 1024,
+    /// range 0-102400). The least recently shown covers go first when it is full. 0 turns the
+    /// cover cache off and every cover is asked of Navidrome again.
+    /// Environment variable: COVER_CACHE_MB
+    pub cover_cache_mb: i32,
+
+    /// Apps that read a song's size only to decide whether to show it, comma-separated,
+    /// matched against the client name the app sends (the Subsonic `c` parameter) or its
+    /// User-Agent, ignoring case (default: "Amperfy").
+    /// Environment variable: SIZE_FLAG_CLIENTS
+    ///
+    /// Such an app hides a song with no size. An outside song has none until Octo learns the
+    /// bytes of its stream, so these apps get 1 for it until then, which reads as "this song
+    /// is here". A size above 2,147,483,647, which they cannot store, is held to that number.
+    /// Every other app gets sizes unchanged. Empty turns this off.
+    pub size_flag_clients: String,
+
     /// Directory name for storing playlist .m3u files (default: "playlists")
     /// Environment variable: PLAYLISTS_DIRECTORY
     /// Relative to the music library root directory
@@ -399,6 +419,8 @@ impl Default for SubsonicSettings {
             sync_catalog_clients: "Symfonium".to_string(),
             sync_catalog_max_songs: 1000,
             stream_size_warm_per_minute: 5,
+            cover_cache_mb: 1024,
+            size_flag_clients: "Amperfy".to_string(),
             playlists_directory: "playlists".to_string(),
             download_on_star: true,
             download_album_on_star: true,
@@ -440,6 +462,31 @@ impl SubsonicSettings {
 
     pub fn effective_stream_size_warm_per_minute(&self) -> usize {
         self.stream_size_warm_per_minute.clamp(0, 30) as usize
+    }
+
+    /// The cover cache's size in bytes; 0 when it is off.
+    pub fn effective_cover_cache_bytes(&self) -> u64 {
+        self.cover_cache_mb.clamp(0, 102_400) as u64 * 1024 * 1024
+    }
+
+    /// Whether the app calling, known by its client name or its User-Agent, is one of
+    /// SizeFlagClients: a name in the list contained in either, ignoring case.
+    pub fn is_size_flag_client(&self, client: Option<&str>, user_agent: Option<&str>) -> bool {
+        let callers: Vec<String> = [client, user_agent]
+            .into_iter()
+            .flatten()
+            .filter(|text| !is_blank(text))
+            .map(ordinal_ignore_case_key)
+            .collect();
+        if callers.is_empty() {
+            return false;
+        }
+        self.size_flag_clients
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ordinal_ignore_case_key)
+            .any(|name| callers.iter().any(|caller| caller.contains(&name)))
     }
 
     pub fn effective_heart_download_sources(&self) -> Vec<HeartDownloadStep> {
@@ -610,6 +657,41 @@ mod tests {
     }
 
     #[test]
+    fn size_flag_clients_match_the_client_name_or_the_user_agent_ignoring_case() {
+        let defaults = SubsonicSettings::default();
+        let cases: [(Option<&str>, Option<&str>, bool); 7] = [
+            (Some("Amperfy"), None, true),
+            (Some("amperfy"), Some("CFNetwork/1568"), true),
+            (
+                None,
+                Some("Amperfy/2026.7 CFNetwork/1568.100.1 Darwin/25.0.0"),
+                true,
+            ),
+            (Some("Symfonium"), Some("okhttp/4.12"), false),
+            (Some("  "), None, false),
+            (None, None, false),
+            (Some("Octo"), None, false),
+        ];
+        for (client, user_agent, expected) in cases {
+            assert_eq!(
+                defaults.is_size_flag_client(client, user_agent),
+                expected,
+                "{client:?} {user_agent:?}"
+            );
+        }
+        let listed = SubsonicSettings {
+            size_flag_clients: " narjo , ,Amperfy".to_string(),
+            ..Default::default()
+        };
+        assert!(listed.is_size_flag_client(Some("Narjo for iOS"), None));
+        let off = SubsonicSettings {
+            size_flag_clients: String::new(),
+            ..Default::default()
+        };
+        assert!(!off.is_size_flag_client(Some("Amperfy"), Some("Amperfy/1")));
+    }
+
+    #[test]
     fn stream_size_warming_is_five_a_minute_by_default_and_zero_turns_it_off() {
         assert_eq!(
             SubsonicSettings::default().effective_stream_size_warm_per_minute(),
@@ -623,6 +705,25 @@ mod tests {
             assert_eq!(
                 s.effective_stream_size_warm_per_minute(),
                 expected,
+                "{configured}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cover_cache_is_a_gigabyte_by_default_and_zero_turns_it_off() {
+        assert_eq!(
+            SubsonicSettings::default().effective_cover_cache_bytes(),
+            1024 * 1024 * 1024
+        );
+        for (configured, expected) in [(0, 0), (-5, 0), (10, 10), (500_000, 102_400)] {
+            let s = SubsonicSettings {
+                cover_cache_mb: configured,
+                ..Default::default()
+            };
+            assert_eq!(
+                s.effective_cover_cache_bytes(),
+                expected * 1024 * 1024,
                 "{configured}"
             );
         }

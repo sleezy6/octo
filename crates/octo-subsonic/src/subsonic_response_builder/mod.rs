@@ -56,9 +56,10 @@ pub const SUBSONIC_VERSION: &str = "1.16.1";
 
 /// The OpenSubsonic extension a client checks for before it asks for getAcquisitions. Version 2
 /// adds each row's log (getAcquisition), clearing finished rows (clearAcquisitions) and Find
-/// songs (findSongs, getFoundSongs, pickFoundSong).
+/// songs (findSongs, getFoundSongs, pickFoundSong). Version 3: pickFoundSong takes `anyway` and
+/// may answer `confirm`, asking before a library song is replaced by a copy no better than it.
 pub const ACQUISITIONS_EXTENSION: &str = "octoAcquisitions";
-pub const ACQUISITIONS_EXTENSION_VERSION: i32 = 2;
+pub const ACQUISITIONS_EXTENSION_VERSION: i32 = 3;
 
 /// getArtistTopSongs and getTopChart. Version 2: getTopChart takes `chart` (Best New Songs,
 /// Trending Songs, a genre) and getCharts lists the charts.
@@ -70,7 +71,7 @@ pub const TOP_SONGS_EXTENSION_VERSION: i32 = 2;
 /// enhanced=true (version 2) with word cues; a Navidrome that lists fewer versions has them
 /// added, never removed.
 pub const OWN_EXTENSIONS: &[(&str, &[i32])] = &[
-    (ACQUISITIONS_EXTENSION, &[1, ACQUISITIONS_EXTENSION_VERSION]),
+    (ACQUISITIONS_EXTENSION, &[1, 2, ACQUISITIONS_EXTENSION_VERSION]),
     (LYRICS_EXTENSION, &[LYRICS_EXTENSION_VERSION]),
     (
         LIBRARY_ACTIONS_EXTENSION,

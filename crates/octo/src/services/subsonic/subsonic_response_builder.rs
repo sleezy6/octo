@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 use octo_core::models::download::{AcquisitionCandidate, AcquisitionEvent};
 
 use crate::services::common::acquisition_tracker::{AcquisitionSnapshot, key_of};
+use crate::services::common::replace_anyway::{self, CopyFacts};
 use crate::services::common::song_finder::{FindSnapshot, PickOutcome};
 use crate::services::library::{
     GeneratedPlaylist, LibraryActionOutcome, LibraryEditOutcome, SongLookup, TrashedSong, UpgradeJob,
@@ -159,7 +160,13 @@ impl SubsonicResponseBuilderExt for SubsonicResponseBuilder {
         fields.insert("comment".into(), comment.into());
         fields.insert("created".into(), millis(&mix.period_start_utc).into());
         fields.insert("changed".into(), millis(&mix.period_start_utc).into());
-        fields.insert("coverArt".into(), mix.id.clone().into());
+        // The cover id names the picture as drawn: it changes with the design and the count the
+        // cover shows, so apps that keep covers by id fetch the new one.
+        let version = octo_media::cover::CoverBook::shipped().version;
+        fields.insert(
+            "coverArt".into(),
+            format!("{}_{version}c{song_count}", mix.id).into(),
+        );
         fields.insert("readonly".into(), true.into());
         fields.insert("validUntil".into(), millis(&mix.period_end_utc).into());
         // octoLists: which Made for you list this is, so the Octo apps can put it on Home.
@@ -244,15 +251,19 @@ impl SubsonicResponseBuilderExt for SubsonicResponseBuilder {
             "openSubsonic": true,
             "libraryTrash": {
                 "keepDays": keep_days,
-                "songs": songs.iter().map(|song| json!({
-                    "id": song.id,
-                    "title": song.title,
-                    "artist": song.artist,
-                    "album": song.album,
-                    "removedBy": song.username,
-                    "removedAt": round_trip(&song.removed_utc),
-                    "goneAt": song.gone_utc.as_ref().map(round_trip),
-                })).collect::<Vec<_>>(),
+                "songs": songs.iter().map(|song| {
+                    let mut json = json!({
+                        "id": song.id,
+                        "title": song.title,
+                        "artist": song.artist,
+                        "album": song.album,
+                        "removedBy": song.username,
+                        "removedAt": round_trip(&song.removed_utc),
+                        "goneAt": song.gone_utc.as_ref().map(round_trip),
+                    });
+                    with_replaced(&mut json, song);
+                    json
+                }).collect::<Vec<_>>(),
             },
         }))
     }
@@ -326,13 +337,43 @@ impl SubsonicResponseBuilderExt for SubsonicResponseBuilder {
             "status": "ok",
             "version": SUBSONIC_VERSION,
             "type": "octo",
-            "pick": {
-                "state": outcome.state,
-                "detail": outcome.detail,
-                "key": outcome.key,
-            },
+            "pick": pick_json(outcome),
         }))
     }
+}
+
+/// A trashed song that another file replaced says so, and names both files: `kind` is
+/// "replaced", `was` the file in the trash, `now` the one in the library. A removed song is left
+/// as it always was.
+pub fn with_replaced(json: &mut Value, song: &TrashedSong) {
+    if let (Some(replaced), Some(fields)) = (&song.replaced, json.as_object_mut()) {
+        fields.insert("kind".into(), "replaced".into());
+        fields.insert("was".into(), json!(replaced.was));
+        fields.insert("now".into(), json!(replaced.now));
+    }
+}
+
+/// What a pick did, as the apps and the dashboard read it: its state, the words, the downloads
+/// row to follow, and, for a pick that asks first, the two copies side by side.
+pub fn pick_json(outcome: &PickOutcome) -> Value {
+    let mut fields = Fields::new();
+    fields.insert("state".into(), outcome.state.clone().into());
+    fields.insert("detail".into(), outcome.detail.clone().into());
+    fields.insert("key".into(), json!(outcome.key));
+    if let Some(compare) = &outcome.compare {
+        let side = |facts: &CopyFacts| {
+            json!({
+                "quality": facts.quality,
+                "length": facts.length,
+                "take": facts.take,
+            })
+        };
+        fields.insert(
+            "compare".into(),
+            json!({ "yours": side(&compare.yours), "copy": side(&compare.copy) }),
+        );
+    }
+    Value::Object(fields)
 }
 
 /// A Find songs search as the apps and the dashboard read it.
@@ -343,20 +384,23 @@ pub fn found_songs_json(found: &FindSnapshot) -> Fields {
     fields.insert("error".into(), json!(found.error));
     fields.insert("startedAt".into(), utc(&found.started_at).into());
     let target = &found.target;
-    fields.insert(
-        "song".into(),
-        json!({
-            "artist": target.artist,
-            "title": target.title,
-            "album": target.album,
-            "duration": target.duration,
-            "coverArt": target.cover_art,
-            "libraryId": target.library_id,
-            "format": target.owned_format,
-            "quality": target.owned_quality,
-            "size": target.owned_size,
-        }),
-    );
+    let mut song = json!({
+        "artist": target.artist,
+        "title": target.title,
+        "album": target.album,
+        "duration": target.duration,
+        "coverArt": target.cover_art,
+        "libraryId": target.library_id,
+        "format": target.owned_format,
+        "quality": target.owned_quality,
+        "size": target.owned_size,
+    });
+    // A library song whose file is another take says so before anything is picked.
+    if let (Some(take), Some(song)) = (found.take, song.as_object_mut()) {
+        song.insert("take".into(), replace_anyway::take_header(take).into());
+        song.insert("takeKind".into(), replace_anyway::take_kind(take).into());
+    }
+    fields.insert("song".into(), song);
     fields.insert(
         "source".into(),
         Value::Array(
@@ -385,6 +429,11 @@ pub fn found_songs_json(found: &FindSnapshot) -> Fields {
                     let mut json = candidate_json(&copy.shown);
                     json.insert("id".into(), copy.id.clone().into());
                     json.insert("index".into(), index.into());
+                    // A copy no better than the library's says so on the list.
+                    if let Some((vs, text)) = replace_anyway::vs_yours(target, copy) {
+                        json.insert("vsYours".into(), vs.into());
+                        json.insert("vsYoursText".into(), text.into());
+                    }
                     Value::Object(json)
                 })
                 .collect(),
@@ -601,7 +650,7 @@ mod tests {
             builder()
                 .create_generated_playlist_response("json", &mix, &settings, &entries)
                 .text(),
-            r#"{"subsonic-response":{"status":"ok","version":"1.16.1","playlist":{"id":"og1","name":"Rock mix","owner":"alice","public":false,"songCount":1,"duration":200,"comment":"Generated by Octo from your library","created":"2026-10-01T00:00:00.000Z","changed":"2026-10-01T00:00:00.000Z","coverArt":"og1","readonly":true,"validUntil":"2026-10-08T00:00:00.000Z","entry":[{"id":"n1","duration":200}]}}}"#
+            r#"{"subsonic-response":{"status":"ok","version":"1.16.1","playlist":{"id":"og1","name":"Rock mix","owner":"alice","public":false,"songCount":1,"duration":200,"comment":"Generated by Octo from your library","created":"2026-10-01T00:00:00.000Z","changed":"2026-10-01T00:00:00.000Z","coverArt":"og1_2c10","readonly":true,"validUntil":"2026-10-08T00:00:00.000Z","entry":[{"id":"n1","duration":200}]}}}"#
         );
     }
 }

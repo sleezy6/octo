@@ -193,7 +193,9 @@ async fn liked_songs_is_listed_first_in_json_and_xml() {
     assert_eq!(first["octoList"], "liked");
     assert_eq!(first["songCount"], 2);
     assert_eq!(first["readonly"], true);
-    assert_eq!(first["coverArt"], first["id"]);
+    let version = octo_media::cover::CoverBook::shipped().version;
+    let id = first["id"].as_str().expect("an id");
+    assert_eq!(first["coverArt"], format!("{id}_{version}c2"));
     let first_row = xml.find("<playlist ").expect("a row");
     assert!(xml[first_row..].starts_with("<playlist ") && xml[first_row..].contains(r#"octoList="liked""#));
     let liked_at = xml.find(r#"octoList="liked""#).expect("liked");
@@ -280,9 +282,9 @@ async fn each_listener_sees_only_their_own_hearts() {
 async fn liked_songs_has_a_heart_cover() {
     let (upstream, app) = setup().await;
     heart(&upstream, "alice", "big1", "2026-10-01T10:00:00.000Z");
-    let id = playlists(&app).await[0]["id"]
+    let id = playlists(&app).await[0]["coverArt"]
         .as_str()
-        .expect("an id")
+        .expect("a cover id")
         .to_string();
 
     let cover = get(&app, &format!("/rest/getCoverArt.view?{AUTH}&id={id}&size=600")).await;

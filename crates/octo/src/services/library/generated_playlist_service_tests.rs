@@ -415,7 +415,11 @@ mod response {
         assert_eq!(fields["owner"], "alice");
         assert_eq!(fields["readonly"], true);
         assert_eq!(fields["songCount"], 40);
-        assert_eq!(fields["coverArt"], Value::String(mix().id));
+        let version = octo_media::cover::CoverBook::shipped().version;
+        assert_eq!(
+            fields["coverArt"],
+            Value::String(format!("{}_{version}c40", mix().id))
+        );
     }
 
     #[test]

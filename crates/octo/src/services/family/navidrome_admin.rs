@@ -363,6 +363,41 @@ impl NavidromeAdmin {
         Ok(())
     }
 
+    /// One song Navidrome keeps as missing (`/api/missing/{id}`), with the plays, favorite,
+    /// rating and bookmark of the user Octo signs in as. None when Navidrome has no missing song
+    /// by that id: its file came back, or the row is gone already.
+    pub async fn missing_song(&self, id: &str) -> Result<Option<Value>, AdminError> {
+        match self
+            .call(
+                Method::GET,
+                &format!("/api/missing/{}", escape_data_string(id)),
+                None,
+            )
+            .await
+        {
+            Ok(song @ Value::Object(_)) => Ok(Some(song)),
+            Ok(_) | Err(AdminError::Status { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Removes these missing songs from Navidrome (`DELETE /api/missing?id=..`), as its Missing
+    /// Files page does. Navidrome removes only songs still marked missing. No ids sends nothing:
+    /// Navidrome reads a call without ids as every missing song.
+    pub async fn delete_missing(&self, ids: &[String]) -> Result<(), AdminError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let query = ids
+            .iter()
+            .map(|id| format!("id={}", escape_data_string(id)))
+            .collect::<Vec<_>>()
+            .join("&");
+        self.call(Method::DELETE, &format!("/api/missing?{query}"), None)
+            .await?;
+        Ok(())
+    }
+
     /// Navidrome's settings as its admin About page reads them (`/api/config/config`). Navidrome
     /// offers the page only while `DevUIShowConfig` is on; otherwise the call is refused.
     pub async fn server_config(&self) -> Result<Value, AdminError> {

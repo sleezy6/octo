@@ -85,6 +85,106 @@ async fn external_playback_uses_you_tube_regardless_of_legacy_storage_mode() {
 }
 
 #[tokio::test]
+async fn an_outside_song_downloads_as_it_streams() {
+    let navidrome = ping_ok().await;
+    let downloads = Arc::new(FakeStreams::streaming(
+        "soulseek",
+        "track-id",
+        &[1, 2, 3],
+        "audio/mp4",
+    ));
+    let library = Arc::new(FakeLibrary::with_external(
+        "external-track",
+        "soulseek",
+        "track-id",
+    ));
+    let state = state_with(playback_settings(&navidrome.uri(), false, false), |inner| {
+        inner.download_service = downloads.clone();
+        inner.local_library = library.clone();
+    });
+    let app = app(&state);
+
+    for uri in [
+        "/rest/download?id=external-track&u=alice&t=good&s=salt&v=1.16.1&c=Amperfy",
+        "/rest/download.view?id=external-track&u=alice&t=good&s=salt&v=1.16.1&c=Amperfy",
+    ] {
+        let response = get(&app, uri).await;
+        assert_eq!(response.status, StatusCode::OK, "{uri}");
+        assert_eq!(response.body.as_ref(), [1, 2, 3], "{uri}");
+        assert_eq!(response.header("content-type"), Some("audio/mp4"), "{uri}");
+    }
+    assert_eq!(downloads.stream_calls().len(), 2);
+}
+
+#[tokio::test]
+async fn an_outside_download_sent_as_a_form_is_the_song_too() {
+    let navidrome = ping_ok().await;
+    let downloads = Arc::new(FakeStreams::streaming(
+        "soulseek",
+        "track-id",
+        &[4, 5],
+        "audio/mp4",
+    ));
+    let library = Arc::new(FakeLibrary::with_external(
+        "external-track",
+        "soulseek",
+        "track-id",
+    ));
+    let state = state_with(playback_settings(&navidrome.uri(), false, false), |inner| {
+        inner.download_service = downloads.clone();
+        inner.local_library = library.clone();
+    });
+    let app = app(&state);
+
+    let response = send(
+        &app,
+        Method::POST,
+        "/rest/download",
+        &[("Content-Type", "application/x-www-form-urlencoded")],
+        Body::from("id=external-track&u=alice&t=good&s=salt&v=1.16.1&c=test"),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body.as_ref(), [4, 5]);
+}
+
+#[tokio::test]
+async fn a_library_download_still_goes_to_navidromes_download() {
+    let navidrome = MockServer::start().await;
+    Mock::given(wiremock::matchers::path("/rest/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(vec![9, 8, 7], "audio/flac"))
+        .mount(&navidrome)
+        .await;
+    Mock::given(any())
+        .respond_with(navidrome_json(NAVIDROME_OK))
+        .mount(&navidrome)
+        .await;
+    let downloads = Arc::new(FakeStreams::default());
+    let state = state_with(playback_settings(&navidrome.uri(), false, false), |inner| {
+        inner.download_service = downloads.clone();
+        inner.local_library = Arc::new(FakeLibrary::default());
+    });
+    let app = app(&state);
+
+    let response = get(
+        &app,
+        "/rest/download?id=lib-1&u=alice&t=good&s=salt&v=1.16.1&c=Amperfy",
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body.as_ref(), [9, 8, 7]);
+    assert!(
+        received_paths(&navidrome)
+            .await
+            .iter()
+            .any(|path| path == "/rest/download"),
+        "relayed to Navidrome's download"
+    );
+    assert!(downloads.stream_calls().is_empty());
+}
+
+#[tokio::test]
 async fn wait_for_lossless_still_acquires_before_playback_when_enabled() {
     let navidrome = ping_ok().await;
     let downloads = Arc::new(FakeStreams::default());

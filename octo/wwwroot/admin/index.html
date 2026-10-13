@@ -569,6 +569,14 @@
               </div>
               <label class="switch"><input type="checkbox" id="f-skip-owned-songs" name="Subsonic.SkipOwnedSongs" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Apps that hide songs without a size</div>
+                <div class="set-info-d">Until Octo knows the file size of a song you don't own, these apps get a stand-in so the song still shows. App names, separated by commas.</div>
+                <div class="set-info-more">Amperfy hides any song that has no size. Octo learns the real size in the background or on the first play and sends it from then on. Other apps get no size until it is known. Leave empty to turn this off.</div>
+              </div>
+              <input class="set-input" id="f-size-flag-clients" name="Subsonic.SizeFlagClients" placeholder="Amperfy" />
+            </div>
           </form>
         </div>
         <div class="set-section">

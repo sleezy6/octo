@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use super::{BaseDownloadService, FileNotFoundException, RequestedIdentity, file_exists, get_extension};
 use crate::services::common::acquisition_tracker::{AcquisitionState, acquisition_event_kinds, key_of};
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
+use crate::services::library::replacement_handoff::ArrivedTags;
 use crate::services::library::{ReplacementHandoff, ReplacementRejectedException};
 use crate::services::lyrics::lyrics_sidecar_writer::LyricsJob;
 use crate::services::soulseek::soulseek_download_service::INCOMING_FOLDER_NAME;
@@ -321,6 +322,12 @@ impl BaseDownloadService {
         handoff: &ReplacementHandoff,
     ) -> anyhow::Result<Placement> {
         let revealed = async {
+            if let Ok(file) = octo_media::tags::TagFile::open(Path::new(staged)) {
+                handoff.set_arrived(ArrivedTags {
+                    title: file.title(),
+                    album: file.album(),
+                });
+            }
             KeptIdentityTags::apply(Path::new(staged), &handoff.identity)?;
             if let Some(problem) = (handoff.before_reveal)(staged.to_string()).await {
                 return Err(ReplacementRejectedException::new(problem).into());

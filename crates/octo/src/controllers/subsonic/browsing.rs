@@ -414,10 +414,22 @@ pub async fn get_album(State(state): State<AppState>, req: Request) -> AppResult
     }
 
     if let Some(deezer_album) = deezer_album {
+        // Every song on the page is filed under the album it was opened as, so an app that
+        // groups songs by their album lists the outside ones with the rest.
+        let album_id = album_data
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
         let mut merged_songs = local_songs;
         for deezer_song in &deezer_album.songs {
             if !AlbumFillIn::owned(&library, deezer_song) {
-                merged_songs.push(Value::Object(builder.convert_song_to_json(deezer_song)));
+                let mut row = builder.convert_song_to_json(deezer_song);
+                if let Some(album_id) = &album_id {
+                    row.insert("albumId".into(), album_id.clone().into());
+                    row.insert("parent".into(), album_id.clone().into());
+                }
+                merged_songs.push(Value::Object(row));
             }
         }
 

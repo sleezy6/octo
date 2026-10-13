@@ -341,6 +341,25 @@ async fn get_album_marks_the_songs_the_library_does_not_hold() {
             assert!(song.get(key).is_none(), "{title} has {key}");
         }
         assert_eq!(song["suffix"], "m4a", "{title}");
+        // Filed under the album the page was opened as, like the library's songs.
+        assert_eq!(song["albumId"], "al-1", "{title}");
+        assert_eq!(song["parent"], "al-1", "{title}");
+    }
+
+    // An app that hides songs without a size (Amperfy) is given one for each outside song,
+    // and the library's sizes are left as they are.
+    let amperfy = fixture
+        .xml(&format!("/rest/getAlbum.view?{AUTH}&id=al-1&c=Amperfy"))
+        .await;
+    for song in children(child(&amperfy, "album"), "song") {
+        match song.attribute("title") {
+            Some("One") => assert_eq!(song.attribute("size"), Some("34684600")),
+            Some("Two" | "Four") => {
+                assert_eq!(song.attribute("size"), Some("1"), "{song:?}");
+                assert_eq!(song.attribute("albumId"), Some("al-1"), "{song:?}");
+            }
+            _ => {}
+        }
     }
 
     // XML says the same.

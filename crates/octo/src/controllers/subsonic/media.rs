@@ -1,4 +1,4 @@
-//! `stream`, `getCoverArt` and `getTranscodeDecision`.
+//! `stream`, `download`, `getCoverArt` and `getTranscodeDecision`.
 
 use std::io::SeekFrom;
 use std::path::Path;
@@ -17,25 +17,31 @@ use octo_core::models::radio::{LastFmRadioStation, LastFmRadioStationKind};
 use octo_core::settings::NoticeKind;
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
 use octo_media::cover::{CoverGlyph, CoverSeed, ListCover, list_kinds};
+use octo_subsonic::SubsonicCredential;
+use octo_subsonic::subsonic_request_parser::Parameters;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use super::action_helpers::MAX_REQUEST_BODY;
 use super::caller_checks::{
     SubsonicCall, file, is_first_byte_request, is_successful_subsonic_response, refuse_unless_signed_in,
     requester_for, signed_in_user,
 };
 use crate::app::AppState;
+use crate::http::catch_all;
 use crate::http::error::{AppError, AppResult, json_status, problem};
 use crate::http::routes::RouteSet;
 use crate::http::static_files::{RangeOutcome, parse_range};
 use crate::services::common::track_acquisition_queue::Completion;
+use crate::services::cover_art::local_cover_cache::{CoverPicture, Fetched, NotKept};
 use crate::services::family::{FamilyCaller, LibraryScope, audio_gate, family_caller};
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::library::{GeneratedPlaylist, navidrome_song_list};
 use crate::services::subsonic::subsonic_proxy_service::content_type_of;
+use crate::services::subsonic::{CredentialVerdict, SubsonicProxyService};
 
 pub fn routes() -> RouteSet {
     RouteSet::new()
@@ -43,6 +49,7 @@ pub fn routes() -> RouteSet {
         // player on iPhone does), and Navidrome, which the catch-all would ask, has no such
         // song. A library song's HEAD still goes to Navidrome.
         .subsonic_with_head("stream", get(stream).post(stream).head(stream_head))
+        .subsonic("download", get(download).post(download))
         .subsonic("getCoverArt", get(get_cover_art).post(get_cover_art))
         .subsonic(
             "getTranscodeDecision",
@@ -165,6 +172,28 @@ async fn stream_head(State(state): State<AppState>, req: Request) -> AppResult {
     let response = stream(State(state), req).await?;
     let (parts, _) = response.into_parts();
     Ok(Response::from_parts(parts, Body::empty()))
+}
+
+// ---------------------------------------------------------------------------------------
+// download
+// ---------------------------------------------------------------------------------------
+
+/// An outside song downloads exactly as it streams: the bytes Octo relays, or the copy it
+/// waits for, are the only file it has. A library song goes to Navidrome's own `download`
+/// through the faithful relay.
+pub async fn download(State(state): State<AppState>, req: Request) -> AppResult {
+    let (parts, body) = req.into_parts();
+    let Ok(body) = axum::body::to_bytes(body, MAX_REQUEST_BODY).await else {
+        return Ok(StatusCode::PAYLOAD_TOO_LARGE.into_response());
+    };
+    let call = SubsonicCall::from_parts(&state, &parts, body.clone());
+    let outside = state.local_library.parse_song_id(call.param("id")).0;
+    let req = Request::from_parts(parts, Body::from(body));
+    if outside {
+        stream(State(state), req).await
+    } else {
+        Ok(catch_all::catch_all(State(state), req).await)
+    }
 }
 
 /// Queues the play, waits for a lossless copy when asked to, else serves the preview. An error
@@ -598,9 +627,16 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
         return Ok(file(bytes, "image/jpeg"));
     }
 
+    // A made list's cover id (Liked Songs, a mix or a chart list) is its list id, then `_` and
+    // a tag naming the picture as drawn.
+    let list_id = match id.split_once('_') {
+        Some((list, _)) if list.starts_with("og") => list,
+        _ => id.as_str(),
+    };
+
     // Liked Songs: Octo's painted cover with a heart, picked by its name.
     let cover_user = call.param("u").to_string();
-    if !cover_user.is_empty() && id == state.generated_playlists.liked_id(&cover_user) {
+    if !cover_user.is_empty() && list_id == state.generated_playlists.liked_id(&cover_user) {
         let name = state
             .settings
             .current()
@@ -621,7 +657,7 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
 
     // A mix is the listener's own library, so its cover carries no Octo mark: the logo says
     // where a result came from, and this came from them.
-    if let Some(mix) = state.generated_playlists.find(&cover_user, &id) {
+    if let Some(mix) = state.generated_playlists.find(&cover_user, list_id) {
         let song_count = state
             .generated_playlists
             .drawn(&cover_user, &mix)
@@ -655,7 +691,7 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
 
     // A chart list's cover, drawn like a mix's from its first songs' covers. It is only ever
     // drawn from a list already made: drawing it never makes one.
-    if let Some(chart) = state.chart_playlists.cover(call.param("u"), &id) {
+    if let Some(chart) = state.chart_playlists.cover(call.param("u"), list_id) {
         let song_count = Some(i32::try_from(chart.entries.len()).unwrap_or(i32::MAX));
         let kind = match octo_core::charts::chart_settings::kind(&chart.chart) {
             Some(octo_core::charts::chart_settings::ChartKind::NewSongs) => list_kinds::NEW_SONGS,
@@ -795,7 +831,13 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
         return Ok(missing_cover(&state, plain).await);
     }
 
-    // Local library: proxy to Navidrome unchanged.
+    // Local library: from the cover cache when it can answer, else proxied to Navidrome
+    // unchanged.
+    match cached_library_cover(&state, &call, &id).await {
+        Ok(picture) => return Ok(file(picture.bytes.as_ref().clone(), picture.content_type)),
+        Err(NotKept::Unreachable) => return Ok(serve_placeholder(&state, false).await),
+        Err(NotKept::Ask) => {}
+    }
     match call.proxy.relay("rest/getCoverArt", &call.parameters).await {
         Ok(result) => Ok(file(
             result.body,
@@ -809,6 +851,55 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
             // by missing art: all the more reason not to brand it.
             debug!("cover art relay failed for local id {id}: {e}");
             Ok(serve_placeholder(&state, false).await)
+        }
+    }
+}
+
+/// A library cover from the cover cache, for a request with a size and no `square`, from a
+/// caller Navidrome accepts. The sign-in is checked here because a kept cover never reaches
+/// Navidrome, which would otherwise be the one to check it. Anything else, a refused or
+/// unchecked sign-in included, is `NotKept::Ask`: Navidrome answers it as before.
+async fn cached_library_cover(
+    state: &AppState,
+    call: &SubsonicCall,
+    id: &str,
+) -> Result<CoverPicture, NotKept> {
+    let cache = &state.local_cover_cache;
+    let Some(size) = requested_cover_size(call).and_then(|size| u32::try_from(size).ok()) else {
+        return Err(NotKept::Ask);
+    };
+    if !cache.is_on() || super::caller_checks::is_true(call.param("square")) {
+        return Err(NotKept::Ask);
+    }
+    let credential = SubsonicCredential::from(&call.parameters);
+    match state
+        .credential_check
+        .check(credential.as_ref(), &call.proxy)
+        .await
+    {
+        Ok(CredentialVerdict::Accepted) => {}
+        _ => return Err(NotKept::Ask),
+    }
+    let proxy = call.proxy.clone();
+    let parameters = call.parameters.clone();
+    cache
+        .cover(id, size, move |side| fetch_library_cover(proxy, parameters, side))
+        .await
+}
+
+/// A library cover from Navidrome at `side`, as the cover cache keeps it.
+pub(crate) async fn fetch_library_cover(
+    proxy: SubsonicProxyService,
+    mut parameters: Parameters,
+    side: u32,
+) -> Fetched {
+    parameters.insert("size".into(), side.to_string());
+    match proxy.relay_dated_image("rest/getCoverArt", &parameters).await {
+        Ok(Some(bytes)) => Fetched::Picture(bytes.to_vec()),
+        Ok(None) => Fetched::Other,
+        Err(e) => {
+            debug!("cover fetch for the cover cache failed: {e}");
+            Fetched::Unreachable
         }
     }
 }

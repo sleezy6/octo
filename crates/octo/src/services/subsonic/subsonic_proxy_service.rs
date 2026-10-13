@@ -376,6 +376,42 @@ impl SubsonicProxyService {
         self.relay(endpoint, parameters).await.ok()
     }
 
+    /// A picture from the Subsonic server that is worth keeping: `Some` only for a 200 answer
+    /// with an `image/` type and a `Last-Modified` header. Navidrome sends its stand-in for
+    /// missing art without that header, and answers an unknown id with an XML error, so neither
+    /// comes back as a picture. A failure to reach the server is the error.
+    pub async fn relay_dated_image<I, K, V>(
+        &self,
+        endpoint: &str,
+        parameters: I,
+    ) -> Result<Option<Bytes>, RelayError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let base = self.configured_url()?;
+        let query = self.build_query(parameters, false);
+        let url = format!("{}/{endpoint}?{query}", base.trim_end_matches('/'));
+        let target = request_url(&url)?;
+
+        let response = self
+            .shared
+            .client
+            .get(target)
+            .send()
+            .await
+            .map_err(RelayError::from_reqwest)?;
+        let is_image = content_type_of(response.headers())
+            .is_some_and(|kind| kind.trim_start().to_ascii_lowercase().starts_with("image/"));
+        let dated = response.headers().contains_key(reqwest::header::LAST_MODIFIED);
+        if response.status() != reqwest::StatusCode::OK || !is_image || !dated {
+            return Ok(None);
+        }
+        let body = response.bytes().await.map_err(RelayError::from_reqwest)?;
+        Ok((!body.is_empty()).then_some(body))
+    }
+
     /// Faithful relay: forwards the caller's HTTP method + body + content-type and returns the
     /// upstream status verbatim (a failure status is not an error). This is what makes non-GET
     /// / body-carrying endpoints work through Octo: e.g. Navidrome's native POST /auth/login
@@ -600,6 +636,61 @@ impl SubsonicProxyService {
         };
         Ok(builder
             .body(body)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+    }
+
+    /// Relays Navidrome's server-sent events (`api/events`), passing each event on as it
+    /// arrives: the stream never ends, so a relay that reads the body first never answers.
+    pub async fn relay_events<I, K, V>(&self, endpoint: &str, parameters: I) -> Response
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        match self.open_events(endpoint, parameters).await {
+            Ok(response) => response,
+            Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+        }
+    }
+
+    async fn open_events<I, K, V>(&self, endpoint: &str, parameters: I) -> Result<Response, RelayError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let base = self.configured_url()?;
+        let parameters = owned_pairs(parameters);
+        let query = self.build_query(parameters.iter().map(|(k, v)| (k, v)), false);
+        let url = format!("{}/{endpoint}?{query}", base.trim_end_matches('/'));
+        let mut request = self.shared.stream_client.get(request_url(&url)?);
+        if let Some(incoming) = self.incoming.as_deref() {
+            for name in FORWARD_REQUEST_HEADERS {
+                if let Some(value) = joined_request_header(&incoming.headers, name) {
+                    request = request.header(name, value);
+                }
+            }
+        }
+        let response = match tokio::time::timeout(DEFAULT_TIMEOUT, request.send()).await {
+            Ok(result) => result.map_err(RelayError::from_reqwest)?,
+            Err(_) => return Err(RelayError::Canceled(timeout_message(DEFAULT_TIMEOUT))),
+        };
+
+        let mut builder = Response::builder().status(response.status());
+        for name in FORWARD_RESPONSE_HEADERS {
+            for value in response_header_values(response.headers(), name) {
+                if let Ok(value) = HeaderValue::from_str(&value) {
+                    builder = builder.header(name, value);
+                }
+            }
+        }
+        let content_type =
+            content_type_of(response.headers()).unwrap_or_else(|| "text/event-stream".to_string());
+        builder = builder
+            .header(header::CONTENT_TYPE, content_type)
+            .header("X-Accel-Buffering", "no");
+        Ok(builder
+            .body(Body::from_stream(response.bytes_stream()))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
     }
 

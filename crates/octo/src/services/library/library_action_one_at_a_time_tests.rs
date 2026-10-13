@@ -18,6 +18,7 @@ use super::*;
 use crate::services::common::test_fakes::{OfflineLink, until};
 use crate::services::common::track_acquisition_queue::AcquisitionRequest;
 use crate::services::library::library_action_test_support::{Extras, RecordingLibrary, executor, store};
+use crate::services::library::replacement_handoff::ArrivedTags;
 
 const FILE_NAME: &str = "Massive Attack - Teardrop";
 /// The Soulseek download service's `INCOMING_FOLDER_NAME`.
@@ -613,6 +614,226 @@ async fn better_quality_with_no_source_set_up_fails_without_downloading() {
     assert!(outcome.detail.unwrap_or_default().contains("no source set up"));
     assert!(f.queue.is_idle());
     assert!(Path::new(&f.original).exists());
+}
+
+// ---- Replaced anyway ----------------------------------------------------------------------
+
+fn replaced_anyway(song: AnywaySong) -> LibraryActionRequest {
+    LibraryActionRequest {
+        only_source: Some(DownloadSource::Soulseek),
+        anyway: Some(song),
+        ..better_quality()
+    }
+}
+
+fn plain_teardrop(length: i32) -> AnywaySong {
+    AnywaySong {
+        title: "Teardrop".into(),
+        album: None,
+        length: Some(length),
+        retitle: true,
+    }
+}
+
+#[tokio::test]
+async fn a_copy_replaced_anyway_goes_in_though_it_is_no_better_and_the_original_is_kept() {
+    let f = Fixture::new().await;
+    let action = spawn_apply(
+        &f.executor(true, None, None),
+        replaced_anyway(AnywaySong {
+            title: "Teardrop".into(),
+            album: Some("Mezzanine".into()),
+            length: Some(330),
+            retitle: false,
+        }),
+    );
+
+    let download = f.next_download().await;
+    assert_eq!(download.source_override, Some(DownloadSource::Soulseek));
+    // The same MP3 as the original: refused by Better quality, taken when the person said so.
+    let staged = f.staged(&mp3(), ".mp3");
+    let placed = reveal(&download, &staged)
+        .await
+        .expect("admitted though not better");
+    f.finish(&download, &placed);
+    let outcome = outcome_of(action).await;
+
+    assert_eq!(outcome.state, LibraryActionState::Applied, "{outcome:?}");
+    assert!(Path::new(&placed).exists());
+    // The original waits in the trash folder, and the journal says where.
+    let kept = f.quarantined();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(f.action().quarantine_path.as_deref(), Some(kept[0].as_str()));
+    assert_eq!(outcome.quarantine_path.as_deref(), Some(kept[0].as_str()));
+}
+
+#[tokio::test]
+async fn without_anyway_the_same_copy_is_refused_and_the_original_stays() {
+    let f = Fixture::new().await;
+    let action = spawn_apply(
+        &f.executor(true, None, None),
+        LibraryActionRequest {
+            only_source: Some(DownloadSource::Soulseek),
+            ..better_quality()
+        },
+    );
+
+    let download = f.next_download().await;
+    let staged = f.staged(&mp3(), ".mp3");
+    let refused = reveal(&download, &staged).await.expect_err("refused");
+    assert_eq!(refused.problem, "is not lossless");
+    f.fail(&download, anyhow::Error::new(refused));
+
+    assert_eq!(outcome_of(action).await.state, LibraryActionState::Failed);
+    assert!(Path::new(&f.original).exists());
+    assert!(f.quarantined().is_empty());
+}
+
+#[tokio::test]
+async fn a_replacement_anyway_is_looked_for_and_checked_as_the_song_it_was_picked_as() {
+    let f = Fixture::new().await;
+    // The library's file is another take; the copy is held to the plain song's name and length.
+    let action = spawn_apply(
+        &f.executor(true, None, None),
+        replaced_anyway(plain_teardrop(270)),
+    );
+
+    let download = f.next_download().await;
+    let routing = f
+        .ids
+        .lookup(&download.external_id)
+        .expect("the replacement's routing")
+        .snapshot();
+    assert_eq!(routing.title.as_deref(), Some("Teardrop"));
+    assert_eq!(routing.album, None);
+    assert_eq!(routing.duration, Some(270));
+    assert_eq!(routing.artist.as_deref(), Some("Massive Attack"));
+    f.fail(&download, not_found("no peer had it"));
+
+    assert_eq!(outcome_of(action).await.state, LibraryActionState::Failed);
+    assert!(Path::new(&f.original).exists());
+}
+
+/// An executor whose history check records the album the new file carried when Navidrome was
+/// asked whether the song kept its place, and at which path it asked.
+fn recording_history(
+    f: &Fixture,
+) -> (
+    Arc<LibraryActionExecutor>,
+    Arc<Mutex<Vec<(String, Option<String>)>>>,
+) {
+    let executor = f.executor(true, None, None);
+    let asked: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::default();
+    let heard = asked.clone();
+    executor.configure(move |seams| {
+        seams.shows_at = Some(Arc::new(move |_, path| {
+            let album = TagFile::open(&path).ok().and_then(|file| file.album());
+            heard.lock().push((path, album));
+            async { true }.boxed()
+        }));
+    });
+    (executor, asked)
+}
+
+async fn album_becomes(path: &str, album: &str) -> bool {
+    for _ in 0..200 {
+        if TagFile::open(path).ok().and_then(|file| file.album()).as_deref() == Some(album) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn another_take_replaced_anyway_takes_the_plain_songs_names_once_its_place_is_kept() {
+    let f = Fixture::new().await;
+    let (executor, asked) = recording_history(&f);
+    let action = spawn_apply(&executor, replaced_anyway(plain_teardrop(330)));
+
+    let download = f.next_download().await;
+    // The download tagged its file as the plain song before the original's identity went on.
+    download
+        .replacement
+        .as_ref()
+        .expect("a handoff")
+        .set_arrived(ArrivedTags {
+            title: Some("Teardrop".into()),
+            album: Some("Mezzanine (Studio)".into()),
+        });
+    let staged = f.staged(&mp3(), ".mp3");
+    {
+        let mut file = TagFile::open(&staged).expect("an MP3");
+        file.set_title(Some("Teardrop (Live)"));
+        file.set_album(Some("Live in Bristol"));
+        file.save().expect("saved");
+    }
+    let placed = reveal(&download, &staged).await.expect("admitted");
+    f.finish(&download, &placed);
+    assert_eq!(outcome_of(action).await.state, LibraryActionState::Applied);
+
+    assert!(
+        album_becomes(&placed, "Mezzanine (Studio)").await,
+        "the plain song's album"
+    );
+    let file = TagFile::open(&placed).expect("the new file");
+    assert_eq!(file.title().as_deref(), Some("Teardrop"));
+    // Navidrome was asked about this same path while the file still carried the identity it
+    // arrived with, and the new names went onto that path in place, where a song keeps its id.
+    let asked = asked.lock().clone();
+    assert!(!asked.is_empty());
+    assert!(asked.iter().all(|(path, _)| *path == placed), "{asked:?}");
+    assert!(
+        asked
+            .iter()
+            .all(|(_, album)| album.as_deref() != Some("Mezzanine (Studio)")),
+        "{asked:?}"
+    );
+    assert_eq!(placed, f.original, "the original's own path");
+}
+
+#[tokio::test]
+async fn a_same_quality_copy_replaced_anyway_keeps_the_old_names() {
+    let f = Fixture::new().await;
+    let (executor, asked) = recording_history(&f);
+    let action = spawn_apply(
+        &executor,
+        replaced_anyway(AnywaySong {
+            title: "Teardrop".into(),
+            album: Some("Mezzanine".into()),
+            length: Some(330),
+            retitle: false,
+        }),
+    );
+
+    let download = f.next_download().await;
+    download
+        .replacement
+        .as_ref()
+        .expect("a handoff")
+        .set_arrived(ArrivedTags {
+            title: Some("Teardrop".into()),
+            album: Some("Mezzanine (Studio)".into()),
+        });
+    let staged = f.staged(&mp3(), ".mp3");
+    {
+        let mut file = TagFile::open(&staged).expect("an MP3");
+        file.set_album(Some("Mezzanine"));
+        file.save().expect("saved");
+    }
+    let placed = reveal(&download, &staged).await.expect("admitted");
+    f.finish(&download, &placed);
+    assert_eq!(outcome_of(action).await.state, LibraryActionState::Applied);
+
+    until(|| !asked.lock().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        TagFile::open(&placed)
+            .ok()
+            .and_then(|file| file.album())
+            .as_deref(),
+        Some("Mezzanine")
+    );
 }
 
 // ---- Delete, dry run and the write-ahead rule --------------------------------------------

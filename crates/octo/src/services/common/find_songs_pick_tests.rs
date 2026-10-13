@@ -13,7 +13,7 @@ use octo_core::settings::{
 use tokio_util::sync::CancellationToken;
 
 use super::download_log_tests::upgrade_worker;
-use super::download_picks::{DownloadPicks, PickedCopy, SOULSEEK_SOURCE};
+use super::download_picks::{AnywaySong, DownloadPicks, PickedCopy, SOULSEEK_SOURCE};
 use super::song_finder::{
     FindSnapshot, FindTarget, FoundCopy, SearchAnswer, SongFinder, SongFinderServices, find_states,
     library_action_states,
@@ -36,6 +36,7 @@ struct Server {
     finder: Arc<SongFinder>,
     queue: Arc<UpgradeQueue>,
     picks: Arc<DownloadPicks>,
+    settings: Arc<SettingsStore>,
 }
 
 fn flac(peer: &str, rank: i32) -> FoundCopy {
@@ -98,7 +99,7 @@ fn build(target: FindTarget, acquisitions: Option<Arc<TrackAcquisitionQueue>>) -
     let finder = Arc::new(SongFinder::new(SongFinderServices {
         settings: Some(settings.clone()),
         upgrade_queue: Some(queue.clone()),
-        upgrade_sources: Some(Arc::new(UpgradeSources::new(settings, None))),
+        upgrade_sources: Some(Arc::new(UpgradeSources::new(settings.clone(), None))),
         executor: true,
         acquisitions,
         picks: Some(picks.clone()),
@@ -112,7 +113,12 @@ fn build(target: FindTarget, acquisitions: Option<Arc<TrackAcquisitionQueue>>) -
         seams.sources_for = Arc::new(|_| vec![(SOULSEEK_SOURCE.to_string(), None)]);
         seams.search_soulseek = Arc::new(|_, _| async { three_flacs() }.boxed());
     });
-    Server { finder, queue, picks }
+    Server {
+        finder,
+        queue,
+        picks,
+        settings,
+    }
 }
 
 async fn look(finder: &Arc<SongFinder>, user: &str) -> FindSnapshot {
@@ -292,6 +298,256 @@ async fn an_upgrade_lets_go_of_a_pick_it_never_used() {
     worker.drain().await;
 
     assert!(!picks.has("ext1"));
+}
+
+// ---- Replacing anyway ------------------------------------------------------------------------
+
+fn owned_flac() -> FindTarget {
+    FindTarget {
+        library_id: Some("nd-1".into()),
+        owned_format: Some("flac".into()),
+        owned_quality: Some("FLAC 16-bit 44.1 kHz".into()),
+        owned_path: Some("/music/Air/Moon Safari/02 - Sexy Boy.flac".into()),
+        ..FindTarget::new("Air", "Sexy Boy", Some("Moon Safari"), Some(298), "nd-1")
+    }
+}
+
+const SAME_QUALITY: &str = "This copy is FLAC like yours, so it is not better. Replace yours anyway?";
+
+#[tokio::test]
+async fn an_app_that_cannot_ask_hears_the_old_refusal_and_one_that_can_is_asked_first() {
+    let server = build(owned_flac(), None);
+    let look = look(&server.finder, "alice").await;
+    let copy = &look.copies[0].id;
+
+    let old = server.finder.pick_by_id(&look.id, copy, "alice").await;
+    assert_eq!(old.state, library_action_states::SKIPPED);
+    assert_eq!(
+        old.detail,
+        "Your copy is already lossless, so nothing would be better."
+    );
+
+    let asked = server
+        .finder
+        .pick_copy(&look.id, copy, "alice", Some(false))
+        .await;
+    assert_eq!(asked.state, library_action_states::CONFIRM);
+    assert_eq!(asked.detail, SAME_QUALITY);
+    assert!(
+        server.queue.snapshot().is_empty(),
+        "nothing is queued before the person says yes"
+    );
+
+    // Picking by place asks the same way.
+    let by_place = server.finder.pick_place(&look.id, 0, "alice", Some(false)).await;
+    assert_eq!(by_place.state, library_action_states::CONFIRM);
+}
+
+#[tokio::test]
+async fn replace_anyway_queues_the_copy_held_to_the_library_song_with_no_quality_check() {
+    let server = build(owned_flac(), None);
+    let look = look(&server.finder, "alice").await;
+
+    let picked = server
+        .finder
+        .pick_copy(&look.id, &look.copies[1].id, "alice", Some(true))
+        .await;
+
+    assert_eq!(picked.state, library_action_states::QUEUED, "{}", picked.detail);
+    let jobs = server.queue.snapshot();
+    assert_eq!(jobs.len(), 1);
+    let pick = jobs[0].pick.clone().expect("the pick");
+    assert_eq!(pick.peer.as_deref(), Some("peer2"));
+    assert_eq!(
+        pick.anyway,
+        Some(AnywaySong {
+            title: "Sexy Boy".into(),
+            album: Some("Moon Safari".into()),
+            length: Some(298),
+            retitle: false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_better_copy_asked_about_is_ready_and_then_an_ordinary_pick() {
+    let server = build(owned(), None);
+    let look = look(&server.finder, "alice").await;
+
+    let asked = server
+        .finder
+        .pick_copy(&look.id, &look.copies[0].id, "alice", Some(false))
+        .await;
+    assert_eq!(asked.state, library_action_states::READY);
+    assert!(server.queue.snapshot().is_empty(), "asking fetches nothing");
+    let compare = asked.compare.expect("the two copies");
+    assert_eq!(compare.yours.quality.as_deref(), Some("MP3"));
+    assert_eq!(compare.copy.quality.as_deref(), Some("FLAC"));
+    assert_eq!(compare.copy.length, Some(298));
+    assert_eq!(compare.copy.take, None);
+
+    let picked = server
+        .finder
+        .pick_copy(&look.id, &look.copies[0].id, "alice", Some(true))
+        .await;
+    assert_eq!(picked.state, library_action_states::QUEUED);
+    let jobs = server.queue.snapshot();
+    assert_eq!(jobs[0].pick.as_ref().and_then(|p| p.anyway.clone()), None);
+}
+
+#[tokio::test]
+async fn a_live_take_in_the_library_is_named_on_the_look_and_in_the_question() {
+    let target = FindTarget {
+        library_id: Some("nd-1".into()),
+        owned_format: Some("flac".into()),
+        owned_quality: Some("FLAC 16-bit 44.1 kHz".into()),
+        owned_path: Some("/music/Air/Live at the Olympia/05 - Sexy Boy (Live).flac".into()),
+        ..FindTarget::new(
+            "Air",
+            "Sexy Boy (Live)",
+            Some("Live at the Olympia"),
+            Some(402),
+            "nd-1",
+        )
+    };
+    let server = build(target, None);
+    let look = look(&server.finder, "alice").await;
+    assert_eq!(look.take, Some(super::replace_anyway::OtherTake::Live));
+
+    let asked = server
+        .finder
+        .pick_copy(&look.id, &look.copies[0].id, "alice", Some(false))
+        .await;
+    assert_eq!(asked.state, library_action_states::CONFIRM);
+    let compare = asked.compare.expect("the two copies");
+    assert_eq!(compare.yours.take.as_deref(), Some("live recording"));
+    assert_eq!(compare.yours.length, Some(402));
+    assert_eq!(compare.copy.take.as_deref(), Some("the plain song"));
+
+    let replaced = server
+        .finder
+        .pick_copy(&look.id, &look.copies[0].id, "alice", Some(true))
+        .await;
+    assert_eq!(replaced.state, library_action_states::QUEUED);
+    let song = server.queue.snapshot()[0]
+        .pick
+        .as_ref()
+        .and_then(|p| p.anyway.clone())
+        .expect("forced");
+    assert!(song.retitle);
+    assert_eq!(song.title, "Sexy Boy");
+}
+
+#[tokio::test]
+async fn the_wrong_song_is_refused_even_with_anyway() {
+    let server = build(owned_flac(), None);
+    server.finder.seams(|seams| {
+        seams.search_soulseek = Arc::new(|_, _| {
+            async {
+                let mut other = flac("peer1", 1);
+                let mut pick = (*other.pick).clone();
+                pick.file = Some(r"Music\Air\Moon Safari (1998)\04 - Kelly Watch the Stars.flac".into());
+                other.pick = Arc::new(pick);
+                Ok((vec![other], Vec::new(), None))
+            }
+            .boxed()
+        });
+    });
+    let look = look(&server.finder, "alice").await;
+
+    for anyway in [Some(false), Some(true)] {
+        let picked = server
+            .finder
+            .pick_copy(&look.id, &look.copies[0].id, "alice", anyway)
+            .await;
+        assert_eq!(picked.state, library_action_states::SKIPPED);
+        assert_eq!(
+            picked.detail,
+            "The file name does not match the title, so it cannot take the place of the one in your library."
+        );
+    }
+    assert!(server.queue.snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn someone_who_may_no_longer_replace_songs_is_told_so_and_never_asked() {
+    let server = build(owned_flac(), None);
+    let look = look(&server.finder, "alice").await;
+    let mut changed = (*server.settings.current()).clone();
+    changed.library_actions.allowed_users = vec!["bob".into()];
+    server.settings.set(changed);
+
+    for anyway in [Some(false), Some(true)] {
+        let picked = server
+            .finder
+            .pick_copy(&look.id, &look.copies[0].id, "alice", anyway)
+            .await;
+        assert_eq!(picked.state, library_action_states::SKIPPED);
+        assert_eq!(picked.detail, "alice is not on the library actions allowed list.");
+    }
+    assert!(server.queue.snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn the_upgrade_worker_hands_the_anyway_song_to_the_replacement() {
+    let queue = Arc::new(UpgradeQueue::new());
+    let picks = Arc::new(DownloadPicks::default());
+    let song = AnywaySong {
+        title: "Sexy Boy".into(),
+        album: None,
+        length: Some(298),
+        retitle: true,
+    };
+    queue.add(
+        vec![UpgradeAsk {
+            title: Some("Sexy Boy (Live)".into()),
+            artist: Some("Air".into()),
+            suffix: Some("flac".into()),
+            pick: Some(PickedCopy {
+                anyway: Some(song.clone()),
+                ..(*flac("peer1", 1).pick).clone()
+            }),
+            ..UpgradeAsk::new("nd-1")
+        }],
+        "alice",
+        "find",
+    );
+    let heard = Arc::new(parking_lot::Mutex::new(None));
+    let seen = heard.clone();
+    let worker = upgrade_worker(&queue, None, picks, move |request| {
+        *seen.lock() = Some((request.anyway.clone(), request.only_source));
+        LibraryActionOutcome::new(LibraryActionState::Failed, Some("not this time".into()))
+    });
+
+    worker.tick(&CancellationToken::new()).await;
+    worker.drain().await;
+
+    assert_eq!(
+        heard.lock().clone(),
+        Some((Some(song), Some(octo_core::settings::DownloadSource::Soulseek)))
+    );
+}
+
+#[test]
+fn a_pick_with_no_anyway_song_is_written_as_before() {
+    let plain = serde_json::to_string(&*flac("peer1", 1).pick).expect("json");
+    assert!(!plain.contains("Anyway"), "{plain}");
+    let forced = PickedCopy {
+        anyway: Some(AnywaySong {
+            title: "Sexy Boy".into(),
+            album: None,
+            length: Some(298),
+            retitle: false,
+        }),
+        ..(*flac("peer1", 1).pick).clone()
+    };
+    let text = serde_json::to_string(&forced).expect("json");
+    assert!(
+        text.contains(r#""Anyway":{"Title":"Sexy Boy","Album":null,"Length":298}"#),
+        "{text}"
+    );
+    let back: PickedCopy = serde_json::from_str(&text).expect("read back");
+    assert_eq!(back, forced);
 }
 
 // ---- How many looks run at once --------------------------------------------------------------

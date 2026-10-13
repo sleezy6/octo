@@ -22,6 +22,7 @@ use super::plumbing::{BROWSE_COOKIE_NAME, BROWSE_TOKEN_HEADER, ok, request_cooki
 use super::request_binding::{SIGN_IN_FIRST, error, split, utc, utc_opt};
 use crate::app::AppState;
 use crate::http::routes::RouteSet;
+use crate::services::subsonic::subsonic_response_builder::with_replaced;
 
 pub fn routes() -> RouteSet {
     RouteSet::new()
@@ -67,7 +68,7 @@ async fn trash(State(state): State<AppState>, request: Request) -> Response {
         .trash()
         .into_iter()
         .map(|song| {
-            json!({
+            let mut json = json!({
                 "id": song.id,
                 "title": song.title,
                 "artist": song.artist,
@@ -78,7 +79,9 @@ async fn trash(State(state): State<AppState>, request: Request) -> Response {
                 "sidecars": song.sidecars,
                 "key": song.key,
                 "blocksDownloads": song.blocks_downloads,
-            })
+            });
+            with_replaced(&mut json, &song);
+            json
         })
         .collect();
     ok(&json!({

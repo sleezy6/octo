@@ -107,6 +107,19 @@ pub fn fit_within(bytes: &[u8], max_side: u32) -> Vec<u8> {
     encode_jpeg(&resized, 92).unwrap_or_else(|| bytes.to_vec())
 }
 
+/// The picture shrunk to `max_side` on its longer side, the other side in proportion, as a
+/// JPEG at `quality`. None when it already fits or cannot be read, so the caller sends it as
+/// it is.
+pub fn shrink_to(bytes: &[u8], max_side: u32, quality: u8) -> Option<Vec<u8>> {
+    let (width, height) = measure(bytes)?;
+    if max_side == 0 || width.max(height) <= max_side {
+        return None;
+    }
+    let image = decode(bytes)?;
+    // Catmull-Rom: sharp enough for a shrink, and about a third quicker than Lanczos.
+    encode_jpeg(&image.resize(max_side, max_side, FilterType::CatmullRom), quality)
+}
+
 /// A 64-bit fingerprint of what a picture looks like (a difference hash: the picture shrunk to
 /// 9 by 8 greys, one bit per neighbor pair, set when the left one is darker). The same artwork
 /// at another size or compression comes out within a few bits; a different cover about half of
@@ -221,6 +234,17 @@ mod tests {
 
     fn jpeg(width: u32, height: u32) -> Vec<u8> {
         encode_jpeg(&DynamicImage::new_rgb8(width, height), 90).expect("encodes")
+    }
+
+    #[test]
+    fn shrinking_keeps_the_shape_and_leaves_small_pictures_alone() {
+        let wide = jpeg(1200, 600);
+        let small = shrink_to(&wide, 300, 85).expect("shrunk");
+        assert_eq!(measure(&small), Some((300, 150)));
+        assert_eq!(image::guess_format(&small).ok(), Some(ImageFormat::Jpeg));
+        assert!(shrink_to(&wide, 1200, 85).is_none());
+        assert!(shrink_to(&wide, 2000, 85).is_none());
+        assert!(shrink_to(b"not a picture", 300, 85).is_none());
     }
 
     #[test]

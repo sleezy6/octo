@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "about": "Octo's designed playlist covers, read by the phone, the desktop and the server so all three draw the same thing. Positions and sizes are shares of the cover's side (0 to 1, origin top left, y down) unless named Px. Colours are sRGB hex. Words are always white.",
   "fonts": {
     "family": "Inter 4.1 (rsms/inter v4.1, OFL-1.1), static Display cut",
@@ -77,7 +77,7 @@
     "box": 0.36,
     "veilGrow": 0.15,
     "shadow": { "alpha": 0.1, "offsets": [0.004, 0.006, 0.008] },
-    "heart": { "from": [0.5, 0.88], "lobe": [[0.06, 0.55], [0.06, 0.18], [0.5, 0.3]], "rule": "a cubic from `from` through lobe's two control points to its end, then the same mirrored left to right back to `from`" },
+    "heart": { "from": [0.5, 0.8211], "left": [[[0.4831, 0.8057], [0.4662, 0.7903], [0.4493, 0.7749]], [[0.269, 0.6115], [0.15, 0.5037], [0.15, 0.3714]], [[0.15, 0.2636], [0.2347, 0.1789], [0.3425, 0.1789]], [[0.4034, 0.1789], [0.4618, 0.2072], [0.5, 0.252]]], "rule": "cubics from `from` up the left side, each two control points and its end, the last ending at the top of the dip between the lobes; then the same cubics mirrored left to right and run backwards, down the right side to `from`" },
     "magnifier": { "center": [0.42, 0.42], "radius": 0.3, "stroke": 0.09, "handle": [[0.64, 0.64], [0.88, 0.88]], "handleWidth": 0.11, "rule": "a ring of `radius` stroked `stroke` wide, and a line `handleWidth` wide with round ends" },
     "copies": { "side": 0.56, "radius": 0.08, "back": [0.3, 0.1], "front": [0.12, 0.3], "stroke": 0.09, "gap": 0.06, "rule": "two rounded squares `side` wide with corners of `radius`, placed by their top left corners: the back one stroked `stroke` wide, the front one filled; the back's stroke is cut away within `gap` of the front square" }
   }

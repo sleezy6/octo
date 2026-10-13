@@ -592,7 +592,7 @@ async fn the_real_admin_ui_is_served_with_content_hash_etags() {
         ("/admin/admin.css", c_sharp_etag("wwwroot/admin/admin.css")),
         (
             "/Assets/octo_logo.png",
-            "\"KNN70wc7+BPdCgtpEGChPHWCHgn3iTsuDCEXScFLWoQ=\"".to_string(),
+            "\"Qptg3+qU6TXlwlGbzo6M68djiy8XJUt94wGNPAXBs14=\"".to_string(),
         ),
     ] {
         assert_eq!(assets.get(url).map(|a| a.etag()), Some(etag.as_str()), "{url}");

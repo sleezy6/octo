@@ -49,6 +49,27 @@ pub struct PickedCopy {
     pub release_guid: Option<String>,
     pub indexer_id: Option<i32>,
     pub release_title: Option<String>,
+
+    /// Set when the copy replaces a library file whatever its quality, because the person said
+    /// so: the song it is held to in place of the library file's own title, album and length.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anyway: Option<AnywaySong>,
+}
+
+/// The song a copy picked to replace a library file anyway is held to: the library file's own
+/// title, album and length, or the plain song when that file is another take of it (a live
+/// recording, another version, or a length far from the song's usual one).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct AnywaySong {
+    #[serde(deserialize_with = "state_file::null_as_default")]
+    pub title: String,
+    pub album: Option<String>,
+    pub length: Option<i32>,
+    /// The library file was another take: once the replacement keeps the song's place, its
+    /// title and album become the plain song's.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub retitle: bool,
 }
 
 impl Default for PickedCopy {
@@ -66,6 +87,7 @@ impl Default for PickedCopy {
             release_guid: None,
             indexer_id: None,
             release_title: None,
+            anyway: None,
         }
     }
 }
@@ -79,6 +101,11 @@ impl PickedCopy {
     /// Deezer's copy.
     pub fn is_deezer(&self) -> bool {
         dotnet::eq_ignore_case(&self.source, DEEZER_SOURCE)
+    }
+
+    /// Lidarr's own choice: not a Soulseek file, not Deezer's copy, and no release named.
+    pub fn is_lidarr_choice(&self) -> bool {
+        !self.is_soulseek() && !self.is_deezer() && self.release().is_none()
     }
 
     /// Where the download is to fetch this copy from.

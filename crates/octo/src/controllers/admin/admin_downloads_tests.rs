@@ -306,7 +306,7 @@ async fn find_songs_runs_as_the_signed_in_admin_and_only_they_can_follow_or_pick
             }
             .boxed()
         });
-        seams.fetch = Arc::new(move |_, copy, user| {
+        seams.fetch = Arc::new(move |_, copy, user, _| {
             heard
                 .lock()
                 .push((user, copy.pick.peer.clone().unwrap_or_default()));
@@ -394,6 +394,81 @@ async fn find_songs_runs_as_the_signed_in_admin_and_only_they_can_follow_or_pick
     );
     assert_eq!(finder.for_user("admin").len(), 2);
     assert!(finder.for_user("other-admin").is_empty());
+}
+
+#[tokio::test]
+async fn a_dashboard_pick_passes_anyway_through_and_relays_the_question() {
+    let dash = Dashboard::new();
+    let finder: Arc<SongFinder> = dash.state.song_finder.clone();
+    let asked: Arc<Mutex<Vec<Option<bool>>>> = Arc::default();
+    let heard = asked.clone();
+    finder.seams(|seams| {
+        seams.resolve = Arc::new(|id, _| {
+            let target = FindTarget {
+                external_id: Some(id.clone()),
+                ..FindTarget::new("Daft Punk", "Digital Love", None, None, id)
+            };
+            async move { Some(target) }.boxed()
+        });
+        seams.sources_for = Arc::new(|_| vec![("Soulseek".to_string(), None)]);
+        seams.search_soulseek = Arc::new(|_, _| {
+            async {
+                Ok((
+                    vec![FoundCopy::new(
+                        AcquisitionCandidate {
+                            source: "Soulseek".into(),
+                            peer: Some("peer1".into()),
+                            file: Some("Digital Love.flac".into()),
+                            format: Some("flac".into()),
+                            ..Default::default()
+                        },
+                        PickedCopy {
+                            peer: Some("peer1".into()),
+                            file: Some("/share/Digital Love.flac".into()),
+                            format: Some("flac".into()),
+                            ..Default::default()
+                        },
+                    )],
+                    Vec::new(),
+                    None,
+                ))
+            }
+            .boxed()
+        });
+        seams.fetch = Arc::new(move |_, _, _, ask| {
+            heard.lock().push(ask.anyway);
+            let outcome = match ask.anyway {
+                Some(false) => PickOutcome::new(library_action_states::CONFIRM, "Replace yours anyway?"),
+                _ => PickOutcome::new(library_action_states::QUEUED, "Getting the copy you picked."),
+            };
+            async move { Ok(outcome) }.boxed()
+        });
+    });
+    let admin = dash.token(Some("admin"));
+    let admin = admin.as_deref();
+    let started = dash
+        .post(admin, "/api/admin/find", &json!({ "id": "ext-1" }))
+        .await
+        .json();
+    let id = started["id"].as_str().expect("an id").to_string();
+    finder.wait(&id, Duration::from_secs(5)).await;
+    let pick = format!("/api/admin/find/{id}/pick");
+
+    let old = dash.post(admin, &pick, &json!({ "copy": "c1" })).await.json();
+    assert_eq!(old["state"], "queued");
+    let question = dash
+        .post(admin, &pick, &json!({ "copy": "c1", "anyway": false }))
+        .await
+        .json();
+    assert_eq!(question["state"], "confirm");
+    assert_eq!(question["detail"], "Replace yours anyway?");
+    let anyway = dash
+        .post(admin, &pick, &json!({ "copy": "c1", "anyway": true }))
+        .await
+        .json();
+    assert_eq!(anyway["state"], "queued");
+
+    assert_eq!(*asked.lock(), [None, Some(false), Some(true)]);
 }
 
 #[tokio::test]

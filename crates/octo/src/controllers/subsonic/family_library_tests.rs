@@ -14,6 +14,7 @@ use wiremock::matchers::{path, query_param};
 use wiremock::{Mock, MockServer};
 
 use crate::app::{AppState, TestServices};
+use crate::controllers::subsonic::downloads::pick_found_song;
 use crate::controllers::subsonic::extensions::apply_library_action;
 use crate::controllers::subsonic::playlists::mutate_playlist;
 use crate::controllers::subsonic::test_app::{NAVIDROME_OK, navidrome_json, query_of, settings};
@@ -242,4 +243,125 @@ async fn a_member_removes_only_their_own_songs_with_library_actions() {
     let body = edit.into_body().collect().await.expect("read").to_bytes();
     let answer: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
     assert_eq!(answer["subsonic-response"]["error"]["code"], 50);
+}
+
+/// A look by `user` at a library song held as FLAC, whose one copy is FLAC too.
+async fn a_look_at_a_shared_flac(state: &AppState, user: &str) -> (String, String) {
+    use futures::FutureExt;
+
+    use crate::services::common::PickedCopy;
+    use crate::services::common::song_finder::{FindTarget, FoundCopy};
+
+    state.song_finder.seams(|seams| {
+        seams.resolve = Arc::new(|_, _| {
+            async {
+                Some(FindTarget {
+                    library_id: Some("shared-1".into()),
+                    owned_format: Some("flac".into()),
+                    ..FindTarget::new(
+                        "Massive Attack",
+                        "Teardrop",
+                        Some("Mezzanine"),
+                        Some(331),
+                        "shared-1",
+                    )
+                })
+            }
+            .boxed()
+        });
+        seams.sources_for = Arc::new(|_| vec![("Soulseek".to_string(), None)]);
+        seams.search_soulseek = Arc::new(|_, _| {
+            async {
+                Ok((
+                    vec![FoundCopy::new(
+                        octo_core::models::download::AcquisitionCandidate {
+                            source: "Soulseek".into(),
+                            format: Some("flac".into()),
+                            ..Default::default()
+                        },
+                        PickedCopy {
+                            peer: Some("peer1".into()),
+                            file: Some(r"Music\Mezzanine\03 Teardrop.flac".into()),
+                            format: Some("flac".into()),
+                            length: Some(331),
+                            ..Default::default()
+                        },
+                    )],
+                    Vec::new(),
+                    None,
+                ))
+            }
+            .boxed()
+        });
+    });
+    let look = state
+        .song_finder
+        .start("shared-1", user, &tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("a look");
+    let found = state
+        .song_finder
+        .wait(&look.id, std::time::Duration::from_secs(10))
+        .await
+        .expect("the look");
+    (
+        look.id,
+        found
+            .copies
+            .first()
+            .map_or_else(|| "c1".to_string(), |c| c.id.clone()),
+    )
+}
+
+async fn pick_anyway(fixture: &Fixture, caller: FamilyCaller, search: &str, copy: &str) -> serde_json::Value {
+    let response = pick_found_song(
+        State(fixture.state.clone()),
+        fixture.request(
+            "pickFoundSong",
+            &format!("search={search}&copy={copy}&anyway=true"),
+            Some(caller),
+        ),
+    )
+    .await
+    .expect("answered");
+    let body = response.into_body().collect().await.expect("read").to_bytes();
+    let answer: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    answer["subsonic-response"]["pick"].clone()
+}
+
+#[tokio::test]
+async fn a_member_who_may_not_add_songs_cannot_replace_one_anyway() {
+    let fixture = Fixture::new().await;
+    let mut saver = member("dee", Preset::Listener, 5);
+    saver
+        .edits
+        .insert("AddToLibrary".into(), serde_json::json!("SaveOnly"));
+    fixture.state.family_store.upsert_member(saver.clone());
+    let (search, copy) = a_look_at_a_shared_flac(&fixture.state, "dee").await;
+
+    let pick = pick_anyway(
+        &fixture,
+        FamilyCaller::member("dee", Preset::Listener, saver.abilities()),
+        &search,
+        &copy,
+    )
+    .await;
+
+    assert_eq!(pick["state"], "skipped", "{pick}");
+    assert_eq!(
+        pick["detail"],
+        "Adding songs to your library is off for this account."
+    );
+    assert!(fixture.state.upgrade_queue.snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn a_member_who_asks_first_asks_and_never_replaces_anyway() {
+    let fixture = Fixture::new().await;
+    let (search, copy) = a_look_at_a_shared_flac(&fixture.state, "sam").await;
+
+    let pick = pick_anyway(&fixture, Fixture::sam(), &search, &copy).await;
+
+    assert_ne!(pick["state"], "confirm", "{pick}");
+    assert!(fixture.state.upgrade_queue.snapshot().is_empty(), "{pick}");
 }

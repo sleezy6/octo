@@ -23,6 +23,7 @@ pub mod library_snapshot;
 pub mod library_tag_edits;
 pub mod library_walk;
 pub mod library_write_gate;
+pub mod missing_rows;
 pub mod navidrome_playlist_api;
 pub mod navidrome_song_list;
 pub mod navidrome_song_path_resolver;
@@ -53,7 +54,7 @@ pub use library_action_executor::{
 pub use library_action_journal::{LibraryActionEntry, LibraryActionJournal, LibraryActionState};
 pub use library_action_playlist_provisioner::LibraryActionPlaylistProvisioner;
 pub use library_action_playlist_worker::LibraryActionPlaylistWorker;
-pub use library_action_quarantine::{LibraryActionQuarantine, QuarantineManifest, QuarantineResult};
+pub use library_action_quarantine::{LibraryActionQuarantine, QuarantineManifest, QuarantineResult, Swept};
 pub use library_action_rating_worker::{LibraryActionRatingWorker, RatingActionRequest};
 pub use library_edit_service::{
     LibraryEditOutcome, LibraryEditService, LibraryRescan, SongLookup, TrashedSong,
@@ -64,6 +65,7 @@ pub use library_review_sweep_worker::{
     ReviewSweepState, ReviewSweepStatus, ReviewSweepStore, SweepVerification,
 };
 pub use library_snapshot::LibrarySnapshot;
+pub use missing_rows::{Forgotten, MissingRows};
 pub use navidrome_playlist_api::NavidromePlaylistApi;
 pub use navidrome_song_list::NavidromeSongEntry;
 pub use navidrome_song_path_resolver::{NavidromeSongPathResolver, PathSource, ResolvedSongFile};

@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use super::library_action_journal::LibraryActionEntry;
 use super::library_action_journal::{LibraryActionJournal, LibraryActionState};
 use super::library_action_quarantine::LibraryActionQuarantine;
 use super::library_tag_edits::{
@@ -35,6 +36,7 @@ use super::library_write_gate::LibraryWriteGate;
 use super::navidrome_song_path_resolver::{
     NavidromeSongPathResolver, PathSource, ResolvedSongFile, get_full_path, is_inside,
 };
+use super::upgrade_queue::AudioSummary;
 use crate::services::common::base_download_service::BaseDownloadService;
 use crate::services::cover_art::{AlbumCoverQuery, FoundCover, IAlbumCoverFinder};
 use crate::services::fingerprint::DownloadVerificationService;
@@ -105,7 +107,20 @@ pub struct TrashedSong {
     pub blocks_downloads: bool,
     /// The song's own files (its lyrics) in the trash with it, by name.
     pub sidecars: Vec<String>,
+    /// For a file another one replaced, rather than one removed: both files described.
+    pub replaced: Option<ReplacedFiles>,
 }
+
+/// A replaced file in the trash and the one in the library in its place, each described from
+/// its own header ("FLAC 16-bit 44.1 kHz").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplacedFiles {
+    pub was: Option<String>,
+    pub now: Option<String>,
+}
+
+/// What a Put back answers when the file another one replaced was not kept.
+pub const NOT_KEPT_TEXT: &str = "Your old copy was not kept on this server, so there is nothing to put back.";
 
 /// The services the edits use, each optional.
 #[derive(Default, Clone)]
@@ -422,18 +437,21 @@ impl LibraryEditService {
         .await
     }
 
-    /// Puts a removed song back where it was, from the server's trash.
+    /// Puts a removed song back where it was, from the server's trash, or the file another one
+    /// replaced back in that one's place.
     pub async fn restore(&self, id: &str, username: &str) -> LibraryEditOutcome {
         let entry = self.actions.recent(usize::MAX).into_iter().find(|e| {
             e.navidrome_id == id
-                && e.action == LibraryAction::Delete
                 && !e.dry_run
                 && e.state == LibraryActionState::Applied
-                && e.quarantine_path.is_some()
+                && ((e.action == LibraryAction::Delete && e.quarantine_path.is_some()) || is_replacement(e))
         });
         let Some(entry) = entry else {
             return LibraryEditOutcome::new("skipped", "This song is not in the server's trash.");
         };
+        if entry.action != LibraryAction::Delete {
+            return self.put_back_replaced(&entry, username).await;
+        }
         let trashed = entry.quarantine_path.clone().unwrap_or_default();
         if !file_exists(&trashed) {
             return LibraryEditOutcome::new("failed", "The file is no longer in the server's trash.");
@@ -481,6 +499,163 @@ impl LibraryEditService {
         LibraryEditOutcome::new("applied", "Put back in your library.")
     }
 
+    /// Swaps the file a replacement took the place of back in: the file in the library now goes
+    /// to the trash (so it can be swapped in again the same way), the old one back in the
+    /// library, carrying the identity the song has now so Navidrome keeps it as the same song,
+    /// with its plays, favorites, ratings and playlist places. When the old file lands at
+    /// another path (another kind of file), its own names go back once Navidrome shows the
+    /// song there; at the same path they never left it.
+    async fn put_back_replaced(&self, entry: &LibraryActionEntry, username: &str) -> LibraryEditOutcome {
+        let old = entry.quarantine_path.clone().unwrap_or_default();
+        let now = entry.revealed_path.clone().unwrap_or_default();
+        if !file_exists(&old) {
+            return if self.settings.current().library_actions.keep_replaced_originals {
+                LibraryEditOutcome::new("failed", "The old file is no longer in the server's trash.")
+            } else {
+                LibraryEditOutcome::new("skipped", NOT_KEPT_TEXT)
+            };
+        }
+        if !file_exists(&now) {
+            return LibraryEditOutcome::new(
+                "failed",
+                "The file in your library now is missing, so nothing was swapped.",
+            );
+        }
+        if self.dry_run() {
+            return LibraryEditOutcome::new(
+                "rehearsed",
+                format!("Dry run: would put back {old} in place of {now}"),
+            );
+        }
+        let music_root = self.resolver.music_root();
+        let current = KeptIdentityTags::read(Path::new(&now), None);
+        let own = KeptIdentityTags::read(Path::new(&old), None);
+        let renamed = matches!((&current, &own), (Some(current), Some(own))
+            if KeptIdentityTags::pid_inputs(current) != KeptIdentityTags::pid_inputs(own));
+        if renamed
+            && let Some(current) = &current
+            && let Err(e) = KeptIdentityTags::apply(Path::new(&old), current)
+        {
+            return LibraryEditOutcome::new("failed", format!("Could not get the old file ready ({e})."));
+        }
+        let size = std::fs::metadata(&now).map(|m| m.len() as i64).unwrap_or(0);
+        let out = self.quarantine.move_file(
+            &ResolvedSongFile {
+                navidrome_id: entry.navidrome_id.clone(),
+                absolute_path: now.clone(),
+                size_bytes: size,
+                title: entry.title.clone(),
+                artist: entry.artist.clone(),
+                album: entry.album.clone(),
+                suffix: String::new(),
+                duration_seconds: None,
+                source: entry.resolution.unwrap_or(PathSource::NativeApi),
+                album_artist: None,
+            },
+            &music_root,
+            LibraryAction::BetterQuality,
+            username,
+        );
+        if !out.moved {
+            if renamed && let Some(own) = &own {
+                let _ = KeptIdentityTags::apply(Path::new(&old), own);
+            }
+            return LibraryEditOutcome::new(
+                "failed",
+                format!(
+                    "Could not move the file in your library now aside: {}.",
+                    out.error.as_deref().unwrap_or("")
+                ),
+            );
+        }
+        let newer = out.quarantine_path.clone().unwrap_or_default();
+        let back = self.quarantine.restore(&old, Some(&music_root));
+        if !back.moved {
+            // The library is never left without the song: the newer file goes back.
+            let undone = self.quarantine.restore(&newer, Some(&music_root));
+            if renamed && let Some(own) = &own {
+                let _ = KeptIdentityTags::apply(Path::new(&old), own);
+            }
+            return LibraryEditOutcome::new(
+                "failed",
+                format!(
+                    "Could not put the old file back: {}.{}",
+                    back.error.as_deref().unwrap_or(""),
+                    if undone.moved {
+                        " The song is as it was."
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        }
+        let restored = back.quarantine_path.clone().unwrap_or_default();
+        self.actions.complete(
+            &entry.key,
+            LibraryActionState::Restored,
+            Some(&format!("Put back by {username}.")),
+            None,
+            None,
+            None,
+        );
+        self.actions.record(LibraryActionEntry {
+            key: LibraryActionJournal::make_key(
+                LibraryAction::BetterQuality,
+                &entry.navidrome_id,
+                &format!("putback:{}", dotnet_ticks(Utc::now())),
+            ),
+            source_path: Some(now.clone()),
+            quarantine_path: Some(newer.clone()),
+            revealed_path: Some(restored.clone()),
+            state: LibraryActionState::Applied,
+            detail: Some(format!(
+                "Put back by {username}: the old copy took the newer one's place."
+            )),
+            username: username.to_string(),
+            at_utc: Utc::now(),
+            history_kept: None,
+            ..entry.clone()
+        });
+        self.actions.flush();
+        self.rescan.soon();
+        info!("{username} put back {restored} in place of {now}, which went to {newer}");
+        if renamed && let Some(own) = own {
+            if restored == now {
+                // The same path keeps the same song, so its own names go back at once.
+                if let Err(e) = KeptIdentityTags::apply(Path::new(&restored), &own) {
+                    warn!("The old names of {restored} could not be written back: {e}");
+                }
+                self.rescan.soon();
+            } else {
+                let (resolver, rescan, id) = (
+                    self.resolver.clone(),
+                    self.rescan.clone(),
+                    entry.navidrome_id.clone(),
+                );
+                tokio::spawn(async move {
+                    for _ in 0..120 {
+                        if resolver
+                            .resolve(&id)
+                            .await
+                            .is_some_and(|song| song.absolute_path == restored)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                    if let Err(e) = KeptIdentityTags::apply(Path::new(&restored), &own) {
+                        warn!("The old names of {restored} could not be written back: {e}");
+                    }
+                    rescan.soon();
+                });
+            }
+        }
+        LibraryEditOutcome::new(
+            "applied",
+            "Put back your old copy. The one that replaced it is in Recently removed.",
+        )
+    }
+
     /// The songs removed from the apps or the playlists that are still in the trash, newest first.
     pub fn trash(&self) -> Vec<TrashedSong> {
         let days = self
@@ -493,7 +668,7 @@ impl LibraryEditService {
             .recent(usize::MAX)
             .into_iter()
             .filter(|e| {
-                e.action == LibraryAction::Delete
+                (e.action == LibraryAction::Delete || is_replacement(e))
                     && !e.dry_run
                     && e.state == LibraryActionState::Applied
                     && e.quarantine_path.as_deref().is_some_and(file_exists)
@@ -522,6 +697,10 @@ impl LibraryEditService {
                     key: Some(e.key.clone()),
                     blocks_downloads: e.blocks_downloads(),
                     sidecars: self.quarantine.sidecar_names(&trashed),
+                    replaced: is_replacement(&e).then(|| ReplacedFiles {
+                        was: AudioSummary::describe(Some(&trashed)).0,
+                        now: AudioSummary::describe(e.revealed_path.as_deref()).0,
+                    }),
                 }
             })
             .collect()
@@ -956,6 +1135,12 @@ impl Drop for RescanHold {
             rescan.schedule();
         }
     }
+}
+
+/// A Better quality replacement that went in, whose current file is still where it went: what
+/// Put back swaps.
+fn is_replacement(entry: &LibraryActionEntry) -> bool {
+    entry.action == LibraryAction::BetterQuality && entry.revealed_path.as_deref().is_some_and(file_exists)
 }
 
 #[cfg(test)]

@@ -108,6 +108,7 @@ fn wanted_playlists_a_notice_playlist_named_like_an_action_is_never_a_command() 
 // ---- A sweep -----------------------------------------------------------------------------
 
 struct Sweep {
+    root: String,
     _dir: tempfile::TempDir,
     song: String,
     navidrome: MockServer,
@@ -192,26 +193,75 @@ async fn sweep_fixture(enabled: bool) -> Sweep {
     );
     let http = crate::services::http_client_factory::default_client();
     let identity = NavidromeIdentityService::new(settings.clone(), http.clone());
-    let worker = Arc::new(LibraryActionPlaylistWorker::new(
-        executor.clone(),
-        journal,
-        Arc::new(LibraryActionQuarantine::new(settings.clone())),
-        Arc::new(NavidromeSongPathResolver::new(
+    let admin =
+        crate::services::family::NavidromeAdmin::new(identity.clone(), http.clone(), settings.clone());
+    let worker = Arc::new(
+        LibraryActionPlaylistWorker::new(
+            executor.clone(),
+            journal,
+            Arc::new(LibraryActionQuarantine::new(settings.clone())),
+            Arc::new(NavidromeSongPathResolver::new(
+                identity.clone(),
+                Arc::new(crate::services::local::test_support::FakeLocalLibrary::default()),
+                http.clone(),
+                settings.clone(),
+            )),
             identity.clone(),
-            Arc::new(crate::services::local::test_support::FakeLocalLibrary::default()),
-            http.clone(),
-            settings.clone(),
-        )),
-        identity.clone(),
-        Arc::new(NavidromePlaylistApi::new(http, identity, settings.clone())),
-        settings,
-    ));
+            Arc::new(NavidromePlaylistApi::new(http, identity, settings.clone())),
+            settings,
+        )
+        .with_missing_rows(Arc::new(MissingRows::new(Arc::new(admin)))),
+    );
     Sweep {
+        root: root.to_string_lossy().into_owned(),
         _dir: dir,
         song: song.to_string_lossy().into_owned(),
         navidrome,
         worker,
     }
+}
+
+/// A file the trash deleted for good leaves no row behind in Navidrome; a song trashed today,
+/// which can still be put back, keeps its row.
+#[tokio::test]
+async fn a_sweep_removes_the_navidrome_rows_of_songs_the_trash_deleted_for_good() {
+    let f = sweep_fixture(true).await;
+    let old_day = (chrono::Utc::now() - chrono::TimeDelta::days(400)).format("%Y-%m-%d");
+    let old = format!("{}/.octo-trash/{old_day}", f.root);
+    std::fs::create_dir_all(&old).expect("old trash");
+    std::fs::write(format!("{old}/Old - Song.flac"), [1u8; 8]).expect("written");
+    std::fs::write(
+        format!("{old}/Old - Song.flac.octo-action.json"),
+        json!({"OriginalPath": format!("{}/Old - Song.flac", f.root), "NavidromeId": "nd-old",
+               "Action": "Delete", "Username": "alice", "AtUtc": "2025-01-01T00:00:00Z"})
+        .to_string(),
+    )
+    .expect("written");
+    Mock::given(method("GET"))
+        .and(path("/api/missing/nd-old"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "nd-old", "missing": true})))
+        .with_priority(1)
+        .mount(&f.navidrome)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/missing"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ids": ["nd-old"]})))
+        .with_priority(1)
+        .mount(&f.navidrome)
+        .await;
+
+    f.worker.sweep(&CancellationToken::new()).await;
+
+    assert!(!Path::new(&old).exists());
+    let requests = f.navidrome.received_requests().await.expect("recorded");
+    let removals: Vec<String> = requests
+        .iter()
+        .filter(|r| r.method == http::Method::DELETE && r.url.path() == "/api/missing")
+        .map(|r| r.url.query().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(removals, ["id=nd-old"]);
+    // The song trashed in this sweep can still be put back, so its row is never asked about.
+    assert!(!requests.iter().any(|r| r.url.path() == "/api/missing/nd-1"));
 }
 
 /// The owner's own playlist is applied, someone off the allowlist is ignored, and the track

@@ -4462,7 +4462,7 @@ document.getElementById('fetched-list')?.addEventListener('toggle', event => {
 // copy listed with its details and Octo's verdict, and the one picked fetched through the same
 // checks as any download. A library song's pick replaces its file through Better quality, so it
 // asks first. Started from the search box, or from a row anywhere a song is listed.
-const finder = { search: null, look: null, hint: {}, timer: null, shown: 40, token: 0 };
+const finder = { search: null, look: null, hint: {}, timer: null, shown: 40, token: 0, status: {} };
 const FIND_PAGE = 40;
 const findEl = id => document.getElementById(id);
 const findCover = (song, hint) => hint?.cover || (song?.coverArt ? `/api/admin/find/cover?id=${encodeURIComponent(song.coverArt)}` : '');
@@ -4544,6 +4544,7 @@ async function findSongs(id, hint = {}) {
   clearTimeout(finder.timer);
   const token = ++finder.token;
   finder.look = null;
+  finder.status = {};
   finder.hint = hint;
   finder.shown = FIND_PAGE;
   look.hidden = false;
@@ -4626,12 +4627,60 @@ function findCopyRow(c, song, cover, searching) {
       ${why}
     </div>
     <div class="dl-side">
-      <div class="dl-tags"><span class="dl-badge ${lossless ? 'flac' : 'mp3'}">${escapeHtml(format)}</span></div>
+      <div class="dl-tags"><span class="dl-badge ${lossless ? 'flac' : 'mp3'}">${escapeHtml(format)}</span>${c.vsYoursText ? `<span class="dl-badge state find-vs" aria-label="${escapeHtml(`${c.vsYoursText} in quality`)}">${escapeHtml(c.vsYoursText)}</span>` : ''}</div>
       ${facts.length ? `<div class="dl-sub">${escapeHtml(facts.join(' · '))}</div>` : ''}
       <button type="button" class="btn btn-sm ${ranked && c.rank === 1 ? 'btn-primary' : 'btn-ghost'}" data-find-pick="${escapeHtml(c.id)}"
         ${searching ? 'disabled title="Pick a copy once the search ends"' : ''}>Get this copy</button>
+      ${findStatusHtml(c.id)}
     </div>
   </div>`;
+}
+
+// What happened to a copy picked to replace the library's, kept across redraws of the list:
+// replacing (with the download's step), replaced (with Undo), or why it did not go in.
+function findStatusHtml(copyId) {
+  const status = finder.status?.[copyId];
+  if (!status) return '';
+  const glyph = { ok: 'i-check-circle-fill', error: 'i-x-circle-fill', info: 'i-info-fill', busy: 'i-circle-notch' }[status.kind] ?? 'i-info-fill';
+  const undo = status.undo ? ` <button type="button" class="btn btn-ghost btn-sm" data-find-undo="${escapeHtml(status.undo)}">${icon('i-arrow-counter-clockwise')}<span>Undo</span></button>` : '';
+  return `<div class="inline-note ${status.kind} find-status" role="status" data-find-status="${escapeHtml(copyId)}">${icon(glyph)}<span>${escapeHtml(status.text)}</span>${undo}</div>`;
+}
+
+function setFindStatus(copyId, status) {
+  finder.status = finder.status || {};
+  if (status) finder.status[copyId] = status; else delete finder.status[copyId];
+  const old = document.querySelector(`[data-find-status="${CSS.escape(copyId)}"]`);
+  const html = findStatusHtml(copyId);
+  if (old) { old.outerHTML = html; return; }
+  const pick = document.querySelector(`[data-find-pick="${CSS.escape(copyId)}"]`);
+  if (pick && html) pick.insertAdjacentHTML('afterend', html);
+}
+
+// Follows a library replacement on the upgrade queue until it ends, on the copy's own row.
+function followReplacement(copyId, libraryId, plain) {
+  const step = async () => {
+    if (!finder.look || finder.look.song?.libraryId !== libraryId) return;
+    let job = null;
+    try {
+      const response = await lossyFetch('/api/admin/upgrades');
+      if (response.ok) job = ((await response.json()).jobs || []).find(j => j.id === libraryId) || null;
+    } catch { /* tried again below */ }
+    const state = job?.state || 'queued';
+    if (['queued', 'waiting', 'working'].includes(state)) {
+      const pct = typeof job?.progress === 'number' ? ` ${Math.round(job.progress * 100)}%` : '';
+      const how = state === 'waiting' ? 'Waiting for Soulseek' : job?.note || (state === 'queued' ? 'Waiting its turn' : 'Getting it');
+      setFindStatus(copyId, { kind: 'busy', text: `Replacing...${pct} ${how}.` });
+      setTimeout(step, 2000);
+      return;
+    }
+    if (state === 'upgraded') {
+      setFindStatus(copyId, { kind: 'ok', text: `Replaced with ${plain ? 'the plain song' : 'the copy you picked'}. Put back stays in Recently removed.`, undo: libraryId });
+      loadAcquisitions();
+      return;
+    }
+    setFindStatus(copyId, { kind: 'error', text: `${job?.detail || 'The copy you picked did not replace yours. Your copy was kept.'} Details are in Downloads.` });
+  };
+  step();
 }
 
 function renderFindLook() {
@@ -4655,10 +4704,11 @@ function renderFindLook() {
     : searching ? stateBlock('loading', 'Asking every peer. This takes up to a minute.') : stateBlock('empty', 'No copies were found.');
   const failed = found.state === 'failed' && found.error ? `<div class="notice notice-warn">${escapeHtml(found.error)}</div>` : '';
   const replaces = song.libraryId && copies.length
-    ? `<p class="set-info-d">A copy you pick replaces the one in your library through Better quality: only a lossless copy can, and yours stays until the new one passes every check.</p>` : '';
+    ? `<p class="set-info-d">A copy you pick replaces the one in your library through Better quality. One that is no better than yours asks first, and yours stays until the new one passes every check.</p>` : '';
+  const take = song.libraryId && song.take ? `<div class="notice find-take" role="note">${escapeHtml(song.take)}</div>` : '';
   look.innerHTML = `${findTargetHead(song, finder.hint)}
     <div class="find-sources">${sources}</div>
-    ${failed}${replaces}${list}`;
+    ${failed}${take}${replaces}${list}`;
 }
 
 findEl('find-look')?.addEventListener('click', async event => {
@@ -4671,25 +4721,60 @@ findEl('find-look')?.addEventListener('click', async event => {
     return;
   }
   if (event.target.closest('#find-more')) { finder.shown += FIND_PAGE; renderFindLook(); return; }
+  const undo = event.target.closest('[data-find-undo]');
+  if (undo) {
+    const copyId = undo.closest('[data-find-status]')?.dataset.findStatus;
+    undo.disabled = true;
+    try {
+      const response = await parityFetch('/api/admin/trash/restore', parityJson({ id: undo.dataset.findUndo }), findEl('find-look'));
+      if (!response.ok) throw new Error(await parityError(response));
+      const body = await response.json().catch(() => ({}));
+      setFindStatus(copyId, { kind: body.state === 'applied' ? 'ok' : 'info', text: body.detail || 'Put back.' });
+    } catch (error) {
+      setFindStatus(copyId, { kind: 'error', text: error.message });
+    }
+    return;
+  }
   const pick = event.target.closest('[data-find-pick]');
   if (!pick || !finder.look) return;
   const found = finder.look;
   const song = found.song || {};
-  const copy = (found.candidate || []).find(c => c.id === pick.dataset.findPick);
-  if (song.libraryId) {
-    const what = [copy?.quality || (copy?.format || '').toUpperCase(), copy?.peer ? `from ${copy.peer}` : copy?.source].filter(Boolean).join(' ');
-    const yours = song.quality || (song.format || '').toUpperCase() || 'your copy';
-    if (!(await askConfirm(`Replace your copy of ${song.title}?`,
-      `Octo fetches ${what || 'this copy'} and puts it in place of your ${yours} once it passes every check. Your copy waits in the trash until then.`,
-      'Replace it'))) return;
-  }
+  const copyId = pick.dataset.findPick;
+  const copy = (found.candidate || []).find(c => c.id === copyId);
   pick.disabled = true;
   try {
-    const response = await parityFetch(`/api/admin/find/${encodeURIComponent(found.id)}/pick`, parityJson({ copy: pick.dataset.findPick }), findEl('find-look'));
-    if (!response.ok) throw new Error(await parityError(response));
-    const outcome = await response.json();
+    const send = async anyway => {
+      const response = await parityFetch(`/api/admin/find/${encodeURIComponent(found.id)}/pick`, parityJson({ copy: copyId, anyway }), findEl('find-look'));
+      if (!response.ok) throw new Error(await parityError(response));
+      return response.json();
+    };
+    // A library song is asked about first: nothing is fetched until the person says yes, and
+    // they are asked once, the way the answer calls for.
+    let outcome = await send(false);
+    let plain = false;
+    if (outcome.state === 'ready') {
+      const what = [copy?.quality || (copy?.format || '').toUpperCase(), copy?.peer ? `from ${copy.peer}` : copy?.source].filter(Boolean).join(' ');
+      const yours = song.quality || (song.format || '').toUpperCase() || 'your copy';
+      if (!(await askConfirm(`Replace your copy of ${song.title}?`,
+        `Octo fetches ${what || 'this copy'} and puts it in place of your ${yours} once it passes every check. Your copy waits in the trash until then.`,
+        'Replace it'))) return;
+      outcome = await send(true);
+    } else if (outcome.state === 'confirm') {
+      const side = (label, facts) => `${label}: ${[facts?.quality, parityLength(facts?.length), facts?.take].filter(Boolean).join(', ')}`;
+      const compare = outcome.compare
+        ? `${side('Yours', outcome.compare.yours)}\n${side('This copy', outcome.compare.copy)}\n\n` : '';
+      plain = outcome.compare?.copy?.take === 'the plain song';
+      const replace = await askDialog({ title: 'Replace your copy?', message: `${song.title}\n\n${compare}${outcome.detail}`, confirm: 'Replace anyway', cancel: 'Keep mine' });
+      if (!replace) { setFindStatus(copyId, { kind: 'info', text: 'Kept yours. Nothing was fetched.' }); return; }
+      outcome = await send(true);
+    }
     const queued = outcome.state === 'queued';
-    note(pick, song.libraryId && queued ? `${outcome.detail} Follow it on Better quality.` : outcome.detail, queued ? 'ok' : 'info');
+    if (song.libraryId && queued) {
+      setFindStatus(copyId, { kind: 'busy', text: 'Replacing...' });
+      followReplacement(copyId, song.libraryId, plain);
+    } else {
+      note(pick, outcome.detail, queued ? 'ok' : 'info');
+    }
     if (queued) loadAcquisitions();
   } catch (error) {
     note(pick, error.message, 'error');
@@ -4726,14 +4811,16 @@ async function loadTrash() {
     list.innerHTML = rehearsal + songs.map(song => {
       const left = trashLeft(song.goneAt);
       const sidecars = (song.sidecars || []).length ? `with ${song.sidecars.join(', ')}` : '';
-      const sub = [`Removed ${relTime(song.removedAt)} by ${song.removedBy || 'someone'}`, sidecars].filter(Boolean).join(' · ');
+      const replaced = song.kind === 'replaced';
+      const sub = [`${replaced ? 'Replaced' : 'Removed'} ${relTime(song.removedAt)} by ${song.removedBy || 'someone'}`, sidecars].filter(Boolean).join(' · ');
+      const both = replaced ? `<div class="dl-sub">Was ${escapeHtml(song.was || 'the old copy')}, now ${escapeHtml(song.now || 'the new copy')}. Put back swaps them.</div>` : '';
       return `<div class="dl-item trash-item">
         <div class="acq-art">${icon('i-trash')}</div>
         <div class="dl-main">
           <div class="dl-title">${escapeHtml(song.title || '?')}</div>
           <div class="dl-by">${[song.artist, song.album].filter(Boolean).map(escapeHtml).join(' <span class="dl-dash">·</span> ')}</div>
           <div class="dl-sub">${escapeHtml(sub)}</div>
-          ${song.blocksDownloads ? '<div class="dl-sub">Removed from disk, so a heart does not download it again.</div>' : ''}
+          ${both}${song.blocksDownloads ? '<div class="dl-sub">Removed from disk, so a heart does not download it again.</div>' : ''}
         </div>
         <div class="dl-side">
           <div class="dl-tags"><span class="dl-badge ${left.tone}">${escapeHtml(left.text)}</span></div>

@@ -1,5 +1,6 @@
 //! The Subsonic wire format: response shapes in XML and JSON, request parsing, model mapping.
 
+pub mod size_flag;
 pub mod subsonic_credential;
 pub mod subsonic_model_mapper;
 pub mod subsonic_request_parser;

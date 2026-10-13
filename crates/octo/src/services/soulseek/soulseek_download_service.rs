@@ -409,14 +409,16 @@ impl SoulseekDownloadService {
             &combine(&combine(&base.download_path(), INCOMING_FOLDER_NAME), "lidarr"),
             &new_guid(),
         );
-        // A release picked in Find songs is grabbed as it is, instead of Lidarr's own search.
+        // A release picked in Find songs is grabbed as it is, instead of Lidarr's own search. One
+        // the person said to take whatever its quality is taken in any quality.
         let external_id = song.external_id.clone().unwrap_or_default();
-        let picked = song
+        let taken = song
             .external_id
             .as_deref()
             .filter(|id| !id.is_empty())
-            .and_then(|id| base.services().picks.as_ref()?.take(id, LIDARR_SOURCE))
-            .and_then(|pick| pick.release());
+            .and_then(|id| base.services().picks.as_ref()?.take(id, LIDARR_SOURCE));
+        let lossless_only = lossless_only && taken.as_ref().is_none_or(|pick| pick.anyway.is_none());
+        let picked = taken.and_then(|pick| pick.release());
         let base_arc = base.arc();
         let step_id = external_id.clone();
         let request = LidarrTrackRequest {

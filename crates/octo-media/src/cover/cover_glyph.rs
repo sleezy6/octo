@@ -46,8 +46,9 @@ pub struct GlyphShadow {
 #[derive(Clone, Debug, Deserialize)]
 pub struct HeartNumbers {
     pub from: [f64; 2],
-    /// Two control points and the end of the left lobe's cubic.
-    pub lobe: [[f64; 2]; 3],
+    /// The cubics up the left side from `from`, each two control points and its end; the last
+    /// ends at the top of the dip between the lobes.
+    pub left: Vec<[[f64; 2]; 3]>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -219,22 +220,30 @@ pub fn drawing(glyph: CoverGlyph, side: i32, numbers: &GlyphNumbers) -> GlyphDra
     let steps = match glyph {
         CoverGlyph::Heart => {
             let h = &numbers.heart;
-            let [c1, c2, end] = h.lobe;
-            // The left lobe, then the same mirrored back to the point.
-            let left_lobe = [x(c1[0]), y(c1[1]), x(c2[0]), y(c2[1]), x(end[0]), y(end[1])];
-            let right_lobe = [
-                x(1.0 - c2[0]),
-                y(c2[1]),
-                x(1.0 - c1[0]),
-                y(c1[1]),
-                x(1.0 - h.from[0]),
-                y(h.from[1]),
-            ];
+            // Up the left side, then each cubic mirrored and run backwards down the right side:
+            // a reversed cubic swaps its control points and ends where it began.
+            let starts: Vec<[f64; 2]> = std::iter::once(h.from)
+                .chain(h.left.iter().map(|c| c[2]))
+                .collect();
+            let up = h
+                .left
+                .iter()
+                .map(|[c1, c2, end]| [x(c1[0]), y(c1[1]), x(c2[0]), y(c2[1]), x(end[0]), y(end[1])]);
+            let down = h.left.iter().zip(&starts).rev().map(|([c1, c2, _], start)| {
+                [
+                    x(1.0 - c2[0]),
+                    y(c2[1]),
+                    x(1.0 - c1[0]),
+                    y(c1[1]),
+                    x(1.0 - start[0]),
+                    y(start[1]),
+                ]
+            });
             vec![GlyphStep {
                 shape: GlyphShape::Curves {
                     x: x(h.from[0]),
                     y: y(h.from[1]),
-                    cubics: vec![left_lobe, right_lobe],
+                    cubics: up.chain(down).collect(),
                 },
                 add: true,
             }]

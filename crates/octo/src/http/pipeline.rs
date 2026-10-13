@@ -35,7 +35,7 @@ use crate::app::AppState;
 use crate::middleware::admin_sign_in_gate::GateState;
 use crate::middleware::{
     admin_guard, admin_headers, admin_port_split, admin_sign_in_gate, cors, exception, family_gate,
-    forwarded, request_log,
+    forwarded, request_log, size_flag,
 };
 use crate::services::you_tube::stream_size_warmer;
 
@@ -73,6 +73,7 @@ pub fn build_with_port(state: AppState, routes: RouteSet, admin_port: u16) -> Ap
         canon: Arc::new(canon.clone()),
     };
     let warmer = state.stream_size_warmer.clone();
+    let size_flag_state = state.clone();
     // The family gate reads the path after it is spelled as the routes spell it.
     let family_state = state.clone();
     let router = router.with_state(state);
@@ -85,6 +86,7 @@ pub fn build_with_port(state: AppState, routes: RouteSet, admin_port: u16) -> Ap
         .layer(from_fn_with_state(gate, admin_sign_in_gate::admin_sign_in_gate))
         .layer(from_fn(cors::cors))
         .layer(from_fn(exception::catch_panic))
+        .layer(from_fn_with_state(size_flag_state, size_flag::size_flag))
         // Each answer is one listing for the stream size warmer.
         .layer(from_fn_with_state(warmer, stream_size_warmer::listing_scope))
         .map_request(move |mut req: Request| {

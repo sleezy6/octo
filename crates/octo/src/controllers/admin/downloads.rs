@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use super::json_body::bind_optional_body;
-use super::json_body::{FromBody, Shape, text_record};
+use super::json_body::{FromBody, Kind, Member, Shape, text_record};
 use super::plumbing::{BROWSE_COOKIE_NAME, BROWSE_TOKEN_HEADER, request_cookie};
 use super::request_binding::{error, ok, query, sign_in, split};
 use crate::app::AppState;
@@ -31,7 +31,9 @@ use crate::http::routes::RouteSet;
 use crate::services::common::acquisition_tracker::AcquisitionSnapshot;
 use crate::services::local::DownloadHistoryService;
 use crate::services::soulseek::SoulseekMetadataService;
-use crate::services::subsonic::subsonic_response_builder::{acquisition_json, event_json, found_songs_json};
+use crate::services::subsonic::subsonic_response_builder::{
+    acquisition_json, event_json, found_songs_json, pick_json,
+};
 
 /// Outside songs a search on the Find songs page lists.
 pub const OUTSIDE_LIMIT: usize = 20;
@@ -120,16 +122,30 @@ impl FromBody for FindRequest {
     const SHAPE: &'static Shape = text_record!("Octo.Controllers.AdminDownloadsController+FindRequest", "id");
 }
 
-/// `PickRequest(string? Copy)`.
+/// `PickRequest(string? Copy, bool Anyway)`: `anyway` as the apps' pickFoundSong takes it, left out
+/// by a page that cannot ask.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct PickRequest {
     copy: Option<String>,
+    anyway: Option<bool>,
 }
 
 impl FromBody for PickRequest {
-    const SHAPE: &'static Shape =
-        text_record!("Octo.Controllers.AdminDownloadsController+PickRequest", "copy");
+    const SHAPE: &'static Shape = &Shape {
+        name: "Octo.Controllers.AdminDownloadsController+PickRequest",
+        by_constructor: true,
+        members: &[
+            Member {
+                name: "copy",
+                kind: Kind::Text,
+            },
+            Member {
+                name: "anyway",
+                kind: Kind::Bool,
+            },
+        ],
+    };
 }
 
 /// Starts a Find songs search for one song (an outside song's id or key, or a library song's
@@ -178,7 +194,8 @@ pub async fn get_find(
 
 /// Fetches exactly one copy the search listed, by its id there. A library song's copy goes
 /// through Better quality, so only someone on the library actions allowed list may pick one, and
-/// the original stays until the new file passes every check.
+/// the original stays until the new file passes every check. `anyway` asks first and then
+/// replaces anyway, as pickFoundSong's does.
 pub async fn pick_found(
     State(state): State<AppState>,
     Path(search): Path<String>,
@@ -192,11 +209,15 @@ pub async fn pick_found(
     let Some(user) = admin(&state, &parts.headers) else {
         return sign_in();
     };
-    let Some(copy) = request.and_then(|r| r.copy).filter(|copy| !is_blank(copy)) else {
+    let (copy, anyway) = request.map_or((None, None), |r| (r.copy, r.anyway));
+    let Some(copy) = copy.filter(|copy| !is_blank(copy)) else {
         return error(StatusCode::BAD_REQUEST, "Which copy? The copy is missing.");
     };
-    let outcome = state.song_finder.pick_by_id(&search, copy.trim(), &user).await;
-    ok(&json!({ "state": outcome.state, "detail": outcome.detail, "key": outcome.key }))
+    let outcome = state
+        .song_finder
+        .pick_copy(&search, copy.trim(), &user, anyway)
+        .await;
+    ok(&pick_json(&outcome))
 }
 
 /// Songs Octo can find outside the library for this search, the ones the apps' search lists
