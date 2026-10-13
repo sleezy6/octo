@@ -1,6 +1,7 @@
 //! Cover art from Apple's iTunes catalog. The barcode forms, which tagging reads too, are
 //! `octo_core::tagging::release_distance::barcode_forms`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -30,6 +31,7 @@ use tracing::{debug, info};
 use super::i_cover_art_source::ICoverArtSource;
 use crate::services::framework::HttpAnswer;
 use crate::services::framework::http::client_builder;
+use crate::services::metadata::deezer_metadata_service::recording_matches;
 
 /// The size asked of Apple's CDN for a master. It answers with the original when
 /// that is smaller, so this reads as "as large as there is". 5000, as sacad asks: 3000
@@ -49,6 +51,12 @@ const MASTER_URL_CAP: usize = 20_000;
 
 /// How often the matches are written to disk.
 const FLUSH_EVERY: Duration = Duration::from_secs(15);
+
+/// How long a song length (or Apple having none) is trusted before Apple is asked again.
+const SONG_LENGTH_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// Most remembered song lengths; the oldest go first.
+const SONG_LENGTH_CAP: usize = 20_000;
 
 static RELEASE_SUFFIX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\s+-\s+(?:Single|EP)\s*$").expect("the release suffix regex compiles"));
@@ -140,6 +148,10 @@ pub struct ITunesCoverArtLookup {
     /// Apple. Written at most every 15 seconds.
     cache_path: Option<PathBuf>,
     dirty: AtomicBool,
+
+    /// Song lengths Apple's catalog gave, and the songs it had none for, by artist, title and
+    /// ISRC, with when each was learned. In memory: a found length is kept on the song itself.
+    lengths: Mutex<HashMap<String, (Option<i32>, Instant)>>,
 }
 
 impl ITunesCoverArtLookup {
@@ -165,6 +177,7 @@ impl ITunesCoverArtLookup {
             master_urls: Mutex::new(IndexMap::new()),
             cache_path: cache_path.filter(|p| !dotnet::is_blank(&p.to_string_lossy())),
             dirty: AtomicBool::new(false),
+            lengths: Mutex::new(HashMap::new()),
         };
         lookup.load_cache();
         lookup
@@ -769,6 +782,104 @@ fn write_rows(path: &Path, rows: &[CachedMaster]) -> anyhow::Result<()> {
     std::fs::write(&tmp, octo_core::json::to_string(rows))?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+impl ITunesCoverArtLookup {
+    /// Apple's catalog length of a song, in seconds: the track its ISRC names when that is the
+    /// same recording, else the song search's first track that is (by
+    /// [`recording_matches`]: a karaoke, cover or live take by another name is not). `None` when
+    /// Apple has no such song or did not answer. Paced with every other Apple request.
+    pub async fn song_length(&self, artist: &str, title: &str, isrc: Option<&str>) -> Option<i32> {
+        if dotnet::is_blank(title) {
+            return None;
+        }
+        let isrc = isrc.and_then(SongIdentity::normalize_isrc);
+        let key = format!(
+            "{}|{}",
+            SongIdentity::match_key(artist, title),
+            isrc.as_deref().unwrap_or("")
+        );
+        if let Some((seconds, at)) = self.lengths.lock().get(&key).copied()
+            && at.elapsed() < SONG_LENGTH_TTL
+        {
+            return seconds;
+        }
+
+        let mut answered = true;
+        let mut found = None;
+        if let Some(code) = &isrc {
+            let url = format!(
+                "{}/lookup?isrc={}&entity=song",
+                self.base,
+                dotnet::escape_data_string(code)
+            );
+            match self.song_rows(&url).await {
+                Some(rows) => found = matching_length(&rows, artist, title),
+                None => answered = false,
+            }
+        }
+        if found.is_none() {
+            let url = format!(
+                "{}/search?term={}&entity=song&limit=10",
+                self.base,
+                dotnet::escape_data_string(&format!("{artist} {title}"))
+            );
+            match self.song_rows(&url).await {
+                Some(rows) => found = matching_length(&rows, artist, title),
+                None => answered = false,
+            }
+        }
+        // A miss is remembered only when Apple answered: one it refused is asked again.
+        if found.is_some() || answered {
+            let mut lengths = self.lengths.lock();
+            if lengths.len() >= SONG_LENGTH_CAP
+                && let Some(oldest) = lengths
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(k, _)| k.clone())
+            {
+                lengths.remove(&oldest);
+            }
+            lengths.insert(key, (found, Instant::now()));
+        }
+        found
+    }
+
+    /// The `results` of a song search or lookup, or `None` when Apple did not answer.
+    async fn song_rows(&self, url: &str) -> Option<Vec<Value>> {
+        let answer = match self.apple_get(url).await {
+            Ok(Some(answer)) if answer.is_success() => answer,
+            Ok(_) => return None,
+            Err(e) => {
+                debug!("Apple song search {url} failed: {e}");
+                return None;
+            }
+        };
+        let doc: Value = serde_json::from_str(&answer.text()).ok()?;
+        Some(doc.get("results")?.as_array()?.clone())
+    }
+}
+
+/// The length of the first row that is the recording asked for.
+fn matching_length(rows: &[Value], artist: &str, title: &str) -> Option<i32> {
+    rows.iter()
+        .filter(|row| {
+            row.get("kind")
+                .and_then(Value::as_str)
+                .is_none_or(|kind| kind == "song")
+        })
+        .filter(|row| {
+            recording_matches(
+                Some(artist),
+                Some(title),
+                row.get("artistName").and_then(Value::as_str),
+                row.get("trackName").and_then(Value::as_str),
+            )
+        })
+        .find_map(|row| {
+            let millis = row.get("trackTimeMillis").and_then(Value::as_i64)?;
+            i32::try_from((millis + 500) / 1000).ok().filter(|&s| s > 0)
+        })
 }
 
 #[cfg(test)]

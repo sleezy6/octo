@@ -831,6 +831,8 @@ async fn a_free_text_search_is_split_at_its_first_space() {
 struct LengthTables {
     deezer: Arc<Mutex<HashMap<String, i32>>>,
     last_fm: Arc<Mutex<HashMap<String, i32>>>,
+    /// Apple's catalog lengths, by "artist|title".
+    apple: Arc<Mutex<HashMap<String, i32>>>,
     video: Arc<Mutex<HashMap<String, i32>>>,
     /// The album Deezer names for a track, by "artist title".
     albums: Arc<Mutex<HashMap<String, String>>>,
@@ -955,6 +957,20 @@ impl LastFmTrackLengths for LastFmTable {
     }
 }
 
+/// Apple's catalog half of the fixture.
+struct AppleTable(LengthTables);
+
+#[async_trait]
+impl AppleTrackLengths for AppleTable {
+    async fn track_length(&self, artist: &str, title: &str, _isrc: Option<&str>) -> Option<i32> {
+        self.0
+            .requests
+            .lock()
+            .push(format!("apple?artist={artist}&title={title}"));
+        find_ignore_case(&self.0.apple.lock(), &format!("{artist}|{title}")).map(|(_, seconds)| seconds)
+    }
+}
+
 struct LengthFixture {
     tables: LengthTables,
     registry: Arc<ExternalIdRegistry>,
@@ -1002,6 +1018,18 @@ impl LengthFixture {
     fn last_fm(&self, key: &str, seconds: i32) -> &Self {
         self.tables.last_fm.lock().insert(key.into(), seconds);
         self
+    }
+
+    fn apple(&self, key: &str, seconds: i32) -> &Self {
+        self.tables.apple.lock().insert(key.into(), seconds);
+        self
+    }
+
+    /// The service, asking Apple's catalog after Deezer.
+    fn with_apple(&self) -> SoulseekMetadataService {
+        self.service
+            .clone()
+            .with_apple_lengths(Arc::new(AppleTable(self.tables.clone())))
     }
 
     fn video(&self, key: &str, seconds: i32) -> &Self {
@@ -2221,4 +2249,61 @@ async fn a_station_answer_looks_every_row_up_not_only_the_first_twenty() {
     for (i, song) in songs.iter().enumerate() {
         assert_eq!(song.duration, Some(200 + i as i32), "row {i}");
     }
+}
+
+// ---- Apple's catalog, after Deezer and before Last.fm ----
+
+#[tokio::test]
+async fn apple_gives_the_length_deezer_lacks_before_last_fm_is_asked() {
+    let fixture = LengthFixture::new().await;
+    fixture
+        .apple("Tove Lo|Stay High", 258)
+        .last_fm("Tove Lo|Stay High", 250);
+    let service = fixture.with_apple();
+    let mut songs = vec![fixture.search("Tove Lo", "Stay High").await];
+
+    service
+        .complete_song_lengths_within(&mut songs, Duration::from_secs(5))
+        .await;
+
+    assert_eq!(songs[0].duration, Some(258));
+    assert_eq!(fixture.shown(&songs[0]), (Some(258), LengthSource::Apple));
+    assert!(
+        !fixture.requests().iter().any(|r| r.starts_with("lastfm")),
+        "{:?}",
+        fixture.requests()
+    );
+}
+
+#[tokio::test]
+async fn last_fm_still_answers_when_apple_has_no_length() {
+    let fixture = LengthFixture::new().await;
+    fixture.last_fm("Kavinsky|Prelude", 95);
+    let service = fixture.with_apple();
+    let mut songs = vec![fixture.search("Kavinsky", "Prelude").await];
+
+    service
+        .complete_song_lengths_within(&mut songs, Duration::from_secs(5))
+        .await;
+
+    assert_eq!(songs[0].duration, Some(95));
+    assert_eq!(fixture.shown(&songs[0]), (Some(95), LengthSource::LastFm));
+    assert!(fixture.requests().iter().any(|r| r.starts_with("apple")));
+}
+
+#[tokio::test]
+async fn apple_is_not_asked_when_deezer_has_the_length() {
+    let fixture = LengthFixture::new().await;
+    fixture
+        .deezer("Justice Genesis", 234)
+        .apple("Justice|Genesis", 230);
+    let service = fixture.with_apple();
+    let mut songs = vec![fixture.search("Justice", "Genesis").await];
+
+    service
+        .complete_song_lengths_within(&mut songs, Duration::from_secs(5))
+        .await;
+
+    assert_eq!(fixture.shown(&songs[0]), (Some(234), LengthSource::Deezer));
+    assert!(!fixture.requests().iter().any(|r| r.starts_with("apple")));
 }

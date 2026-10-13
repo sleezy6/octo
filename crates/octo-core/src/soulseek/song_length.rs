@@ -4,11 +4,10 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::soulseek::soulseek_metadata_service::SoulseekRouting;
 
-/// Where the length shown for an outside song came from, weakest first. A shown length is
-/// only ever replaced by one from the same or a stronger source.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize_repr, Deserialize_repr,
-)]
+/// Where the length shown for an outside song came from. A shown length is only ever replaced
+/// by one from the same or a stronger source; strength is [`LengthSource::rank`], not the
+/// number a source is saved as (Apple came later, and is saved after the others).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize_repr, Deserialize_repr)]
 #[repr(i32)]
 pub enum LengthSource {
     /// Nothing is known. The song goes out with no length.
@@ -28,6 +27,36 @@ pub enum LengthSource {
 
     /// The length of the audio in a file downloaded for the song: what it really runs.
     File = 4,
+
+    /// Apple's catalog length for the matched track (the iTunes Search API). As trustworthy as
+    /// a catalog gets, below Deezer's, which is the catalog the song streams from.
+    Apple = 5,
+}
+
+impl LengthSource {
+    /// How far the source is trusted, weakest first.
+    pub fn rank(self) -> u8 {
+        match self {
+            LengthSource::None => 0,
+            LengthSource::Video => 1,
+            LengthSource::LastFm => 2,
+            LengthSource::Apple => 3,
+            LengthSource::Deezer => 4,
+            LengthSource::File => 5,
+        }
+    }
+}
+
+impl PartialOrd for LengthSource {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LengthSource {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
 }
 
 /// The rules for the length a client is shown for a song Octo found outside the library.
@@ -99,7 +128,7 @@ impl SongLength {
     }
 
     /// A length from a metadata source is known. A video length is only a
-    /// stand-in, and still worth asking Deezer and Last.fm about.
+    /// stand-in, and still worth asking Deezer, Apple and Last.fm about.
     pub fn has_metadata_length(routing: &SoulseekRouting) -> bool {
         Self::shown(routing).1 >= LengthSource::LastFm
     }
@@ -108,6 +137,19 @@ impl SongLength {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apple_ranks_between_last_fm_and_deezer() {
+        assert!(LengthSource::LastFm < LengthSource::Apple);
+        assert!(LengthSource::Apple < LengthSource::Deezer);
+        assert!(LengthSource::Deezer < LengthSource::File);
+        let mut r = routing("Tove Lo", "Habits");
+        assert!(SongLength::remember(&mut r, Some(258), LengthSource::Apple));
+        assert!(!SongLength::remember(&mut r, Some(250), LengthSource::LastFm));
+        assert!(SongLength::remember(&mut r, Some(252), LengthSource::Deezer));
+        assert!(!SongLength::remember(&mut r, Some(258), LengthSource::Apple));
+        assert!(SongLength::has_metadata_length(&r));
+    }
 
     fn routing(artist: &str, title: &str) -> SoulseekRouting {
         SoulseekRouting {

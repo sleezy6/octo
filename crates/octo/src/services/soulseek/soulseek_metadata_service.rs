@@ -46,6 +46,23 @@ pub trait LastFmTrackLengths: Send + Sync {
     async fn track_duration(&self, artist: &str, title: &str) -> Option<i32>;
 }
 
+/// Apple's catalog length of a song, in seconds, for the length lookup. A seam rather than the
+/// iTunes client.
+///
+/// Implemented by `ITunesCoverArtLookup`, which paces it with every other Apple request; tests
+/// substitute a fake.
+#[async_trait]
+pub trait AppleTrackLengths: Send + Sync {
+    async fn track_length(&self, artist: &str, title: &str, isrc: Option<&str>) -> Option<i32>;
+}
+
+#[async_trait]
+impl AppleTrackLengths for crate::services::cover_art::ITunesCoverArtLookup {
+    async fn track_length(&self, artist: &str, title: &str, isrc: Option<&str>) -> Option<i32> {
+        self.song_length(artist, title, isrc).await
+    }
+}
+
 /// Music metadata service for the YouTube-first / Soulseek-on-star architecture.
 ///
 /// Radio queue creation is YouTube-only and lightweight: one yt-dlp search per
@@ -79,6 +96,8 @@ struct Inner {
     deezer: Arc<DeezerMetadataService>,
     cover_art: Arc<CoverArtAggregator>,
     last_fm: Option<Arc<dyn LastFmTrackLengths>>,
+    /// Apple's catalog, asked after Deezer and before Last.fm; set once at startup.
+    apple: std::sync::OnceLock<Arc<dyn AppleTrackLengths>>,
 
     /// Ids with a lookup queued or running, so several clients loading one station
     /// at once do not each look its songs up again.
@@ -353,6 +372,7 @@ impl SoulseekMetadataService {
                 deezer,
                 cover_art,
                 last_fm,
+                apple: std::sync::OnceLock::new(),
                 length_lookups: Mutex::new(HashSet::new()),
                 last_length_warm: Mutex::new(None),
                 last_rows_finish: Mutex::new(None),
@@ -364,6 +384,12 @@ impl SoulseekMetadataService {
                 count_walks: InFlight::new(),
             }),
         }
+    }
+
+    /// Asks Apple's catalog for the lengths Deezer has none for, before Last.fm.
+    pub fn with_apple_lengths(self, apple: Arc<dyn AppleTrackLengths>) -> Self {
+        let _ = self.inner.apple.set(apple);
+        self
     }
 
     /// Outside songs play from Deezer, so the lengths their rows lack are asked of Deezer
@@ -899,6 +925,16 @@ impl Inner {
             .remember_length(id, meta.and_then(|m| m.duration), LengthSource::Deezer)
         {
             return;
+        }
+
+        // Apple's catalog next: as exact as Deezer's where it has the song, and it has many
+        // Deezer lacks. Paced to Apple's limit, so a long list waits its turn here.
+        if let Some(apple) = self.apple.get() {
+            let isrc = self.lookup(id).and_then(|routing| routing.lock().isrc.clone());
+            let seconds = apple.track_length(artist, title, isrc.as_deref()).await;
+            if self.id_registry.remember_length(id, seconds, LengthSource::Apple) {
+                return;
+            }
         }
 
         if let Some(last_fm) = self.last_fm.as_ref().filter(|l| l.has_api_key()) {

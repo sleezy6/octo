@@ -166,14 +166,22 @@ impl SoulseekRouting {
 /// number it does not know. Both that form and the plain number are read.
 const SHOWN_FROM_FILE: &str = "ShownFromFile";
 
+/// A length from Apple's catalog is written as Last.fm's number with `ShownFromApple` beside it,
+/// for the same reason: an older reader keeps the length, and ranks it as Last.fm's.
+const SHOWN_FROM_APPLE: &str = "ShownFromApple";
+
 impl<'de> Deserialize<'de> for SoulseekRouting {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
         let value = serde_json::Value::deserialize(deserializer)?;
         let from_file = value.get(SHOWN_FROM_FILE).and_then(serde_json::Value::as_bool) == Some(true);
+        let from_apple = value.get(SHOWN_FROM_APPLE).and_then(serde_json::Value::as_bool) == Some(true);
         let mut routing = SoulseekRouting::deserialize(value).map_err(D::Error::custom)?;
         if from_file && routing.shown_duration_source == LengthSource::Deezer {
             routing.shown_duration_source = LengthSource::File;
+        }
+        if from_apple && routing.shown_duration_source == LengthSource::LastFm {
+            routing.shown_duration_source = LengthSource::Apple;
         }
         Ok(routing)
     }
@@ -197,8 +205,11 @@ impl Serialize for SoulseekRouting {
         .filter(|known| *known)
         .count();
         let from_file = self.shown_duration_source == LengthSource::File;
-        let mut s =
-            serializer.serialize_struct("SoulseekRouting", 18 + stream_fields + usize::from(from_file))?;
+        let from_apple = self.shown_duration_source == LengthSource::Apple;
+        let mut s = serializer.serialize_struct(
+            "SoulseekRouting",
+            18 + stream_fields + usize::from(from_file) + usize::from(from_apple),
+        )?;
         s.serialize_field("Kind", &self.kind)?;
         s.serialize_field("YouTubeId", &self.you_tube_id)?;
         s.serialize_field("Artist", &self.artist)?;
@@ -214,6 +225,8 @@ impl Serialize for SoulseekRouting {
         s.serialize_field("ShownDuration", &self.shown_duration)?;
         if from_file {
             s.serialize_field("ShownDurationSource", &LengthSource::Deezer)?;
+        } else if from_apple {
+            s.serialize_field("ShownDurationSource", &LengthSource::LastFm)?;
         } else {
             s.serialize_field("ShownDurationSource", &self.shown_duration_source)?;
         }
@@ -243,6 +256,9 @@ impl Serialize for SoulseekRouting {
         if from_file {
             s.serialize_field(SHOWN_FROM_FILE, &true)?;
         }
+        if from_apple {
+            s.serialize_field(SHOWN_FROM_APPLE, &true)?;
+        }
         s.serialize_field("HasYouTube", &self.has_you_tube())?;
         s.serialize_field("HasArtistTitle", &self.has_artist_title())?;
         s.end()
@@ -270,6 +286,33 @@ mod tests {
         );
         let back: SoulseekRouting = serde_json::from_str(&json).expect("reads back");
         assert_eq!(back, routing);
+    }
+
+    #[test]
+    fn a_length_from_apple_is_written_as_last_fms_with_a_marker() {
+        let routing = SoulseekRouting {
+            title: Some("Habits".into()),
+            shown_duration: Some(258),
+            shown_duration_source: LengthSource::Apple,
+            ..Default::default()
+        };
+        let json = crate::json::to_string(&routing);
+        assert!(json.contains(r#""ShownDurationSource":2,"#), "{json}");
+        assert!(json.contains(r#""ShownFromApple":true"#), "{json}");
+        let back: SoulseekRouting = serde_json::from_str(&json).expect("reads back");
+        assert_eq!(back, routing);
+        // A Last.fm length stays Last.fm's, with no marker written.
+        let last_fm = SoulseekRouting {
+            shown_duration: Some(258),
+            shown_duration_source: LengthSource::LastFm,
+            ..Default::default()
+        };
+        let json = crate::json::to_string(&last_fm);
+        assert!(!json.contains("ShownFromApple"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<SoulseekRouting>(&json).expect("reads"),
+            last_fm
+        );
     }
 
     #[test]

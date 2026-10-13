@@ -238,3 +238,102 @@ async fn a_search_takes_the_hit_that_names_the_artist() {
 
     assert_eq!(cover.as_deref(), Some(&b"kino"[..]));
 }
+
+// ---- Song lengths from Apple's catalog ----
+
+fn song_row(artist: &str, title: &str, millis: i64) -> serde_json::Value {
+    serde_json::json!({ "kind": "song", "artistName": artist, "trackName": title, "trackTimeMillis": millis })
+}
+
+#[tokio::test]
+async fn a_song_length_skips_karaoke_and_covers_for_the_recording_asked_for() {
+    set_apple_interval(Duration::ZERO);
+    let server = MockServer::start().await;
+    Mock::given(path("/search"))
+        .and(query_param("entity", "song"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [
+            song_row("Brass Tax Hit Makers", "Stay High (Originally Performed by Tove Lo) [Karaoke Version]", 258_000),
+            song_row("Tove Lo", "Habits (Stay High) [Oliver Nelson Remix]", 252_000),
+            song_row("Tove Lo", "Stay High", 257_600),
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let lookup = ITunesCoverArtLookup::with_base_url(None, &server.uri(), Clock::system());
+
+    assert_eq!(lookup.song_length("Tove Lo", "Stay High", None).await, Some(258));
+    // Remembered: asked once.
+    assert_eq!(lookup.song_length("Tove Lo", "Stay High", None).await, Some(258));
+}
+
+#[tokio::test]
+async fn a_song_length_tries_the_isrc_first_and_remembers_a_miss() {
+    set_apple_interval(Duration::ZERO);
+    let server = MockServer::start().await;
+    Mock::given(path("/lookup"))
+        .and(query_param("isrc", "SEUM71400750"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [
+                song_row("Tove Lo", "Habits (Stay High)", 209_000),
+            ]})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [] })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let lookup = ITunesCoverArtLookup::with_base_url(None, &server.uri(), Clock::system());
+
+    assert_eq!(
+        lookup
+            .song_length("Tove Lo", "Habits (Stay High)", Some("SEUM71400750"))
+            .await,
+        Some(209)
+    );
+    // No ISRC and no match: a miss, asked about once.
+    assert_eq!(lookup.song_length("Nobody", "Nothing", None).await, None);
+    assert_eq!(lookup.song_length("Nobody", "Nothing", None).await, None);
+}
+
+#[tokio::test]
+async fn a_refused_song_length_is_not_remembered() {
+    set_apple_interval(Duration::ZERO);
+    let server = MockServer::start().await;
+    Mock::given(path("/search"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let lookup = ITunesCoverArtLookup::with_base_url(None, &server.uri(), Clock::system());
+
+    assert_eq!(lookup.song_length("Tove Lo", "Stay High", None).await, None);
+    assert_eq!(lookup.song_length("Tove Lo", "Stay High", None).await, None);
+}
+
+/// Apple's real answer for Tove Lo's "Stay High" (2026-10-12), asked for under the title Last.fm
+/// gives the Hippie Sabotage remix: only that remix may answer, not "Habits" or another remix.
+#[test]
+fn the_habits_remix_is_matched_under_last_fms_title() {
+    let rows = vec![
+        song_row("Tove Lo", "Habits (Stay High)", 209_160),
+        song_row(
+            "Tove Lo",
+            "Habits (Stay High) [The Chainsmokers Radio Edit]",
+            264_920,
+        ),
+        song_row("Tove Lo", "Habits (Stay High) [Oliver Nelson Remix]", 252_093),
+        song_row("Miro Mas", "Stay High", 191_820),
+        song_row(
+            "Tove Lo",
+            "Stay High (feat. Hippie Sabotage) [Habits Remix]",
+            257_889,
+        ),
+    ];
+    assert_eq!(
+        matching_length(&rows, "Tove Lo", "Stay High - Habits Remix"),
+        Some(258)
+    );
+    assert_eq!(matching_length(&rows, "Tove Lo", "Habits (Stay High)"), Some(209));
+}

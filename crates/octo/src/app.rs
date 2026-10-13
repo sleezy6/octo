@@ -135,7 +135,7 @@ use crate::services::sonic::{
     ISonicClient, NavidromeSonicLibrary, SonicAnalysisWorker, SonicClient, SonicStore, TransitionStore,
 };
 use crate::services::soulseek::soulseek_download_service::{SoulseekDownloadParts, SoulseekDownloadService};
-use crate::services::soulseek::soulseek_metadata_service::LastFmTrackLengths;
+use crate::services::soulseek::soulseek_metadata_service::{AppleTrackLengths, LastFmTrackLengths};
 use crate::services::soulseek::{
     ExternalIdRegistry, ISlskdShares, ISoulseekLink, RadioQueueStore, RejectedPeerRegistry, SoulseekClient,
     SoulseekLink, SoulseekMetadataService, SoulseekPortCheck, SoulseekShareSwitch, SoulseekSharing,
@@ -1787,11 +1787,14 @@ struct SoulseekServices {
 }
 
 impl SoulseekServices {
+    /// `apple_lengths`: ask Apple's catalog for the song lengths Deezer lacks. Off in the test
+    /// app, whose clients point at the real hosts and must not be asked anything.
     fn build(
         settings: &Arc<SettingsStore>,
         stores: &Stores,
         clients: &MetadataClients,
         last_fm: &Arc<LastFmService>,
+        apple_lengths: bool,
     ) -> Self {
         // The client deliberately keeps the address and login Octo started with.
         let client = SoulseekClient::new(&settings.current().soulseek);
@@ -1808,8 +1811,8 @@ impl SoulseekServices {
             port_check,
             share_switch,
             link: Arc::new(SoulseekLink::new(client.clone(), Arc::clone(settings))),
-            metadata: Arc::new(
-                SoulseekMetadataService::new(
+            metadata: Arc::new({
+                let metadata = SoulseekMetadataService::new(
                     Arc::clone(&stores.you_tube_resolver),
                     Arc::clone(&stores.external_id_registry),
                     Arc::clone(&clients.deezer_metadata),
@@ -1823,8 +1826,15 @@ impl SoulseekServices {
                         .current()
                         .deezer_stream_when(stores.you_tube_resolver.is_on())
                         .is_some(),
-                ),
-            ),
+                );
+                if apple_lengths {
+                    metadata.with_apple_lengths(
+                        Arc::clone(&clients.itunes_cover_art) as Arc<dyn AppleTrackLengths>
+                    )
+                } else {
+                    metadata
+                }
+            }),
             validator: Arc::new(SoulseekStartupValidator::new(settings, client.clone())),
             client,
         }
@@ -2671,7 +2681,7 @@ impl AppState {
             }
         });
         let integrations = Integrations::build(&settings, &settings_writer, &clients.deezer_metadata, None);
-        let soulseek = SoulseekServices::build(&settings, &stores, &clients, &integrations.last_fm);
+        let soulseek = SoulseekServices::build(&settings, &stores, &clients, &integrations.last_fm, true);
         let metadata_service: Arc<dyn IMusicMetadataService> = soulseek.metadata.clone();
         // The Share my library switch: keeps slskd.yml's share list to it, and checks every 10
         // minutes.
@@ -3065,7 +3075,7 @@ impl AppState {
             &clients.deezer_metadata,
             overrides.last_fm_base_url.as_deref(),
         );
-        let soulseek = SoulseekServices::build(&settings, &stores, &clients, &integrations.last_fm);
+        let soulseek = SoulseekServices::build(&settings, &stores, &clients, &integrations.last_fm, false);
         let metadata_service: Arc<dyn IMusicMetadataService> = overrides
             .metadata
             .clone()
