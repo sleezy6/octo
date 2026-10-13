@@ -356,7 +356,13 @@ async fn try_serve_native_external_song(state: &AppState, endpoint: &str) -> Opt
     // The video's length above is what plays, so it stays; only a song still without a
     // length takes one the registry remembered.
     if one[0].duration.is_none_or(|d| d <= 0) {
-        state.metadata_service.complete_song_lengths(&mut one);
+        state
+            .metadata_service
+            .complete_song_lengths_within(
+                &mut one,
+                crate::controllers::subsonic::playlists::STATION_LENGTH_WAIT,
+            )
+            .await;
     }
 
     let body = octo_core::json::to_string(&native_song_object(state, &one[0]));

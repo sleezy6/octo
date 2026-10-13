@@ -70,8 +70,13 @@ pub async fn get_song(State(state): State<AppState>, req: Request) -> AppResult 
     // The routing's own length is the one that plays, so it stays; only a song without
     // one takes the length the registry remembered for display.
     let mut one = [song];
+    // Someone is waiting on this answer (a player reads the song's length from it when the
+    // track starts), so the lookups get a few seconds now instead of the next answer.
     if one[0].duration.is_none_or(|d| d <= 0) {
-        state.music_metadata.complete_song_lengths(&mut one);
+        state
+            .music_metadata
+            .complete_song_lengths_within(&mut one, super::playlists::STATION_LENGTH_WAIT)
+            .await;
     }
     // Nothing known at all: look it up now, since this answer is all the client will show.
     if one[0].duration.is_none_or(|d| d <= 0) {
