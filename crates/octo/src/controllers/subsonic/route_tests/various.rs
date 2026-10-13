@@ -1002,13 +1002,16 @@ async fn get_song_an_outside_song_with_no_known_length_takes_its_videos_length()
 async fn a_played_outside_song_remembers_the_length_of_the_video_that_played() {
     let fixture = length_fixture().await;
     let ids = station_song_ids(&fixture, &[("Nobody", "Nothing")]).await;
+    // Before the video exists: getSong now waits for the length lookups, and the station's
+    // prewarm runs meanwhile, so a video findable this early could pin its length before any
+    // play (the race this test lost once in CI).
+    let before = song_by_id(&fixture, &ids["Nothing"]).await;
+    assert!(before.get("duration").is_none(), "{before}");
     fixture
         .upstream
         .played_video
         .lock()
         .insert("Nobody Nothing".into(), 199);
-    let before = song_by_id(&fixture, &ids["Nothing"]).await;
-    assert!(before.get("duration").is_none(), "{before}");
 
     let stream = get(
         &fixture.app,
