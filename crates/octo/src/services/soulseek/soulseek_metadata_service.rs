@@ -882,9 +882,11 @@ impl Inner {
             // it costs a second request per album and no row shows it.
             for (id, artist, title) in queued {
                 // Best-effort; the song keeps the placeholder until next time.
-                let _ =
-                    tokio::time::timeout(LENGTH_LOOKUP_TIMEOUT, this.look_up_length(&id, &artist, &title))
-                        .await;
+                let _ = tokio::time::timeout(
+                    LENGTH_LOOKUP_TIMEOUT,
+                    this.look_up_length(&id, &artist, &title, true),
+                )
+                .await;
                 this.length_lookups.lock().remove(&id);
             }
         });
@@ -909,17 +911,22 @@ impl Inner {
                 if !this.length_lookups.lock().insert(id.clone()) {
                     return;
                 }
-                let _ =
-                    tokio::time::timeout(LENGTH_LOOKUP_TIMEOUT, this.look_up_length(&id, &artist, &title))
-                        .await;
+                let _ = tokio::time::timeout(
+                    LENGTH_LOOKUP_TIMEOUT,
+                    this.look_up_length(&id, &artist, &title, false),
+                )
+                .await;
                 this.length_lookups.lock().remove(&id);
             }
         });
         futures::future::join_all(tasks).await;
     }
 
-    async fn look_up_length(&self, id: &str, artist: &str, title: &str) {
-        let meta = self.deezer.enrich_track(artist, title, false, true).await;
+    /// `background` picks the Deezer lane: a list a client is waiting on asks on the
+    /// interactive lane (`false`), the fire-and-forget warm pass on the background lane. The
+    /// video guess at the end stays background work either way.
+    async fn look_up_length(&self, id: &str, artist: &str, title: &str, background: bool) {
+        let meta = self.deezer.enrich_track(artist, title, false, background).await;
         if self
             .id_registry
             .remember_length(id, meta.and_then(|m| m.duration), LengthSource::Deezer)
