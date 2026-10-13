@@ -27,6 +27,12 @@ concurrency:
 
 env:
   DOTNET_VERSION: "9.0.x"
+  # The octo test binary outgrew the memory of the runner a private repository gets (2 cores,
+  # 7 GB): with debug info the link was killed mid-build ("The runner has received a shutdown
+  # signal"). Tests need no debug info, and line numbers in a panic still show without it.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   # The Rust server: the workspace in Cargo.toml, crates/.

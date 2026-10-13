@@ -15,7 +15,7 @@ services:
   # ghcr.io), build octo-source, at the end of this file. Octo is written in Rust; the
   # environment below and the config folder are the ones the C# Octo read, unchanged.
   octo:
-    image: ghcr.io/sleezy6/octo:${OCTO_IMAGE_TAG:-main}
+    image: ghcr.io/sleezy6/octo:${OCTO_IMAGE_TAG:-2026.10.13}
     container_name: octo
     restart: unless-stopped
     logging: *logging
@@ -382,7 +382,7 @@ services:
   # Pulled, not built, like Octo, and at the same tag, so the two always match.
   # Without access to ghcr.io, build it from this folder with yt-dlp-shim-source (below).
   yt-dlp-shim:
-    image: ghcr.io/sleezy6/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-main}
+    image: ghcr.io/sleezy6/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.13}
     container_name: yt-dlp-shim
     restart: unless-stopped
     logging: *logging
@@ -438,7 +438,7 @@ services:
   # Pulled, not built, like the shim: compiling it (Rust and FFmpeg) takes minutes and more
   # memory than a small machine has. octo-sonic-source (below) builds it from this folder.
   octo-sonic:
-    image: ghcr.io/sleezy6/octo-sonic:${OCTO_IMAGE_TAG:-main}
+    image: ghcr.io/sleezy6/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.13}
     container_name: octo-sonic
     restart: unless-stopped
     logging: *logging
@@ -536,15 +536,15 @@ services:
   # nothing, which is what an older update helper runs; that keeps even the update to this
   # release from compiling anything.
   octo-source:
-    image: ghcr.io/sleezy6/octo:${OCTO_IMAGE_TAG:-main}
+    image: ghcr.io/sleezy6/octo:${OCTO_IMAGE_TAG:-2026.10.13}
     build: .
     profiles: ["source"]
   yt-dlp-shim-source:
-    image: ghcr.io/sleezy6/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-main}
+    image: ghcr.io/sleezy6/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.13}
     build: ./yt-dlp-shim
     profiles: ["source"]
   octo-sonic-source:
-    image: ghcr.io/sleezy6/octo-sonic:${OCTO_IMAGE_TAG:-main}
+    image: ghcr.io/sleezy6/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.13}
     build: ./sonic
     profiles: ["source"]
 
