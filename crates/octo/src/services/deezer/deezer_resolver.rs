@@ -403,6 +403,17 @@ impl DeezerResolver {
             anyhow::bail!("Invalid Deezer track ID.");
         }
         let settings = self.deezer_settings();
+        // An address already held is handed back without queueing: a seek into the song that is
+        // playing must not wait behind another song's sign-in and lookups.
+        for arl in settings
+            .accounts()
+            .into_iter()
+            .filter(|arl| !rejected_accounts.contains(arl))
+        {
+            if let Some(cached) = self.media_cache.get(&Self::media_key(&arl, track_id, quality)) {
+                return Ok(cached);
+            }
+        }
         let _gate = self.media_gate.lock().await;
         for arl in settings
             .accounts()

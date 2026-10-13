@@ -92,6 +92,8 @@ pub struct InvalidOperationException(pub String);
 /// No copy found, or the copy found is gone. Reported as an `io::Error` of kind `NotFound`, which
 /// is how the library-action executor recognizes "no copy here".
 /// What a Deezer download says while no account is set.
+/// What a download from YouTube says when YouTube is switched off.
+pub const YOUTUBE_OFF: &str = "YouTube is off (YouTube:Enabled is false).";
 pub const DEEZER_NOT_SET_UP: &str = "Deezer is not set up (no ARL in the Deezer settings).";
 
 fn file_not_found(message: String) -> anyhow::Error {
@@ -458,6 +460,10 @@ impl SoulseekDownloadService {
         let download_path = base.download_path();
         if download_path.is_empty() {
             return Err(InvalidOperationException("DownloadPath is not configured".into()).into());
+        }
+
+        if !self.youtube.is_on() {
+            return Err(InvalidOperationException(YOUTUBE_OFF.to_string()).into());
         }
 
         let provider = base.provider_name().to_string();
@@ -2433,7 +2439,9 @@ impl DownloadBackend for SoulseekDownloadService {
                     .await
                 {
                     Ok(path) => Ok(path),
-                    Err(e) if !cancellation_token.is_cancelled() => {
+                    // With YouTube off there is nothing to fall back to, and Soulseek's own
+                    // failure is the answer.
+                    Err(e) if !cancellation_token.is_cancelled() && self.youtube.is_on() => {
                         warn!("Soulseek download failed ({e}); falling back to YouTube MP3");
                         if !download.suppress_notify {
                             base.notifications().notify(NotificationEvent {

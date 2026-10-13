@@ -1214,6 +1214,11 @@ impl Stores {
         // size lookups ask YouTube about a stream that then never plays, so they are off.
         let deezer_stream = settings.current().deezer_stream_when(you_tube_resolver.is_on());
         let from_deezer = deezer_stream.is_some();
+        if !from_deezer && !you_tube_resolver.is_on() {
+            tracing::warn!(
+                "YouTube is off and no Deezer account is set: songs from outside the library have nothing to play from"
+            );
+        }
         let stream_size_warmer = Arc::new(
             StreamSizeWarmer::new(external_id_registry.clone(), you_tube_resolver.clone()).with_per_minute(
                 Arc::new(move || {
