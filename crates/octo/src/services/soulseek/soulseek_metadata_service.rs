@@ -23,7 +23,7 @@ use octo_core::soulseek::{LengthSource, RoutingKind, SongLength, SoulseekRouting
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::external_id_registry::{ExternalIdRegistry, SharedRouting};
 use crate::services::cover_art::CoverArtAggregator;
@@ -933,8 +933,15 @@ impl Inner {
             let isrc = self.lookup(id).and_then(|routing| routing.lock().isrc.clone());
             let seconds = apple.track_length(artist, title, isrc.as_deref()).await;
             if self.id_registry.remember_length(id, seconds, LengthSource::Apple) {
+                let s = seconds.unwrap_or_default();
+                info!(
+                    "Length of '{artist} - {title}' from Apple: {}:{:02} (Deezer had none)",
+                    s / 60,
+                    s % 60
+                );
                 return;
             }
+            debug!("Apple has no length for '{artist} - {title}'; asking Last.fm");
         }
 
         if let Some(last_fm) = self.last_fm.as_ref().filter(|l| l.has_api_key()) {
