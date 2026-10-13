@@ -2258,11 +2258,15 @@ impl DownloadBackend for SoulseekDownloadService {
             if let Some(stream) = self.deezer_direct_stream(&r, range_header).await {
                 return Ok(Some(stream));
             }
-            warn!(
-                "Deezer could not serve '{} - {}'; playing it from YouTube",
+            let (artist, title) = (
                 r.artist.as_deref().unwrap_or(""),
-                r.title.as_deref().unwrap_or("")
+                r.title.as_deref().unwrap_or(""),
             );
+            if !self.youtube.is_on() {
+                warn!("Deezer could not serve '{artist} - {title}', and YouTube is off, so it cannot play");
+                return Ok(None);
+            }
+            warn!("Deezer could not serve '{artist} - {title}'; playing it from YouTube");
         }
         let mut video_id = r.you_tube_id.clone().filter(|v| !v.is_empty());
         if video_id.is_none() && r.has_artist_title() {

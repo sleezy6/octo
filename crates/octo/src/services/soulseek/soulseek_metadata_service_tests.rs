@@ -2202,3 +2202,23 @@ async fn with_you_tube_streams_a_station_answer_also_waits_for_lengths() {
 
     assert_eq!(songs[0].duration, Some(190));
 }
+
+#[tokio::test]
+async fn a_station_answer_looks_every_row_up_not_only_the_first_twenty() {
+    let fixture = LengthFixture::new().await;
+    let mut songs = Vec::new();
+    for i in 0..30 {
+        // One word: the fake catalog takes a key's last word as its title.
+        songs.push(fixture.search("Artist", &format!("Track{i}")).await);
+        fixture.deezer(&format!("Artist Track{i}"), 200 + i);
+    }
+
+    fixture
+        .service
+        .complete_song_lengths_within(&mut songs, Duration::from_secs(10))
+        .await;
+
+    for (i, song) in songs.iter().enumerate() {
+        assert_eq!(song.duration, Some(200 + i as i32), "row {i}");
+    }
+}

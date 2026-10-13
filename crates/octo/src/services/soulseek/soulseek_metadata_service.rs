@@ -194,6 +194,10 @@ const BACKGROUND_ENRICH_LIMIT: usize = 60;
 /// queues the next ones, since those done by then are no longer cold.
 const STATION_LENGTH_WARM_LIMIT: usize = 20;
 
+/// How many songs' lengths a list that waits for them looks up at once. Deezer's limiter holds
+/// the requests to its quota whatever this is; this is how much of it one list may take.
+const LENGTHS_AT_ONCE: usize = 4;
+
 /// Ceiling on one song's lookup chain. Last.fm has no client timeout of its
 /// own, and one hung call would otherwise stall every song queued behind it.
 const LENGTH_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -375,6 +379,51 @@ impl SoulseekMetadataService {
         if let Some(finish) = finish {
             finish.await;
         }
+    }
+
+    /// The lengths a row can have for free (the registry, Deezer's cache), put on the rows; the
+    /// rows still without one, to look up.
+    fn fill_known_lengths(&self, songs: &mut [Song]) -> Vec<(String, String, String)> {
+        let inner = &self.inner;
+        let mut cold = Vec::new();
+        for song in songs.iter_mut() {
+            if song.is_local || song.id.is_empty() {
+                continue;
+            }
+            let Some(routing) = inner.lookup(&song.id) else {
+                continue;
+            };
+            {
+                let r = routing.lock();
+                if r.kind != RoutingKind::Song || !r.has_artist_title() {
+                    continue;
+                }
+                // A song rebuilt from its id (getSong) carries only the routing's own length,
+                // so a row with none takes the length the registry remembered for display.
+                if song.duration.is_none_or(|d| d <= 0) {
+                    song.duration = SongLength::shown(&r).0.or(r.duration).filter(|&d| d > 0);
+                }
+                if SongLength::has_metadata_length(&r) {
+                    continue;
+                }
+            }
+
+            // Free: a search for the same song may have asked Deezer already.
+            if let Some(d) = inner
+                .deezer
+                .cached_track(&song.artist, &song.title)
+                .and_then(|m| m.duration)
+                .filter(|&d| d > 0)
+            {
+                song.duration = Some(d);
+                inner
+                    .id_registry
+                    .remember_length(&song.id, Some(d), LengthSource::Deezer);
+                continue;
+            }
+            cold.push(key_of(song));
+        }
+        cold
     }
 
     /// The most recent background length lookup, for a test to wait on (`LastLengthWarm`).
@@ -814,6 +863,33 @@ impl Inner {
             }
         });
         *self.last_length_warm.lock() = Some(task.map(|_| ()).boxed().shared());
+    }
+
+    /// Looks the lengths of `songs` up, [`LENGTHS_AT_ONCE`] at a time, in order; a song another
+    /// lookup already has is left to it. Ends when all are done.
+    async fn look_up_lengths_together(self: Arc<Self>, songs: Vec<(String, String, String)>) {
+        let gate = Arc::new(Semaphore::new(LENGTHS_AT_ONCE));
+        let tasks = songs.into_iter().map(|(id, artist, title)| {
+            let (this, gate) = (Arc::clone(&self), Arc::clone(&gate));
+            async move {
+                if id.is_empty() || dotnet::is_blank(&title) {
+                    return;
+                }
+                let Ok(_permit) = gate.acquire().await else { return };
+                match this.lookup(&id) {
+                    Some(routing) if !SongLength::has_metadata_length(&routing.lock()) => {}
+                    _ => return,
+                }
+                if !this.length_lookups.lock().insert(id.clone()) {
+                    return;
+                }
+                let _ =
+                    tokio::time::timeout(LENGTH_LOOKUP_TIMEOUT, this.look_up_length(&id, &artist, &title))
+                        .await;
+                this.length_lookups.lock().remove(&id);
+            }
+        });
+        futures::future::join_all(tasks).await;
     }
 
     async fn look_up_length(&self, id: &str, artist: &str, title: &str) {
@@ -1316,64 +1392,23 @@ impl IMusicMetadataService for SoulseekMetadataService {
     }
 
     fn complete_song_lengths(&self, songs: &mut [Song]) {
-        let inner = &self.inner;
-        let mut cold = Vec::new();
-        for song in songs.iter_mut() {
-            if song.is_local || song.id.is_empty() {
-                continue;
-            }
-            let Some(routing) = inner.lookup(&song.id) else {
-                continue;
-            };
-            {
-                let r = routing.lock();
-                if r.kind != RoutingKind::Song || !r.has_artist_title() {
-                    continue;
-                }
-                // A song rebuilt from its id (getSong) carries only the routing's own length,
-                // so a row with none takes the length the registry remembered for display.
-                if song.duration.is_none_or(|d| d <= 0) {
-                    song.duration = SongLength::shown(&r).0.or(r.duration).filter(|&d| d > 0);
-                }
-                if SongLength::has_metadata_length(&r) {
-                    continue;
-                }
-            }
-
-            // Free: a search for the same song may have asked Deezer already.
-            if let Some(d) = inner
-                .deezer
-                .cached_track(&song.artist, &song.title)
-                .and_then(|m| m.duration)
-                .filter(|&d| d > 0)
-            {
-                song.duration = Some(d);
-                inner
-                    .id_registry
-                    .remember_length(&song.id, Some(d), LengthSource::Deezer);
-                continue;
-            }
-            cold.push(key_of(song));
-        }
-        inner.warm_lengths(cold.into_iter().take(STATION_LENGTH_WARM_LIMIT));
+        let cold = self.fill_known_lengths(songs);
+        self.inner
+            .warm_lengths(cold.into_iter().take(STATION_LENGTH_WARM_LIMIT));
     }
 
     async fn complete_song_lengths_within(&self, songs: &mut [Song], budget: Duration) {
-        self.complete_song_lengths(songs);
-        let missing = |songs: &[Song]| {
-            songs
-                .iter()
-                .any(|song| !song.is_local && !song.id.is_empty() && song.duration.is_none_or(|d| d <= 0))
-        };
-        if !missing(songs) {
+        let cold = self.fill_known_lengths(songs);
+        if cold.is_empty() {
             return;
         }
-        let warm = self.inner.last_length_warm.lock().clone();
-        if let Some(warm) = warm {
-            let _ = tokio::time::timeout(budget, warm).await;
-        }
-        // What came back in time is on the registry now; this pass queues nothing new.
-        self.complete_song_lengths(songs);
+        // A list a client reads once: every song without a length is looked up now, a few at a
+        // time (Deezer's limiter paces them), in list order. What is not back within `budget`
+        // goes on in the background and is the next answer's.
+        let inner = Arc::clone(&self.inner);
+        let mut lookups = tokio::spawn(async move { inner.look_up_lengths_together(cold).await });
+        let _ = tokio::time::timeout(budget, &mut lookups).await;
+        self.fill_known_lengths(songs);
     }
 
     async fn resolve_top_durations(&self, songs: &mut [Song], background: bool) {
