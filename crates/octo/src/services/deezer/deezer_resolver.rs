@@ -56,6 +56,7 @@ impl DeezerOpenStream {
 }
 
 /// What one account attempt signs its calls with.
+#[derive(Clone)]
 struct Session {
     cookie: String,
     api_token: String,
@@ -129,6 +130,10 @@ pub struct DeezerResolver {
     media_cache: MemoryCache<Media>,
     // ponytail: serial media resolution bounds gateway bursts; add per-account gates if contention grows.
     media_gate: tokio::sync::Mutex<()>,
+    /// The sign-in each account was last given and when, so a play does not sign in again for
+    /// [`Self::SESSION_TTL`]. Held while an account signs in, so plays at the same moment share
+    /// one sign-in.
+    sessions: tokio::sync::Mutex<std::collections::HashMap<String, (Session, tokio::time::Instant)>>,
     /// The last answer of [`Self::check_accounts`]: when, for which accounts, and what.
     account_check: tokio::sync::Mutex<Option<AccountCheck>>,
     gateway_url: String,
@@ -145,6 +150,9 @@ impl DeezerResolver {
     pub const MEDIA_URL: &'static str = "https://media.deezer.com/v1/get_url";
 
     pub const API_TIMEOUT: Duration = Duration::from_secs(10);
+    /// How long an account's sign-in is reused. A play that Deezer refuses on a reused sign-in
+    /// signs in again once before giving up.
+    pub const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
     /// How long a media address is reused.
     const MEDIA_TTL: Duration = Duration::from_secs(120);
     const MEDIA_CACHE_SIZE: u64 = 128;
@@ -193,6 +201,7 @@ impl DeezerResolver {
             catalog,
             media_cache: MemoryCache::new(Self::MEDIA_CACHE_SIZE),
             media_gate: tokio::sync::Mutex::new(()),
+            sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             account_check: tokio::sync::Mutex::new(None),
             gateway_url: gateway_url.to_string(),
             media_url: media_url.to_string(),
@@ -257,7 +266,12 @@ impl DeezerResolver {
         }
         let mut health = Vec::new();
         for arl in &accounts {
-            health.push(match self.authenticate(arl).await {
+            let signed_in = self.authenticate(arl).await;
+            match &signed_in {
+                Ok(session) => self.remember_session(arl, session).await,
+                Err(_) => self.forget_session(arl).await,
+            }
+            health.push(match signed_in {
                 Ok(session) => DeezerAccountHealth {
                     signed_in: true,
                     problem: None,
@@ -327,6 +341,44 @@ impl DeezerResolver {
     /// when an album listing named it). `None` when the catalog has no such song.
     pub async fn track_id_for(&self, artist: &str, title: &str, isrc: Option<&str>) -> Option<String> {
         self.catalog.find_track_id(artist, title, isrc).await
+    }
+
+    /// The account's sign-in: the one kept while it is younger than [`Self::SESSION_TTL`], else a
+    /// new one, which is kept. The flag is true for a kept one.
+    async fn session_for(&self, arl: &str) -> anyhow::Result<(Session, bool)> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some((session, at)) = sessions.get(arl)
+            && at.elapsed() < Self::SESSION_TTL
+        {
+            return Ok((session.clone(), true));
+        }
+        sessions.remove(arl);
+        let session = self.authenticate(arl).await?;
+        let now = tokio::time::Instant::now();
+        sessions.retain(|_, (_, at)| now.duration_since(*at) < Self::SESSION_TTL);
+        sessions.insert(arl.to_string(), (session.clone(), now));
+        Ok((session, false))
+    }
+
+    /// Makes every kept sign-in `by` older, for a test that waits out [`Self::SESSION_TTL`].
+    #[cfg(test)]
+    pub(crate) async fn age_sessions(&self, by: Duration) {
+        for (_, at) in self.sessions.lock().await.values_mut() {
+            *at = at
+                .checked_sub(by)
+                .expect("the clock is far enough from its start");
+        }
+    }
+
+    async fn forget_session(&self, arl: &str) {
+        self.sessions.lock().await.remove(arl);
+    }
+
+    async fn remember_session(&self, arl: &str, session: &Session) {
+        self.sessions
+            .lock()
+            .await
+            .insert(arl.to_string(), (session.clone(), tokio::time::Instant::now()));
     }
 
     async fn authenticate(&self, arl: &str) -> anyhow::Result<Session> {
@@ -445,7 +497,26 @@ impl DeezerResolver {
         track_id: &str,
         quality: &str,
     ) -> anyhow::Result<Option<Media>> {
-        let session = self.authenticate(arl).await?;
+        let (session, reused) = self.session_for(arl).await?;
+        let first = self.resolve_with_session(&session, arl, track_id, quality).await;
+        // A kept sign-in may have gone stale before its time; Deezer then answers with an error
+        // that looks like a song it cannot give. Sign in again and ask once more.
+        if reused && !matches!(first, Ok(Some(_))) {
+            debug!("Deezer gave nothing on a kept sign-in; signing in again");
+            self.forget_session(arl).await;
+            let (session, _) = self.session_for(arl).await?;
+            return self.resolve_with_session(&session, arl, track_id, quality).await;
+        }
+        first
+    }
+
+    async fn resolve_with_session(
+        &self,
+        session: &Session,
+        arl: &str,
+        track_id: &str,
+        quality: &str,
+    ) -> anyhow::Result<Option<Media>> {
         let mut visited: HashSet<String> = HashSet::new();
         let mut candidate = track_id.to_string();
         let mut candidate_reason = "requested";

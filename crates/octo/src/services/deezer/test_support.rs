@@ -67,6 +67,8 @@ pub(crate) struct Seen {
     pub(crate) media_cookies: Vec<String>,
     pub(crate) cdn_ranges: Vec<String>,
     pub(crate) urls_issued: usize,
+    /// API tokens the gateway no longer accepts for `pageTrack`, as a sign-in that expired early.
+    pub(crate) stale_tokens: Vec<String>,
 }
 
 struct Deezer {
@@ -101,7 +103,7 @@ impl Respond for Deezer {
             let mut body = json!({
                 "error": [],
                 "results": {
-                    "checkForm": format!("api-{account}"),
+                    "checkForm": format!("api-{account}-{}", seen.auth_cookies.iter().filter(|c| **c == cookie).count()),
                     "USER": {
                         "USER_ID": if rejected { 0 } else { 7 },
                         "OPTIONS": { "license_token": format!("{account}-license") },
@@ -121,6 +123,16 @@ impl Respond for Deezer {
         }
         if path == "/gw" && query.contains("method=deezer.pageTrack") {
             seen.page_cookies.push(header(request, "cookie"));
+            let api_token = query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("api_token="))
+                .unwrap_or("")
+                .to_string();
+            if seen.stale_tokens.contains(&api_token) {
+                return ResponseTemplate::new(200).set_body_json(
+                    json!({ "error": { "VALID_TOKEN_REQUIRED": "Invalid CSRF token" }, "results": {} }),
+                );
+            }
             let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
             let id = body["SNG_ID"].as_str().unwrap_or("").to_string();
             seen.page_ids.push(id.clone());

@@ -3,7 +3,10 @@
 //! Deezer is already the catalog Octo reads album and track facts from, with no account. These
 //! settings are the other half: an account's ARL cookie, which lets Octo play and keep the songs
 //! themselves from Deezer. Adapted from am-yy/octo's `Octo.Models.Settings.DeezerSettings`.
-//! Every value is read at use, so a change needs no restart.
+//! Most values are read at use, so a change needs no restart. The exceptions are the ones that
+//! decide what outside songs declare as they play (`Subsonic:StreamSource`, `StreamQuality`, the
+//! first `Arl`) and `CachePath`: they are read once at startup, and the dashboard marks them
+//! "restart to apply" (`RestartTracker`).
 
 use serde::{Deserialize, Serialize};
 

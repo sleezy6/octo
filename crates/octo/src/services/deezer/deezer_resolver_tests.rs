@@ -205,7 +205,8 @@ async fn expired_cdn_url_is_evicted_and_resolved_again() {
     .await;
     drop(fixture.open(None).await.expect("the second address opens"));
     let seen = fixture.seen.lock();
-    assert_eq!(seen.auth_cookies, ["arl=primary", "arl=primary"]);
+    // The stale address is asked for again on the sign-in already held.
+    assert_eq!(seen.auth_cookies, ["arl=primary"]);
     assert_eq!(seen.media_bodies.len(), 2);
 }
 
@@ -222,7 +223,7 @@ async fn account_specific_cdn_failure_uses_fallback_account_after_refresh() {
     .await;
     drop(fixture.open(None).await.expect("the fallback account opens it"));
     let seen = fixture.seen.lock();
-    assert_eq!(seen.auth_cookies, ["arl=primary", "arl=primary", "arl=fallback"]);
+    assert_eq!(seen.auth_cookies, ["arl=primary", "arl=fallback"]);
     assert!(
         seen.media_bodies
             .last()
@@ -476,4 +477,92 @@ async fn a_stream_that_stops_sending_ends_with_an_error() {
         .collect()
         .await;
     assert_eq!(whole, ["a", "b"]);
+}
+
+#[tokio::test]
+async fn songs_played_in_turn_share_one_sign_in() {
+    let fixture = Fixture::new(Scenario::default()).await;
+    drop(fixture.open(None).await.expect("opens"));
+    // Another quality is another media address, so this asks Deezer again, but not to sign in.
+    drop(
+        fixture
+            .resolver
+            .open_stream("42", None, "MP3_128")
+            .await
+            .expect("opens again"),
+    );
+    assert_eq!(fixture.seen.lock().auth_cookies, ["arl=primary"]);
+    assert_eq!(fixture.seen.lock().media_bodies.len(), 2);
+}
+
+#[tokio::test]
+async fn plays_at_the_same_moment_share_one_sign_in() {
+    let fixture = Fixture::new(Scenario::default()).await;
+    let (a, b, c) = tokio::join!(
+        fixture.resolver.open_stream("42", None, "MP3_128"),
+        fixture.resolver.open_stream("42", None, "MP3_320"),
+        fixture.resolver.open_stream("42", None, "FLAC"),
+    );
+    assert!(a.is_some() && b.is_some() && c.is_some());
+    assert_eq!(fixture.seen.lock().auth_cookies, ["arl=primary"]);
+}
+
+#[tokio::test]
+async fn a_sign_in_is_made_again_after_ten_minutes() {
+    let fixture = Fixture::new(Scenario::default()).await;
+    drop(fixture.open(None).await.expect("opens"));
+    fixture
+        .resolver
+        .age_sessions(DeezerResolver::SESSION_TTL + std::time::Duration::from_secs(1))
+        .await;
+    drop(
+        fixture
+            .resolver
+            .open_stream("42", None, "MP3_128")
+            .await
+            .expect("opens after the sign-in ran out"),
+    );
+    assert_eq!(fixture.seen.lock().auth_cookies, ["arl=primary", "arl=primary"]);
+}
+
+#[tokio::test]
+async fn a_sign_in_deezer_no_longer_accepts_is_replaced_once_and_the_play_goes_on() {
+    let fixture = Fixture::new(Scenario::default()).await;
+    drop(fixture.open(None).await.expect("opens"));
+    // The first sign-in's token stops working before its ten minutes are up.
+    fixture.seen.lock().stale_tokens.push("api-primary-1".into());
+    drop(
+        fixture
+            .resolver
+            .open_stream("42", None, "MP3_128")
+            .await
+            .expect("signs in again and opens"),
+    );
+    assert_eq!(fixture.seen.lock().auth_cookies, ["arl=primary", "arl=primary"]);
+    // The new sign-in is the one kept now.
+    drop(
+        fixture
+            .resolver
+            .open_stream("42", None, "FLAC")
+            .await
+            .expect("opens on the new sign-in"),
+    );
+    assert_eq!(fixture.seen.lock().auth_cookies.len(), 2);
+}
+
+#[tokio::test]
+async fn a_song_deezer_cannot_give_does_not_loop_on_sign_ins() {
+    let fixture = Fixture::new(Scenario::default()).await;
+    drop(fixture.open(None).await.expect("opens"));
+    fixture.seen.lock().stale_tokens.push("api-primary-1".into());
+    fixture.seen.lock().stale_tokens.push("api-primary-2".into());
+    assert!(
+        fixture
+            .resolver
+            .open_stream("42", None, "MP3_128")
+            .await
+            .is_none()
+    );
+    // One sign-in kept, one more for the retry: no more than that for a single play.
+    assert_eq!(fixture.seen.lock().auth_cookies.len(), 2);
 }

@@ -755,8 +755,9 @@ impl HeartAcquisitionCoordinator {
     fn enabled_steps(&self, album_heart: bool) -> Vec<HeartDownloadSource> {
         let soulseek_off = self.extras.soulseek.as_ref().is_some_and(|link| link.is_off());
         let you_tube_off = !self.settings.you_tube_enabled();
-        self.settings
-            .current()
+        let snapshot = self.settings.current();
+        let deezer_unset = !snapshot.deezer.is_configured();
+        snapshot
             .subsonic
             .effective_heart_download_sources()
             .into_iter()
@@ -769,6 +770,7 @@ impl HeartAcquisitionCoordinator {
             })
             .filter(|step| !(soulseek_off && step.source == HeartDownloadSource::Soulseek))
             .filter(|step| !(you_tube_off && step.source == HeartDownloadSource::YouTube))
+            .filter(|step| !(deezer_unset && step.source == HeartDownloadSource::Deezer))
             .map(|step| step.source)
             .collect()
     }
