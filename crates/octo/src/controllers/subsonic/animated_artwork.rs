@@ -2,8 +2,10 @@
 //! the owner's own server of m8tec/apple-music-animated-artworks (`Metadata:AnimatedArtworkUrl`).
 //!
 //! - `getAnimatedArtwork?id=<album id>` (a library album or an outside one), or
-//!   `?artist=&album=`: `animatedArtwork` with `url` (square) and `urlTall` (tall), HLS
-//!   playlists; no `animatedArtwork` when the album has none.
+//!   `?artist=&album=`: `animatedArtwork` with `url` (square) and `urlTall` (tall), Apple's HLS
+//!   playlists, and `streamUrl` / `streamUrlTall`, the same relayed through this server
+//!   (relative to the server address, as `rest/` is; see [`super::animated_relay`]); no
+//!   `animatedArtwork` when the album has none.
 //! - `getAlbum` in JSON carries the same `animatedArtwork` on the album when it is known, or
 //!   comes back within a moment; otherwise the next getAlbum has it.
 //!
@@ -20,6 +22,7 @@ use axum::routing::get;
 use octo_core::common::dotnet::is_blank;
 use serde_json::{Value, json};
 
+use super::animated_relay::stream_path;
 use super::caller_checks::{SubsonicCall, as_json, refuse_unless_signed_in};
 use super::family::octo_reply;
 use crate::app::AppState;
@@ -41,15 +44,30 @@ pub const ASK_WAIT: Duration = Duration::from_secs(12);
 const MAX_ALBUM_BODY: usize = 8 * 1024 * 1024;
 
 pub fn routes() -> RouteSet {
-    RouteSet::new().subsonic(
-        "getAnimatedArtwork",
-        get(get_animated_artwork).post(get_animated_artwork),
-    )
+    RouteSet::new()
+        .subsonic(
+            "getAnimatedArtwork",
+            get(get_animated_artwork).post(get_animated_artwork),
+        )
+        .merge(super::animated_relay::routes())
 }
 
-/// `animatedArtwork` as the apps read it.
-fn as_value(cover: &AnimatedCover) -> Value {
-    serde_json::to_value(cover).unwrap_or_else(|_| json!({}))
+/// `animatedArtwork` as the apps read it: Apple's own playlists (`url`, `urlTall`), and the
+/// same through this server (`streamUrl`, `streamUrlTall`), relative to the server address.
+fn as_value(state: &AppState, artist: &str, album: &str, cover: &AnimatedCover) -> Value {
+    let mut value = serde_json::to_value(cover).unwrap_or_else(|_| json!({}));
+    if let (Some(relay), Some(map)) = (
+        state.animated_artwork.relay_key(artist, album),
+        value.as_object_mut(),
+    ) {
+        if cover.url.is_some() {
+            map.insert("streamUrl".into(), Value::String(stream_path(&relay, false)));
+        }
+        if cover.url_tall.is_some() {
+            map.insert("streamUrlTall".into(), Value::String(stream_path(&relay, true)));
+        }
+    }
+    value
 }
 
 pub async fn get_animated_artwork(State(state): State<AppState>, req: Request) -> AppResult {
@@ -101,7 +119,7 @@ pub async fn get_animated_artwork(State(state): State<AppState>, req: Request) -
         AnimatedLookup::Found(cover) => Ok(octo_reply(
             &state,
             &format,
-            Some(("animatedArtwork", &as_value(&cover))),
+            Some(("animatedArtwork", &as_value(&state, &artist, &album, &cover))),
         )),
         AnimatedLookup::None => Ok(octo_reply(&state, &format, None)),
         AnimatedLookup::Unavailable => Ok(builder
@@ -170,12 +188,12 @@ pub async fn with_album_artwork(state: &AppState, response: Response) -> Respons
             let text = |key: &str| album.get(key).and_then(Value::as_str).map(str::to_string);
             Some((text("artist")?, text("name")?))
         });
-    let Some((artist, album)) = names else {
+    let Some((artist, album_name)) = names else {
         return unchanged(parts, bytes);
     };
     let AnimatedLookup::Found(cover) = state
         .animated_artwork
-        .find_within(&artist, &album, ALBUM_WAIT)
+        .find_within(&artist, &album_name, ALBUM_WAIT)
         .await
     else {
         return unchanged(parts, bytes);
@@ -187,7 +205,8 @@ pub async fn with_album_artwork(state: &AppState, response: Response) -> Respons
     else {
         return unchanged(parts, bytes);
     };
-    album.insert("animatedArtwork".into(), as_value(&cover));
+    let value = as_value(state, &artist, &album_name, &cover);
+    album.insert("animatedArtwork".into(), value);
     let body = serde_json::to_vec(&document).unwrap_or_else(|_| bytes.to_vec());
     parts.headers.remove(header::CONTENT_LENGTH);
     Response::from_parts(parts, Body::from(body))

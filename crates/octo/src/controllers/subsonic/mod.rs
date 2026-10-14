@@ -3,6 +3,7 @@
 //! action claims, reaches the catch-all (`http::catch_all`).
 pub mod action_helpers;
 pub mod animated_artwork;
+pub mod animated_relay;
 pub mod info;
 pub mod internet_radio;
 pub mod native;

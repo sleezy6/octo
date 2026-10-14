@@ -126,6 +126,25 @@ async fn get_animated_artwork_by_artist_and_album() {
     assert_eq!(envelope["status"], "ok", "{envelope}");
     assert_eq!(envelope["animatedArtwork"]["url"], SQUARE);
     assert_eq!(envelope["animatedArtwork"]["urlTall"], TALL);
+    // The same through this server, relative to its address.
+    let square = envelope["animatedArtwork"]["streamUrl"]
+        .as_str()
+        .expect("streamUrl");
+    let tall = envelope["animatedArtwork"]["streamUrlTall"]
+        .as_str()
+        .expect("streamUrlTall");
+    assert!(
+        square.starts_with("animated-artwork/") && square.ends_with("/square.m3u8"),
+        "{square}"
+    );
+    assert!(
+        tall.starts_with("animated-artwork/") && tall.ends_with("/tall.m3u8"),
+        "{tall}"
+    );
+    assert_eq!(
+        square.trim_end_matches("square.m3u8"),
+        tall.trim_end_matches("tall.m3u8")
+    );
 }
 
 #[tokio::test]

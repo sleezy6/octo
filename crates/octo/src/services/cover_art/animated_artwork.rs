@@ -58,6 +58,10 @@ struct Known {
     url_tall: Option<String>,
     /// When it was asked, in seconds since 1970.
     checked: i64,
+    /// The cover's key under `/animated-artwork/`, where Octo relays its streams: random, so
+    /// only an app Octo told of the cover can ask for it.
+    #[serde(default)]
+    relay: Option<String>,
 }
 
 impl Known {
@@ -81,6 +85,10 @@ struct Answer {
 pub struct AnimatedArtwork {
     settings: Arc<SettingsStore>,
     client: reqwest::Client,
+    /// For the relay: no overall timeout (a video file is read as the player reads it).
+    relay_client: reqwest::Client,
+    /// Tests only: the origin the relay may fetch from in place of Apple's video host.
+    relay_test_origin: Option<String>,
     path: PathBuf,
     known: Mutex<HashMap<String, Known>>,
     flights: InFlight<AnimatedLookup>,
@@ -119,13 +127,53 @@ impl AnimatedArtwork {
             .timeout(Self::TIMEOUT)
             .build()
             .expect("a plain HTTP client builds");
+        let relay_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(30))
+            .build()
+            .expect("a plain HTTP client builds");
         Self {
             settings,
             client,
+            relay_client,
+            relay_test_origin: None,
             path,
             known: Mutex::new(known),
             flights: InFlight::new(),
         }
+    }
+
+    /// The client the relay asks Apple's video host with.
+    pub fn relay_client(&self) -> &reqwest::Client {
+        &self.relay_client
+    }
+
+    /// Tests only: the relay fetches from `origin` (a mock server) instead of Apple.
+    pub fn relay_test_origin(&self) -> Option<&str> {
+        self.relay_test_origin.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn with_relay_test_origin(mut self, origin: &str) -> Self {
+        self.relay_test_origin = Some(origin.trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Tests only: a found cover, kept as if the server had answered it. Its relay key.
+    #[cfg(test)]
+    pub fn seed(&self, artist: &str, album: &str, url: Option<&str>, url_tall: Option<&str>) -> String {
+        let key = Self::key(artist, album).expect("an artist and an album");
+        let relay = Self::new_relay_key();
+        self.known.lock().insert(
+            key,
+            Known {
+                url: url.map(str::to_string),
+                url_tall: url_tall.map(str::to_string),
+                checked: Self::now(),
+                relay: Some(relay.clone()),
+            },
+        );
+        relay
     }
 
     /// The server's address, when one is set.
@@ -259,6 +307,43 @@ impl AnimatedArtwork {
         }
     }
 
+    fn new_relay_key() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    /// The relay key of the album's found cover (one is made for a cover kept before keys
+    /// were), or `None` when no cover is known for it.
+    pub fn relay_key(&self, artist: &str, album: &str) -> Option<String> {
+        let key = Self::key(artist, album)?;
+        let (relay, text) = {
+            let mut known = self.known.lock();
+            let entry = known.get_mut(&key).filter(|k| k.cover().is_some())?;
+            if let Some(relay) = &entry.relay {
+                return Some(relay.clone());
+            }
+            let relay = Self::new_relay_key();
+            entry.relay = Some(relay.clone());
+            (relay, serde_json::to_string(&*known).unwrap_or_default())
+        };
+        if let Err(e) = state_file::save_atomic(&self.path, &text) {
+            warn!("{} could not be saved: {e}", self.path.display());
+        }
+        Some(relay)
+    }
+
+    /// The cover a relay key stands for: its square and tall playlists. `None` for a key
+    /// Octo never handed out.
+    pub fn relayed_cover(&self, relay: &str) -> Option<AnimatedCover> {
+        if relay.is_empty() || !self.enabled() {
+            return None;
+        }
+        self.known
+            .lock()
+            .values()
+            .find(|k| k.relay.as_deref() == Some(relay))
+            .and_then(Known::cover)
+    }
+
     fn remember(&self, artist: &str, album: &str, found: &AnimatedLookup) {
         let Some(key) = Self::key(artist, album) else {
             return;
@@ -268,16 +353,25 @@ impl AnimatedArtwork {
                 url: cover.url.clone(),
                 url_tall: cover.url_tall.clone(),
                 checked: Self::now(),
+                relay: Some(Self::new_relay_key()),
             },
             AnimatedLookup::None => Known {
                 url: None,
                 url_tall: None,
                 checked: Self::now(),
+                relay: None,
             },
             AnimatedLookup::Unavailable => return,
         };
         let text = {
             let mut known = self.known.lock();
+            // A cover found again keeps its relay key, so links an app already holds still work.
+            let mut entry = entry;
+            if entry.relay.is_some()
+                && let Some(previous) = known.get(&key).and_then(|k| k.relay.clone())
+            {
+                entry.relay = Some(previous);
+            }
             known.insert(key, entry);
             if known.len() > Self::MAX_KNOWN {
                 let mut by_age: Vec<(String, i64)> =
