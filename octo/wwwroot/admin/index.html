@@ -1984,6 +1984,14 @@
               </div>
               <label class="switch"><input type="checkbox" name="Metadata.EmbedFullSizeCovers" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Animated album covers <span class="set-opt">optional</span></div>
+                <div class="set-info-d">The address of your own apple-music-animated-artworks server, for example <code>http://apple-music-animated-artworks:8080</code>. The Octo apps then show Apple Music&rsquo;s animated covers where an album has one.</div>
+                <div class="set-info-more">Octo asks the server once per album and keeps the answer, &ldquo;no animated cover&rdquo; included. Other Subsonic apps see no difference. Empty is off.</div>
+              </div>
+              <input class="set-input" id="f-animated-artwork-url" name="Metadata.AnimatedArtworkUrl" placeholder="http://host:8080" maxlength="256" />
+            </div>
           </form>
         </div>
       </section>

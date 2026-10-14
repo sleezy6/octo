@@ -113,7 +113,12 @@ pub const FAMILY_EXTENSION: (&str, i32) = ("octoFamily", 1);
 /// Adds `octoFamily` to a `getOpenSubsonicExtensions` answer (an ok one; a failed or unreadable
 /// answer goes out as it came).
 pub fn with_family_extension(reply: SubsonicReply, format: &str) -> SubsonicReply {
-    let (name, version) = FAMILY_EXTENSION;
+    with_extension(reply, format, FAMILY_EXTENSION)
+}
+
+/// Adds the extension `(name, version)` to a `getOpenSubsonicExtensions` answer (an ok one; a
+/// failed or unreadable answer goes out as it came).
+pub fn with_extension(reply: SubsonicReply, format: &str, (name, version): (&str, i32)) -> SubsonicReply {
     if format.eq_ignore_ascii_case("json") {
         let Some(mut value) = reply.json_value() else {
             return reply;

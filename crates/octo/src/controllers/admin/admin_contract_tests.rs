@@ -755,7 +755,7 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // Subsonic:StreamSource, Deezer:Arl, :ArlFallback, :Quality and :StreamQuality, and the
     // playback cache's four: Deezer:CacheEnabled, :CachePath, :CacheMaxGiB and
     // :CacheRetentionDays.
-    assert_eq!(rows.len(), 205);
+    assert_eq!(rows.len(), 206);
     assert_eq!(row("Subsonic:SizeFlagClients")["IsSecret"], false);
     assert_eq!(row("Deezer:CacheEnabled")["IsSecret"], false);
     // An ARL signs the account in, so it is masked like a password.

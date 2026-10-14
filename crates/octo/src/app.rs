@@ -53,7 +53,7 @@ use octo_media::cover::CoverArtService;
 
 use crate::services::charts::{AppleMusicPages, ChartsWarmWorker};
 use crate::services::common::TopSongsService;
-use crate::services::cover_art::{ArtworkHints, HintedArtwork};
+use crate::services::cover_art::{AnimatedArtwork, ArtworkHints, HintedArtwork};
 use crate::services::deezer::{DeezerAudioCache, DeezerResolver};
 use crate::services::family::LibraryWriteGate as FamilyWriteGate;
 use crate::services::family::request_service::{
@@ -302,6 +302,9 @@ pub struct AppInner {
     /// `LocalCoverCache`: library covers kept on disk in `<config>/cover-cache/`, each size cut
     /// from one copy.
     pub local_cover_cache: Arc<LocalCoverCache>,
+    /// Apple Music's animated album covers, through the owner's own server; off until
+    /// `Metadata:AnimatedArtworkUrl` is set.
+    pub animated_artwork: Arc<AnimatedArtwork>,
     /// `RadioQueueStore`: recent search and radio queues for prewarming, in memory.
     pub radio_queues: Arc<RadioQueueStore>,
     /// `DirectoryBrowser`: the dashboard's folder picker.
@@ -1171,6 +1174,7 @@ struct Stores {
     you_tube_resolver: Arc<YouTubeResolver>,
     stream_size_warmer: Arc<StreamSizeWarmer>,
     local_cover_cache: Arc<LocalCoverCache>,
+    animated_artwork: Arc<AnimatedArtwork>,
     external_id_registry: Arc<ExternalIdRegistry>,
     radio_queues: Arc<RadioQueueStore>,
     directory_browser: Arc<DirectoryBrowser>,
@@ -1258,6 +1262,10 @@ impl Stores {
             ),
             stream_size_warmer,
             local_cover_cache,
+            animated_artwork: Arc::new(AnimatedArtwork::new(
+                settings.clone(),
+                config_dir.join("animated-artwork.json"),
+            )),
             external_id_registry,
             radio_queues: Arc::new(RadioQueueStore::new()),
             directory_browser: Arc::new(DirectoryBrowser::new()),
@@ -2907,6 +2915,7 @@ impl AppState {
             external_id_registry: stores.external_id_registry,
             stream_size_warmer: stores.stream_size_warmer,
             local_cover_cache: stores.local_cover_cache,
+            animated_artwork: stores.animated_artwork,
             radio_queues: stores.radio_queues,
             directory_browser: stores.directory_browser,
             browse_sessions: stores.browse_sessions,
@@ -3298,6 +3307,7 @@ impl AppState {
             external_id_registry: stores.external_id_registry,
             stream_size_warmer: stores.stream_size_warmer,
             local_cover_cache: stores.local_cover_cache,
+            animated_artwork: stores.animated_artwork,
             radio_queues: stores.radio_queues,
             directory_browser: stores.directory_browser,
             browse_sessions: stores.browse_sessions,

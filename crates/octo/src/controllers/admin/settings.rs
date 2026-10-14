@@ -507,6 +507,7 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
                 n_num(metadata.replay_gain_timeout_seconds),
             ),
             ("TagRehearsal", Node::Bool(metadata.tag_rehearsal)),
+            ("AnimatedArtworkUrl", n_str(&metadata.animated_artwork_url)),
         ]),
     );
     doc.insert(

@@ -363,6 +363,7 @@ Enums:
 | `ReplayGain` | `REPLAYGAIN` | bool | true / - / `true` | - | Live | yes |
 | `ReplayGainTimeoutSeconds` | `REPLAYGAIN_TIMEOUT_SECONDS` | int | 45 / - / `45` | `Clamp(10, 300)` | Live | yes |
 | `TagRehearsal` | `TAG_REHEARSAL` | bool | false / - / `false` | - | Live | yes |
+| `AnimatedArtworkUrl` | `ANIMATED_ARTWORK_URL` | string | empty / - / empty | an http(s) address, trailing slash dropped; anything else is off | Live | yes |
 
 ### 3.12 `GeneratedPlaylists` → `GeneratedPlaylistSettings` (12)
 

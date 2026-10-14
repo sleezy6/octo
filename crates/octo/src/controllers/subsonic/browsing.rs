@@ -255,7 +255,14 @@ pub async fn get_artist(State(state): State<AppState>, req: Request) -> AppResul
 }
 
 /// Enriches local albums with Deezer songs.
+/// getAlbum, with the album's animated cover added for the Octo apps when there is one
+/// ([`super::animated_artwork::with_album_artwork`]).
 pub async fn get_album(State(state): State<AppState>, req: Request) -> AppResult {
+    let response = album_answer(State(state.clone()), req).await?;
+    Ok(super::animated_artwork::with_album_artwork(&state, response).await)
+}
+
+async fn album_answer(State(state): State<AppState>, req: Request) -> AppResult {
     let scope = scope_of(crate::services::family::family_caller(req.extensions()));
     let call = match SubsonicCall::read(&state, req).await {
         Ok(call) => call,

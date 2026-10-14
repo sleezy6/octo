@@ -126,7 +126,11 @@ pub async fn get_open_subsonic_extensions(State(state): State<AppState>, req: Re
     }
     // octoFamily is listed only while Family is on.
     if settings.family.enabled {
-        return super::family::with_family_extension(reply, &format).into_response();
+        reply = super::family::with_family_extension(reply, &format);
+    }
+    // octoAnimatedArtwork only while an animated artwork server is set.
+    if state.animated_artwork.enabled() {
+        reply = super::family::with_extension(reply, &format, super::animated_artwork::EXTENSION);
     }
     reply.into_response()
 }
