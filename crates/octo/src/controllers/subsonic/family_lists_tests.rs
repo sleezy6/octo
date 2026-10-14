@@ -319,6 +319,10 @@ async fn fixture_with(enabled: bool, change: impl FnOnce(&mut FamilySettings)) -
         TestServices {
             config_dir: Some(dir.path().to_path_buf()),
             metadata: Some(Arc::new(metadata)),
+            // Never the live catalog: an artist page merges the catalog's albums for its name,
+            // and what api.deezer.com holds for "Shared" changes ("The Shared" matched it on
+            // 2026-10-14 and put an outside album on the owner's page).
+            deezer_base_url: Some("http://127.0.0.1:1".into()),
             ..Default::default()
         },
     );
