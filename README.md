@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="octo/Assets/octo_logo.png" alt="Octo" width="280" />
-
 # Octo
 
 **A self-hosted music service.**
