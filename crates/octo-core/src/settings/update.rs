@@ -12,8 +12,9 @@ pub struct UpdateSettings {
     /// Environment variable: UPDATES__CHECK
     pub check: bool,
 
-    /// The GitHub repository whose releases count, as "owner/name" (default: winters27/octo).
-    /// Only a fork that publishes its own dated releases needs to change it.
+    /// The GitHub repository whose releases count, as "owner/name" (default: sleezy6/octo).
+    /// This modified version names its own repository, so upstream's releases are never offered
+    /// as an update over it.
     /// Environment variable: UPDATES__REPO
     pub repo: String,
 }
@@ -22,7 +23,7 @@ impl Default for UpdateSettings {
     fn default() -> Self {
         Self {
             check: true,
-            repo: "winters27/octo".to_string(),
+            repo: "sleezy6/octo".to_string(),
         }
     }
 }

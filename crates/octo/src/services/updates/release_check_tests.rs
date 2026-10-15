@@ -9,13 +9,13 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const RELEASES: &str = r####"
 [
-  { "tag_name": "desktop-v1.3.2", "name": "Octo for Windows and Linux 1.3.2", "draft": false, "prerelease": false, "body": "app", "html_url": "https://github.com/winters27/octo/releases/tag/desktop-v1.3.2", "published_at": "2026-10-03T10:42:57Z" },
+  { "tag_name": "desktop-v1.3.2", "name": "Octo for Windows and Linux 1.3.2", "draft": false, "prerelease": false, "body": "app", "html_url": "https://github.com/sleezy6/octo/releases/tag/desktop-v1.3.2", "published_at": "2026-10-03T10:42:57Z" },
   { "tag_name": "2026.10.05", "name": "2026.10.05", "draft": true, "prerelease": false, "body": "draft", "html_url": "", "published_at": null },
   { "tag_name": "2026.10.04", "name": "2026.10.04", "draft": false, "prerelease": true, "body": "pre", "html_url": "", "published_at": "2026-10-04T10:00:00Z" },
   { "tag_name": "android-v1.3.0", "name": "Octo for Android 1.3.0", "draft": false, "prerelease": false, "body": "app", "html_url": "", "published_at": "2026-10-03T11:20:07Z" },
-  { "tag_name": "2026.10.02.1", "name": "", "draft": false, "prerelease": false, "body": "### Fix\n- one", "html_url": "https://github.com/winters27/octo/releases/tag/2026.10.02.1", "published_at": "2026-10-02T22:00:00Z" },
-  { "tag_name": "2026.10.02", "name": "2026.10.02", "draft": false, "prerelease": false, "body": "two", "html_url": "https://github.com/winters27/octo/releases/tag/2026.10.02", "published_at": "2026-10-02T20:00:00Z" },
-  { "tag_name": "2026.10.01", "name": "2026.10.01", "draft": false, "prerelease": false, "body": "one", "html_url": "https://github.com/winters27/octo/releases/tag/2026.10.01", "published_at": "2026-10-01T21:33:35Z" }
+  { "tag_name": "2026.10.02.1", "name": "", "draft": false, "prerelease": false, "body": "### Fix\n- one", "html_url": "https://github.com/sleezy6/octo/releases/tag/2026.10.02.1", "published_at": "2026-10-02T22:00:00Z" },
+  { "tag_name": "2026.10.02", "name": "2026.10.02", "draft": false, "prerelease": false, "body": "two", "html_url": "https://github.com/sleezy6/octo/releases/tag/2026.10.02", "published_at": "2026-10-02T20:00:00Z" },
+  { "tag_name": "2026.10.01", "name": "2026.10.01", "draft": false, "prerelease": false, "body": "one", "html_url": "https://github.com/sleezy6/octo/releases/tag/2026.10.01", "published_at": "2026-10-01T21:33:35Z" }
 ]
 "####;
 
@@ -75,7 +75,7 @@ impl Fixture {
     async fn answer(&self, response: ResponseTemplate) {
         self.github.reset().await;
         Mock::given(method("GET"))
-            .and(path("/repos/winters27/octo/releases"))
+            .and(path("/repos/sleezy6/octo/releases"))
             .and(query_param("per_page", "30"))
             .respond_with(response)
             .mount(&self.github)
@@ -166,7 +166,7 @@ async fn it_asks_the_release_list_with_its_own_name() {
     let requests = f.requests().await;
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
-    assert_eq!(request.url.path(), "/repos/winters27/octo/releases");
+    assert_eq!(request.url.path(), "/repos/sleezy6/octo/releases");
     assert_eq!(request.url.query(), Some("per_page=30"));
     assert_eq!(ReleaseCheck::GITHUB_API, "https://api.github.com");
     assert!(header(request, "user-agent").is_some_and(|ua| ua.starts_with("Octo/2026.10.01")));
@@ -358,7 +358,7 @@ async fn the_saved_state_is_what_the_fixture_shape_says() {
     f.check("2026.10.01").check(false).await;
     let saved = std::fs::read_to_string(&f.cache_path).expect("saved");
     assert!(saved.starts_with(
-        r####"{"Repo":"winters27/octo","CheckedUtc":"2026-10-03T12:00:00Z","AttemptedUtc":"2026-10-03T12:00:00Z","Error":null,"ETag":"W/\u0022abc\u0022","Releases":[{"Tag":"2026.10.02.1","Name":"2026.10.02.1","Notes":"### Fix\n- one","####
+        r####"{"Repo":"sleezy6/octo","CheckedUtc":"2026-10-03T12:00:00Z","AttemptedUtc":"2026-10-03T12:00:00Z","Error":null,"ETag":"W/\u0022abc\u0022","Releases":[{"Tag":"2026.10.02.1","Name":"2026.10.02.1","Notes":"### Fix\n- one","####
     ), "{saved}");
     assert!(!state_file::tmp_path(&f.cache_path).exists());
 }

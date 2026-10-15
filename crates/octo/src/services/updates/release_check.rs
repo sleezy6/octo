@@ -239,7 +239,7 @@ impl ReleaseCheck {
 
         if !REPO_PATTERN.is_match(&repo) {
             state.error = Some(format!(
-                "Updates:Repo should read owner/name, like winters27/octo, not \"{repo}\"."
+                "Updates:Repo should read owner/name, like sleezy6/octo, not \"{repo}\"."
             ));
         } else {
             self.ask_git_hub(&repo, &mut state).await;
@@ -398,7 +398,7 @@ impl ReleaseCheck {
 
     fn repo(settings: &UpdateSettings) -> String {
         if settings.repo.trim().is_empty() {
-            "winters27/octo".to_string()
+            "sleezy6/octo".to_string()
         } else {
             settings.repo.trim().trim_matches('/').to_string()
         }

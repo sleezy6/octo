@@ -37,10 +37,10 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 - **Starter Radio can be turned off.** `LASTFM_ENABLE_STARTER_RADIO=false` gives a new listener no mix of their own until enough plays were learned from.
 - **Bring your own Navidrome.** The built-in installer and bundled Navidrome are gone; Octo runs beside the Navidrome you already have.
 
-Running this version differs from upstream in two ways:
+It also runs a little differently:
 
-- **Images.** They are published as `ghcr.io/sleezy6/octo`, `octo-yt-dlp-shim` and `octo-sonic`, for amd64 only, on every change to `main` (tagged `main` and the commit), never as dated releases. Set `OCTO_IMAGE_TAG=main` in `.env`.
-- **Updates.** Octo's release check, and **Update now**, follow upstream's releases, which don't have these changes: installing one replaces this version with upstream's. Set `UPDATES_CHECK=false`, and update with `git pull` then `docker compose pull && docker compose up -d`.
+- **Images.** This version publishes `ghcr.io/sleezy6/octo`, `octo-yt-dlp-shim` and `octo-sonic` for amd64, on every change to `main`, tagged `main` and the commit. `docker-compose.yml` pulls `main`, so there is nothing to set.
+- **Updates.** There are no dated releases. Octo's release check looks only at this repository, so it never offers upstream's release, which lacks these changes. Update with `git pull`, then `docker compose pull && docker compose up -d` (see [Updating](#updating)).
 
 ## What you get
 
@@ -67,7 +67,6 @@ cp .env.example .env
 
 Edit `.env`. The ones that matter first:
 
-- **`OCTO_IMAGE_TAG=main`** and **`UPDATES_CHECK=false`**: this version's images and updates (see [What this version adds](#what-this-version-adds)).
 - **`SUBSONIC_URL`**: your Navidrome's address as Octo's container sees it, and `SUBSONIC_ADMIN_USERNAME` / `SUBSONIC_ADMIN_PASSWORD` for a Navidrome admin login.
 - **`DOWNLOAD_PATH`**: the music folder Navidrome reads, on this machine.
 - **`LASTFM_API_KEY`**: a free [Last.fm API key](https://www.last.fm/api/account/create) powers radio and discovery. Optional, but without it search only finds your own music.
@@ -183,7 +182,14 @@ don't own → Apps that hide songs without a size** in the admin dashboard
 ## Updating
 
 > [!IMPORTANT]
-> On this version, don't use **Update now** or check out a dated release: those are upstream's and would replace this version's changes. Update with `git pull`, then `docker compose pull && docker compose up -d`, with `OCTO_IMAGE_TAG=main` in `.env`. What follows is upstream's own description.
+> This version has no dated releases, so update it by hand from the Octo folder:
+>
+> ```bash
+> git pull
+> docker compose pull && docker compose up -d
+> ```
+>
+> Don't check out one of upstream's dated tags (such as `2026.10.14`): it has none of this version's changes. What follows is upstream's own description of releases and the update helper.
 
 Octo checks GitHub every 6 hours for a newer release. When one is out, the dashboard says so at the top of every page, and **About** shows what's new.
 
@@ -247,7 +253,7 @@ Upstream publishes three images for every release, each for amd64 and arm64 (a R
 | `ghcr.io/sleezy6/octo-yt-dlp-shim` | the yt-dlp shim beside it |
 | `ghcr.io/sleezy6/octo-sonic` | octo-sonic, which reads each song for Sounds alike and transition profiles |
 
-`docker-compose.yml` pulls all three, tagged with the release the folder holds, so no install compiles anything. `OCTO_IMAGE_TAG` in `.env` picks another tag for all three, such as `latest`.
+`docker-compose.yml` pulls all three, tagged `main` on this version, so no install compiles anything. `OCTO_IMAGE_TAG` in `.env` picks another tag for all three, such as a commit sha.
 
 To build one from the folder instead (changes of your own, or no network to `ghcr.io`), build its `-source` service. The build takes the name the running service pulls, so `up -d` then uses it:
 
@@ -1108,6 +1114,9 @@ Project layout:
 
 ## Acknowledgments
 
+- [**winters27/octo**](https://github.com/winters27/octo): Octo itself, by Brandon Winters and its contributors. Everything here is built on it, and this version keeps taking in its changes.
+- [**am-yy/octo**](https://github.com/am-yy/octo): the Deezer backend this version's Deezer support was ported from.
+- [**m8tec/apple-music-animated-artworks**](https://github.com/m8tec/apple-music-animated-artworks): the server behind animated album covers.
 - [**Navidrome**](https://www.navidrome.org/): the music server Octo proxies.
 - [**slskd**](https://github.com/slskd/slskd): Soulseek with a REST API.
 - [**GeoNames**](https://www.geonames.org/): place data from GeoNames ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)), converted and simplified by Octo, behind `getPlace`; the image carries GeoNames' readme as `licenses/GeoNames-postal-codes.txt`.

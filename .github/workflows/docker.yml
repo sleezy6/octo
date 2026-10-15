@@ -73,23 +73,22 @@ jobs:
             exit 1
           fi
 
-      # docker-compose.yml pulls Octo and its sidecars at Octo's own version unless
-      # OCTO_IMAGE_TAG says otherwise, so a release bump that missed it would leave
-      # installs pulling the last release, Octo included. Checked on main too, so a
-      # missed bump shows up before anyone tags it.
+      # This modified version publishes its images from main, never as dated releases, so
+      # docker-compose.yml pulls them tagged main unless OCTO_IMAGE_TAG says otherwise. A
+      # merge from upstream brings back its release number; this catches that.
       - name: Compose pulls this version's images
         run: |
-          version="$(tr -d ' \r\n' < VERSION)"
-          stale="$(grep -o 'OCTO_IMAGE_TAG:-[^}]*' docker-compose.yml | sed 's/^OCTO_IMAGE_TAG:-//' | grep -Fvx "$version" | paste -sd ' ' || true)"
+          tag=main
+          stale="$(grep -o 'OCTO_IMAGE_TAG:-[^}]*' docker-compose.yml | sed 's/^OCTO_IMAGE_TAG:-//' | grep -Fvx "$tag" | paste -sd ' ' || true)"
           if [ -n "$stale" ]; then
-            echo "::error::docker-compose.yml pulls images tagged $stale, but VERSION says $version. Bump the OCTO_IMAGE_TAG defaults with it."
+            echo "::error::docker-compose.yml pulls images tagged $stale, but this version publishes $tag. Set the OCTO_IMAGE_TAG defaults back to $tag."
             exit 1
           fi
           # The owner is this repo's, so a fork's compose pulls the fork's own images.
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           for image in octo octo-yt-dlp-shim octo-sonic; do
-            if ! grep -Fq "image: ghcr.io/$owner/$image:\${OCTO_IMAGE_TAG:-$version}" docker-compose.yml; then
-              echo "::error::docker-compose.yml does not pull ghcr.io/$owner/$image at \${OCTO_IMAGE_TAG:-$version}."
+            if ! grep -Fq "image: ghcr.io/$owner/$image:\${OCTO_IMAGE_TAG:-$tag}" docker-compose.yml; then
+              echo "::error::docker-compose.yml does not pull ghcr.io/$owner/$image at \${OCTO_IMAGE_TAG:-$tag}."
               exit 1
             fi
           done

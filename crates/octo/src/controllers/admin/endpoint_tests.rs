@@ -391,13 +391,13 @@ async fn scan_now_with_duplicates_off_says_what_to_turn_on() {
 /// GitHub's release list, apps' and draft releases included.
 const RELEASES: &str = r####"
 [
-  { "tag_name": "desktop-v1.3.2", "name": "Octo for Windows and Linux 1.3.2", "draft": false, "prerelease": false, "body": "app", "html_url": "https://github.com/winters27/octo/releases/tag/desktop-v1.3.2", "published_at": "2026-10-03T10:42:57Z" },
+  { "tag_name": "desktop-v1.3.2", "name": "Octo for Windows and Linux 1.3.2", "draft": false, "prerelease": false, "body": "app", "html_url": "https://github.com/sleezy6/octo/releases/tag/desktop-v1.3.2", "published_at": "2026-10-03T10:42:57Z" },
   { "tag_name": "2026.10.05", "name": "2026.10.05", "draft": true, "prerelease": false, "body": "draft", "html_url": "", "published_at": null },
   { "tag_name": "2026.10.04", "name": "2026.10.04", "draft": false, "prerelease": true, "body": "pre", "html_url": "", "published_at": "2026-10-04T10:00:00Z" },
   { "tag_name": "android-v1.3.0", "name": "Octo for Android 1.3.0", "draft": false, "prerelease": false, "body": "app", "html_url": "", "published_at": "2026-10-03T11:20:07Z" },
-  { "tag_name": "2026.10.02.1", "name": "", "draft": false, "prerelease": false, "body": "### Fix\n- one", "html_url": "https://github.com/winters27/octo/releases/tag/2026.10.02.1", "published_at": "2026-10-02T22:00:00Z" },
-  { "tag_name": "2026.10.02", "name": "2026.10.02", "draft": false, "prerelease": false, "body": "two", "html_url": "https://github.com/winters27/octo/releases/tag/2026.10.02", "published_at": "2026-10-02T20:00:00Z" },
-  { "tag_name": "2026.10.01", "name": "2026.10.01", "draft": false, "prerelease": false, "body": "one", "html_url": "https://github.com/winters27/octo/releases/tag/2026.10.01", "published_at": "2026-10-01T21:33:35Z" }
+  { "tag_name": "2026.10.02.1", "name": "", "draft": false, "prerelease": false, "body": "### Fix\n- one", "html_url": "https://github.com/sleezy6/octo/releases/tag/2026.10.02.1", "published_at": "2026-10-02T22:00:00Z" },
+  { "tag_name": "2026.10.02", "name": "2026.10.02", "draft": false, "prerelease": false, "body": "two", "html_url": "https://github.com/sleezy6/octo/releases/tag/2026.10.02", "published_at": "2026-10-02T20:00:00Z" },
+  { "tag_name": "2026.10.01", "name": "2026.10.01", "draft": false, "prerelease": false, "body": "one", "html_url": "https://github.com/sleezy6/octo/releases/tag/2026.10.01", "published_at": "2026-10-01T21:33:35Z" }
 ]
 "####;
 
@@ -415,7 +415,7 @@ impl UpdateFixture {
         std::fs::create_dir_all(&update_dir).unwrap();
         let github = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/repos/winters27/octo/releases"))
+            .and(path("/repos/sleezy6/octo/releases"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_raw(RELEASES.as_bytes().to_vec(), "application/json"),
             )
@@ -657,7 +657,7 @@ async fn with_checks_off_the_card_and_the_refusal_match_the_baseline() {
     assert_eq!(
         reply.body,
         format!(
-            r#"{{"enabled":false,"repo":"winters27/octo","running":"{running}","latest":null,"newer":[],"updateAvailable":false,"standing":"unknown","checkedUtc":null,"error":null,"helper":{{"installed":false}},"reinstallCommand":"scripts/updater/install-updater.sh","pending":false,"pendingId":null,"unanswered":null,"run":null,"command":"git fetch --tags && git checkout --detach <release> && (docker compose pull octo yt-dlp-shim octo-sonic || docker compose --profile source build octo-source yt-dlp-shim-source octo-sonic-source) && docker compose up -d","imageCommand":"docker compose pull octo yt-dlp-shim octo-sonic && docker compose up -d octo yt-dlp-shim octo-sonic"}}"#
+            r#"{{"enabled":false,"repo":"sleezy6/octo","running":"{running}","latest":null,"newer":[],"updateAvailable":false,"standing":"unknown","checkedUtc":null,"error":null,"helper":{{"installed":false}},"reinstallCommand":"scripts/updater/install-updater.sh","pending":false,"pendingId":null,"unanswered":null,"run":null,"command":"git fetch --tags && git checkout --detach <release> && (docker compose pull octo yt-dlp-shim octo-sonic || docker compose --profile source build octo-source yt-dlp-shim-source octo-sonic-source) && docker compose up -d","imageCommand":"docker compose pull octo yt-dlp-shim octo-sonic && docker compose up -d octo yt-dlp-shim octo-sonic"}}"#
         )
     );
     let reply = send(
