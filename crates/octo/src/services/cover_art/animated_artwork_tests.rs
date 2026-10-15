@@ -221,3 +221,36 @@ async fn a_short_wait_gives_up_but_the_answer_is_kept_for_next_time() {
         Some(AnimatedLookup::Found(_))
     ));
 }
+
+/// Many answers back at once (an app opening a page of albums) save one at a time, and the file
+/// ends up holding every one of them: no save writes over another's temporary file, and no older
+/// list lands over a newer one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn answers_saved_at_once_all_reach_the_file() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/artwork/search"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let artwork = service(&server.uri(), &dir);
+    let asks: Vec<_> = (0..40)
+        .map(|n| {
+            let artwork = artwork.clone();
+            tokio::spawn(async move { artwork.find("Artist", &format!("Album {n}")).await })
+        })
+        .collect();
+    for ask in asks {
+        assert_eq!(ask.await.expect("joins"), AnimatedLookup::None);
+    }
+    let restarted = service(&server.uri(), &dir);
+    for n in 0..40 {
+        assert_eq!(
+            restarted.known("Artist", &format!("Album {n}")),
+            Some(AnimatedLookup::None),
+            "album {n} was saved"
+        );
+    }
+    assert!(!dir.path().join("animated-artwork.json.tmp").exists());
+}

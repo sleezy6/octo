@@ -92,6 +92,9 @@ pub struct AnimatedArtwork {
     path: PathBuf,
     known: Mutex<HashMap<String, Known>>,
     flights: InFlight<AnimatedLookup>,
+    /// Held for a whole save: every save writes the same `<file>.tmp`, so two at once would
+    /// write over each other's and the second rename would find it gone.
+    save_turn: Mutex<()>,
 }
 
 impl AnimatedArtwork {
@@ -140,6 +143,7 @@ impl AnimatedArtwork {
             path,
             known: Mutex::new(known),
             flights: InFlight::new(),
+            save_turn: Mutex::new(()),
         }
     }
 
@@ -315,7 +319,7 @@ impl AnimatedArtwork {
     /// were), or `None` when no cover is known for it.
     pub fn relay_key(&self, artist: &str, album: &str) -> Option<String> {
         let key = Self::key(artist, album)?;
-        let (relay, text) = {
+        let relay = {
             let mut known = self.known.lock();
             let entry = known.get_mut(&key).filter(|k| k.cover().is_some())?;
             if let Some(relay) = &entry.relay {
@@ -323,11 +327,9 @@ impl AnimatedArtwork {
             }
             let relay = Self::new_relay_key();
             entry.relay = Some(relay.clone());
-            (relay, serde_json::to_string(&*known).unwrap_or_default())
+            relay
         };
-        if let Err(e) = state_file::save_atomic(&self.path, &text) {
-            warn!("{} could not be saved: {e}", self.path.display());
-        }
+        self.save();
         Some(relay)
     }
 
@@ -363,7 +365,7 @@ impl AnimatedArtwork {
             },
             AnimatedLookup::Unavailable => return,
         };
-        let text = {
+        {
             let mut known = self.known.lock();
             // A cover found again keeps its relay key, so links an app already holds still work.
             let mut entry = entry;
@@ -382,8 +384,15 @@ impl AnimatedArtwork {
                     known.remove(&key);
                 }
             }
-            serde_json::to_string(&*known).unwrap_or_default()
-        };
+        }
+        self.save();
+    }
+
+    /// Writes what is known to the file, one save at a time, each with what is known when its
+    /// turn comes: an older list never lands over a newer one.
+    fn save(&self) {
+        let _turn = self.save_turn.lock();
+        let text = serde_json::to_string(&*self.known.lock()).unwrap_or_default();
         if let Err(e) = state_file::save_atomic(&self.path, &text) {
             warn!("{} could not be saved: {e}", self.path.display());
         }
