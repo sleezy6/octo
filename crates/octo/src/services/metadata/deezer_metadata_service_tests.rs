@@ -1468,3 +1468,46 @@ async fn an_album_search_does_not_list_is_found_among_the_artists_releases() {
     // Not an artist of exactly that name: nothing, rather than another artist's record.
     assert_eq!(h.service.find_album_id("Grime", "Visions").await, None);
 }
+
+/// Deezer's search for "Burial Archangel" lists neither copy of the song, and Deezer has three
+/// artists called "Burial", the one meant listed third. The song is found among the top songs of
+/// the best known of them, and the lesser-known namesakes are not asked.
+#[tokio::test]
+async fn a_song_search_misses_is_found_among_the_best_known_namesakes_top_songs() {
+    let h = Harness::new(vec![
+        (
+            "/search/artist",
+            r#"{"data":[{"id":10294722,"name":"Burial","nb_album":1,"nb_fan":12},
+                        {"id":71690712,"name":"Burial","nb_album":8,"nb_fan":300},
+                        {"id":6281,"name":"Burial","nb_album":26,"nb_fan":400000}]}"#,
+        ),
+        ("/search/album", r#"{"data":[]}"#),
+        (
+            "/search?",
+            r#"{"data":[{"id":3394862181,"title":"Burial","duration":180,"artist":{"id":1,"name":"Archangel Radio"}}]}"#,
+        ),
+        (
+            "/artist/6281/top",
+            r#"{"data":[{"id":80546728,"title":"Archangel","duration":240,"artist":{"id":6281,"name":"Burial"}},
+                        {"id":80546729,"title":"Near Dark","duration":236,"artist":{"id":6281,"name":"Burial"}}]}"#,
+        ),
+        ("/artist/10294722/top", r#"{"data":[]}"#),
+        ("/artist/71690712/top", r#"{"data":[]}"#),
+    ])
+    .await;
+
+    assert_eq!(
+        h.service
+            .find_track_id("Burial", "Archangel", None)
+            .await
+            .as_deref(),
+        Some("80546728")
+    );
+    assert_eq!(h.calls("/artist/6281/top"), 1);
+    assert_eq!(
+        h.calls("/artist/10294722/top"),
+        0,
+        "the namesakes are not asked first"
+    );
+    assert_eq!(h.calls("/artist/71690712/top"), 0);
+}

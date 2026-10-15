@@ -52,6 +52,8 @@ const PARTIAL_TTL: Duration = Duration::from_secs(10 * 60);
 const TRACK_SEARCHES: usize = 3;
 /// How many artists an artist search reads to find the one named exactly as asked.
 const ARTIST_NAME_CANDIDATES: i32 = 5;
+/// How many artists of one name a lookup tries, the best known first.
+const SAME_NAME_ARTISTS: usize = 3;
 
 /// How many hits to weigh before giving up. A plain query is fuzzier than a
 /// qualified one was, so it puts covers, karaoke and live takes next to the real
@@ -1117,27 +1119,42 @@ impl DeezerMetadataService {
     /// The id of `album` among the releases of the catalog artist named exactly `artist`, when
     /// there is one: the title the same name, or the same once edition words are set aside.
     async fn find_album_in_artist_releases(&self, artist: &str, album: &str) -> Option<String> {
-        if is_blank(artist) {
-            return None;
+        let wanted = AlbumOwnership::base_key(Some(album));
+        for named in self.artists_named(artist, false).await {
+            let releases = self
+                .get_artist_albums_on(&named.deezer_id, &named.name, false, 1)
+                .await;
+            let found = releases
+                .iter()
+                .find(|release| compare_titles(album, Some(&release.title)) == FieldVerdict::Match)
+                .or_else(|| {
+                    releases.iter().find(|release| {
+                        !wanted.is_empty() && AlbumOwnership::base_key(Some(&release.title)) == wanted
+                    })
+                });
+            if let Some(release) = found {
+                return Some(release.deezer_id.clone());
+            }
         }
-        let named = self
-            .search_artists(artist, ARTIST_NAME_CANDIDATES)
+        None
+    }
+
+    /// The catalog artists named exactly `artist`, the best known first (most fans, then most
+    /// albums), at most [`SAME_NAME_ARTISTS`]. Deezer has three called "Burial", and the one
+    /// most people mean is the third its search lists; the others are still tried after it.
+    async fn artists_named(&self, artist: &str, background: bool) -> Vec<ArtistHit> {
+        if is_blank(artist) {
+            return Vec::new();
+        }
+        let mut named: Vec<ArtistHit> = self
+            .search_artists_on(artist, ARTIST_NAME_CANDIDATES, background)
             .await
             .into_iter()
-            .find(|hit| dotnet::eq_ignore_case(hit.name.trim(), artist.trim()))?;
-        let releases = self
-            .get_artist_albums_on(&named.deezer_id, &named.name, false, 1)
-            .await;
-        let wanted = AlbumOwnership::base_key(Some(album));
-        releases
-            .iter()
-            .find(|release| compare_titles(album, Some(&release.title)) == FieldVerdict::Match)
-            .or_else(|| {
-                releases.iter().find(|release| {
-                    !wanted.is_empty() && AlbumOwnership::base_key(Some(&release.title)) == wanted
-                })
-            })
-            .map(|release| release.deezer_id.clone())
+            .filter(|hit| dotnet::eq_ignore_case(hit.name.trim(), artist.trim()))
+            .collect();
+        named.sort_by_key(|hit| std::cmp::Reverse((hit.fans, hit.album_count)));
+        named.truncate(SAME_NAME_ARTISTS);
+        named
     }
 
     /// Album detail plus its full tracklist, ordered by disc then track position.
@@ -1748,22 +1765,36 @@ impl DeezerMetadataService {
             return Ok((false, on_album));
         }
 
-        let Some(artist_id) = artist_id.or(album_artist_id) else {
-            return Ok((false, None));
-        };
-        let url = format!(
-            "{}/artist/{}/top?limit={ARTIST_TOP_SONGS}",
-            self.base(),
-            escape_data_string(&artist_id)
-        );
-        let r = self.get_json(&url, background).await;
-        if r.transient {
-            return Ok((true, None));
+        // The artist's own top songs. Search does not always list a well-known song (Burial's
+        // "Archangel" is not among "Burial Archangel"'s hits), and the artist a search names
+        // may be a namesake, so the artists of exactly that name are asked, best known first;
+        // the one the searches named comes after them when it is none of those.
+        let mut artist_ids: Vec<String> = self
+            .artists_named(artist, background)
+            .await
+            .into_iter()
+            .map(|hit| hit.deezer_id)
+            .collect();
+        for named in [artist_id, album_artist_id].into_iter().flatten() {
+            if !artist_ids.contains(&named) && artist_ids.len() < SAME_NAME_ARTISTS {
+                artist_ids.push(named);
+            }
         }
-        Ok((
-            false,
-            best_match(r.doc.as_ref(), artist, title)?.map(|hit| (hit, r.doc)),
-        ))
+        for artist_id in artist_ids {
+            let url = format!(
+                "{}/artist/{}/top?limit={ARTIST_TOP_SONGS}",
+                self.base(),
+                escape_data_string(&artist_id)
+            );
+            let r = self.get_json(&url, background).await;
+            if r.transient {
+                return Ok((true, None));
+            }
+            if let Some(hit) = best_match(r.doc.as_ref(), artist, title)? {
+                return Ok((false, Some((hit, r.doc))));
+            }
+        }
+        Ok((false, None))
     }
 
     /// The song on the album named after it: the album search's first match for the artist and
