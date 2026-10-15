@@ -2,7 +2,7 @@
 //! plays it from its own server and never contacts Apple itself.
 //!
 //! `{key}` is the random relay key of a cover Octo found (getAnimatedArtwork and getAlbum hand
-//! it out as `streamUrl` / `streamUrlTall`). `{file}` is `square.m3u8` or `tall.m3u8` for the
+//! it out as `animatedArtwork`'s `url` / `urlTall`). `{file}` is `square.m3u8` or `tall.m3u8` for the
 //! cover's top playlist, or a name Octo wrote into a playlist it relayed: the address of the
 //! next playlist or video file, base64url, with its extension. Playlists come back with every
 //! address rewritten that way, and relative to the playlist, so the app's player follows them
@@ -27,7 +27,8 @@ use tracing::debug;
 use crate::app::AppState;
 use crate::http::routes::RouteSet;
 
-/// The path the relay answers under, without its leading slash: what `streamUrl` starts with.
+/// The path the relay answers under, without its leading slash: what `url` and `urlTall` start
+/// with.
 pub const RELAY_PREFIX: &str = "animated-artwork";
 
 /// The one host the relay fetches from.

@@ -124,15 +124,9 @@ async fn get_animated_artwork_by_artist_and_album() {
     .await;
     let envelope = reply.envelope();
     assert_eq!(envelope["status"], "ok", "{envelope}");
-    assert_eq!(envelope["animatedArtwork"]["url"], SQUARE);
-    assert_eq!(envelope["animatedArtwork"]["urlTall"], TALL);
-    // The same through this server, relative to its address.
-    let square = envelope["animatedArtwork"]["streamUrl"]
-        .as_str()
-        .expect("streamUrl");
-    let tall = envelope["animatedArtwork"]["streamUrlTall"]
-        .as_str()
-        .expect("streamUrlTall");
+    // Only links through this server, relative to its address: Apple's never leave Octo.
+    let square = envelope["animatedArtwork"]["url"].as_str().expect("url");
+    let tall = envelope["animatedArtwork"]["urlTall"].as_str().expect("urlTall");
     assert!(
         square.starts_with("animated-artwork/") && square.ends_with("/square.m3u8"),
         "{square}"
@@ -145,6 +139,7 @@ async fn get_animated_artwork_by_artist_and_album() {
         square.trim_end_matches("square.m3u8"),
         tall.trim_end_matches("tall.m3u8")
     );
+    assert!(!reply.text().contains("itunes.apple.com"), "{envelope}");
 }
 
 #[tokio::test]
@@ -221,8 +216,14 @@ async fn get_album_carries_the_animated_cover_when_there_is_one() {
     artwork_has(&t.artwork, "Grimes", "Art Angels").await;
     let answer = read(with_album_artwork(&t.state, album_answer("Grimes", "Art Angels")).await).await;
     let album = &answer["subsonic-response"]["album"];
-    assert_eq!(album["animatedArtwork"]["url"], SQUARE);
-    assert_eq!(album["animatedArtwork"]["urlTall"], TALL);
+    let url = album["animatedArtwork"]["url"].as_str().expect("url");
+    assert!(
+        url.starts_with("animated-artwork/") && url.ends_with("/square.m3u8"),
+        "{url}"
+    );
+    let tall = album["animatedArtwork"]["urlTall"].as_str().expect("urlTall");
+    assert!(tall.ends_with("/tall.m3u8"), "{tall}");
+    assert!(!answer.to_string().contains("itunes.apple.com"), "{answer}");
     assert_eq!(album["name"], "Art Angels");
 }
 

@@ -2,10 +2,10 @@
 //! the owner's own server of m8tec/apple-music-animated-artworks (`Metadata:AnimatedArtworkUrl`).
 //!
 //! - `getAnimatedArtwork?id=<album id>` (a library album or an outside one), or
-//!   `?artist=&album=`: `animatedArtwork` with `url` (square) and `urlTall` (tall), Apple's HLS
-//!   playlists, and `streamUrl` / `streamUrlTall`, the same relayed through this server
-//!   (relative to the server address, as `rest/` is; see [`super::animated_relay`]); no
-//!   `animatedArtwork` when the album has none.
+//!   `?artist=&album=`: `animatedArtwork` with `url` (square) and `urlTall` (tall), HLS
+//!   playlists relayed through this server, relative to the server address as `rest/` is (see
+//!   [`super::animated_relay`]); no `animatedArtwork` when the album has none. Apple's own
+//!   addresses never leave Octo, so an app that plays these never contacts Apple.
 //! - `getAlbum` in JSON carries the same `animatedArtwork` on the album when it is known, or
 //!   comes back within a moment; otherwise the next getAlbum has it.
 //!
@@ -20,7 +20,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use octo_core::common::dotnet::is_blank;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::animated_relay::stream_path;
 use super::caller_checks::{SubsonicCall, as_json, refuse_unless_signed_in};
@@ -52,22 +52,19 @@ pub fn routes() -> RouteSet {
         .merge(super::animated_relay::routes())
 }
 
-/// `animatedArtwork` as the apps read it: Apple's own playlists (`url`, `urlTall`), and the
-/// same through this server (`streamUrl`, `streamUrlTall`), relative to the server address.
-fn as_value(state: &AppState, artist: &str, album: &str, cover: &AnimatedCover) -> Value {
-    let mut value = serde_json::to_value(cover).unwrap_or_else(|_| json!({}));
-    if let (Some(relay), Some(map)) = (
-        state.animated_artwork.relay_key(artist, album),
-        value.as_object_mut(),
-    ) {
-        if cover.url.is_some() {
-            map.insert("streamUrl".into(), Value::String(stream_path(&relay, false)));
-        }
-        if cover.url_tall.is_some() {
-            map.insert("streamUrlTall".into(), Value::String(stream_path(&relay, true)));
-        }
+/// `animatedArtwork` as the apps read it: the square (`url`) and tall (`urlTall`) playlists
+/// relayed through this server, relative to the server address as `rest/` is. Apple's own
+/// addresses never leave Octo. `None` when the cover has no relay key (it is not known).
+fn as_value(state: &AppState, artist: &str, album: &str, cover: &AnimatedCover) -> Option<Value> {
+    let relay = state.animated_artwork.relay_key(artist, album)?;
+    let mut map = serde_json::Map::new();
+    if cover.url.is_some() {
+        map.insert("url".into(), Value::String(stream_path(&relay, false)));
     }
-    value
+    if cover.url_tall.is_some() {
+        map.insert("urlTall".into(), Value::String(stream_path(&relay, true)));
+    }
+    (!map.is_empty()).then_some(Value::Object(map))
 }
 
 pub async fn get_animated_artwork(State(state): State<AppState>, req: Request) -> AppResult {
@@ -116,11 +113,10 @@ pub async fn get_animated_artwork(State(state): State<AppState>, req: Request) -
         .find_within(&artist, &album, ASK_WAIT)
         .await
     {
-        AnimatedLookup::Found(cover) => Ok(octo_reply(
-            &state,
-            &format,
-            Some(("animatedArtwork", &as_value(&state, &artist, &album, &cover))),
-        )),
+        AnimatedLookup::Found(cover) => match as_value(&state, &artist, &album, &cover) {
+            Some(value) => Ok(octo_reply(&state, &format, Some(("animatedArtwork", &value)))),
+            None => Ok(octo_reply(&state, &format, None)),
+        },
         AnimatedLookup::None => Ok(octo_reply(&state, &format, None)),
         AnimatedLookup::Unavailable => Ok(builder
             .create_error(
@@ -205,7 +201,9 @@ pub async fn with_album_artwork(state: &AppState, response: Response) -> Respons
     else {
         return unchanged(parts, bytes);
     };
-    let value = as_value(state, &artist, &album_name, &cover);
+    let Some(value) = as_value(state, &artist, &album_name, &cover) else {
+        return unchanged(parts, bytes);
+    };
     album.insert("animatedArtwork".into(), value);
     let body = serde_json::to_vec(&document).unwrap_or_else(|_| bytes.to_vec());
     parts.headers.remove(header::CONTENT_LENGTH);
