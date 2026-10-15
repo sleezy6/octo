@@ -252,25 +252,66 @@ fn merge_search_results_xml_deduplicates_album_against_local() {
     assert_eq!(merged.1.len(), 2);
 }
 
-/// An outside album with an owned count was already weighed against the library and kept: a
-/// one-song namesake in the library does not hide it, in JSON or XML.
+/// A library namesake holding less than half the outside album (a one-song heart of it) does not
+/// hide it, in JSON or XML.
 #[test]
-fn merge_search_results_keeps_a_counted_album_beside_its_namesake() {
+fn merge_search_results_keeps_an_album_beside_a_small_namesake() {
     let mut counted = rainbows();
     counted.albums[0].owned_count = Some(1);
+    counted.albums[0].song_count = Some(10);
 
     let local_json = json_rows(vec![
-        json!({"id": "local1", "name": "In Rainbows", "artist": "Radiohead"}),
+        json!({"id": "local1", "name": "In Rainbows", "artist": "Radiohead", "songCount": 1}),
     ]);
     let merged = mapper().merge_search_results(vec![], local_json, vec![], &counted, &[], true, None);
     assert_eq!(merged.1.len(), 3);
 
     let local_xml = vec![xml_row(
         "album",
-        &[("id", "local1"), ("name", "In Rainbows"), ("artist", "Radiohead")],
+        &[
+            ("id", "local1"),
+            ("name", "In Rainbows"),
+            ("artist", "Radiohead"),
+            ("songCount", "1"),
+        ],
     )];
     let merged = mapper().merge_search_results(vec![], local_xml, vec![], &counted, &[], false, None);
     assert_eq!(merged.1.len(), 3);
+}
+
+/// The library's whole album hides its outside copy, even when ownership counted it a song short
+/// (a bonus track, or an album artist spelled another way), in JSON or XML.
+#[test]
+fn merge_search_results_hides_an_album_the_library_holds_most_of() {
+    let mut counted = rainbows();
+    counted.albums[0].owned_count = Some(9);
+    counted.albums[0].song_count = Some(10);
+
+    let local_json = json_rows(vec![
+        json!({"id": "local1", "name": "In Rainbows", "artist": "Radiohead", "songCount": 9}),
+    ]);
+    let merged = mapper().merge_search_results(vec![], local_json, vec![], &counted, &[], true, None);
+    assert_eq!(merged.1.len(), 2, "the library's own and Kid A");
+
+    let local_xml = vec![xml_row(
+        "album",
+        &[
+            ("id", "local1"),
+            ("name", "In Rainbows"),
+            ("artist", "Radiohead"),
+            ("songCount", "9"),
+        ],
+    )];
+    let merged = mapper().merge_search_results(vec![], local_xml, vec![], &counted, &[], false, None);
+    assert_eq!(merged.1.len(), 2);
+}
+
+#[test]
+fn a_namesake_stands_in_unless_it_holds_less_than_half() {
+    assert!(namesake_stands_in(Some(5), Some(10)));
+    assert!(!namesake_stands_in(Some(4), Some(10)));
+    assert!(namesake_stands_in(None, Some(10)), "no count: by name, as before");
+    assert!(namesake_stands_in(Some(1), None));
 }
 
 #[test]

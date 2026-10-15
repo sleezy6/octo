@@ -1,6 +1,6 @@
 //! Parsing Subsonic search responses and merging local with external search results.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use octo_core::common::SongIdentity;
 use octo_core::common::song_identity::SongRef;
@@ -237,17 +237,20 @@ impl SubsonicModelMapper {
         );
         merged_songs.extend(trailing_local_songs);
 
-        // Albums, deduplicated by artist+name so an album you own is not listed twice. An
-        // outside album with an owned count was already weighed against the library and kept
-        // (a one-song namesake does not hide its album), so the name does not drop it here.
+        // Albums, deduplicated by artist+name so an album you own is not listed twice, unless
+        // the library's namesake holds less than half of it (see `namesake_stands_in`).
         // Playlists follow, appearing as albums with genre "Playlist".
-        let mut local_album_keys = HashSet::new();
+        let mut local_album_keys: HashMap<String, Option<i64>> = HashMap::new();
         for album in &local_albums {
             let Row::Json(Value::Object(dict)) = album else {
                 continue;
             };
             if let Some(key) = album_key(text(dict, "artist").as_deref(), text(dict, "name").as_deref()) {
-                local_album_keys.insert(key);
+                add_namesake(
+                    &mut local_album_keys,
+                    key,
+                    dict.get("songCount").and_then(Value::as_i64),
+                );
             }
         }
 
@@ -257,9 +260,9 @@ impl SubsonicModelMapper {
                 .albums
                 .iter()
                 .filter(|a| {
-                    a.owned_count.is_some()
-                        || album_key(Some(&a.artist), Some(&a.title))
-                            .is_none_or(|k| !local_album_keys.contains(&k))
+                    album_key(Some(&a.artist), Some(&a.title))
+                        .and_then(|k| local_album_keys.get(&k).copied())
+                        .is_none_or(|held| !namesake_stands_in(held, a.song_count))
                 })
                 .map(|a| Row::Json(Value::Object(self.response_builder.convert_album_to_json(a)))),
         );
@@ -328,19 +331,22 @@ impl SubsonicModelMapper {
             }
         }
 
-        // Albums, deduplicated by artist+name as the JSON merge does, counted albums aside.
-        let mut local_album_keys = HashSet::new();
+        // Albums, deduplicated by artist+name as the JSON merge does.
+        let mut local_album_keys: HashMap<String, Option<i64>> = HashMap::new();
         let mut merged_albums = Vec::new();
         for album in local_albums.into_iter().filter_map(Row::into_xml) {
             if let Some(key) = album_key(album.attribute("artist"), album.attribute("name")) {
-                local_album_keys.insert(key);
+                let songs = album
+                    .attribute("songCount")
+                    .and_then(|count| count.trim().parse().ok());
+                add_namesake(&mut local_album_keys, key, songs);
             }
             merged_albums.push(Row::Xml(rename(album, "album")));
         }
         for album in &external_result.albums {
-            if album.owned_count.is_none()
-                && album_key(Some(&album.artist), Some(&album.title))
-                    .is_some_and(|key| local_album_keys.contains(&key))
+            if album_key(Some(&album.artist), Some(&album.title))
+                .and_then(|key| local_album_keys.get(&key).copied())
+                .is_some_and(|held| namesake_stands_in(held, album.song_count))
             {
                 continue;
             }
@@ -460,6 +466,28 @@ impl LocalSongs {
 /// Dedup key for an album, case, accents and punctuation ignored. None when there is not
 /// enough to compare on, which means "never treat this as a duplicate". Shared with the native
 /// album search, so both APIs agree on what counts as the same album.
+/// Whether the library's albums of an outside album's name, holding `held` songs together
+/// (`None` when a count is missing), stand for it so it is not listed twice: they do unless
+/// they hold less than half the songs it lists. A one-song heart of "Real Deal" files a
+/// one-song "Real Deal" that must not hide the album; the album itself, a song or two short of
+/// the catalog's edition or counted short by ownership, must. Without both counts a namesake
+/// stands for it, as before.
+pub fn namesake_stands_in(held: Option<i64>, listed: Option<i32>) -> bool {
+    match (held, listed.filter(|count| *count > 0)) {
+        (Some(held), Some(listed)) => held * 2 >= i64::from(listed),
+        _ => true,
+    }
+}
+
+/// Adds one library album's song count (`None` when it gives none) to what its key holds.
+pub fn add_namesake(held: &mut HashMap<String, Option<i64>>, key: String, songs: Option<i64>) {
+    let entry = held.entry(key).or_insert(Some(0));
+    *entry = match (*entry, songs) {
+        (Some(sum), Some(songs)) => Some(sum + songs),
+        _ => None,
+    };
+}
+
 pub fn album_key(artist: Option<&str>, name: Option<&str>) -> Option<String> {
     let name = name.filter(|n| !n.trim().is_empty())?;
     Some(format!(

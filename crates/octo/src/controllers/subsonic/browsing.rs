@@ -1,7 +1,9 @@
 //! `getSong`, `getArtist` and `getAlbum`: an outside id is answered from the catalog, a library
 //! artist or album is Navidrome's merged with what the catalog has that the library lacks.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
+
+use octo_subsonic::subsonic_model_mapper::{add_namesake, namesake_stands_in};
 
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
@@ -228,10 +230,18 @@ pub async fn get_artist(State(state): State<AppState>, req: Request) -> AppResul
     }
 
     // An owned album is one the library has by the matcher's key, so "Discovery" in the
-    // library hides the catalog's "Discovery" however either is spelled or punctuated. One
-    // with an owned count was already weighed against the library and kept, so it stays.
-    let local_album_names: HashSet<String> =
-        local_album_titles.iter().map(|t| SongIdentity::key(t)).collect();
+    // library hides the catalog's "Discovery" however either is spelled or punctuated, unless
+    // the library's "Discovery" holds less than half of it (a one-song heart).
+    let mut local_album_names: HashMap<String, Option<i64>> = HashMap::new();
+    for album in &local_albums {
+        if let Some(name) = album.get("name").and_then(Value::as_str) {
+            add_namesake(
+                &mut local_album_names,
+                SongIdentity::key(name),
+                album.get("songCount").and_then(Value::as_i64),
+            );
+        }
+    }
 
     // Each outside album says how much of it the library holds; one the page's own albums hold
     // whole, or by name, is left out.
@@ -239,9 +249,10 @@ pub async fn get_artist(State(state): State<AppState>, req: Request) -> AppResul
 
     let mut merged_albums = local_albums;
     for deezer_album in &deezer_albums {
-        if deezer_album.owned_count.is_some()
-            || !local_album_names.contains(&SongIdentity::key(&deezer_album.title))
-        {
+        let stands_in = local_album_names
+            .get(&SongIdentity::key(&deezer_album.title))
+            .is_some_and(|held| namesake_stands_in(*held, deezer_album.song_count));
+        if !stands_in {
             merged_albums.push(Value::Object(builder.convert_album_to_json(deezer_album)));
         }
     }
