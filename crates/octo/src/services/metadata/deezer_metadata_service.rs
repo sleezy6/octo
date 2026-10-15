@@ -131,6 +131,15 @@ pub struct DeezerMetadataService {
     inner: Arc<Inner>,
 }
 
+/// Another catalog's ISRCs for a song, asked when Deezer's own search cannot find it: an ISRC
+/// names the recording exactly, and Deezer looks a track up by one. MusicBrainz in Octo.
+#[async_trait::async_trait]
+pub trait IsrcSource: Send + Sync {
+    /// The ISRCs of `title` by `artist`, best match first; with `seconds`, of a recording about
+    /// that long. Empty when none are known or the source did not answer.
+    async fn isrcs_for(&self, artist: &str, title: &str, seconds: Option<i32>) -> Vec<String>;
+}
+
 struct Inner {
     http: Arc<DeezerRateLimitHandler>,
     settings: Arc<SettingsStore>,
@@ -149,6 +158,8 @@ struct Inner {
     /// Requests on their way to the catalog, by cache key. The cache only answers
     /// once a request is back, so two callers asking the same thing at once each asked.
     in_flight_artists: InFlight<Vec<ArtistHit>>,
+    /// Asked for a song's ISRCs when search cannot find it (see [`IsrcSource`]); set once.
+    isrc_source: std::sync::OnceLock<Arc<dyn IsrcSource>>,
     in_flight_counts: InFlight<Option<i32>>,
     in_flight_albums: InFlight<AlbumLookup>,
 
@@ -186,6 +197,7 @@ impl DeezerMetadataService {
                 cache: MemoryCache::new(MAX_CACHE),
                 album_year_tasks: InFlight::new(),
                 in_flight_artists: InFlight::new(),
+                isrc_source: std::sync::OnceLock::new(),
                 in_flight_counts: InFlight::new(),
                 in_flight_albums: InFlight::new(),
                 in_flight_calls: InFlight::new(),
@@ -1071,6 +1083,11 @@ impl DeezerMetadataService {
 
     /// Resolve an artist + album name to a Deezer album id. Needed because album
     /// ids minted from a song row carry no Deezer id, so the name is all we have.
+    /// Has a song search cannot find asked of `source` for its ISRCs (see [`IsrcSource`]).
+    pub fn set_isrc_source(&self, source: Arc<dyn IsrcSource>) {
+        let _ = self.inner.isrc_source.set(source);
+    }
+
     pub async fn find_album_id(&self, artist: &str, album: &str) -> Option<String> {
         if is_blank(album) {
             return None;

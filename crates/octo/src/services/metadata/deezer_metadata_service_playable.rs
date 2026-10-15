@@ -77,9 +77,17 @@ fn playable_key(artist: &str, title: &str, isrc: Option<&str>) -> String {
 
 impl DeezerMetadataService {
     /// The catalog id of this song: the track its ISRC names when that is the same recording,
-    /// else the track search's match for the artist and title. None when the catalog has no
-    /// such song or did not answer; only an answer is remembered.
-    pub async fn find_track_id(&self, artist: &str, title: &str, isrc: Option<&str>) -> Option<String> {
+    /// else the track search's match for the artist and title, else the track another catalog's
+    /// ISRC for the song names (see [`super::deezer_metadata_service::IsrcSource`]; `seconds`,
+    /// when known, tells apart two songs of one name). None when the catalog has no such song
+    /// or did not answer; only an answer is remembered.
+    pub async fn find_track_id(
+        &self,
+        artist: &str,
+        title: &str,
+        isrc: Option<&str>,
+        seconds: Option<i32>,
+    ) -> Option<String> {
         if is_blank(artist) && is_blank(title) {
             return None;
         }
@@ -105,6 +113,30 @@ impl DeezerMetadataService {
                 Err(e) => {
                     debug!("deezer track id for '{artist} - {title}' could not be read: {e}");
                     transient = true;
+                }
+            }
+        }
+        // Search can miss a song the catalog has: the copy it finds is one not sold where Octo
+        // runs, or the artist shares a name. Another catalog's ISRC names the recording exactly.
+        if found.is_none()
+            && !transient
+            && !is_blank(artist)
+            && !is_blank(title)
+            && let Some(source) = self.inner.isrc_source.get().cloned()
+        {
+            for code in source
+                .isrcs_for(artist, title, seconds)
+                .await
+                .into_iter()
+                .filter(|code| isrc.as_deref() != Some(code.as_str()))
+                .take(3)
+            {
+                let (id, busy) = self.track_id_by_isrc(&code, artist, title).await;
+                transient |= busy;
+                if id.is_some() {
+                    debug!("deezer found '{artist} - {title}' by its ISRC {code}");
+                    found = id;
+                    break;
                 }
             }
         }

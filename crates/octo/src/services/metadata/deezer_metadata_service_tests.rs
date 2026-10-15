@@ -1498,7 +1498,7 @@ async fn a_song_search_misses_is_found_among_the_best_known_namesakes_top_songs(
 
     assert_eq!(
         h.service
-            .find_track_id("Burial", "Archangel", None)
+            .find_track_id("Burial", "Archangel", None, None)
             .await
             .as_deref(),
         Some("80546728")
@@ -1510,4 +1510,66 @@ async fn a_song_search_misses_is_found_among_the_best_known_namesakes_top_songs(
         "the namesakes are not asked first"
     );
     assert_eq!(h.calls("/artist/71690712/top"), 0);
+}
+
+/// Another catalog's ISRCs for a song, fixed.
+struct FixedIsrcs(Vec<&'static str>, std::sync::Mutex<Vec<Option<i32>>>);
+
+#[async_trait::async_trait]
+impl IsrcSource for FixedIsrcs {
+    async fn isrcs_for(&self, _artist: &str, _title: &str, seconds: Option<i32>) -> Vec<String> {
+        self.1.lock().unwrap().push(seconds);
+        self.0.iter().map(|code| (*code).to_string()).collect()
+    }
+}
+
+/// Deezer's search finds nothing of a song it has (the copy it would find is not sold where Octo
+/// runs): the song is found by the ISRC another catalog knows it by, the length passed along so
+/// the other catalog can tell two songs of one name apart.
+#[tokio::test]
+async fn a_song_search_cannot_find_is_found_by_another_catalogs_isrc() {
+    let h = Harness::new(vec![
+        (
+            "/track/isrc:GBLZC0700013",
+            r#"{"id":80546728,"title":"Archangel","duration":238,"artist":{"id":6281,"name":"Burial"}}"#,
+        ),
+        ("/search", r#"{"data":[],"total":0}"#),
+    ])
+    .await;
+    let isrcs = Arc::new(FixedIsrcs(
+        vec!["GBLZC0700013"],
+        std::sync::Mutex::new(Vec::new()),
+    ));
+    h.service.set_isrc_source(isrcs.clone());
+
+    assert_eq!(
+        h.service
+            .find_track_id("Burial", "Archangel", None, Some(238))
+            .await
+            .as_deref(),
+        Some("80546728")
+    );
+    assert_eq!(*isrcs.1.lock().unwrap(), vec![Some(238)]);
+}
+
+/// An ISRC that names another song is not taken for the one asked for.
+#[tokio::test]
+async fn another_catalogs_isrc_for_a_different_song_is_not_taken() {
+    let h = Harness::new(vec![
+        (
+            "/track/isrc:GBLZC0700099",
+            r#"{"id":1,"title":"Near Dark","duration":236,"artist":{"id":6281,"name":"Burial"}}"#,
+        ),
+        ("/search", r#"{"data":[],"total":0}"#),
+    ])
+    .await;
+    h.service.set_isrc_source(Arc::new(FixedIsrcs(
+        vec!["GBLZC0700099"],
+        std::sync::Mutex::new(Vec::new()),
+    )));
+
+    assert_eq!(
+        h.service.find_track_id("Burial", "Archangel", None, None).await,
+        None
+    );
 }

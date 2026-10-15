@@ -412,9 +412,16 @@ impl DeezerResolver {
     }
 
     /// The catalog id of an outside song, which Octo knows by artist and title (and by ISRC
-    /// when an album listing named it). `None` when the catalog has no such song.
-    pub async fn track_id_for(&self, artist: &str, title: &str, isrc: Option<&str>) -> Option<String> {
-        self.catalog.find_track_id(artist, title, isrc).await
+    /// when an album listing named it, and its length in seconds when known). `None` when the
+    /// catalog has no such song.
+    pub async fn track_id_for(
+        &self,
+        artist: &str,
+        title: &str,
+        isrc: Option<&str>,
+        seconds: Option<i32>,
+    ) -> Option<String> {
+        self.catalog.find_track_id(artist, title, isrc, seconds).await
     }
 
     /// The account's sign-in: the one kept until it expires (see [`Session::lasts`]), else a

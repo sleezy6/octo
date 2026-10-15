@@ -553,3 +553,83 @@ pub fn parse_recording_facts(
         releases,
     })
 }
+
+/// The ISRCs of the recordings in a recording search (`build_recording_search_url`) that are
+/// `title` by `artist`: the same title (no remix or other version), an artist credit that agrees,
+/// and with `seconds`, a length within 10 seconds of it; best match first, each once, at most
+/// five. Without `seconds`, nothing when the recordings that match differ by more than 20
+/// seconds: two songs of one name (three artists are called "Burial", each with an
+/// "Archangel"), and no way to tell which is meant.
+pub fn isrcs_of_recordings(
+    doc: &serde_json::Value,
+    artist: &str,
+    title: &str,
+    seconds: Option<i32>,
+) -> Vec<String> {
+    let want_title = SongIdentity::key(title);
+    if want_title.is_empty() {
+        return Vec::new();
+    }
+    let seconds = seconds.filter(|s| *s > 0);
+    let mut lengths: Vec<i64> = Vec::new();
+    let mut found: Vec<String> = Vec::new();
+    let recordings = doc.get("recordings").and_then(serde_json::Value::as_array);
+    for recording in recordings.into_iter().flatten() {
+        let got_title = recording
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if SongIdentity::key(got_title) != want_title {
+            continue;
+        }
+        let credit: String = recording
+            .get("artist-credit")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|part| {
+                let name = part.get("name").and_then(serde_json::Value::as_str).unwrap_or("");
+                let join = part
+                    .get("joinphrase")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                format!("{name}{join}")
+            })
+            .collect();
+        if !SongIdentity::artists_agree(artist, &credit) {
+            continue;
+        }
+        let length = recording.get("length").and_then(serde_json::Value::as_i64);
+        if let (Some(want), Some(got)) = (seconds, length)
+            && (i64::from(want) * 1000 - got).abs() > 10_000
+        {
+            continue;
+        }
+        let codes: Vec<String> = recording
+            .get("isrcs")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|code| code.as_str().and_then(SongIdentity::normalize_isrc))
+            .collect();
+        if codes.is_empty() {
+            continue;
+        }
+        if let Some(length) = length {
+            lengths.push(length);
+        }
+        for code in codes {
+            if !found.contains(&code) {
+                found.push(code);
+            }
+        }
+    }
+    if seconds.is_none()
+        && let (Some(low), Some(high)) = (lengths.iter().min(), lengths.iter().max())
+        && high - low > 20_000
+    {
+        return Vec::new();
+    }
+    found.truncate(5);
+    found
+}

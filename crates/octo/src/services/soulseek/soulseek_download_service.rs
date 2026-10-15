@@ -636,7 +636,7 @@ impl SoulseekDownloadService {
         let Some(deezer) = self.deezer.as_ref().filter(|deezer| deezer.is_configured()) else {
             anyhow::bail!("{DEEZER_NOT_SET_UP}");
         };
-        let Some(track_id) = deezer.track_id_for(artist, title, None).await else {
+        let Some(track_id) = deezer.track_id_for(artist, title, None, None).await else {
             return Ok(None);
         };
         let quality = if lossless_only {
@@ -666,7 +666,10 @@ impl SoulseekDownloadService {
             return None;
         }
         let (artist, title) = names(r);
-        deezer.track_id_for(&artist, &title, r.isrc.as_deref()).await
+        let seconds = r.duration.filter(|d| *d > 0).or(r.shown_duration);
+        deezer
+            .track_id_for(&artist, &title, r.isrc.as_deref(), seconds)
+            .await
     }
 
     /// An outside song played straight from Deezer, decrypted as it is read. `None` when no

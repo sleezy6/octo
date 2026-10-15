@@ -178,6 +178,27 @@ impl MusicBrainzClient {
         Ok(Some(doc))
     }
 
+    /// The ISRCs of the recordings that are `title` by `artist` (at about `seconds` long when
+    /// known), best match first: see [`pure::isrcs_of_recordings`]. One search, inside the same
+    /// one-a-second budget, remembered six hours.
+    pub async fn isrcs_for(
+        &self,
+        artist: &str,
+        title: &str,
+        seconds: Option<i32>,
+    ) -> Result<Vec<String>, MusicBrainzError> {
+        if dotnet::is_blank(artist) || dotnet::is_blank(title) {
+            return Ok(Vec::new());
+        }
+        let Some(doc) = self
+            .search_recordings(artist, title, seconds.filter(|s| *s > 0).unwrap_or(0))
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(pure::isrcs_of_recordings(&doc, artist, title, seconds))
+    }
+
     /// The recordings that carry one code, with their releases.
     pub async fn lookup_isrc(&self, isrc: &str) -> Result<Option<Value>, MusicBrainzError> {
         let Some(code) = SongIdentity::normalize_isrc(isrc) else {
@@ -523,3 +544,16 @@ fn make_room<K, V>(map: &mut HashMap<K, V>, adding: usize, max: usize) {
 #[cfg(test)]
 #[path = "music_brainz_client_tests.rs"]
 mod tests;
+
+#[async_trait::async_trait]
+impl crate::services::metadata::deezer_metadata_service::IsrcSource for MusicBrainzClient {
+    async fn isrcs_for(&self, artist: &str, title: &str, seconds: Option<i32>) -> Vec<String> {
+        match MusicBrainzClient::isrcs_for(self, artist, title, seconds).await {
+            Ok(codes) => codes,
+            Err(e) => {
+                tracing::debug!("MusicBrainz could not name ISRCs for '{artist} - {title}': {e}");
+                Vec::new()
+            }
+        }
+    }
+}

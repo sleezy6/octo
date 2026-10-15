@@ -468,3 +468,43 @@ fn a_name_search_takes_no_country_when_two_artists_share_the_name() {
     );
     assert_eq!(searched_artist_country(&twice, "Nirvana"), "US");
 }
+
+fn burial_archangels() -> serde_json::Value {
+    serde_json::json!({"recordings": [
+        {"title": "Archangel", "length": 238000, "isrcs": ["GBLZC0700013"],
+         "artist-credit": [{"name": "Burial", "joinphrase": ""}]},
+        {"title": "Archangel (Phaseone remix)", "length": 300000, "isrcs": ["GBXXX1500001"],
+         "artist-credit": [{"name": "Burial", "joinphrase": ""}]},
+        {"title": "Archangel", "length": 412000, "isrcs": ["DEXXX0900002"],
+         "artist-credit": [{"name": "Burial", "joinphrase": ""}]},
+        {"title": "Archangel", "length": 239000, "isrcs": ["USXXX0000003"],
+         "artist-credit": [{"name": "Someone Else", "joinphrase": ""}]}
+    ]})
+}
+
+#[test]
+fn isrcs_of_recordings_keeps_the_song_of_that_length_by_that_artist() {
+    assert_eq!(
+        isrcs_of_recordings(&burial_archangels(), "Burial", "Archangel", Some(240)),
+        vec!["GBLZC0700013".to_string()]
+    );
+}
+
+#[test]
+fn isrcs_of_recordings_without_a_length_gives_nothing_for_two_songs_of_one_name() {
+    assert!(isrcs_of_recordings(&burial_archangels(), "Burial", "Archangel", None).is_empty());
+}
+
+#[test]
+fn isrcs_of_recordings_without_a_length_takes_one_song_s_codes() {
+    let doc = serde_json::json!({"recordings": [
+        {"title": "Archangel", "length": 238000, "isrcs": ["GBLZC0700013"],
+         "artist-credit": [{"name": "Burial"}]},
+        {"title": "Archangel", "length": 241000, "isrcs": ["GBLZC0700013", "GBLZC1200050"],
+         "artist-credit": [{"name": "Burial"}]}
+    ]});
+    assert_eq!(
+        isrcs_of_recordings(&doc, "Burial", "Archangel", None),
+        vec!["GBLZC0700013".to_string(), "GBLZC1200050".to_string()]
+    );
+}

@@ -1444,6 +1444,12 @@ impl MetadataClients {
             }
             None => DeezerMetadataService::new(Arc::clone(&deezer_client), Arc::clone(settings)),
         });
+        let music_brainz = Arc::new(MusicBrainzClient::new());
+        // A song Deezer's search misses is looked up by MusicBrainz's ISRCs for it. Not when the
+        // catalog is a test's stand-in, which the real MusicBrainz knows nothing of.
+        if deezer_base_url.is_none() {
+            deezer_metadata.set_isrc_source(Arc::clone(&music_brainz) as _);
+        }
         let deezer_resolver = Arc::new(DeezerResolver::new(
             Arc::clone(settings),
             Arc::clone(&deezer_metadata),
@@ -1480,7 +1486,7 @@ impl MetadataClients {
             deezer_metadata,
             deezer_resolver,
             deezer_cache,
-            music_brainz: Arc::new(MusicBrainzClient::new()),
+            music_brainz,
             acoust_id_rate_limiter,
             acoust_id,
             itunes_cover_art,
