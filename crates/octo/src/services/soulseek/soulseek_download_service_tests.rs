@@ -1991,3 +1991,32 @@ async fn a_deezer_heart_takes_the_song_from_the_playback_cache_when_it_is_there(
     assert!(deezer.seen.lock().cdn_ranges.is_empty());
     assert!(cached.is_file());
 }
+
+/// A song's catalog lookup is told the length it was listed with, else a catalog's, never the
+/// length of a video that played in its place: a 59 s preview kept Burial's four-minute
+/// "Archangel" from matching.
+#[test]
+fn a_catalog_lookup_is_never_told_a_videos_length() {
+    let routing = |duration, shown, source| SoulseekRouting {
+        duration,
+        shown_duration: shown,
+        shown_duration_source: source,
+        ..Default::default()
+    };
+    assert_eq!(
+        lookup_seconds(&routing(None, Some(59), LengthSource::Video)),
+        None
+    );
+    assert_eq!(
+        lookup_seconds(&routing(None, Some(238), LengthSource::LastFm)),
+        Some(238)
+    );
+    assert_eq!(
+        lookup_seconds(&routing(Some(240), Some(238), LengthSource::Deezer)),
+        Some(240)
+    );
+    assert_eq!(
+        lookup_seconds(&routing(Some(0), Some(238), LengthSource::Apple)),
+        Some(238)
+    );
+}

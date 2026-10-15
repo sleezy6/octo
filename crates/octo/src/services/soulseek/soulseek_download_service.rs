@@ -240,6 +240,18 @@ pub struct SoulseekDownloadService {
     album_batches: Mutex<HashMap<String, (String, String)>>,
 }
 
+/// How long the song runs, to tell a catalog lookup which recording is meant: the length the
+/// song was listed with, else the one shown for it from a catalog. Never a video's length: that
+/// may be the very clip that played in the song's place (a 59 s preview of a four-minute song),
+/// and would keep the right recording from matching.
+pub(crate) fn lookup_seconds(r: &SoulseekRouting) -> Option<i32> {
+    let shown = r
+        .shown_duration
+        .filter(|s| *s > 0)
+        .filter(|_| !matches!(r.shown_duration_source, LengthSource::None | LengthSource::Video));
+    r.duration.filter(|d| *d > 0).or(shown)
+}
+
 impl SoulseekDownloadService {
     /// `soulseek_settings` is captured here.
     pub fn new(soulseek_settings: SoulseekSettings, parts: SoulseekDownloadParts) -> Self {
@@ -666,7 +678,7 @@ impl SoulseekDownloadService {
             return None;
         }
         let (artist, title) = names(r);
-        let seconds = r.duration.filter(|d| *d > 0).or(r.shown_duration);
+        let seconds = lookup_seconds(r);
         deezer
             .track_id_for(&artist, &title, r.isrc.as_deref(), seconds)
             .await
