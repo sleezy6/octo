@@ -250,18 +250,34 @@ pub async fn get_artist(State(state): State<AppState>, req: Request) -> AppResul
     // An outside album the page's stub of it (under half its songs) stands beside is listed in
     // the stub's place: one entry, whose page plays the songs held and whose heart fetches the
     // rest.
+    let local_covers: HashMap<String, String> = local_albums
+        .iter()
+        .filter_map(|album| {
+            let name = album.get("name").and_then(Value::as_str)?;
+            let cover = album
+                .get("coverArt")
+                .and_then(Value::as_str)
+                .filter(|cover| !cover.is_empty())?;
+            Some((SongIdentity::key(name), cover.to_string()))
+        })
+        .collect();
     let mut stubs: HashSet<String> = HashSet::new();
     let mut outside_albums = Vec::new();
     for deezer_album in &deezer_albums {
         let key = SongIdentity::key(&deezer_album.title);
+        let mut fields = builder.convert_album_to_json(deezer_album);
         match local_album_names.get(&key) {
             Some(held) if namesake_stands_in(*held, deezer_album.song_count) => continue,
             Some(_) => {
+                // The stub's own cover: no catalog cover to fetch.
+                if let Some(cover) = local_covers.get(&key) {
+                    fields.insert("coverArt".into(), cover.clone().into());
+                }
                 stubs.insert(key);
             }
             None => {}
         }
-        outside_albums.push(Value::Object(builder.convert_album_to_json(deezer_album)));
+        outside_albums.push(Value::Object(fields));
     }
     let mut merged_albums: Vec<Value> = local_albums
         .into_iter()

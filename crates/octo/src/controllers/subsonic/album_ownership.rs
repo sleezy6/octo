@@ -242,7 +242,30 @@ pub(crate) async fn outside_album_with_owned_songs(
         return None;
     }
 
+    // The library's cover of this album, from a song it holds: the album and the songs it does
+    // not hold show it too, so the catalog's cover is never fetched.
+    let is_copy: Vec<bool> = rows
+        .iter()
+        .map(|row| row.as_ref().is_some_and(|row| copies.contains_key(&row.id)))
+        .collect();
+    let library_cover = merged
+        .iter()
+        .zip(&is_copy)
+        .filter(|(_, copy)| **copy)
+        .find_map(|(song, _)| song.get("coverArt").and_then(Value::as_str).map(str::to_string))
+        .filter(|cover| !cover.is_empty());
+    if let Some(cover) = &library_cover {
+        for (song, copy) in merged.iter_mut().zip(&is_copy) {
+            if !*copy && let Some(fields) = song.as_object_mut() {
+                fields.insert("coverArt".into(), cover.clone().into());
+            }
+        }
+    }
+
     let mut fields = builder.album_detail_fields(album);
+    if let Some(cover) = library_cover {
+        fields.insert("coverArt".into(), cover.into());
+    }
     fields.insert("song".into(), Value::Array(merged));
     debug!(
         "getAlbum '{} - {}': {owned} of {} songs given as the library's copies in {} ms",

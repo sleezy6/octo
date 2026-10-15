@@ -159,7 +159,7 @@ impl Respond for FakeNavidrome {
                         "song": rows.iter().enumerate().map(|(i, row)| json!({
                             "id": row.id, "title": row.title, "album": row.album, "albumId": row.album_id,
                             "artist": row.artist, "track": i + 1, "duration": row.duration, "suffix": "flac",
-                            "path": row.path,
+                            "path": row.path, "coverArt": format!("al-{id}"),
                         })).collect::<Vec<_>>(),
                     }}}),
                 );
@@ -440,6 +440,13 @@ async fn outside_album_gives_the_songs_the_library_holds_as_the_librarys_copies(
             .filter(|s| s["isExternal"] != false)
             .all(|s| s["isExternal"] == true)
     );
+    // The library's cover for the album and every song on it, so no catalog cover is fetched.
+    let library_cover = format!("al-{}", drake::WATTBA_ID);
+    assert_eq!(text_of(album, "coverArt"), library_cover);
+    assert!(
+        songs.iter().all(|s| text_of(s, "coverArt") == library_cover),
+        "{songs:?}"
+    );
 
     // XML says the same.
     let xml = XElement::parse(
@@ -681,7 +688,7 @@ impl Respond for WithOneMaidSong {
                 "id": "ar-drake", "name": "Drake", "albumCount": 3, "album": [
                     {"id": "al-fomo", "name": "HABIBTI (FOMO)", "artist": "Drake", "songCount": 15},
                     {"id": "al-takecare", "name": "Take Care", "artist": "Drake", "songCount": 2},
-                    {"id": ONE_MAID_SONG_ID, "name": "MAID OF HONOUR", "artist": "Drake", "songCount": 1}]}}}),
+                    {"id": ONE_MAID_SONG_ID, "name": "MAID OF HONOUR", "artist": "Drake", "songCount": 1, "coverArt": "al-maid-one"}]}}}),
             );
         }
         FakeNavidrome.respond(request)
@@ -756,6 +763,12 @@ async fn artist_page_lists_the_whole_album_in_place_of_its_one_song_namesake() {
     assert_eq!(maid.len(), 1, "{albums:?}");
     assert!(maid[0].1, "the catalog album: {albums:?}");
     assert_eq!(maid[0].2, Some(1), "{albums:?}");
+    // With the stub's own cover, so the catalog's is not fetched.
+    let maid_row = albums
+        .iter()
+        .find(|a| text_of(a, "name") == "MAID OF HONOUR")
+        .expect("listed");
+    assert_eq!(text_of(maid_row, "coverArt"), "al-maid-one", "{maid_row}");
     // The other library albums are listed as before.
     assert!(
         albums.iter().any(|a| text_of(a, "id") == "al-takecare"),

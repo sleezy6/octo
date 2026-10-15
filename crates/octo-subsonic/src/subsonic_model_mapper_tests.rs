@@ -261,10 +261,20 @@ fn merge_search_results_lists_the_whole_album_in_a_stubs_place() {
     counted.albums[0].song_count = Some(10);
 
     let local_json = json_rows(vec![
-        json!({"id": "local1", "name": "In Rainbows", "artist": "Radiohead", "songCount": 1}),
+        json!({"id": "local1", "name": "In Rainbows", "artist": "Radiohead", "songCount": 1, "coverArt": "al-local1"}),
         json!({"id": "local2", "name": "OK Computer", "artist": "Radiohead", "songCount": 12}),
     ]);
     let merged = mapper().merge_search_results(vec![], local_json, vec![], &counted, &[], true, None);
+    // The whole album shows the stub's own cover.
+    let whole = merged
+        .1
+        .iter()
+        .find_map(|row| match row {
+            Row::Json(value) if value["name"] == "in rainbows" => Some(value.clone()),
+            _ => None,
+        })
+        .expect("the whole album is listed");
+    assert_eq!(whole["coverArt"], "al-local1");
     let listed = ids(&merged.1);
     assert_eq!(listed.len(), 3, "{listed:?}");
     assert!(

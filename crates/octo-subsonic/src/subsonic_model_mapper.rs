@@ -241,11 +241,15 @@ impl SubsonicModelMapper {
         // the library's namesake holds less than half of it (see `namesake_stands_in`).
         // Playlists follow, appearing as albums with genre "Playlist".
         let mut local_album_keys: HashMap<String, Option<i64>> = HashMap::new();
+        let mut local_covers: HashMap<String, String> = HashMap::new();
         for album in &local_albums {
             let Row::Json(Value::Object(dict)) = album else {
                 continue;
             };
             if let Some(key) = album_key(text(dict, "artist").as_deref(), text(dict, "name").as_deref()) {
+                if let Some(cover) = text(dict, "coverArt").filter(|cover| !cover.is_empty()) {
+                    local_covers.entry(key.clone()).or_insert(cover);
+                }
                 add_namesake(
                     &mut local_album_keys,
                     key,
@@ -255,11 +259,21 @@ impl SubsonicModelMapper {
         }
 
         let mut stubs: HashSet<String> = HashSet::new();
-        let outside_albums: Vec<Row> = external_result
+        let kept: Vec<&Album> = external_result
             .albums
             .iter()
             .filter(|a| keep_beside_namesake(&local_album_keys, &mut stubs, a))
-            .map(|a| Row::Json(Value::Object(self.response_builder.convert_album_to_json(a))))
+            .collect();
+        let outside_albums: Vec<Row> = kept
+            .into_iter()
+            .map(|a| {
+                let mut fields = self.response_builder.convert_album_to_json(a);
+                // In a stub's place, the library's own cover: no catalog cover to fetch.
+                if let Some(cover) = stub_cover(&stubs, &local_covers, a) {
+                    fields.insert("coverArt".into(), cover.into());
+                }
+                Row::Json(Value::Object(fields))
+            })
             .collect();
         // A library stub of an album listed whole is left out: the album stands for it.
         let mut merged_albums: Vec<Row> = local_albums
@@ -340,6 +354,7 @@ impl SubsonicModelMapper {
 
         // Albums, deduplicated by artist+name as the JSON merge does.
         let mut local_album_keys: HashMap<String, Option<i64>> = HashMap::new();
+        let mut local_covers: HashMap<String, String> = HashMap::new();
         let mut library_albums = Vec::new();
         for album in local_albums.into_iter().filter_map(Row::into_xml) {
             let key = album_key(album.attribute("artist"), album.attribute("name"));
@@ -348,15 +363,29 @@ impl SubsonicModelMapper {
                     .attribute("songCount")
                     .and_then(|count| count.trim().parse().ok());
                 add_namesake(&mut local_album_keys, key.clone(), songs);
+                if let Some(cover) = album.attribute("coverArt").filter(|cover| !cover.is_empty()) {
+                    local_covers
+                        .entry(key.clone())
+                        .or_insert_with(|| cover.to_string());
+                }
             }
             library_albums.push((key, album));
         }
         let mut stubs: HashSet<String> = HashSet::new();
-        let outside_albums: Vec<Row> = external_result
+        let kept: Vec<&Album> = external_result
             .albums
             .iter()
             .filter(|album| keep_beside_namesake(&local_album_keys, &mut stubs, album))
-            .map(|album| Row::Xml(self.response_builder.convert_album_to_xml(album, ns)))
+            .collect();
+        let outside_albums: Vec<Row> = kept
+            .into_iter()
+            .map(|album| {
+                let mut element = self.response_builder.convert_album_to_xml(album, ns);
+                if let Some(cover) = stub_cover(&stubs, &local_covers, album) {
+                    element.set_attr("coverArt", cover);
+                }
+                Row::Xml(element)
+            })
             .collect();
         // A library stub of an album listed whole is left out: the album stands for it.
         let mut merged_albums: Vec<Row> = library_albums
@@ -513,6 +542,20 @@ pub fn keep_beside_namesake(
             true
         }
     }
+}
+
+/// The cover of the library stub an outside album is listed in place of, when it is one and
+/// the stub has a cover: the library's own picture, so the catalog's is never fetched.
+pub fn stub_cover(
+    stubs: &HashSet<String>,
+    covers: &HashMap<String, String>,
+    album: &Album,
+) -> Option<String> {
+    let key = album_key(Some(&album.artist), Some(&album.title))?;
+    if !stubs.contains(&key) {
+        return None;
+    }
+    covers.get(&key).cloned()
 }
 
 /// Adds one library album's song count (`None` when it gives none) to what its key holds.
