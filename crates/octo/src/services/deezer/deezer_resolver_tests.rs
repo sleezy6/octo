@@ -366,10 +366,10 @@ async fn the_account_check_says_which_accounts_sign_in_and_is_asked_once() {
     assert_eq!(fixture.resolver.check_accounts().await, [false, true]);
     assert_eq!(fixture.seen.lock().auth_cookies.len(), 2);
 
-    // Other accounts are checked afresh.
+    // Other accounts are checked afresh, from the sign-in already kept for this one.
     fixture.settings.set(deezer("fallback", None));
     assert_eq!(fixture.resolver.check_accounts().await, [true]);
-    assert_eq!(fixture.seen.lock().auth_cookies.len(), 3);
+    assert_eq!(fixture.seen.lock().auth_cookies.len(), 2);
 }
 
 #[tokio::test]
@@ -508,12 +508,25 @@ async fn plays_at_the_same_moment_share_one_sign_in() {
 }
 
 #[tokio::test]
-async fn a_sign_in_is_made_again_after_ten_minutes() {
+async fn a_sign_in_that_says_no_expiry_is_made_again_after_six_hours() {
     let fixture = Fixture::new(Scenario::default()).await;
     drop(fixture.open(None).await.expect("opens"));
     fixture
         .resolver
-        .age_sessions(DeezerResolver::SESSION_TTL + std::time::Duration::from_secs(1))
+        .age_sessions(DeezerResolver::SESSION_UNSAID - std::time::Duration::from_secs(60))
+        .await;
+    // Another quality each time, so the play asks for a new media address and needs a sign-in.
+    drop(
+        fixture
+            .resolver
+            .open_stream("42", None, "FLAC")
+            .await
+            .expect("still the same sign-in"),
+    );
+    assert_eq!(fixture.seen.lock().auth_cookies.len(), 1);
+    fixture
+        .resolver
+        .age_sessions(std::time::Duration::from_secs(61))
         .await;
     drop(
         fixture
@@ -529,7 +542,7 @@ async fn a_sign_in_is_made_again_after_ten_minutes() {
 async fn a_sign_in_deezer_no_longer_accepts_is_replaced_once_and_the_play_goes_on() {
     let fixture = Fixture::new(Scenario::default()).await;
     drop(fixture.open(None).await.expect("opens"));
-    // The first sign-in's token stops working before its ten minutes are up.
+    // The first sign-in's token stops working before it was due to expire.
     fixture.seen.lock().stale_tokens.push("api-primary-1".into());
     drop(
         fixture
@@ -760,4 +773,63 @@ async fn deezer_is_asked_as_a_desktop_browser() {
             .all(|agent| agent.contains("Chrome/") && agent.contains("Windows NT")),
         "{agents:?}"
     );
+}
+
+/// A sign-in is kept until Deezer says it expires, within a floor and a ceiling.
+#[tokio::test]
+async fn a_sign_in_is_kept_until_deezer_says_it_expires() {
+    // Another quality each play, so each asks for a new media address and needs a sign-in.
+    let play = |fixture: &Fixture, quality: &'static str| {
+        let resolver = fixture.resolver.clone();
+        async move { resolver.open_stream("42", None, quality).await.is_some() }
+    };
+    let fixture = Fixture::new(Scenario {
+        session_expires_in: Some(3 * 60 * 60),
+        ..Default::default()
+    })
+    .await;
+    assert!(play(&fixture, "MP3_320").await);
+    fixture
+        .resolver
+        .age_sessions(Duration::from_secs(3 * 60 * 60 - 120))
+        .await;
+    assert!(play(&fixture, "MP3_128").await);
+    assert_eq!(fixture.seen.lock().auth_cookies.len(), 1, "the same sign-in");
+    fixture.resolver.age_sessions(Duration::from_secs(180)).await;
+    assert!(play(&fixture, "FLAC").await);
+    assert_eq!(fixture.seen.lock().auth_cookies.len(), 2, "a new sign-in");
+
+    // An expiry already near would sign in for every play: it lasts ten minutes at least.
+    let fixture = Fixture::new(Scenario {
+        session_expires_in: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert!(play(&fixture, "MP3_320").await);
+    fixture.resolver.age_sessions(Duration::from_secs(60)).await;
+    assert!(play(&fixture, "MP3_128").await);
+    assert_eq!(fixture.seen.lock().auth_cookies.len(), 1, "the same sign-in");
+}
+
+/// The account check reads the sign-in a play is using instead of signing in again; Check now
+/// signs in.
+#[tokio::test]
+async fn the_account_check_reuses_the_sign_in_a_play_made() {
+    let fixture = Fixture::new(Scenario {
+        plan: Some(("Deezer Premium", "US", true, true)),
+        ..Default::default()
+    })
+    .await;
+    drop(fixture.open(None).await.expect("opens"));
+    let (health, _) = fixture.resolver.account_health(false).await;
+    assert!(health[0].signed_in);
+    assert_eq!(health[0].offer.as_deref(), Some("Deezer Premium"));
+    assert_eq!(
+        fixture.seen.lock().auth_cookies.len(),
+        1,
+        "no sign-in for the check"
+    );
+
+    fixture.resolver.account_health(true).await;
+    assert_eq!(fixture.seen.lock().auth_cookies.len(), 2, "Check now signs in");
 }

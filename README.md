@@ -32,7 +32,7 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 - **Deezer as a song source.** With your own Deezer account, songs you don't own play from Deezer (MP3 320 or FLAC) instead of a YouTube preview, and hearted songs download from Deezer in FLAC, with a second account to fall back on and an optional playback cache. See [Your own Deezer account](#your-own-deezer-account).
 - **Soulseek and YouTube are optional.** Turn either off with `SOULSEEK_ENABLED=false` or `YOUTUBE_ENABLED=false`; Deezer, Lidarr or the other source carries on without them.
 - **Every song has a length.** A song from outside your library gets its length from Deezer, then Apple's catalog, then Last.fm. Radio stations, instant mixes and song lookups wait a moment for it, so players that read a length only once (iPhone apps such as NaviBeat) show it.
-- **Deezer kept within its limits.** Octo paces its Deezer requests, ahead for what an app is waiting on and behind for background work, and keeps each account's sign-in for ten minutes rather than signing in for every song.
+- **Deezer kept within its limits.** Octo paces its Deezer requests, ahead for what an app is waiting on and behind for background work, and keeps each account's sign-in until Deezer says it expires, signing in again only when Deezer says it is no longer good. An ARL Deezer refuses is not used again until you change it, and a song Deezer has no audio for is not asked about again for six hours.
 - **Animated album covers.** Point `ANIMATED_ARTWORK_URL` at your own [m8tec/apple-music-animated-artworks](https://github.com/m8tec/apple-music-animated-artworks) server and the apps can show Apple Music's moving covers, relayed through Octo so they never contact Apple themselves. See [Tags, covers and lyrics](#tags-covers-and-lyrics).
 - **Starter Radio can be turned off.** `LASTFM_ENABLE_STARTER_RADIO=false` gives a new listener no mix of their own until enough plays were learned from.
 - **Bring your own Navidrome.** The built-in installer and bundled Navidrome are gone; Octo runs beside the Navidrome you already have.
@@ -885,7 +885,7 @@ Setting it up, on the dashboard's **Deezer** page or in `.env`:
 
 | Setting | `.env` | Default | |
 |---|---|---|---|
-| ARL | `DEEZER_ARL` | empty | The `arl` cookie of deezer.com while you are signed in (browser developer tools, Cookies). It lasts a few months. Octo signs in with it every half hour and warns in the log when it stops working; the Deezer page shows the plan, whether it gives FLAC, and what to do when it does not. |
+| ARL | `DEEZER_ARL` | empty | The `arl` cookie of deezer.com while you are signed in (browser developer tools, Cookies). It lasts a few months. Octo signs in when something needs Deezer and keeps that sign-in until Deezer says it expires (or that it no longer works), checks it every half hour without signing in again, and warns in the log when it stops working. An ARL Deezer refuses is not used again until you change it or press Check now; the Deezer page shows the plan, whether it gives FLAC, and what to do when it does not. |
 | Fallback ARL | `DEEZER_ARL_FALLBACK` | empty | A second account, tried when the first cannot be given a song. |
 | Songs you keep | `DEEZER_QUALITY` | `FLAC` | `FLAC`, `MP3_320` or `MP3_128`. Each takes the next one down when the account is not given it; FLAC needs a plan with HiFi. |
 | Songs you play | `DEEZER_STREAM_QUALITY` | `MP3_320` | The same choices. MP3 plays and seeks in every app. |

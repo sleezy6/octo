@@ -75,6 +75,10 @@ struct Session {
     license_token: String,
     /// What the sign-in said about the account, for the dashboard.
     facts: AccountFacts,
+    /// How long Deezer said the sign-in lasts (`OPTIONS.expiration_timestamp`), kept within
+    /// [`DeezerResolver::SESSION_SHORTEST`] and [`DeezerResolver::SESSION_LONGEST`];
+    /// [`DeezerResolver::SESSION_UNSAID`] when it did not say.
+    lasts: Duration,
 }
 
 /// Deezer answered and would not sign the account in: the ARL is wrong, expired, or the
@@ -166,8 +170,8 @@ pub struct DeezerResolver {
     media_cache: MemoryCache<Media>,
     // ponytail: serial media resolution bounds gateway bursts; add per-account gates if contention grows.
     media_gate: tokio::sync::Mutex<()>,
-    /// The sign-in each account was last given and when, so a play does not sign in again for
-    /// [`Self::SESSION_TTL`]. Held while an account signs in, so plays at the same moment share
+    /// The sign-in each account was last given and until when it is reused (see
+    /// [`Session::lasts`]). Held while an account signs in, so plays at the same moment share
     /// one sign-in.
     sessions: tokio::sync::Mutex<std::collections::HashMap<String, (Session, tokio::time::Instant)>>,
     /// Each account whose last sign-in failed, and how: see [`SignInTrouble`].
@@ -190,9 +194,14 @@ impl DeezerResolver {
     pub const MEDIA_URL: &'static str = "https://media.deezer.com/v1/get_url";
 
     pub const API_TIMEOUT: Duration = Duration::from_secs(10);
-    /// How long an account's sign-in is reused. A play that Deezer refuses on a reused sign-in
-    /// signs in again once before giving up.
-    pub const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
+    /// How long an account's sign-in is reused when Deezer does not say when it expires. A
+    /// sign-in Deezer says is no longer good is replaced at once whatever its age, so the length
+    /// is only how often Octo signs in again of its own accord, as deemix keeps one for its run.
+    pub const SESSION_UNSAID: Duration = Duration::from_secs(6 * 60 * 60);
+    /// The shortest and longest a sign-in is reused, whatever Deezer says: an expiry already
+    /// near would sign in for every play, and a day is often enough to sign in anyway.
+    pub const SESSION_SHORTEST: Duration = Duration::from_secs(10 * 60);
+    pub const SESSION_LONGEST: Duration = Duration::from_secs(24 * 60 * 60);
     /// How long a media address is reused.
     const MEDIA_TTL: Duration = Duration::from_secs(120);
     /// How long a track no account could be given is not asked about again.
@@ -320,11 +329,20 @@ impl DeezerResolver {
         }
         let mut health = Vec::new();
         for arl in &accounts {
-            let signed_in = self.sign_in(arl, !fresh).await;
-            match &signed_in {
-                Ok(session) => self.remember_session(arl, session).await,
-                Err(_) => self.forget_session(arl).await,
-            }
+            // A sign-in a play is using says as much as a new one would: only Check now, or an
+            // account with none kept, signs in for the check.
+            let kept = if fresh { None } else { self.kept_session(arl).await };
+            let signed_in = match kept {
+                Some(session) => Ok(session),
+                None => {
+                    let signed_in = self.sign_in(arl, !fresh).await;
+                    match &signed_in {
+                        Ok(session) => self.remember_session(arl, session).await,
+                        Err(_) => self.forget_session(arl).await,
+                    }
+                    signed_in
+                }
+            };
             health.push(match signed_in {
                 Ok(session) => DeezerAccountHealth {
                     signed_in: true,
@@ -399,28 +417,39 @@ impl DeezerResolver {
         self.catalog.find_track_id(artist, title, isrc).await
     }
 
-    /// The account's sign-in: the one kept while it is younger than [`Self::SESSION_TTL`], else a
+    /// The account's sign-in: the one kept until it expires (see [`Session::lasts`]), else a
     /// new one, which is kept. The flag is true for a kept one.
     async fn session_for(&self, arl: &str) -> anyhow::Result<(Session, bool)> {
         let mut sessions = self.sessions.lock().await;
-        if let Some((session, at)) = sessions.get(arl)
-            && at.elapsed() < Self::SESSION_TTL
+        let now = tokio::time::Instant::now();
+        if let Some((session, until)) = sessions.get(arl)
+            && now < *until
         {
             return Ok((session.clone(), true));
         }
         sessions.remove(arl);
         let session = self.sign_in(arl, true).await?;
         let now = tokio::time::Instant::now();
-        sessions.retain(|_, (_, at)| now.duration_since(*at) < Self::SESSION_TTL);
-        sessions.insert(arl.to_string(), (session.clone(), now));
+        sessions.retain(|_, (_, until)| now < *until);
+        sessions.insert(arl.to_string(), (session.clone(), now + session.lasts));
         Ok((session, false))
     }
 
-    /// Makes every kept sign-in `by` older, for a test that waits out [`Self::SESSION_TTL`].
+    /// The account's kept sign-in while it lasts, without signing in.
+    async fn kept_session(&self, arl: &str) -> Option<Session> {
+        self.sessions
+            .lock()
+            .await
+            .get(arl)
+            .filter(|(_, until)| tokio::time::Instant::now() < *until)
+            .map(|(session, _)| session.clone())
+    }
+
+    /// Brings every kept sign-in `by` nearer its end, for a test that waits one out.
     #[cfg(test)]
     pub(crate) async fn age_sessions(&self, by: Duration) {
-        for (_, at) in self.sessions.lock().await.values_mut() {
-            *at = at
+        for (_, until) in self.sessions.lock().await.values_mut() {
+            *until = until
                 .checked_sub(by)
                 .expect("the clock is far enough from its start");
         }
@@ -443,10 +472,10 @@ impl DeezerResolver {
     }
 
     async fn remember_session(&self, arl: &str, session: &Session) {
-        self.sessions
-            .lock()
-            .await
-            .insert(arl.to_string(), (session.clone(), tokio::time::Instant::now()));
+        self.sessions.lock().await.insert(
+            arl.to_string(),
+            (session.clone(), tokio::time::Instant::now() + session.lasts),
+        );
     }
 
     /// A new sign-in for the account, unless `honour_trouble` and its last one failed: an ARL
@@ -562,11 +591,26 @@ impl DeezerResolver {
             cookie.push_str("; ");
             cookie.push_str(&sid);
         }
+        let lasts = options
+            .and_then(|o| o.get("expiration_timestamp"))
+            .and_then(|value| match value {
+                Value::Number(at) => at.as_i64(),
+                Value::String(at) => at.trim().parse::<i64>().ok(),
+                _ => None,
+            })
+            .filter(|at| *at > 0)
+            .map(|at| {
+                let left = at - chrono::Utc::now().timestamp();
+                Duration::from_secs(u64::try_from(left).unwrap_or(0))
+                    .clamp(Self::SESSION_SHORTEST, Self::SESSION_LONGEST)
+            })
+            .unwrap_or(Self::SESSION_UNSAID);
         Ok(Session {
             cookie,
             api_token,
             license_token,
             facts,
+            lasts,
         })
     }
 

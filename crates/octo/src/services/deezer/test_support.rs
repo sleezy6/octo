@@ -39,6 +39,9 @@ pub(crate) struct Scenario {
     /// Formats `pageTrack` says the track has no file in (`FILESIZE_<format>` "0"); the others
     /// it gives a size. Empty: no sizes at all, as an older answer.
     pub(crate) no_file_in: Vec<&'static str>,
+    /// Seconds until the sign-in expires, as `OPTIONS.expiration_timestamp` says; `None` says
+    /// nothing.
+    pub(crate) session_expires_in: Option<i64>,
 }
 
 impl Default for Scenario {
@@ -58,6 +61,7 @@ impl Default for Scenario {
             plan: None,
             fallback_unanswered: false,
             no_file_in: Vec::new(),
+            session_expires_in: None,
         }
     }
 }
@@ -119,6 +123,10 @@ impl Respond for Deezer {
                     },
                 },
             });
+            if let Some(seconds) = scenario.session_expires_in {
+                body["results"]["USER"]["OPTIONS"]["expiration_timestamp"] =
+                    json!(chrono::Utc::now().timestamp() + seconds);
+            }
             if let Some((offer, country, lossless, high_quality)) = scenario.plan {
                 body["results"]["OFFER_NAME"] = json!(offer);
                 body["results"]["COUNTRY"] = json!(country);
