@@ -33,8 +33,16 @@ pub fn recording_matches(
     if artist.is_none() && title.is_none() {
         return false;
     }
-    artist.is_none_or(|a| compare_artists(a, candidate_artist) == FieldVerdict::Match)
-        && title.is_none_or(|t| compare_titles(t, candidate_title) == FieldVerdict::Match)
+    let artist = artist.map(|a| compare_artists(a, candidate_artist));
+    let title = title.map(|t| compare_titles(t, candidate_title));
+    // Each field given agrees, and one of them by the same name: "Grimes" held in "Gary
+    // Grimes" and "Visions" in "Starhand Visions" is another record.
+    artist.is_none_or(|v| v.agrees())
+        && title.is_none_or(|v| v.agrees())
+        && [artist, title]
+            .into_iter()
+            .flatten()
+            .any(|v| v == FieldVerdict::Match)
 }
 
 /// A track record's artist and title, the title with its version when the record names one

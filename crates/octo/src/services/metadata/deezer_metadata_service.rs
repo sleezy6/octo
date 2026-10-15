@@ -50,6 +50,8 @@ const PARTIAL_TTL: Duration = Duration::from_secs(10 * 60);
 /// another way, then the title alone. Each is one request against Deezer's shared budget,
 /// and only a miss makes the next.
 const TRACK_SEARCHES: usize = 3;
+/// How many artists an artist search reads to find the one named exactly as asked.
+const ARTIST_NAME_CANDIDATES: i32 = 5;
 
 /// How many hits to weigh before giving up. A plain query is fuzzier than a
 /// qualified one was, so it puts covers, karaoke and live takes next to the real
@@ -1100,10 +1102,42 @@ impl DeezerMetadataService {
             Ok(Flow::Done) => {}
             Err(e) => debug!("deezer album id lookup '{artist} - {album}' failed: {e}"),
         }
+        // Album search does not always list the album at all (searching "Grimes Visions" finds
+        // Gary Grimes' "Starhand Visions" and not Grimes' "Visions"): look in the artist's own
+        // releases, which an artist page reads and keeps anyway.
+        if id.is_none() {
+            id = self.find_album_in_artist_releases(artist, album).await;
+        }
 
         let ttl = if id.is_none() { NEGATIVE_TTL } else { POSITIVE_TTL };
         self.put(key, Cached::Id(id.clone()), ttl);
         id
+    }
+
+    /// The id of `album` among the releases of the catalog artist named exactly `artist`, when
+    /// there is one: the title the same name, or the same once edition words are set aside.
+    async fn find_album_in_artist_releases(&self, artist: &str, album: &str) -> Option<String> {
+        if is_blank(artist) {
+            return None;
+        }
+        let named = self
+            .search_artists(artist, ARTIST_NAME_CANDIDATES)
+            .await
+            .into_iter()
+            .find(|hit| dotnet::eq_ignore_case(hit.name.trim(), artist.trim()))?;
+        let releases = self
+            .get_artist_albums_on(&named.deezer_id, &named.name, false, 1)
+            .await;
+        let wanted = AlbumOwnership::base_key(Some(album));
+        releases
+            .iter()
+            .find(|release| compare_titles(album, Some(&release.title)) == FieldVerdict::Match)
+            .or_else(|| {
+                releases.iter().find(|release| {
+                    !wanted.is_empty() && AlbumOwnership::base_key(Some(&release.title)) == wanted
+                })
+            })
+            .map(|release| release.deezer_id.clone())
     }
 
     /// Album detail plus its full tracklist, ordered by disc then track position.
@@ -1997,9 +2031,29 @@ fn plain_query(parts: &[&str]) -> String {
 /// What one field of a hit says about the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FieldVerdict {
+    /// The same name, as [`SongIdentity`] reads names.
     Match,
+    /// Only one name held inside the other ("Grimes" in "Gary Grimes"): agrees, but weakly. A
+    /// hit agreeing only this way on both fields is another record (Gary Grimes' "Starhand
+    /// Visions" is not Grimes' "Visions").
+    Contained,
     Absent,
     Mismatch,
+}
+
+impl FieldVerdict {
+    /// The field agrees, exactly or only by one name holding the other.
+    fn agrees(self) -> bool {
+        matches!(self, FieldVerdict::Match | FieldVerdict::Contained)
+    }
+}
+
+/// Whether a hit whose fields say these is the record asked for: neither contradicts, and at
+/// least one is the same name. Containment alone, on one field or both, is not enough.
+fn fields_accept(title: FieldVerdict, artist: FieldVerdict) -> bool {
+    title != FieldVerdict::Mismatch
+        && artist != FieldVerdict::Mismatch
+        && (title == FieldVerdict::Match || artist == FieldVerdict::Match)
 }
 
 /// Compare the titles by `SongIdentity`: the same key, or the same key once stylized
@@ -2020,8 +2074,10 @@ fn compare_titles(want: &str, got: Option<&str>) -> FieldVerdict {
     if SongIdentity::distinct_versions(&a, None) != SongIdentity::distinct_versions(&b, None) {
         return FieldVerdict::Mismatch;
     }
-    if a.key == b.key || a.loose_key == b.loose_key || one_holds_the_other(&a.key, &b.key) {
+    if a.key == b.key || a.loose_key == b.loose_key {
         FieldVerdict::Match
+    } else if one_holds_the_other(&a.key, &b.key) {
+        FieldVerdict::Contained
     } else {
         FieldVerdict::Mismatch
     }
@@ -2036,8 +2092,10 @@ fn compare_artists(want: &str, got: Option<&str>) -> FieldVerdict {
     if a.is_empty() || b.is_empty() {
         return FieldVerdict::Absent;
     }
-    if SongIdentity::artists_agree(want, got) || one_holds_the_other(&a, &b) {
+    if SongIdentity::artists_agree(want, got) {
         FieldVerdict::Match
+    } else if one_holds_the_other(&a, &b) {
+        FieldVerdict::Contained
     } else {
         FieldVerdict::Mismatch
     }
@@ -2060,25 +2118,42 @@ fn one_holds_the_other(a: &str, b: &str) -> bool {
 /// Lengths further apart than this are different recordings.
 const LENGTH_TOLERANCE_SECONDS: i32 = 8;
 
-/// The first hit that positively matches on artist or title and contradicts on
-/// neither. This is the guard that makes a plain query safe to use in place of the
-/// qualified one: without it a near-miss at position 0 would be attached to the song
-/// as fact. Requiring at least one positive match is what stops a hit that states
-/// nothing at all from matching everything.
+/// The hit that best matches on artist and title and contradicts on neither: one the same on
+/// both fields before one the same on one field, the catalog's first among equals. This is the
+/// guard that makes a plain query safe to use in place of the qualified one: without it a
+/// near-miss at position 0 would be attached to the song as fact. Requiring one field to be the
+/// same name is what stops a hit that states nothing at all, or only holds the names asked for
+/// inside longer ones, from matching.
 fn best_match(doc: Option<&Value>, artist: &str, title: &str) -> ElementResult<Option<Value>> {
-    Ok(all_matches(doc, artist, title, None)?.into_iter().next())
+    Ok(scored_matches(doc, artist, title, None)?
+        .into_iter()
+        .enumerate()
+        .max_by_key(|(position, (_, both))| (*both, std::cmp::Reverse(*position)))
+        .map(|(_, (hit, _))| hit))
 }
 
-/// Every hit that positively matches on artist or title and contradicts on neither,
-/// in the catalog's order. The first is what [`best_match`] returns. Given the song's length,
-/// a hit whose own length is known and more than [`LENGTH_TOLERANCE_SECONDS`] away is another
-/// recording.
+/// Every hit that matches on artist or title (one of them the same name) and contradicts on
+/// neither, in the catalog's order. Given the song's length, a hit whose own length is known
+/// and more than [`LENGTH_TOLERANCE_SECONDS`] away is another recording.
 fn all_matches(
     doc: Option<&Value>,
     artist: &str,
     title: &str,
     seconds: Option<i32>,
 ) -> ElementResult<Vec<Value>> {
+    Ok(scored_matches(doc, artist, title, seconds)?
+        .into_iter()
+        .map(|(hit, _)| hit)
+        .collect())
+}
+
+/// [`all_matches`], each hit with whether both of its fields are the same names.
+fn scored_matches(
+    doc: Option<&Value>,
+    artist: &str,
+    title: &str,
+    seconds: Option<i32>,
+) -> ElementResult<Vec<(Value, bool)>> {
     let mut hits = Vec::new();
     let Some(data) = data_array(doc)? else {
         return Ok(hits);
@@ -2091,7 +2166,7 @@ fn all_matches(
         };
         let artist_verdict = compare_artists(artist, hit_artist);
 
-        if title_verdict == FieldVerdict::Mismatch || artist_verdict == FieldVerdict::Mismatch {
+        if !fields_accept(title_verdict, artist_verdict) {
             continue;
         }
         if let (Some(want), Some(got)) = (
@@ -2101,9 +2176,8 @@ fn all_matches(
         {
             continue;
         }
-        if title_verdict == FieldVerdict::Match || artist_verdict == FieldVerdict::Match {
-            hits.push(hit.clone());
-        }
+        let both = title_verdict == FieldVerdict::Match && artist_verdict == FieldVerdict::Match;
+        hits.push((hit.clone(), both));
     }
     Ok(hits)
 }

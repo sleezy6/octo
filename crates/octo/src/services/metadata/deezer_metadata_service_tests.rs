@@ -1377,9 +1377,10 @@ fn a_short_title_is_not_found_inside_a_longer_one() {
 #[test]
 fn a_short_artist_is_not_found_inside_a_longer_one() {
     assert_eq!(compare_artists("Muse", Some("Musette")), FieldVerdict::Mismatch);
+    // Held inside a longer one: it agrees, but only weakly; the title has to be the same name.
     assert_eq!(
         compare_artists("Rihanna", Some("Rihanna Experience Band")),
-        FieldVerdict::Match
+        FieldVerdict::Contained
     );
     assert_eq!(compare_artists("Drake", Some("Drake")), FieldVerdict::Match);
 }
@@ -1402,4 +1403,68 @@ fn a_hit_of_a_far_length_is_another_recording_when_both_lengths_are_known() {
     assert_eq!(ids(Some(338)), [2, 3]);
     assert_eq!(ids(None), [1, 2, 3]);
     assert_eq!(ids(Some(0)), [1, 2, 3]);
+}
+
+// ---- Names that only hold each other ------------------------------------------------------------
+
+#[test]
+fn artist_names_differing_only_in_word_breaks_are_the_same_artist() {
+    // Last.fm's "Foxboro Hot Tubs" is Deezer's "Foxboro Hottubs": names are compared by their
+    // letters, so spaces never decide.
+    assert_eq!(
+        compare_artists("Foxboro Hot Tubs", Some("Foxboro Hottubs")),
+        FieldVerdict::Match
+    );
+}
+
+#[test]
+fn another_artists_record_holding_both_names_is_not_a_match() {
+    // Deezer's album search for "Grimes Visions" answers with Gary Grimes' "Starhand Visions":
+    // "grimes" is held in "garygrimes" and "visions" in "starhandvisions", and nothing more.
+    let doc = serde_json::json!({"data": [
+        {"id": 1, "title": "Starhand Visions", "artist": {"name": "Gary Grimes"}},
+    ]});
+    assert_eq!(best_match(Some(&doc), "Grimes", "Visions").unwrap(), None);
+    // One field the same name and the other held is still enough.
+    let doc = serde_json::json!({"data": [
+        {"id": 2, "title": "Visions", "artist": {"name": "Gary Grimes"}},
+    ]});
+    assert!(best_match(Some(&doc), "Grimes", "Visions").unwrap().is_some());
+}
+
+#[test]
+fn a_hit_the_same_on_both_names_comes_before_an_earlier_one_the_same_on_one() {
+    let doc = serde_json::json!({"data": [
+        {"id": 1, "title": "Visions", "artist": {"name": "Grimesy Collective"}},
+        {"id": 2, "title": "Visions", "artist": {"name": "Grimes"}},
+    ]});
+    let hit = best_match(Some(&doc), "Grimes", "Visions")
+        .unwrap()
+        .expect("a hit");
+    assert_eq!(hit["id"], 2);
+}
+
+#[tokio::test]
+async fn an_album_search_does_not_list_is_found_among_the_artists_releases() {
+    let h = Harness::new(vec![
+        (
+            "/search/album",
+            r#"{"data":[{"id":1,"title":"Starhand Visions","artist":{"id":7,"name":"Gary Grimes"}}]}"#,
+        ),
+        (
+            "/search/artist",
+            r#"{"data":[{"id":7,"name":"Gary Grimes"},{"id":8,"name":"Grimes"}]}"#,
+        ),
+        (
+            "/artist/8/albums",
+            r#"{"data":[{"id":5,"title":"Art Angels"},{"id":6509005,"title":"Visions"}]}"#,
+        ),
+    ])
+    .await;
+    assert_eq!(
+        h.service.find_album_id("Grimes", "Visions").await.as_deref(),
+        Some("6509005")
+    );
+    // Not an artist of exactly that name: nothing, rather than another artist's record.
+    assert_eq!(h.service.find_album_id("Grime", "Visions").await, None);
 }
