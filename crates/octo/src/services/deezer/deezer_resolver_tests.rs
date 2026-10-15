@@ -566,3 +566,198 @@ async fn a_song_deezer_cannot_give_does_not_loop_on_sign_ins() {
     // One sign-in kept, one more for the retry: no more than that for a single play.
     assert_eq!(fixture.seen.lock().auth_cookies.len(), 2);
 }
+
+// ---------------------------------------------------------------------------------------
+// Asking Deezer only with a reason (as deemix does)
+// ---------------------------------------------------------------------------------------
+
+/// A refused ARL is not tried again by plays, downloads or the account watch: only a person
+/// pressing Check now, or a new ARL, asks Deezer with it again.
+#[tokio::test]
+async fn a_refused_arl_is_not_tried_again_until_it_changes_or_is_checked() {
+    let fixture = Fixture::new(Scenario {
+        reject_primary: true,
+        ..Default::default()
+    })
+    .await;
+    assert!(fixture.open(None).await.is_none());
+    assert_eq!(fixture.seen.lock().auth_cookies.len(), 1);
+    for _ in 0..3 {
+        assert!(fixture.open(None).await.is_none());
+    }
+    assert!(!fixture.resolver.is_available().await);
+    let (health, _) = fixture.resolver.account_health(false).await;
+    assert_eq!(health[0].problem, Some(ACCOUNT_REFUSED));
+    assert_eq!(
+        fixture.seen.lock().auth_cookies.len(),
+        1,
+        "no sign-in after the refusal"
+    );
+
+    // Check now asks again.
+    let (health, _) = fixture.resolver.account_health(true).await;
+    assert_eq!(health[0].problem, Some(ACCOUNT_REFUSED));
+    assert_eq!(fixture.seen.lock().auth_cookies.len(), 2);
+
+    // A new ARL is a new account: it is asked at the next play.
+    fixture.settings.set(deezer("renewed", None));
+    drop(fixture.open(None).await.expect("the new ARL signs in"));
+    assert_eq!(fixture.seen.lock().auth_cookies.last().unwrap(), "arl=renewed");
+}
+
+/// A sign-in Deezer did not answer is tried again after a minute, then two, and so on.
+#[tokio::test]
+async fn an_unanswered_sign_in_waits_longer_each_time() {
+    // The fixture leaves the account called "fallback" unanswered.
+    let fixture = Fixture::with_accounts(
+        Scenario {
+            fallback_unanswered: true,
+            ..Default::default()
+        },
+        "fallback",
+        None,
+    )
+    .await;
+    let asked = || fixture.seen.lock().auth_cookies.len();
+    assert!(fixture.open(None).await.is_none());
+    assert!(fixture.open(None).await.is_none());
+    assert_eq!(asked(), 1, "the second play waits");
+
+    fixture
+        .resolver
+        .age_sign_in_waits(DeezerResolver::SIGN_IN_FIRST_WAIT + Duration::from_secs(1));
+    assert!(fixture.open(None).await.is_none());
+    assert_eq!(asked(), 2, "tried again after a minute");
+
+    // The wait is two minutes now.
+    fixture
+        .resolver
+        .age_sign_in_waits(DeezerResolver::SIGN_IN_FIRST_WAIT + Duration::from_secs(1));
+    assert!(fixture.open(None).await.is_none());
+    assert_eq!(asked(), 2, "a minute is not enough the second time");
+    fixture
+        .resolver
+        .age_sign_in_waits(DeezerResolver::SIGN_IN_FIRST_WAIT);
+    assert!(fixture.open(None).await.is_none());
+    assert_eq!(asked(), 3);
+}
+
+/// A song Deezer has no audio for keeps the sign-in, and is not asked about again for hours.
+#[tokio::test]
+async fn a_song_deezer_has_no_audio_for_keeps_the_sign_in_and_is_not_asked_again() {
+    let fixture = Fixture::new(Scenario {
+        available_formats: Vec::new(),
+        ..Default::default()
+    })
+    .await;
+    assert!(fixture.open(None).await.is_none());
+    let (signed_in, looked_up) = {
+        let seen = fixture.seen.lock();
+        (seen.auth_cookies.len(), seen.page_ids.len())
+    };
+    assert_eq!(signed_in, 1);
+    for _ in 0..3 {
+        assert!(fixture.open(None).await.is_none());
+    }
+    {
+        let seen = fixture.seen.lock();
+        assert_eq!(
+            seen.auth_cookies.len(),
+            1,
+            "no new sign-in for a song Deezer lacks"
+        );
+        assert_eq!(seen.page_ids.len(), looked_up, "not looked up again");
+    }
+
+    // Another quality is another question.
+    assert!(
+        fixture
+            .resolver
+            .open_stream("42", None, "MP3_128")
+            .await
+            .is_none()
+    );
+    assert!(fixture.seen.lock().page_ids.len() > looked_up);
+}
+
+/// `get_url` saying the license token has expired is worth one new sign-in.
+#[tokio::test]
+async fn an_expired_license_signs_in_again_once() {
+    let fixture = Fixture::new(Scenario::default()).await;
+    drop(fixture.open(None).await.expect("opens"));
+    fixture
+        .seen
+        .lock()
+        .expired_licenses
+        .push("primary-license".into());
+    // The fake's license token is the same after the new sign-in, so it is still refused: the
+    // play gives up after one new sign-in rather than looping.
+    assert!(
+        fixture
+            .resolver
+            .open_stream("42", None, "MP3_128")
+            .await
+            .is_none()
+    );
+    assert_eq!(fixture.seen.lock().auth_cookies.len(), 2);
+    // Not remembered as a song Deezer lacks: once the license works, it plays.
+    fixture.seen.lock().expired_licenses.clear();
+    drop(
+        fixture
+            .resolver
+            .open_stream("42", None, "MP3_128")
+            .await
+            .expect("plays once the license works"),
+    );
+}
+
+/// Formats the plan or the track does not have are never asked for; a track with none of them
+/// is not asked about at all.
+#[tokio::test]
+async fn formats_the_plan_or_the_track_lacks_are_never_asked_for() {
+    let fixture = Fixture::new(Scenario {
+        plan: Some(("Deezer Premium", "US", false, true)),
+        no_file_in: vec!["MP3_320"],
+        ..Default::default()
+    })
+    .await;
+    let opened = fixture
+        .resolver
+        .open_stream("42", None, "FLAC")
+        .await
+        .expect("the MP3 opens");
+    assert_eq!(opened.format, "MP3_128");
+    let asked = fixture.seen.lock().media_bodies[0].clone();
+    assert!(!asked.contains("FLAC"), "the plan gives no FLAC: {asked}");
+    assert!(!asked.contains("MP3_320"), "the track has no 320: {asked}");
+
+    let fixture = Fixture::new(Scenario {
+        plan: Some(("Deezer Free", "US", false, false)),
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        fixture
+            .resolver
+            .open_stream("42", None, "FLAC_ONLY")
+            .await
+            .is_none()
+    );
+    assert!(
+        fixture.seen.lock().media_bodies.is_empty(),
+        "nothing worth asking for"
+    );
+}
+
+#[tokio::test]
+async fn deezer_is_asked_as_a_desktop_browser() {
+    let fixture = Fixture::new(Scenario::default()).await;
+    drop(fixture.open(None).await.expect("opens"));
+    let agents = fixture.seen.lock().user_agents.clone();
+    assert!(
+        agents
+            .iter()
+            .all(|agent| agent.contains("Chrome/") && agent.contains("Windows NT")),
+        "{agents:?}"
+    );
+}

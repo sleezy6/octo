@@ -36,6 +36,9 @@ pub(crate) struct Scenario {
     pub(crate) plan: Option<(&'static str, &'static str, bool, bool)>,
     /// The gateway answers 503 to the fallback account's sign-in.
     pub(crate) fallback_unanswered: bool,
+    /// Formats `pageTrack` says the track has no file in (`FILESIZE_<format>` "0"); the others
+    /// it gives a size. Empty: no sizes at all, as an older answer.
+    pub(crate) no_file_in: Vec<&'static str>,
 }
 
 impl Default for Scenario {
@@ -54,6 +57,7 @@ impl Default for Scenario {
             catalog_title: "Title".into(),
             plan: None,
             fallback_unanswered: false,
+            no_file_in: Vec::new(),
         }
     }
 }
@@ -69,6 +73,10 @@ pub(crate) struct Seen {
     pub(crate) urls_issued: usize,
     /// API tokens the gateway no longer accepts for `pageTrack`, as a sign-in that expired early.
     pub(crate) stale_tokens: Vec<String>,
+    /// License tokens `get_url` no longer accepts (error 1000), as a sign-in that expired early.
+    pub(crate) expired_licenses: Vec<String>,
+    /// The User-Agent of every sign-in.
+    pub(crate) user_agents: Vec<String>,
 }
 
 struct Deezer {
@@ -95,6 +103,7 @@ impl Respond for Deezer {
         if path == "/gw" && query.contains("method=deezer.getUserData") {
             let cookie = header(request, "cookie");
             seen.auth_cookies.push(cookie.clone());
+            seen.user_agents.push(header(request, "user-agent"));
             let account = cookie.trim_start_matches("arl=").to_string();
             let rejected = scenario.reject_primary && account == "primary";
             if scenario.fallback_unanswered && account == "fallback" {
@@ -145,6 +154,16 @@ impl Respond for Deezer {
             if id == "43" && scenario.wrong_fallback_version {
                 data["VERSION"] = json!("(Live)");
             }
+            if !scenario.no_file_in.is_empty() {
+                for format in ["FLAC", "MP3_320", "MP3_128"] {
+                    let size = if scenario.no_file_in.contains(&format) {
+                        "0"
+                    } else {
+                        "1000"
+                    };
+                    data[format!("FILESIZE_{format}")] = json!(size);
+                }
+            }
             if id == "42" && scenario.fallback_track && !scenario.no_fallback_id {
                 data["FALLBACK"] = json!({ "SNG_ID": "43" });
             }
@@ -158,6 +177,11 @@ impl Respond for Deezer {
             let body: Value = serde_json::from_str(&text).unwrap_or_default();
             let token = body["track_tokens"][0].as_str().unwrap_or("").to_string();
             let license = body["license_token"].as_str().unwrap_or("").to_string();
+            if seen.expired_licenses.contains(&license) {
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [{ "errors": [{ "code": 1000, "message": "License token has no sufficient rights on requested media" }] }],
+                }));
+            }
             if scenario.fallback_track && token == "token-42" {
                 return ResponseTemplate::new(200).set_body_json(json!({ "data": [{ "media": [] }] }));
             }

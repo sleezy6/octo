@@ -11,14 +11,21 @@
 //! followed to the copy Deezer names for it (`FALLBACK`), then to the track sharing its ISRC,
 //! then to another catalog copy, and each of those must be the same recording by artist and
 //! title before a byte of it is played.
+//!
+//! Octo asks Deezer only when it has a reason to, as deemix does, since an ARL that makes
+//! unusual traffic risks being flagged: a sign-in is kept and redone only when Deezer says its
+//! token is no longer good; an ARL Deezer refused is not tried again until it changes (or
+//! someone presses Check now), and a sign-in that failed for want of an answer waits longer
+//! each time; a track no account could be given is not asked about again for six hours; and a
+//! format the plan or the track does not have is never asked for.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::TryStreamExt;
 use octo_core::common::dotnet::escape_data_string;
-use octo_core::settings::deezer::DEEZER_FORMAT_FLAC;
+use octo_core::settings::deezer::{DEEZER_FORMAT_FLAC, DEEZER_FORMAT_MP3_320};
 use octo_core::settings::{DeezerSettings, SettingsStore};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -55,6 +62,11 @@ impl DeezerOpenStream {
     }
 }
 
+/// No account could be given the track when last asked, within [`DeezerResolver::NO_MEDIA_TTL`].
+#[derive(Debug, thiserror::Error)]
+#[error("Deezer has no full-track media for this track (known from an earlier try).")]
+struct NoMediaKnown;
+
 /// What one account attempt signs its calls with.
 #[derive(Clone)]
 struct Session {
@@ -70,6 +82,30 @@ struct Session {
 #[derive(Debug, thiserror::Error)]
 #[error("Deezer ARL expired or account has no full-track license.")]
 struct AccountRefused;
+
+/// Deezer said the sign-in's token is no longer good: the one thing that is worth a new
+/// sign-in. A song Deezer cannot give, or Deezer not answering, is not.
+#[derive(Debug, thiserror::Error)]
+#[error("Deezer sign-in expired.")]
+struct SignInExpired;
+
+/// The account is not tried for now: its last sign-in failed for want of an answer, and the
+/// wait after it has not passed.
+#[derive(Debug, thiserror::Error)]
+#[error("Deezer sign-in paused after a failed attempt.")]
+struct SignInPaused;
+
+/// What went wrong the last time an account signed in.
+#[derive(Debug, Clone, Copy)]
+enum SignInTrouble {
+    /// Deezer refused the ARL: not tried again until it changes or someone checks it.
+    Refused,
+    /// Deezer did not answer: not tried again before `until`; the next wait is twice `wait`.
+    Waiting {
+        until: tokio::time::Instant,
+        wait: Duration,
+    },
+}
 
 /// What a sign-in says about the account. Each is `None` when the answer does not say.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -134,6 +170,10 @@ pub struct DeezerResolver {
     /// [`Self::SESSION_TTL`]. Held while an account signs in, so plays at the same moment share
     /// one sign-in.
     sessions: tokio::sync::Mutex<std::collections::HashMap<String, (Session, tokio::time::Instant)>>,
+    /// Each account whose last sign-in failed, and how: see [`SignInTrouble`].
+    trouble: parking_lot::Mutex<HashMap<String, SignInTrouble>>,
+    /// Tracks no account could be given, by accounts, track and quality, for [`Self::NO_MEDIA_TTL`].
+    no_media: MemoryCache<()>,
     /// The last answer of [`Self::check_accounts`]: when, for which accounts, and what.
     account_check: tokio::sync::Mutex<Option<AccountCheck>>,
     gateway_url: String,
@@ -155,6 +195,16 @@ impl DeezerResolver {
     pub const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
     /// How long a media address is reused.
     const MEDIA_TTL: Duration = Duration::from_secs(120);
+    /// How long a track no account could be given is not asked about again.
+    pub const NO_MEDIA_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+    const NO_MEDIA_CACHE_SIZE: u64 = 4096;
+    /// The wait after the first sign-in Deezer did not answer, doubled after each one after it.
+    pub const SIGN_IN_FIRST_WAIT: Duration = Duration::from_secs(60);
+    /// The longest wait between sign-ins Deezer did not answer.
+    pub const SIGN_IN_LONGEST_WAIT: Duration = Duration::from_secs(60 * 60);
+    /// What Octo calls itself to Deezer: a desktop Chrome, as deemix does, rather than a bare
+    /// "Mozilla/5.0" no browser sends. Worth moving to a newer Chrome now and then.
+    pub const USER_AGENT: &'static str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
     const MEDIA_CACHE_SIZE: u64 = 128;
     /// How long the CDN may take to send its headers.
     const HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -184,12 +234,12 @@ impl DeezerResolver {
         // Neither client keeps cookies: each call carries exactly the cookie it is given.
         let api_client = reqwest::Client::builder()
             .timeout(Self::API_TIMEOUT)
-            .user_agent("Mozilla/5.0")
+            .user_agent(Self::USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("a plain HTTP client builds");
         let stream_client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0")
+            .user_agent(Self::USER_AGENT)
             .no_gzip()
             .no_deflate()
             .build()
@@ -202,6 +252,8 @@ impl DeezerResolver {
             media_cache: MemoryCache::new(Self::MEDIA_CACHE_SIZE),
             media_gate: tokio::sync::Mutex::new(()),
             sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            trouble: parking_lot::Mutex::new(HashMap::new()),
+            no_media: MemoryCache::new(Self::NO_MEDIA_CACHE_SIZE),
             account_check: tokio::sync::Mutex::new(None),
             gateway_url: gateway_url.to_string(),
             media_url: media_url.to_string(),
@@ -233,7 +285,7 @@ impl DeezerResolver {
     pub async fn is_available(&self) -> bool {
         for arl in self.deezer_settings().accounts() {
             // Try the fallback account without logging credentials.
-            if self.authenticate(&arl).await.is_ok() {
+            if self.sign_in(&arl, true).await.is_ok() {
                 return true;
             }
         }
@@ -249,8 +301,10 @@ impl DeezerResolver {
     }
 
     /// Each account, in order, as a sign-in finds it now: whether it signs in, why not, and
-    /// what plan it is on. With the time of the check. `fresh` signs in again whatever was
-    /// kept; otherwise an answer is reused as [`Self::check_accounts`] says.
+    /// what plan it is on. With the time of the check. `fresh` (a person pressing Check now)
+    /// signs in again whatever was kept, an ARL Deezer refused or one waiting after a failure
+    /// included; otherwise an answer is reused as [`Self::check_accounts`] says, and an account
+    /// in trouble is reported as it stands without asking Deezer.
     pub async fn account_health(
         &self,
         fresh: bool,
@@ -266,7 +320,7 @@ impl DeezerResolver {
         }
         let mut health = Vec::new();
         for arl in &accounts {
-            let signed_in = self.authenticate(arl).await;
+            let signed_in = self.sign_in(arl, !fresh).await;
             match &signed_in {
                 Ok(session) => self.remember_session(arl, session).await,
                 Err(_) => self.forget_session(arl).await,
@@ -313,7 +367,9 @@ impl DeezerResolver {
             if accounts.is_empty() {
                 last = None;
             } else {
-                let (health, _) = self.account_health(true).await;
+                // Not fresh: the answer kept is older than this wait anyway, and an ARL Deezer
+                // refused is not asked about again on a timer.
+                let (health, _) = self.account_health(false).await;
                 let now: Vec<Option<&'static str>> = health.iter().map(|account| account.problem).collect();
                 let before = last
                     .as_ref()
@@ -353,7 +409,7 @@ impl DeezerResolver {
             return Ok((session.clone(), true));
         }
         sessions.remove(arl);
-        let session = self.authenticate(arl).await?;
+        let session = self.sign_in(arl, true).await?;
         let now = tokio::time::Instant::now();
         sessions.retain(|_, (_, at)| now.duration_since(*at) < Self::SESSION_TTL);
         sessions.insert(arl.to_string(), (session.clone(), now));
@@ -370,6 +426,18 @@ impl DeezerResolver {
         }
     }
 
+    /// Makes every wait after a failed sign-in `by` shorter, for a test that waits one out.
+    #[cfg(test)]
+    pub(crate) fn age_sign_in_waits(&self, by: Duration) {
+        for trouble in self.trouble.lock().values_mut() {
+            if let SignInTrouble::Waiting { until, .. } = trouble {
+                *until = until
+                    .checked_sub(by)
+                    .expect("the clock is far enough from its start");
+            }
+        }
+    }
+
     async fn forget_session(&self, arl: &str) {
         self.sessions.lock().await.remove(arl);
     }
@@ -379,6 +447,66 @@ impl DeezerResolver {
             .lock()
             .await
             .insert(arl.to_string(), (session.clone(), tokio::time::Instant::now()));
+    }
+
+    /// A new sign-in for the account, unless `honour_trouble` and its last one failed: an ARL
+    /// Deezer refused is not tried again, and one Deezer did not answer waits its turn. What
+    /// happens is remembered for the next.
+    async fn sign_in(&self, arl: &str, honour_trouble: bool) -> anyhow::Result<Session> {
+        if honour_trouble {
+            match self.trouble.lock().get(arl).copied() {
+                Some(SignInTrouble::Refused) => return Err(AccountRefused.into()),
+                Some(SignInTrouble::Waiting { until, .. }) if tokio::time::Instant::now() < until => {
+                    return Err(SignInPaused.into());
+                }
+                _ => {}
+            }
+        }
+        let signed_in = self.authenticate(arl).await;
+        self.note_sign_in(arl, &signed_in);
+        signed_in
+    }
+
+    /// Remembers how a sign-in went: forgets past trouble on success, latches a refused ARL,
+    /// and makes one Deezer did not answer wait, longer each time.
+    fn note_sign_in(&self, arl: &str, signed_in: &anyhow::Result<Session>) {
+        let accounts = self.deezer_settings().accounts();
+        let mut trouble = self.trouble.lock();
+        // An ARL no longer set is forgotten with whatever went wrong with it.
+        trouble.retain(|known, _| accounts.iter().any(|account| account == known));
+        match signed_in {
+            Ok(_) => {
+                if trouble.remove(arl).is_some() {
+                    info!("Deezer signs the account in again");
+                }
+            }
+            Err(error) if error.is::<AccountRefused>() => {
+                if !matches!(trouble.get(arl), Some(SignInTrouble::Refused)) {
+                    info!(
+                        "Deezer refused the ARL; Octo stops asking Deezer with it until it is changed or checked again on the dashboard's Deezer page"
+                    );
+                }
+                trouble.insert(arl.to_string(), SignInTrouble::Refused);
+            }
+            Err(error) => {
+                let wait = match trouble.get(arl) {
+                    Some(SignInTrouble::Waiting { wait, .. }) => (*wait * 2).min(Self::SIGN_IN_LONGEST_WAIT),
+                    _ => Self::SIGN_IN_FIRST_WAIT,
+                };
+                warn!(
+                    "Deezer did not answer a sign-in ({}); the next try waits {} min",
+                    kind_of(error),
+                    wait.as_secs().div_ceil(60)
+                );
+                trouble.insert(
+                    arl.to_string(),
+                    SignInTrouble::Waiting {
+                        until: tokio::time::Instant::now() + wait,
+                        wait,
+                    },
+                );
+            }
+        }
     }
 
     async fn authenticate(&self, arl: &str) -> anyhow::Result<Session> {
@@ -425,8 +553,9 @@ impl DeezerResolver {
         let facts = AccountFacts {
             offer: named(results.and_then(|r| text(r, "OFFER_NAME"))),
             country: named(results.and_then(|r| text(r, "COUNTRY"))),
-            lossless: options.and_then(|o| flag(o, "web_lossless")),
-            high_quality: options.and_then(|o| flag(o, "web_hq")),
+            // Either the web or the mobile right gives the format, as deemix reads them.
+            lossless: options.and_then(|o| either_flag(o, "web_lossless", "mobile_lossless")),
+            high_quality: options.and_then(|o| either_flag(o, "web_hq", "mobile_hq")),
         };
 
         if let Some(sid) = sid {
@@ -439,6 +568,12 @@ impl DeezerResolver {
             license_token,
             facts,
         })
+    }
+
+    /// Which tracks are known to have no audio, for these accounts at this quality: a new ARL
+    /// or another quality asks again.
+    fn no_media_key(accounts: &[String], track_id: &str, quality: &str) -> String {
+        format!("{}\0{track_id}\0{quality}", accounts.join("\u{1}"))
     }
 
     fn media_key(account: &str, track_id: &str, quality: &str) -> String {
@@ -455,6 +590,10 @@ impl DeezerResolver {
             anyhow::bail!("Invalid Deezer track ID.");
         }
         let settings = self.deezer_settings();
+        let none_key = Self::no_media_key(&settings.accounts(), track_id, quality);
+        if self.no_media.get(&none_key).is_some() {
+            anyhow::bail!(NoMediaKnown);
+        }
         // An address already held is handed back without queueing: a seek into the song that is
         // playing must not wait behind another song's sign-in and lookups.
         for arl in settings
@@ -467,6 +606,11 @@ impl DeezerResolver {
             }
         }
         let _gate = self.media_gate.lock().await;
+        if self.no_media.get(&none_key).is_some() {
+            anyhow::bail!(NoMediaKnown);
+        }
+        // Remembered as having none only when every account was asked and answered so.
+        let mut every_account_said_none = rejected_accounts.is_empty();
         for arl in settings
             .accounts()
             .into_iter()
@@ -483,8 +627,14 @@ impl DeezerResolver {
                 }
                 Ok(None) => {}
                 // The error's text can name an address; its kind is enough to tell what failed.
-                Err(e) => debug!("Deezer media attempt failed: {}", kind_of(&e)),
+                Err(e) => {
+                    every_account_said_none = false;
+                    debug!("Deezer media attempt failed: {}", kind_of(&e));
+                }
             }
+        }
+        if every_account_said_none {
+            self.no_media.set(none_key, (), 1, Self::NO_MEDIA_TTL);
         }
         anyhow::bail!("No full-track Deezer media available. Check ARL, subscription and region.")
     }
@@ -499,10 +649,10 @@ impl DeezerResolver {
     ) -> anyhow::Result<Option<Media>> {
         let (session, reused) = self.session_for(arl).await?;
         let first = self.resolve_with_session(&session, arl, track_id, quality).await;
-        // A kept sign-in may have gone stale before its time; Deezer then answers with an error
-        // that looks like a song it cannot give. Sign in again and ask once more.
-        if reused && !matches!(first, Ok(Some(_))) {
-            debug!("Deezer gave nothing on a kept sign-in; signing in again");
+        // A kept sign-in may have gone stale before its time. Only Deezer saying so is worth a
+        // new sign-in: a song it cannot give, or no answer, would only sign in again for nothing.
+        if reused && first.as_ref().is_err_and(|e| e.is::<SignInExpired>()) {
+            debug!("Deezer said a kept sign-in is no longer good; signing in again");
             self.forget_session(arl).await;
             let (session, _) = self.session_for(arl).await?;
             return self.resolve_with_session(&session, arl, track_id, quality).await;
@@ -532,6 +682,9 @@ impl DeezerResolver {
                     Some(&session.cookie),
                 )
                 .await?;
+            if token_refused(&page) {
+                return Err(SignInExpired.into());
+            }
             let Some(data) = page
                 .get("results")
                 .and_then(|r| r.get("DATA"))
@@ -570,11 +723,17 @@ impl DeezerResolver {
                 break;
             }
 
-            if let Some(track_token) = text(data, "TRACK_TOKEN").filter(|t| !t.is_empty()) {
-                let formats: Vec<Value> = DeezerSettings::formats(quality)
-                    .iter()
-                    .map(|format| json!({ "cipher": "BF_CBC_STRIPE", "format": format }))
-                    .collect();
+            let formats: Vec<Value> = DeezerSettings::formats(quality)
+                .iter()
+                .filter(|format| format_possible(format, &session.facts, data))
+                .map(|format| json!({ "cipher": "BF_CBC_STRIPE", "format": format }))
+                .collect();
+            if formats.is_empty() {
+                debug!("Deezer track {actual_id} has none of the formats asked for that the plan gives");
+            }
+            if let Some(track_token) =
+                text(data, "TRACK_TOKEN").filter(|t| !t.is_empty() && !formats.is_empty())
+            {
                 let media = self
                     .post(
                         &self.media_url,
@@ -586,6 +745,9 @@ impl DeezerResolver {
                         None,
                     )
                     .await?;
+                if license_refused(&media) {
+                    return Err(SignInExpired.into());
+                }
                 if let Some(mut found) = self.select_media(&media, &actual_id, quality) {
                     found.account = arl.to_string();
                     debug!(
@@ -677,6 +839,11 @@ impl DeezerResolver {
         for _ in 0..3 {
             let media = match self.resolve_media(track_id, quality, &rejected_accounts).await {
                 Ok(media) => media,
+                Err(e) if e.is::<NoMediaKnown>() || e.is::<AccountRefused>() || e.is::<SignInPaused>() => {
+                    // Said once already: when first found, or by the account watch.
+                    debug!("Deezer stream unavailable for track {track_id}: {e}");
+                    return None;
+                }
                 Err(e) => {
                     warn!("Deezer stream unavailable for track {track_id}: {e}");
                     return None;
@@ -997,6 +1164,56 @@ where
 }
 
 /// A yes or no the gateway writes as `true`, `1` or `"1"`. `None` when it is not there.
+/// True when either flag is, false when neither is and one says so, `None` when neither says.
+fn either_flag(element: &Value, first: &str, second: &str) -> Option<bool> {
+    match (flag(element, first), flag(element, second)) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (None, None) => None,
+        _ => Some(false),
+    }
+}
+
+/// Whether `format` is worth asking `get_url` for: the plan gives it (as far as the sign-in
+/// says) and the track has a file in it (as far as its `FILESIZE_<format>` says; a track that
+/// does not say is asked). Asking for one that is not there only earns an error from Deezer.
+fn format_possible(format: &str, facts: &AccountFacts, track: &Value) -> bool {
+    let plan_gives = match format {
+        DEEZER_FORMAT_FLAC => facts.lossless != Some(false),
+        DEEZER_FORMAT_MP3_320 => facts.high_quality != Some(false),
+        _ => true,
+    };
+    let has_file = match track.get(format!("FILESIZE_{format}")) {
+        Some(Value::String(size)) => size.trim().parse::<u64>().map_or(true, |size| size > 0),
+        Some(Value::Number(size)) => size.as_u64().is_none_or(|size| size > 0),
+        _ => true,
+    };
+    plan_gives && has_file
+}
+
+/// The gateway refused the call's token: the sign-in is no longer good.
+fn token_refused(root: &Value) -> bool {
+    let Some(Value::Object(error)) = root.get("error") else {
+        return false;
+    };
+    error.contains_key("VALID_TOKEN_REQUIRED")
+        || error
+            .get("GATEWAY_ERROR")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.to_ascii_lowercase().contains("invalid api token"))
+}
+
+/// `get_url` refused the license token (errors 1000 to 1002): the sign-in is no longer good.
+fn license_refused(root: &Value) -> bool {
+    root.get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("errors").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|error| error.get("code").and_then(Value::as_i64))
+        .any(|code| (1000..=1002).contains(&code))
+}
+
 fn flag(element: &Value, name: &str) -> Option<bool> {
     match element.get(name)? {
         Value::Bool(value) => Some(*value),
