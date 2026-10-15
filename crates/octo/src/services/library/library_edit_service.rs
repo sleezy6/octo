@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 use super::library_action_journal::LibraryActionEntry;
 use super::library_action_journal::{LibraryActionJournal, LibraryActionState};
 use super::library_action_quarantine::LibraryActionQuarantine;
+use super::library_identity_sweep::stamp_of;
 use super::library_tag_edits::{
     self as tag_edits, TagEditEntry, TagEditJournal, TagEditResult, TagValues, song_tag_fields as fields,
     tag_edit_kinds,
@@ -177,6 +178,8 @@ pub struct LibraryEditService {
 }
 
 pub const BUSY_TEXT: &str = "Another change to this song is still running, so this one was skipped.";
+pub const CHANGED_SINCE_TEXT: &str =
+    "The file has changed since it was checked, so it was left as it is. Check it again first.";
 const UNRESOLVED_TEXT: &str = "Could not work out which file this is, so nothing was touched.";
 
 impl LibraryEditService {
@@ -244,6 +247,19 @@ impl LibraryEditService {
         username: &str,
         changes: IndexMap<String, Option<String>>,
     ) -> LibraryEditOutcome {
+        self.retag_unchanged(id, username, changes, None).await
+    }
+
+    /// Writes these tags into the song's file, unless its size and last write are no longer
+    /// `expected_stamp` (as the library tag check keeps them): values read from a file before it
+    /// was replaced are never written over the new one. None writes whatever the file is now.
+    pub async fn retag_unchanged(
+        self: &Arc<Self>,
+        id: &str,
+        username: &str,
+        changes: IndexMap<String, Option<String>>,
+        expected_stamp: Option<&str>,
+    ) -> LibraryEditOutcome {
         if let Some(invalid) = tag_edits::invalid(&changes) {
             return LibraryEditOutcome::new("failed", invalid);
         }
@@ -261,7 +277,14 @@ impl LibraryEditService {
             );
         }
         let username = username.to_string();
+        let expected_stamp = expected_stamp.map(str::to_string);
         self.locked(&file, move |this, file| {
+            // Checked inside the lock, so no other edit lands between the check and the write.
+            if let Some(expected) = expected_stamp
+                && stamp_of(&file.absolute_path).is_none_or(|stamp| stamp != expected)
+            {
+                return LibraryEditOutcome::new("skipped", CHANGED_SINCE_TEXT);
+            }
             let result = tag_edits::write(Path::new(&file.absolute_path), &changes);
             let changed_text = format!("Changed the {}.", field_words(changed(&result)));
             this.finish(

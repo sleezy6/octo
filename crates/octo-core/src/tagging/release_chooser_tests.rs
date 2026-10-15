@@ -72,6 +72,7 @@ fn evidence(request: TagRequest, file: FileFacts, fingerprinted: &[&str]) -> Tag
         file,
         fingerprint_threshold: 0.85,
         fingerprinted_recording_ids: fingerprinted.iter().copied().collect::<IgnoreCaseSet>(),
+        identity: None,
     }
 }
 

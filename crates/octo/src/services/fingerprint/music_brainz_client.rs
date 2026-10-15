@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use octo_core::common::{SongIdentity, dotnet, octo_user_agent};
 use octo_core::fingerprint::music_brainz_client as pure;
+use octo_core::fingerprint::recording_identity::RecordingFacts;
 use octo_core::json::element::ElementError;
 use octo_core::tagging::{ReleaseDetails, ReleaseLookup};
 use parking_lot::Mutex;
@@ -104,6 +105,23 @@ impl MusicBrainzClient {
         &self,
         release_id: &str,
     ) -> Result<Option<Arc<ReleaseDetails>>, MusicBrainzError> {
+        self.lookup_release_on(release_id, false).await
+    }
+
+    /// [`Self::lookup_release`] on the background lane, for the library sweep: it steps back
+    /// whenever a download is asking.
+    pub async fn lookup_release_in_background(
+        &self,
+        release_id: &str,
+    ) -> Result<Option<Arc<ReleaseDetails>>, MusicBrainzError> {
+        self.lookup_release_on(release_id, true).await
+    }
+
+    async fn lookup_release_on(
+        &self,
+        release_id: &str,
+        background: bool,
+    ) -> Result<Option<Arc<ReleaseDetails>>, MusicBrainzError> {
         if dotnet::is_blank(release_id) {
             return Ok(None);
         }
@@ -116,7 +134,12 @@ impl MusicBrainzClient {
             "release/{}?inc=labels+release-groups+artist-credits+recordings+isrcs+genres&fmt=json",
             dotnet::escape_data_string(release_id.trim())
         );
-        let Some(doc) = self.get(&url, "release lookup").await? else {
+        let asked = if background {
+            self.get_background(&url, "release lookup").await?
+        } else {
+            self.get(&url, "release lookup").await?
+        };
+        let Some(doc) = asked else {
             return Ok(None);
         };
         let details = ReleaseDetails::parse(&doc).map(Arc::new);
@@ -205,6 +228,38 @@ impl MusicBrainzClient {
             Some(doc) => Ok(Some(pure::parse_isrcs(&doc)?)),
             None => Ok(None),
         }
+    }
+
+    /// What the music database says one recording is: its disambiguation and every release it
+    /// is on. None when it could not be asked. `background` asks on the background lane, for
+    /// the library sweep. Answers are remembered a day, since a recording's releases rarely
+    /// change.
+    pub async fn recording_facts(
+        &self,
+        recording_id: &str,
+        background: bool,
+    ) -> Result<Option<RecordingFacts>, MusicBrainzError> {
+        let Some(url) = pure::recording_facts_url(recording_id) else {
+            return Ok(None);
+        };
+        let key = format!("facts|{}", dotnet::to_lower_invariant(recording_id.trim()));
+        let doc = match self.cache.get(&key) {
+            Some(Cached::Json(cached)) => cached,
+            _ => {
+                let asked = if background {
+                    self.get_background(&url, "recording lookup").await?
+                } else {
+                    self.get(&url, "recording lookup").await?
+                };
+                let Some(doc) = asked else {
+                    return Ok(None);
+                };
+                self.cache
+                    .set(key, Cached::Json(doc.clone()), 1, Self::ARTIST_TTL);
+                doc
+            }
+        };
+        Ok(Some(pure::parse_recording_facts(&doc)?))
     }
 
     /// The release group of the oldest official studio album a song appears on, or of a

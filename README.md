@@ -27,9 +27,9 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 ## What you get
 
 - **Search everything.** Your own music comes first, then the songs and albums you don't have yet. Any of it plays straight away, previewed from YouTube.
-- **Radio that learns.** Your Mix, discovery, artist and genre stations grow from what you play, plus optional genre and decade mixes from your own library.
+- **Radio that learns.** Your Radio, discovery, artist and genre stations grow from what you play, plus optional genre and decade mixes from your own library.
 - **Keep what you love.** Press **+** or heart a song and Octo downloads the best copy it can find from Soulseek or your own Lidarr, FLAC first, catches a "lossless" file that was made from an MP3, tags it, adds the cover and lyrics, and files it in your library. Whole albums work too.
-- **Bring your Spotify.** Import your liked songs and playlists, see what you already have, and let Octo fetch the rest a few songs an hour. See [Spotify import](#spotify-import).
+- **Bring your music.** Import your liked songs and playlists from Spotify or any other service, see what you already have, and let Octo fetch the rest a few songs an hour. See [Importing your music](#importing-your-music).
 - **Apps for every device.** [Octo's own apps](#octos-own-apps) for Windows, Linux and Android, and [any Subsonic app](#compatible-apps) on iPhone, Mac and everywhere else.
 - **Yours to run.** The files are on your disk, everyone in the house gets their own login and their own stations, and there is nothing to pay each month.
 
@@ -192,7 +192,7 @@ scripts/updater/install-updater.sh --remove
 Without the helper, **About** shows the command for the new release. From the Octo folder:
 
 ```bash
-git fetch --tags && git checkout --detach 2026.10.13
+git fetch --tags && git checkout --detach 2026.10.14
 docker compose pull octo yt-dlp-shim octo-sonic || docker compose --profile source build octo-source yt-dlp-shim-source octo-sonic-source
 docker compose up -d
 ```
@@ -360,6 +360,8 @@ YouTube is optional the same way: `YOUTUBE_ENABLED=false` (or **Use YouTube** on
 To switch Soulseek off completely, set `SOULSEEK_ENABLED=false` in `.env` (or **Soulseek → Use Soulseek** on the dashboard) and restart Octo. Octo then never contacts slskd: hearts skip it, and Better quality and Find songs use your other sources. slskd itself still starts with the bundled compose file; to not run it at all, delete the `slskd` service and the `- slskd` line under octo's `depends_on`.
 
 Use **Streams & hearts → Heart download priority** in the admin UI to order Soulseek, YouTube, and Lidarr and independently choose whether each handles song hearts, album hearts, or both. Octo tries eligible sources from top to bottom and stops at the first success. `DOWNLOAD_SOURCE`, `DOWNLOAD_ON_STAR`, and `DOWNLOAD_ALBUM_ON_STAR` remain migration defaults for existing and env-only installations.
+
+**Heart a song, get its album** (`DOWNLOAD_ALBUM_ON_SONG_STAR`, off by default) makes a heart on an outside song also fetch the rest of its album, through the album-heart sources, as a heart on the album would. The song itself comes first, and the album follows once the song is in your library. Songs you already have are skipped. When Lidarr takes the song, it brings the album itself. A family member's album songs are not starred for them; only the song they hearted is.
 
 Lidarr works at album level, so enabling it for song hearts still fetches the song's full album. It is last and disabled by default; configure its URL, API key, root folder, and profiles on the Lidarr page, then enable the heart types you want in the priority list.
 
@@ -610,6 +612,33 @@ tags were never confirmed. Octo's own downloads are skipped, since each was chec
 arrived if verification was on at the time; `LIBRARY_ACTIONS_REVIEW_SWEEP_OCTO_DOWNLOADS` checks
 them too.
 
+`LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE` (off by default) lets the check replace a song that
+clearly is another one instead of asking: AcoustID names a different song, by another title, at
+least as sure as `SLSKD_MIN_MATCH_SCORE`. It goes through Wrong song as the library keeper, so
+Wrong song must be on, dry run must be off and the keeper must be on the allowlist, and Review
+keeps a note of what Octo heard ("Octo replaced this: AcoustID heard Artist - Title, 97% sure
+(needs 85%)"). Another take or a remaster of the same song, a song of the wrong length and anything
+AcoustID is not sure of are still asked about. So is a song anyone starred or rated: the admin's
+marks and each Family member's are read with their own sign-in, and while another Navidrome user is
+on the server, or a member's marks cannot be read, the song is asked about too. At most
+`LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PER_DAY` (10) a day are replaced; past that, or after
+three replacements fail in a day, the rest of the day's are asked about. "Re-check Octo's
+downloads" on the dashboard checks every song Octo downloaded once more, at least 60 an hour even
+with the hourly rate at 0, and then stops: the way to go over earlier downloads after changing the
+match score.
+
+`LIBRARY_ACTIONS_TAG_CHECK_PER_HOUR` (default 60, 0 is off) checks that many library songs an
+hour against their audio, only while nothing is downloading, in AcoustID's spare lane. Each file
+is fingerprinted and its one recording decided by its exact length; then its tags are held
+against it: an album that names another take ("(Instrumentals)" on the vocal song), a live or
+instrumental take whose title does not say so, a recording id or release track id from another
+recording, and a live copy kept beside the studio copy under the same title. What disagrees is
+listed in Library health under "Tags that disagree with the audio", with "Use the audio's tags"
+per song and "Fix all sure ones" for songs whose recording the length or a single match decided.
+Fixes are written in place and can be undone. Stray spaces in titles and albums are taken off by
+the check itself when library actions may change files. Needs the AcoustID key; its place is kept
+in `identity-sweep.json` beside the settings, so a restart carries on where it was.
+
 `LIBRARY_ACTIONS_DUPLICATES` adds a Duplicates playlist per allowed user: recordings the
 library holds more than once, side by side, the copy worth keeping first (lossless before
 lossy, then the higher bitrate). Two files are copies only when they carry the same
@@ -663,7 +692,7 @@ track AcoustID named as something else, for a fingerprint other than the standar
 (`SLSKD_FINGERPRINT_SECONDS`), or when no single MusicBrainz recording fits the track's title,
 artist and length.
 
-Each kind of dynamic station is configured on its own, so a listener can keep Your Mix
+Each kind of dynamic station is configured on its own, so a listener can keep Your Radio
 without collecting an artist radio per favorite band. `LASTFM_ENABLE_YOUR_MIX` and
 `LASTFM_ENABLE_DISCOVERY_MIX` (both default true) switch those two stations,
 `LASTFM_ARTIST_STATION_COUNT` (default 2) and `LASTFM_GENRE_STATION_COUNT` (default 3)
@@ -713,15 +742,31 @@ never written to Navidrome, so a rescan cannot empty one and nobody edits one by
 `MIXES_GENRES` and `MIXES_DECADES` choose the kinds. A genre or decade gets a mix once it has
 `MIX_CREATE_AT` tracks (default 20) and loses it only below `MIX_REMOVE_BELOW` (default 10),
 so one at the edge does not come and go, and `MIX_MAX_PLAYLISTS` (default 20) shows the
-largest first. Years and anything on the genre blocklist never get a mix of their own.
+largest first. Genre tags that are years, and anything on the genre blocklist, never get a
+genre mix of their own.
 
 Each mix holds `MIX_TRACK_COUNT` tracks (default 100) with at most `MIX_MAX_PER_ARTIST` (3)
 by one artist; the cap is never relaxed, so a mix that cannot be filled without breaking it
 is shorter. A mix is a seeded draw that holds still for `MIX_REFRESH_HOURS` (24), so every
 client shows the same tracks, and is then drawn again. `MIX_NEW_SHARE` keeps that percentage
-of each mix, and of the Discovery Mix station, for tracks new to the listener: never played,
+of each mix, and of the Discovery Radio station, for tracks new to the listener: never played,
 or added in the last `MIX_NEW_DAYS`. It is 0 by default, which changes nothing.
-`MIX_NAME_FORMAT` names them, `{0}` being the genre or decade ("{0} Mix" when empty).
+`MIX_NAME_FORMAT` names every mix, `{0}` being the genre, decade, year, country or artist
+("{0} Mix" when empty).
+
+`MIXES_YEARS` (off by default) adds a mix per year ("1994 Mix"), counted from the same read
+of each listener's library as Made for you (up to 40,000 songs), with the same thresholds and
+at most `MIX_MAX_YEAR_PLAYLISTS` (10) on top of `MIX_MAX_PLAYLISTS`, the years with the most
+songs first. `MIXES_ARTISTS` (off by default) adds a mix for each of the listener's
+`MIX_ARTIST_COUNT` (5) most played artists ("Radiohead Mix"): half the artist's own songs,
+half songs in the library by the artists Last.fm calls similar (all the artist's own without
+a Last.fm key), drawn again every `MIX_REFRESH_HOURS`. The artist cap holds for the similar
+artists, never for the artist themself. An artist keeps their mix while they rank within
+three places past the count, and one that falls further keeps it until it is a week old.
+
+Every Octo list row in getPlaylists and getPlaylist carries `octoGroup` (octoLists version 2),
+so an app can group Octo's lists: `genre`, `decade`, `year`, `country`, `artist`, `chart`,
+`forYou`, `liked` or `station`.
 
 Mix and station covers are drawn by Octo in the same design as the Octo apps' playlist
 covers: the list's name in white over one of 48 painted backgrounds, picked to match the
@@ -759,38 +804,30 @@ They are on by default, whether or not the mixes are. The dashboard's Mixes page
 `trending` and Apple genre numbers, default `new,trending,18,14,6`; empty for none);
 `CHART_COUNTRY` is `auto` or a two-letter country such as `gb`.
 
-### Spotify import
+### Importing your music
 
-The dashboard's **Spotify import** page, and the same view in the Octo apps, shows what your
-library has of your Spotify liked songs and playlists. A list can be kept as a Navidrome
-playlist of the songs you have, in Spotify's order, and filled in as the rest arrive; its
-missing songs can go to the trickle, which fetches them a few an hour through the same chain
-a heart uses (your library first, then each heart download source in order, Soulseek's outage
-hold, Lidarr). It never starts a song while anyone's own download runs, and waits out a Soulseek
-outage instead of taking a YouTube copy. Lists, sign-ins and the trickle live in
-`/app/config/imports.json`, `spotify-accounts.json` and `imports-trickle.json`, so a restart
-carries on.
+The dashboard's **Import** page, and the same view in the Octo apps, shows what your library
+has of the playlists and liked songs you bring from another service. A list can be kept as a
+Navidrome playlist of the songs you have, in the list's order, and filled in as the rest
+arrive; its missing songs can go to the trickle, which fetches them a few an hour through the
+same chain a heart uses (your library first, then each heart download source in order,
+Soulseek's outage hold, Lidarr). It never starts a song while anyone's own download runs, and
+waits out a Soulseek outage instead of taking a YouTube copy. Lists and the trickle live in
+`/app/config/imports.json` and `imports-trickle.json`, so a restart carries on.
 
-Spotify's Web API only works through an app you register yourself, and in 2026 such an app
-in development mode reads for at most five Spotify accounts, needs its owner to have Premium,
-gets no ISRCs, and is shown the songs only of playlists the account made or works on. Octo
-reads the first 100 songs of any other playlist from its public page, and says so.
+No account, app or key is needed. For Spotify, Apple Music, YouTube Music, Amazon Music, TIDAL,
+Deezer, Qobuz, SoundCloud, Pandora and YouTube, the page walks you through TuneMyMusic's free
+export to a file, private playlists and liked songs included, and the file comes back to
+Octo. Octo also reads a public Spotify playlist or album by its link (the first 100 songs), a
+CSV from Exportify or Soundiiz (any CSV with a title and an artist column), the zip from
+Spotify's own **Download your data**, and a plain list of one Artist - Title a line, from a
+file or pasted. `IMPORTS_SONGS_PER_HOUR` (20) paces the trickle and `IMPORTS_REFRESH_HOURS` (6)
+reads lists from a link that are kept or fetching again, so new songs there reach them.
 
-1. At [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard), **Create app**,
-   tick **Web API**, and add the redirect URI `http://127.0.0.1/callback` exactly. Spotify takes
-   https or a loopback address, never `localhost`; a loopback one with no port lets the Octo apps
-   sign in on any port.
-2. Under **User Management**, add every Spotify account that will connect.
-3. Put the app's **Client ID** in `IMPORTS_SPOTIFY_CLIENT_ID` or on the page. Octo signs in
-   with PKCE, so there is no secret. After you allow Octo, the dashboard asks for the address
-   the browser ended on; an Octo behind https can register
-   `https://<octo>/imports/spotify/callback` instead and finish by itself.
-
-No sign-in is needed for a public playlist or album link (the first 100 songs), a CSV from
-Exportify, TuneMyMusic or Soundiiz (any CSV with a title and an artist column), or the zip
-from Spotify's own **Download your data**, which holds every playlist whole.
-`IMPORTS_SONGS_PER_HOUR` (20) paces the trickle and `IMPORTS_REFRESH_HOURS` (6) reads lists
-that are kept or fetching again, so new songs on Spotify reach them.
+Lists an earlier version saved from a Spotify account sign-in stay, matched and fetched like any
+other list, but are not read again; import a TuneMyMusic file to bring one up to date, or
+remove it. Old `IMPORTS_SPOTIFY_CLIENT_ID` and `IMPORTS_SPOTIFY_REDIRECT_URI` lines in `.env`
+are ignored and can be deleted.
 
 ### Download path on Windows and manual installs
 
@@ -906,11 +943,12 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | `getLibraryActions`, `libraryAction`, `getLibraryTrash` | the `octoLibraryActions` extension: what the caller may do to library files, removing one song the way the Delete playlist does, putting it back, and the tag, album and cover fixes of Library health |
 | `getAcquisitions`, `getAcquisition`, `clearAcquisitions` | the `octoAcquisitions` extension: the caller's downloads; version 2 adds each one's log and clearing finished ones |
 | `findSongs`, `getFoundSongs`, `pickFoundSong` | `octoAcquisitions` 2: a song's search run again on the caller's download sources, every copy found, and fetching the one picked |
-| `getImports`, `getImport`, `importAction` | the `octoImports` extension: the caller's Spotify sign-in, imported lists with what the library has of each, and the trickle |
+| `getImports`, `getImport`, `importAction` | the `octoImports` extension: the caller's imported lists with what the library has of each, and the trickle |
 | `getTopSongs` | the standard top songs of an artist (by name, or by id as Navidrome's `topSongsByArtistId`), for every app: ranked as `getArtistTopSongs` ranks them, songs you have as your library's own and the rest as outside songs (only yours while search discovery is off); Navidrome's answer when Octo has none |
 | `getArtistTopSongs`, `getTopChart` | the `octoTopSongs` extension: an artist's most played songs and the chart of the moment, each marked in the caller's library or playable from outside it |
+| `getPlace` | the `octoPlaces` extension, for the apps' Live radio near you: a postal code (`code` and `country`, any case or spacing, `UK` for `GB`; a full UK, Canadian or Dutch code finds the part GeoNames keeps, and a ZIP+4 its five digits), a city (`name`, optional `state` by name or code, and `country`; of the towns with that name, and that state when one is sent, the one with the most postal codes, at the postal code nearest its others) or a coordinate (`latitude` and `longitude` in decimal degrees: the nearest place within 30 km), in that order when several are sent, answered as `place` with `code`, `name`, `state` (when known), `country`, `latitude` and `longitude` (2 decimals). Error 70 for a place Octo does not know, error 10 for missing parameters or coordinates that are not decimal degrees. Answered from GeoNames' postal codes, built into the image; nothing is sent anywhere |
 | `/api/artist/{id}`, `/api/album?artist_id=` | Navidrome's own API, for clients that use it (Feishin): an outside artist's page and its albums |
-| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 and 2, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` (while search discovery is on), `octoImports`, `octoRadioSources` (while radio can answer: radio songs carry `octoSuggestedBy`) and `songLyrics` 1 and 2 |
+| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 and 2, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` (while search discovery is on), `octoImports`, `octoRadioSources` (while radio can answer: radio songs carry `octoSuggestedBy`), `octoPlaces` (while the place data can be read, so an app without it keeps to its own lookup) and `songLyrics` 1 and 2 |
 
 ### Soulseek download details
 
@@ -996,6 +1034,13 @@ cargo fmt --all
 
 A debug build serves the dashboard and images from the C# folder they still live in: set `OCTO_WWWROOT=octo/wwwroot` and `OCTO_ASSETS=octo/Assets` when you run it from the repository.
 
+`getPlace` reads `data/places.bin` beside the binary (in the image, `/app/data/places.bin`), else `places.bin` in the config folder; `OCTO_PLACES_FILE` names another file. Without one, every place answers error 70, `octoPlaces` is not listed and the log says so once. The image build makes it from GeoNames' postal codes, downloaded once per release (`PLACES_REFRESH` downloads them again; `PLACES_DOWNLOAD=0` builds without them, and the build log warns when an image has none); to make one by hand:
+
+```bash
+curl -O https://download.geonames.org/export/zip/allCountries.zip && unzip allCountries.zip allCountries.txt
+cargo run --release -p octo-core --bin octo-places -- allCountries.txt places.bin
+```
+
 The C# Octo (2026.10.05 and earlier) is still in `octo/` and `octo.Tests/`, with `Dockerfile.csharp`, until it is removed after the Rust release; nothing ships it. The Rust server reads the files the two share from there: the dashboard (`octo/wwwroot`), images (`octo/Assets`), the list cover design and `appsettings.json`.
 
 To run your changes in the stack, build Octo from the folder; `docker-compose.yml` otherwise pulls the published image:
@@ -1043,6 +1088,7 @@ Project layout:
 
 - [**Navidrome**](https://www.navidrome.org/): the music server Octo proxies.
 - [**slskd**](https://github.com/slskd/slskd): Soulseek with a REST API.
+- [**GeoNames**](https://www.geonames.org/): place data from GeoNames ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)), converted and simplified by Octo, behind `getPlace`; the image carries GeoNames' readme as `licenses/GeoNames-postal-codes.txt`.
 - [**Lidarr**](https://github.com/Lidarr/Lidarr): optional album acquisition and import manager.
 - [**yt-dlp**](https://github.com/yt-dlp/yt-dlp): makes YouTube preview feasible.
 - [**Last.fm**](https://www.last.fm/api): similar-tracks API.

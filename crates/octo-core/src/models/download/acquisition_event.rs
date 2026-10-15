@@ -43,6 +43,29 @@ pub struct AcquisitionEvent {
     pub detail: Option<String>,
     #[serde(default)]
     pub candidates: Option<Vec<AcquisitionCandidate>>,
+    /// On a check line, the other recordings AcoustID heard in the file, best first. Left out
+    /// of the file when there are none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heard: Option<Vec<AcquisitionHeard>>,
+}
+
+/// One recording AcoustID heard in a file: its title, its artist, and how sure AcoustID was,
+/// as a whole percent rounded down.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct AcquisitionHeard {
+    #[serde(deserialize_with = "null_as_default")]
+    pub title: String,
+    #[serde(deserialize_with = "null_as_default")]
+    pub artist: String,
+    pub score: i32,
+}
+
+impl AcquisitionHeard {
+    /// "Artist - Title, 64% sure".
+    pub fn describe(&self) -> String {
+        format!("{} - {}, {}% sure", self.artist, self.title, self.score)
+    }
 }
 
 /// One copy a source offered, as the log and Find songs show it. Every figure the source gave is

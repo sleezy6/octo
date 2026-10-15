@@ -322,6 +322,9 @@ if [ "$octo_builds" = 1 ]; then
   build=(octo "${build[@]}")
 fi
 built=""
+# Octo's build downloads the place data again on a later day (docker-compose.yml passes this to
+# it), so one build that could not reach GeoNames does not leave this release without it.
+export PLACES_REFRESH="${PLACES_REFRESH:-$tag $(date -u +%Y-%m-%d)}"
 if [ "${#build[@]}" -gt 0 ]; then
   write_status building "Building ${build[*]} from this folder"
   if ! run docker compose --profile source build "${build[@]}"; then

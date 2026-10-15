@@ -9,14 +9,23 @@ use crate::services::state_file::null_as_default;
 
 /// Where a list came from. The words are a contract with the dashboard and the Octo apps.
 pub mod import_sources {
+    /// A Spotify account's liked songs, saved by an earlier sign-in. Kept, matched and fetched
+    /// like any list, never read again.
     pub const SPOTIFY_LIKED: &str = "spotifyLiked";
+    /// A playlist of a Spotify account, saved by an earlier sign-in. Kept, matched and fetched
+    /// like any list, never read again.
     pub const SPOTIFY_PLAYLIST: &str = "spotifyPlaylist";
     pub const LINK: &str = "link";
     pub const FILE: &str = "file";
 
-    /// Read again on a schedule: from the account, or from a public link.
+    /// Read again on a schedule: from a public link.
     pub fn can_refresh(source: &str) -> bool {
-        matches!(source, SPOTIFY_LIKED | SPOTIFY_PLAYLIST | LINK)
+        source == LINK
+    }
+
+    /// Saved from a Spotify account, which Octo does not read.
+    pub fn from_account(source: &str) -> bool {
+        matches!(source, SPOTIFY_LIKED | SPOTIFY_PLAYLIST)
     }
 }
 

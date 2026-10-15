@@ -86,18 +86,15 @@ pub struct ServiceView {
     pub tile: &'static str,
 }
 
-/// Where a person can bring their music from: every export service, and whether the Spotify
-/// sign-in that keeps a list up to date is set up on this server.
+/// Where a person can bring their music from: every export service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportServices {
     pub services: Vec<ServiceView>,
-    pub spotify_connect: bool,
 }
 
 impl ImportServices {
-    /// The list, with `spotify_connect` true when a Spotify client ID is set.
-    pub fn new(spotify_client_id: &str) -> Self {
+    pub fn new() -> Self {
         ImportServices {
             services: SERVICES
                 .iter()
@@ -108,8 +105,13 @@ impl ImportServices {
                     tile: service.tile,
                 })
                 .collect(),
-            spotify_connect: !spotify_client_id.trim().is_empty(),
         }
+    }
+}
+
+impl Default for ImportServices {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -119,7 +121,7 @@ mod tests {
 
     #[test]
     fn every_service_in_order_with_its_export_page() {
-        let services = ImportServices::new("");
+        let services = ImportServices::new();
         let ids: Vec<&str> = services.services.iter().map(|s| s.id).collect();
         assert_eq!(
             ids,
@@ -143,14 +145,11 @@ mod tests {
             );
             assert!(!service.name.is_empty() && !service.tile.is_empty());
         }
-        assert!(!services.spotify_connect);
-        assert!(ImportServices::new(" client-1 ").spotify_connect);
-        assert!(!ImportServices::new("   ").spotify_connect);
     }
 
     #[test]
     fn the_answer_reads_as_the_contract_says() {
-        let json = serde_json::to_value(ImportServices::new("client-1")).expect("json");
+        let json = serde_json::to_value(ImportServices::new()).expect("json");
         assert_eq!(
             json["services"][1],
             serde_json::json!({
@@ -160,6 +159,6 @@ mod tests {
                 "tile": "Apple Music"
             })
         );
-        assert_eq!(json["spotifyConnect"], true);
+        assert_eq!(json.as_object().map(|o| o.len()), Some(1), "{json}");
     }
 }

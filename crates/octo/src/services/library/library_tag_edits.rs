@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use octo_core::common::dotnet::{is_null_or_white_space, utf16_len};
 use octo_core::common::song_identity::SongIdentity;
+use octo_core::fingerprint::music_brainz_client;
 use octo_core::json::datetime;
 use octo_media::cover::cover_image;
 use octo_media::tags::kept_identity::{KeptIdentity, KeptIdentityTags};
@@ -34,6 +35,16 @@ pub mod song_tag_fields {
 
     pub const ALL: [&str; 9] = [TITLE, ARTIST, ALBUM, ALBUM_ARTIST, YEAR, GENRE, TRACK, DISC, ISRC];
 
+    /// The MusicBrainz ids of the one recording a file is, written when its audio was found to
+    /// be that recording. They are read only when an edit names them, so a song's tags as the
+    /// apps list them stay the ones above.
+    pub const RECORDING_ID: &str = "recordingId";
+    pub const RELEASE_TRACK_ID: &str = "releaseTrackId";
+    pub const RELEASE_ID: &str = "releaseId";
+    pub const RELEASE_GROUP_ID: &str = "releaseGroupId";
+
+    pub const IDENTITY: [&str; 4] = [RECORDING_ID, RELEASE_TRACK_ID, RELEASE_ID, RELEASE_GROUP_ID];
+
     /// Never cleared: without them a song is filed under its file name and an unknown artist.
     pub const REQUIRED: [&str; 3] = [TITLE, ARTIST, ALBUM];
 
@@ -43,7 +54,13 @@ pub mod song_tag_fields {
     /// The field's own name for a name sent in any case, or None for a name that is not one.
     pub fn canonical(name: &str) -> Option<&'static str> {
         ALL.into_iter()
+            .chain(IDENTITY)
             .find(|field| octo_core::common::dotnet::eq_ignore_case(field, name))
+    }
+
+    /// Whether the field is one of the MusicBrainz ids.
+    pub fn is_identity(field: &str) -> bool {
+        IDENTITY.contains(&field)
     }
 }
 
@@ -194,6 +211,9 @@ pub fn invalid(changes: &IndexMap<String, Option<String>>) -> Option<String> {
             fields::ISRC if SongIdentity::normalize_isrc(value).is_none() => {
                 return Some(format!("\"{value}\" is not an ISRC."));
             }
+            field if fields::is_identity(field) && !music_brainz_client::is_mbid(value) => {
+                return Some(format!("\"{value}\" is not a MusicBrainz id."));
+            }
             _ => {}
         }
     }
@@ -204,7 +224,13 @@ pub fn invalid(changes: &IndexMap<String, Option<String>>) -> Option<String> {
 pub fn write(path: &Path, changes: &IndexMap<String, Option<String>>) -> TagEditResult {
     let run = || -> Result<TagEditResult, TagError> {
         let mut file = TagFile::open(path)?;
-        let before = read_file(&file);
+        let mut before = read_file(&file);
+        // The ids an edit names are read too, so its undo puts back what was there.
+        for field in changes.keys().filter_map(|name| fields::canonical(name)) {
+            if fields::is_identity(field) {
+                before.insert(field.to_string(), read_identity(&mut file, field));
+            }
+        }
         let mut changed: IndexMap<&'static str, Option<String>> = IndexMap::new();
         for (name, raw) in changes {
             let Some(field) = fields::canonical(name) else {
@@ -272,7 +298,25 @@ fn set(file: &mut TagFile, field: &str, value: Option<&str>) {
         fields::TRACK => file.set_track(number(value)),
         fields::DISC => file.set_disc(number(value)),
         fields::ISRC => extras::set_or_clear_text(file, TagFields::ISRC, value),
+        fields::RECORDING_ID => match value {
+            Some(id) => extras::set_recording_id(file, id),
+            None => extras::clear_recording_id(file),
+        },
+        fields::RELEASE_TRACK_ID => extras::set_or_clear_text(file, TagFields::RELEASE_TRACK_ID, value),
+        fields::RELEASE_ID => extras::set_or_clear_text(file, TagFields::ALBUM_ID, value),
+        fields::RELEASE_GROUP_ID => extras::set_or_clear_text(file, TagFields::RELEASE_GROUP_ID, value),
         _ => {}
+    }
+}
+
+/// One of the MusicBrainz ids as the file holds it, or None.
+pub fn read_identity(file: &mut TagFile, field: &str) -> Option<String> {
+    match field {
+        fields::RECORDING_ID => extras::read_recording_id(file),
+        fields::RELEASE_TRACK_ID => extras::read_text(file, TagFields::RELEASE_TRACK_ID),
+        fields::RELEASE_ID => extras::read_text(file, TagFields::ALBUM_ID),
+        fields::RELEASE_GROUP_ID => extras::read_text(file, TagFields::RELEASE_GROUP_ID),
+        _ => None,
     }
 }
 
@@ -438,6 +482,10 @@ pub fn words(field: &str) -> &str {
         fields::TRACK => "track number",
         fields::DISC => "disc number",
         fields::ISRC => "ISRC",
+        fields::RECORDING_ID => "recording id",
+        fields::RELEASE_TRACK_ID => "release track id",
+        fields::RELEASE_ID => "release id",
+        fields::RELEASE_GROUP_ID => "release group id",
         _ => field,
     }
 }

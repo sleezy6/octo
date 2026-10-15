@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use octo_core::settings::SettingsStore;
+use octo_subsonic::SubsonicCredential;
 use octo_subsonic::subsonic_request_parser::escape_data_string;
 use reqwest::Method;
 use serde_json::Value;
@@ -146,6 +147,106 @@ impl NavidromePlaylistApi {
             Err(message) => {
                 warn!("Could not read the marks on song {song_id}: {message}");
                 None
+            }
+        }
+    }
+
+    /// Sets the admin's own rating on one song, 1 to 5, or clears it with 0. Straight to
+    /// Navidrome, so no star action of Octo's ever sees it. True when Navidrome said ok.
+    pub async fn set_admin_rating(&self, song_id: &str, rating: i32) -> bool {
+        let rating = rating.clamp(0, 5).to_string();
+        self.admin_subsonic("setRating", &[("id", song_id), ("rating", &rating)])
+            .await
+    }
+
+    /// Stars or unstars one song as the admin, straight to Navidrome. True when Navidrome said
+    /// ok.
+    pub async fn set_admin_starred(&self, song_id: &str, starred: bool) -> bool {
+        let endpoint = if starred { "star" } else { "unstar" };
+        self.admin_subsonic(endpoint, &[("id", song_id)]).await
+    }
+
+    /// Sets the rating of whoever `credential` signs in as on one song, 0 to clear it, straight
+    /// to Navidrome. True when Navidrome said ok.
+    pub async fn set_rating_as(&self, credential: &SubsonicCredential, song_id: &str, rating: i32) -> bool {
+        let base = self.base_url();
+        if base.is_empty() {
+            return false;
+        }
+        let rating = rating.clamp(0, 5).to_string();
+        let query = credential.parameters(&[("id", song_id), ("rating", &rating)]);
+        let answer = async {
+            let response = self
+                .http
+                .get(format!("{base}/rest/setRating"))
+                .query(&query)
+                .send()
+                .await
+                .ok()?;
+            let body: Value = response.json().await.ok()?;
+            Some(body.pointer("/subsonic-response/status").and_then(Value::as_str) == Some("ok"))
+        }
+        .await;
+        answer.unwrap_or(false)
+    }
+
+    /// Sets a playlist's description, as the admin (Navidrome lets an admin edit any playlist's
+    /// details). True when Navidrome said ok.
+    pub async fn set_comment(&self, playlist_id: &str, comment: &str) -> bool {
+        self.admin_subsonic(
+            "updatePlaylist",
+            &[("playlistId", playlist_id), ("comment", comment)],
+        )
+        .await
+    }
+
+    /// One of Navidrome's Subsonic endpoints called as the admin, with the Subsonic sign-in
+    /// Navidrome gave that admin at login. True when the answer's status is ok.
+    async fn admin_subsonic(&self, endpoint: &str, parameters: &[(&str, &str)]) -> bool {
+        let base = self.base_url();
+        if base.is_empty() {
+            return false;
+        }
+        // A login, when none was made yet, brings the Subsonic sign-in with it.
+        if self.identity.get_scan_auth().is_none() {
+            let _ = self.identity.ensure_admin_jwt().await;
+        }
+        let Some((user, token, salt)) = self.identity.get_scan_auth() else {
+            warn!("Could not call {endpoint}: Octo has no Navidrome admin sign-in");
+            return false;
+        };
+        let mut query: Vec<(&str, &str)> = vec![
+            ("f", "json"),
+            ("c", "octo"),
+            ("v", "1.16.1"),
+            ("u", &user),
+            ("t", &token),
+            ("s", &salt),
+        ];
+        query.extend_from_slice(parameters);
+        let answer = async {
+            let response = self
+                .http
+                .get(format!("{base}/rest/{endpoint}"))
+                .query(&query)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let body: Value = response.json().await.map_err(|e| e.to_string())?;
+            Ok::<bool, String>(
+                body.pointer("/subsonic-response/status").and_then(Value::as_str) == Some("ok"),
+            )
+        }
+        .await;
+        match answer {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!("Navidrome refused {endpoint} for the admin");
+                false
+            }
+            Err(message) => {
+                warn!("Could not call {endpoint}: {message}");
+                false
             }
         }
     }

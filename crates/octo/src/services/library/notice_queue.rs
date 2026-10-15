@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::common::{PathHelper, dotnet};
-use octo_core::fingerprint::verification::{InconclusiveReason, VerificationResult};
+use octo_core::fingerprint::verification::{
+    InconclusiveReason, VerificationResult, threshold_percent, whole_percent,
+};
 use octo_core::json::datetime;
 use octo_core::models::domain::Song;
 use octo_core::settings::NoticeKind;
@@ -202,6 +204,21 @@ pub struct NoticeEntry {
     pub queued_utc: Option<DateTime<Utc>>,
     #[serde(default, with = "datetime::utc_option")]
     pub resolved_utc: Option<DateTime<Utc>>,
+
+    /// How sure AcoustID was, as a whole percent rounded down: of the recording it named, else
+    /// of its best result. None when it gave no score. Left out of the file when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acoust_id_score: Option<i32>,
+    /// The score AcoustID's answer needed to count, as a whole percent, beside a score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<i32>,
+    /// What AcoustID matched, "Artist - Title", when it named a recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched: Option<String>,
+    /// The best recording AcoustID heard, "Artist - Title", when it named none: what came
+    /// closest without counting as a match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closest: Option<String>,
 }
 
 impl Default for NoticeEntry {
@@ -231,6 +248,10 @@ impl Default for NoticeEntry {
             created_utc: Utc::now(),
             queued_utc: None,
             resolved_utc: None,
+            acoust_id_score: None,
+            threshold: None,
+            matched: None,
+            closest: None,
         }
     }
 }
@@ -405,6 +426,7 @@ impl NoticeQueue {
                 _ => "Octo could not check this download".to_string(),
             };
             let sweep = origin == NoticeOrigin::LibrarySweep;
+            let score = verdict.shown_score().map(whole_percent);
             entries.set(
                 key.clone(),
                 NoticeEntry {
@@ -429,6 +451,77 @@ impl NoticeQueue {
                     },
                     file_format: Some(dotnet::to_lower_invariant(&extension(local_path))),
                     next_lookup_utc: Utc::now(),
+                    acoust_id_score: score,
+                    threshold: score
+                        .and(Some(verdict.threshold))
+                        .filter(|threshold| *threshold > 0.0)
+                        .map(threshold_percent),
+                    matched: verdict.matched_text(),
+                    closest: verdict.closest_text(),
+                    ..Default::default()
+                },
+            );
+            Self::trim(&mut entries);
+        }
+        self.mark_dirty();
+        true
+    }
+
+    /// What a replaced file's note says: "Octo replaced this: AcoustID heard Artist - Title, 97%
+    /// sure (needs 85%)".
+    pub fn replaced_reason(verdict: &VerificationResult, needs: i32) -> String {
+        format!(
+            "Octo replaced this: AcoustID heard {}, {}% sure (needs {needs}%)",
+            verdict
+                .matched_text()
+                .unwrap_or_else(|| "another song".to_string()),
+            whole_percent(verdict.score)
+        )
+    }
+
+    /// Leave `username` a note that the library sweep replaced the file at `local_path` through
+    /// Wrong song: a Review entry already Acted on, so it is never put in a playlist or asked
+    /// again, with the cause and AcoustID's numbers a question would carry. False when a Review
+    /// entry for this person and file is there already.
+    pub fn add_replaced(
+        &self,
+        username: &str,
+        local_path: &str,
+        song: &Song,
+        verdict: &VerificationResult,
+        navidrome_id: &str,
+        needs: i32,
+    ) -> bool {
+        let key = Self::review_key(username, local_path);
+        {
+            let mut entries = self.entries.lock();
+            if entries.contains_key(&key) {
+                return false;
+            }
+            let now = Utc::now();
+            entries.set(
+                key.clone(),
+                NoticeEntry {
+                    key,
+                    kind: NoticeKind::Review,
+                    username: username.trim().to_string(),
+                    local_path: local_path.to_string(),
+                    artist: song.artist.clone(),
+                    title: song.title.clone(),
+                    album: Some(song.album.clone()),
+                    navidrome_id: Some(navidrome_id.to_string()),
+                    state: NoticeState::Acted,
+                    reason: Self::replaced_reason(verdict, needs),
+                    cause: verdict.reason,
+                    origin: NoticeOrigin::LibrarySweep,
+                    duration_seconds: verdict.duration_seconds,
+                    file_format: Some(dotnet::to_lower_invariant(&extension(local_path))),
+                    next_lookup_utc: now,
+                    created_utc: now,
+                    resolved_utc: Some(now),
+                    acoust_id_score: Some(whole_percent(verdict.score)),
+                    threshold: Some(needs),
+                    matched: verdict.matched_text(),
                     ..Default::default()
                 },
             );

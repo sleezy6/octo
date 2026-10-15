@@ -6,8 +6,8 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -25,6 +25,7 @@ use octo_subsonic::SubsonicCredential;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
+use super::duplicate_fixer::DuplicateFixer;
 use super::library_action_journal::{
     LibraryActionEntry, LibraryActionJournal, LibraryActionState, action_name,
 };
@@ -264,6 +265,8 @@ pub struct LibraryActionExecutor {
     // Paths compare ordinally, as on every platform but Windows.
     busy: Mutex<HashSet<String>>,
     seams: Mutex<ExecutorSeams>,
+    /// Library health's duplicate fix, which Fix duplicates hands each request to.
+    fixer: OnceLock<Arc<dyn DuplicateFixer>>,
 }
 
 /// Takes a song out of the busy set when the action on it ends, however it ends.
@@ -368,6 +371,7 @@ fn describe(action: LibraryAction) -> &'static str {
         LibraryAction::Keep => "keep",
         LibraryAction::WrongLyrics => "look for other lyrics for",
         LibraryAction::WrongCover => "look for another cover for",
+        LibraryAction::FixDuplicates => "fix the copies of",
     }
 }
 
@@ -417,6 +421,7 @@ impl LibraryActionExecutor {
             answers: parts.answers,
             reconciled: AtomicBool::new(false),
             busy: Mutex::new(HashSet::new()),
+            fixer: OnceLock::new(),
             seams: Mutex::new(ExecutorSeams::default()),
         }
     }
@@ -428,6 +433,63 @@ impl LibraryActionExecutor {
 
     pub fn journal(&self) -> &Arc<LibraryActionJournal> {
         &self.journal
+    }
+
+    /// Hands every Fix duplicates request to Library health's duplicate fix.
+    pub fn use_duplicate_fixer(&self, fixer: Arc<dyn DuplicateFixer>) {
+        let _ = self.fixer.set(fixer);
+    }
+
+    /// Fix duplicates: every copy of the song is fixed as Library health's Fix these copies
+    /// would, through the Delete action, so removing songs has to be on too. The song's
+    /// questions in the Duplicates playlist are answered once the fix has started, or kept when
+    /// every copy stays.
+    async fn fix_duplicates(&self, request: &LibraryActionRequest) -> LibraryActionOutcome {
+        let settings = self.settings.current().library_actions.clone();
+        let removing = settings
+            .effective_actions()
+            .into_iter()
+            .any(|entry| entry.action == LibraryAction::Delete && entry.enabled);
+        if !removing {
+            return LibraryActionOutcome::said(
+                LibraryActionState::Skipped,
+                "Removing songs is off: turn on the Delete action under Library actions.",
+            );
+        }
+        if settings.dry_run {
+            return LibraryActionOutcome::said(
+                LibraryActionState::Rehearsed,
+                format!(
+                    "Dry run: would fix every copy of the song {} is one of.",
+                    request.navidrome_id
+                ),
+            );
+        }
+        let Some(fixer) = self.fixer.get() else {
+            return LibraryActionOutcome::said(
+                LibraryActionState::Skipped,
+                "This server cannot fix duplicates.",
+            );
+        };
+        let answer = fixer
+            .fix_copies_of(
+                &request.navidrome_id,
+                &request.username,
+                request.credential.as_ref(),
+            )
+            .await;
+        if answer.state == LibraryActionState::Applied
+            && let Some(notices) = &self.notices
+        {
+            if answer.all_kept {
+                notices.mark_kept(&request.username, &request.navidrome_id);
+            } else {
+                for copy in &answer.copies {
+                    notices.mark_acted(copy);
+                }
+            }
+        }
+        LibraryActionOutcome::said(answer.state, answer.detail)
     }
 
     pub async fn apply(
@@ -467,6 +529,10 @@ impl LibraryActionExecutor {
                 LibraryActionState::Skipped,
                 format!("{} is not enabled.", action_name(request.action)),
             ));
+        }
+
+        if request.action == LibraryAction::FixDuplicates {
+            return Ok(self.fix_duplicates(&request).await);
         }
 
         // Keep is an answer, not an operation. It touches no file, so there is nothing to rehearse
@@ -1066,6 +1132,7 @@ impl LibraryActionExecutor {
                         title: Some(song.title.clone()),
                         album: song.album.clone(),
                         duration: song.length,
+                        replaces_library_file: true,
                         ..Default::default()
                     }
                 }
@@ -1075,6 +1142,7 @@ impl LibraryActionExecutor {
                     title: Some(original.title.clone()),
                     album: Some(original.album.clone()),
                     duration: original.duration_seconds,
+                    replaces_library_file: true,
                     ..Default::default()
                 },
             };

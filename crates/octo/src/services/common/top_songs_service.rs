@@ -29,8 +29,8 @@ use octo_core::charts::top_songs::{
     APPLE_SOURCE, CatalogTrack, CountedTrack, DEEZER_SOURCE, MAX_ROWS, PlannedRow, library_hit,
     library_query, merge, one_row_per_library_song,
 };
-use octo_core::common::SongIdentity;
 use octo_core::common::dotnet::is_blank;
+use octo_core::common::{SongIdentity, skipped_takes};
 use octo_core::models::domain::Song;
 use octo_core::settings::SettingsStore;
 use octo_core::soulseek::soulseek_metadata_service::RoutingKind;
@@ -662,6 +662,41 @@ impl TopSongsService {
         let mut found: Vec<Option<Value>> = futures::future::join_all(searches).await;
         one_row_per_library_song(&mut found);
         found
+    }
+
+    /// The rows to match against the library for a list of `count` while Skip covers and instrumentals is
+    /// `skip`: every row up to the `count`th one it lets through. The rows it would hide are
+    /// matched too, since a song the library has is listed whatever it is.
+    pub fn rows_to_match(rows: &[TopSong], count: usize, skip: bool) -> Vec<TopSong> {
+        let mut let_through = 0;
+        let mut taken = Vec::new();
+        for row in rows {
+            if let_through >= count {
+                break;
+            }
+            if !skipped_takes::hides_song(&row.song, skip) {
+                let_through += 1;
+            }
+            taken.push(row.clone());
+        }
+        taken
+    }
+
+    /// The rows a list shows, each with its library match, at most `count`: an outside
+    /// cover, karaoke or instrumental take is left out while Skip covers and instrumentals is `skip`, unless the
+    /// library has it. Rows keep their chart rank.
+    pub fn shown_rows(
+        rows: Vec<TopSong>,
+        library: Vec<Option<Value>>,
+        count: usize,
+        skip: bool,
+    ) -> (Vec<TopSong>, Vec<Option<Value>>) {
+        let mut library = library.into_iter();
+        rows.into_iter()
+            .map(|row| (row, library.next().flatten()))
+            .filter(|(row, owned)| owned.is_some() || !skipped_takes::hides_song(&row.song, skip))
+            .take(count)
+            .unzip()
     }
 }
 

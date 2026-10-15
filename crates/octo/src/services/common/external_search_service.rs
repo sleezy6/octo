@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use octo_core::common::dotnet::{self, ordinal_ignore_case_key};
-use octo_core::common::{SongIdentity, SupersedableBuildCoordinator};
+use octo_core::common::{SongIdentity, SupersedableBuildCoordinator, skipped_takes};
 use octo_core::last_fm::SimilarTrack;
 use octo_core::last_fm::last_fm_search_cleanup::LastFmSearchCleanup;
 use octo_core::last_fm::last_fm_search_ranking::LastFmSearchRanking;
@@ -102,13 +102,27 @@ impl ExternalSearchService {
     }
 
     /// Up to [`BUILD_SIZE`] enriched external songs for this query. Callers take
-    /// the prefix they need; the list is shared and must not be mutated.
+    /// the prefix they need; the list is shared and must not be mutated. While Skip covers,
+    /// karaoke and instrumentals is on, cover, karaoke and instrumental takes are left out; the build itself
+    /// keeps them, so switching the setting changes the next answer at once.
     pub async fn get(&self, query: &str) -> Arc<Vec<Song>> {
         let key = recent_key(query);
         let songs = self.songs(query, &key).await;
         // However the songs were had, nothing more of this query's rows will be looked up.
         self.row_signals.done(&key);
+        if self.skips_covers_and_instrumentals()
+            && songs.iter().any(|song| skipped_takes::hides_song(song, true))
+        {
+            return Arc::new(skipped_takes::listed_songs(songs.as_ref().clone(), true));
+        }
         songs
+    }
+
+    /// Skip covers and instrumentals, as it is set now.
+    fn skips_covers_and_instrumentals(&self) -> bool {
+        self.settings
+            .as_ref()
+            .is_some_and(|settings| settings.current().soulseek.skip_covers_and_instrumentals)
     }
 
     /// Resolves once the song build for `query` has looked its rows up on Deezer (at once
@@ -195,7 +209,18 @@ impl ExternalSearchService {
 
     /// Up to `limit` external albums for this query, via the same prefix-supersession as
     /// [`ExternalSearchService::get`]. Needs no Last.fm key: Deezer's album catalog is keyless.
+    /// While Skip covers and instrumentals is on, an album named as covers, karaoke or instrumentals is left out.
     pub async fn get_albums(&self, query: &str, limit: i32) -> Arc<Vec<Album>> {
+        let albums = self.albums(query, limit).await;
+        if self.skips_covers_and_instrumentals()
+            && albums.iter().any(|album| skipped_takes::hides_album(album, true))
+        {
+            return Arc::new(skipped_takes::listed_albums(albums.as_ref().clone(), true));
+        }
+        albums
+    }
+
+    async fn albums(&self, query: &str, limit: i32) -> Arc<Vec<Album>> {
         if dotnet::is_blank(query) || limit <= 0 {
             return Arc::new(Vec::new());
         }

@@ -9,7 +9,7 @@ use octo_core::common::dotnet::{eq_ignore_case, is_blank, to_lower_invariant};
 use octo_core::common::song_identity::SongIdentity;
 
 use super::health_words::{self as words, count_text};
-use super::keep_marks::TargetReason;
+use super::keep_marks::{INTO, TargetReason, UNRATED_ONLY};
 use super::library_health::{
     AlbumDifference, BestReason, DuplicateSet, HealthTag, IHealthFields, SplitAlbum, tags_of,
 };
@@ -68,6 +68,8 @@ pub struct DuplicateFix<T> {
     /// The copy whose sound moves into the kept one, which keeps its id, path and identity
     /// tags so people's marks stay with it. None when the kept copy keeps its own sound.
     pub audio: Option<T>,
+    /// Other copies that stay as they are, because someone starred or rated them.
+    pub also_kept: Vec<T>,
 }
 
 /// A split album put right: every song of the other parts takes the album tags of the first
@@ -131,6 +133,10 @@ pub mod fix_actions {
     pub const ALL: [&str; 8] = [
         REMOVE, RETAG, JOIN_ALBUM, COVER, RESTORE, UNDO, MOVE_SOUND, MOVE_BACK,
     ];
+
+    /// A retag's parameter that is not a tag: the file's size and last write the tags were
+    /// worked out from. The retag is refused once the file is no longer that one.
+    pub const FILE_STAMP: &str = "fileStamp";
 }
 
 use fix_actions as actions;
@@ -197,6 +203,20 @@ impl FixStep {
             id,
             title,
             IndexMap::from([("copy".to_string(), "true".to_string())]),
+        )
+    }
+
+    /// A remove of one copy whose stars, ratings and playlist places move to `into`, the copy
+    /// that stays.
+    pub fn remove_copy_into(id: &str, title: &str, into: &str) -> Self {
+        FixStep::with(
+            actions::REMOVE,
+            id,
+            title,
+            IndexMap::from([
+                ("copy".to_string(), "true".to_string()),
+                (INTO.to_string(), into.to_string()),
+            ]),
         )
     }
 
@@ -530,18 +550,7 @@ pub fn duplicate_fix<T: Clone>(
             });
         }
     }
-    // A copy that is the only song of its album here takes the album with it.
-    let lonely = others.iter().find(|other| {
-        let album = SongIdentity::key(fields.album(other).unwrap_or(""));
-        !album.is_empty() && album != my_album
-    });
-    let note = lonely.map(|lonely| {
-        format!(
-            "{} is on {}, so that album will no longer have this song.",
-            copy_name(lonely, fields),
-            fields.album(lonely).unwrap_or("").trim()
-        )
-    });
+    let note = lonely_note(&keep, others.iter(), fields);
     let why = keep_why(set, &keep, fields);
     DuplicateFix {
         keep,
@@ -551,7 +560,61 @@ pub fn duplicate_fix<T: Clone>(
         differs,
         note,
         audio: None,
+        also_kept: Vec::new(),
     }
+}
+
+/// A copy going that is the only song of its album here takes the album with it: the first such
+/// copy, in words.
+fn lonely_note<'a, T: 'a>(
+    keep: &T,
+    going: impl IntoIterator<Item = &'a T>,
+    fields: &dyn IHealthFields<T>,
+) -> Option<String> {
+    let my_album = SongIdentity::key(fields.album(keep).unwrap_or(""));
+    let lonely = going.into_iter().find(|other| {
+        let album = SongIdentity::key(fields.album(other).unwrap_or(""));
+        !album.is_empty() && album != my_album
+    });
+    lonely.map(|lonely| {
+        format!(
+            "{} is on {}, so that album will no longer have this song.",
+            copy_name(lonely, fields),
+            fields.album(lonely).unwrap_or("").trim()
+        )
+    })
+}
+
+/// Every copy the plan would remove that `stays` holds on to stays as it is, beside the kept
+/// copy. The note about an album losing the song then speaks only of the copies that still go.
+pub fn keep_as_well<T: Clone>(
+    fix: &mut DuplicateFix<T>,
+    fields: &dyn IHealthFields<T>,
+    stays: impl Fn(&T) -> bool,
+) {
+    let (staying, going): (Vec<T>, Vec<T>) = fix.remove.drain(..).partition(|copy| stays(copy));
+    fix.remove = going;
+    if staying.is_empty() {
+        return;
+    }
+    fix.also_kept.extend(staying);
+    let my_album = SongIdentity::key(fields.album(&fix.keep).unwrap_or(""));
+    let album_stays = |album: &str| {
+        let album = SongIdentity::key(album);
+        album == my_album
+            || fix
+                .also_kept
+                .iter()
+                .any(|kept| SongIdentity::key(fields.album(kept).unwrap_or("")) == album)
+    };
+    let going: Vec<&T> = fix
+        .remove
+        .iter()
+        .chain(fix.audio.iter())
+        .filter(|copy| !album_stays(fields.album(copy).unwrap_or("")))
+        .collect();
+    fix.note = lonely_note(&fix.keep, going, fields);
+    fix.why = format!("{} {}", fix.why, words::also_keeps_rated(fix.also_kept.len()));
 }
 
 /// The plan that keeps people's marks: `target`, the copy whose id carries them, keeps its id
@@ -621,6 +684,10 @@ pub fn tag_name(tag: &str) -> String {
         fields_of::TRACK => "Track number".to_string(),
         fields_of::DISC => "Disc number".to_string(),
         fields_of::ISRC => "ISRC".to_string(),
+        fields_of::RECORDING_ID => "Recording id".to_string(),
+        fields_of::RELEASE_TRACK_ID => "Release track id".to_string(),
+        fields_of::RELEASE_ID => "Release id".to_string(),
+        fields_of::RELEASE_GROUP_ID => "Release group id".to_string(),
         _ => upper_first(tag),
     }
 }
@@ -648,12 +715,26 @@ pub fn duplicate_steps<T>(
             fills,
         ));
     }
+    let into = fields.id(&fix.keep);
     steps.extend(
         fix.remove
             .iter()
-            .map(|copy| FixStep::remove_copy(fields.id(copy), fields.title(copy))),
+            .map(|copy| FixStep::remove_copy_into(fields.id(copy), fields.title(copy), into)),
     );
     steps
+}
+
+/// The steps go only while nobody starred or rated the copy that goes: each remove, and each
+/// move of the sound out of a copy, checks again when it runs.
+pub fn only_unrated(steps: &mut [FixStep]) {
+    for step in steps
+        .iter_mut()
+        .filter(|step| step.action == actions::REMOVE || step.action == actions::MOVE_SOUND)
+    {
+        step.with
+            .get_or_insert_with(IndexMap::new)
+            .insert(UNRATED_ONLY.to_string(), "true".to_string());
+    }
 }
 
 pub fn album_join<T: Clone>(album: &SplitAlbum<T>) -> AlbumJoin<'_, T> {

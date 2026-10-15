@@ -88,6 +88,12 @@ pub struct SoulseekRouting {
     /// when true, so a routing is written exactly as before until a play confirms its size.
     pub stream_size_confirmed: bool,
 
+    /// The download replaces a file already in the library, whose take (an instrumental, a
+    /// karaoke track, a cover) is the person's own: such a take named in the title is then
+    /// fetched even while Skip covers, karaoke and instrumentals is on. Written only when true,
+    /// and not part of the id.
+    pub replaces_library_file: bool,
+
     /// The pinned video's audio format id (140 is AAC in mp4, 251 Opus in webm).
     pub stream_itag: Option<String>,
 
@@ -195,6 +201,7 @@ impl Serialize for SoulseekRouting {
         let stream_fields = [
             self.stream_size.is_some(),
             self.stream_size_confirmed,
+            self.replaces_library_file,
             self.stream_itag.is_some(),
             self.stream_ext.is_some(),
             self.stream_bit_rate.is_some(),
@@ -237,6 +244,9 @@ impl Serialize for SoulseekRouting {
         }
         if self.stream_size_confirmed {
             s.serialize_field("StreamSizeConfirmed", &true)?;
+        }
+        if self.replaces_library_file {
+            s.serialize_field("ReplacesLibraryFile", &true)?;
         }
         if let Some(itag) = &self.stream_itag {
             s.serialize_field("StreamItag", itag)?;

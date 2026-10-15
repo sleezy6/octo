@@ -9,6 +9,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use octo_core::common::acquisition_tracker::user_safe;
 use octo_core::common::{Clock, dotnet};
+use octo_core::fingerprint::recording_identity::RecordingKind;
 use octo_core::lidarr::{LidarrRelease, LidarrTrackRequest};
 use octo_core::models::download::AcquisitionCandidate;
 use octo_core::settings::{
@@ -51,6 +52,16 @@ pub struct FindTarget {
     pub owned_quality: Option<String>,
     pub owned_size: Option<i64>,
     pub owned_path: Option<String>,
+    /// What take the library song's own file is by its audio, when that was asked: a live take
+    /// or an instrumental is looked for as the plain song.
+    pub audio_take: Option<RecordingKind>,
+}
+
+impl FindTarget {
+    /// Whether the library song's own file was found to be another take than the studio one.
+    pub fn is_another_take(&self) -> bool {
+        self.audio_take.is_some_and(|kind| kind != RecordingKind::Studio)
+    }
 }
 
 impl FindTarget {
@@ -242,6 +253,9 @@ pub struct PickAsk {
     pub listed: Vec<FoundCopy>,
 }
 
+/// What take a library song's own file is, by its audio. None when it cannot be told.
+pub type TakeFn = Arc<dyn Fn(FindTarget) -> BoxFuture<'static, Option<RecordingKind>> + Send + Sync>;
+
 /// The seams, so tests run a look without slskd, Lidarr or Navidrome.
 #[derive(Clone)]
 pub struct SongFinderSeams {
@@ -251,6 +265,7 @@ pub struct SongFinderSeams {
     pub search_deezer: SearchFn,
     pub sources_for: SourcesFn,
     pub fetch: FetchFn,
+    pub take_of: TakeFn,
 }
 
 /// The services a look uses when it needs them. Each may be missing.
@@ -319,6 +334,8 @@ struct JobState {
     updated_at: DateTime<Utc>,
     error: Option<String>,
     take: Option<OtherTake>,
+    /// What take the library song's own file is, by its audio, once it was asked.
+    audio_take: Option<RecordingKind>,
 }
 
 struct Job {
@@ -330,12 +347,21 @@ struct Job {
 }
 
 impl Job {
+    /// The song looked for, with what its own file was found to be.
+    fn target_now(&self) -> FindTarget {
+        FindTarget {
+            audio_take: self.state.lock().audio_take,
+            ..self.target.clone()
+        }
+    }
+
     fn snapshot(&self) -> FindSnapshot {
+        let target = self.target_now();
         let state = self.state.lock();
         FindSnapshot {
             id: self.id.clone(),
             state: state.state.clone(),
-            target: self.target.clone(),
+            target,
             sources: state.sources.clone(),
             copies: state.copies.clone(),
             started_at: self.started_at,
@@ -394,6 +420,9 @@ impl SongFinder {
     /// How long one source may search.
     const SEARCH_LIMIT: Duration = Duration::from_secs(4 * 60);
 
+    /// How long hearing a library song's own file may hold up its search.
+    const TAKE_LIMIT: Duration = Duration::from_secs(20);
+
     pub fn new(services: SongFinderServices) -> Self {
         Self::with_clock(services, Clock::system())
     }
@@ -409,7 +438,7 @@ impl SongFinder {
             .lock()
             .get(id)
             .filter(|job| job.same_user(user))
-            .map(|job| job.target.clone())
+            .map(|job| job.target_now())
     }
 
     pub fn with_clock(services: SongFinderServices, clock: Clock) -> Self {
@@ -452,6 +481,19 @@ impl SongFinder {
                 Arc::new(move |target, copy, user, ask| {
                     let services = services.clone();
                     async move { Ok(fetch(&services, &target, &copy, &user, &ask)) }.boxed()
+                })
+            },
+            take_of: {
+                let services = services.clone();
+                Arc::new(move |target| {
+                    let services = services.clone();
+                    async move {
+                        let (Some(soulseek), Some(path)) = (&services.soulseek, &target.owned_path) else {
+                            return None;
+                        };
+                        soulseek.take_of_file(path, &target.artist, &target.title).await
+                    }
+                    .boxed()
                 })
             },
         };
@@ -502,6 +544,7 @@ impl SongFinder {
             updated_at: now,
             error: None,
             take: None,
+            audio_take: None,
         };
         // A library song's look leads only to replacing its file, which only the people on the
         // library actions allowed list may do: they hear why before a search is spent on it.
@@ -635,12 +678,21 @@ impl SongFinder {
             .filter(|s| s.state == find_states::SEARCHING)
             .map(|s| s.name.clone())
             .collect();
+        // A library song's own file is heard first: a live take or an instrumental filed under
+        // a plain name is then looked for as the plain song, and its copies judged against it.
+        if job.target.library_id.is_some() && job.target.owned_path.is_some() {
+            let take_of = self.seams.lock().take_of.clone();
+            if let Ok(found) = tokio::time::timeout(Self::TAKE_LIMIT, take_of(job.target.clone())).await {
+                job.state.lock().audio_take = found;
+            }
+        }
         futures::future::join_all(names.iter().map(|name| self.search_one(&job, name))).await;
-        let take = if job.target.library_id.is_some() {
+        let target = job.target_now();
+        let take = if target.library_id.is_some() {
             let listed = job.state.lock().copies.clone();
             let settings = self.services.soulseek_settings();
             replace_anyway::library_take(
-                &job.target,
+                &target,
                 replace_anyway::CheckContext {
                     settings: &settings,
                     rejected: self.services.rejected(),
@@ -686,7 +738,7 @@ impl SongFinder {
         };
         let limit = CancellationToken::new();
         let answer =
-            match tokio::time::timeout(Self::SEARCH_LIMIT, search(job.target.clone(), limit.clone())).await {
+            match tokio::time::timeout(Self::SEARCH_LIMIT, search(job.target_now(), limit.clone())).await {
                 Ok(answer) => answer,
                 Err(_) => {
                     limit.cancel();
@@ -787,7 +839,7 @@ impl SongFinder {
         };
         let fetch = self.seams.lock().fetch.clone();
         let ask = PickAsk { anyway, listed };
-        match fetch(job.target.clone(), copy, user.to_string(), ask).await {
+        match fetch(job.target_now(), copy, user.to_string(), ask).await {
             Ok(outcome) => outcome,
             Err(e) => {
                 warn!(
@@ -1143,10 +1195,17 @@ fn judged<'a>(
     rejected: Option<&'a RejectedPeerRegistry>,
     remembers: bool,
 ) -> Judged<'a> {
+    // A library file that is another take than the studio one is replaced by the plain song,
+    // whose album and length are not that take's.
+    let another_take = target.is_another_take();
     Judged {
         title: &target.title,
-        album: target.album.as_deref(),
-        duration: target.duration,
+        album: if another_take {
+            None
+        } else {
+            target.album.as_deref()
+        },
+        duration: if another_take { None } else { target.duration },
         settings,
         rejected,
         remembers_rejections: remembers,

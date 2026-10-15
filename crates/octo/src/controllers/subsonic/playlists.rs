@@ -5,7 +5,6 @@
 //! served per viewer, and changed through `updatePlaylist` and `deletePlaylist` by whoever
 //! may (see [`crate::services::family::family_playlists`]).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
@@ -18,7 +17,6 @@ use octo_core::common::dotnet;
 use octo_core::common::dotnet::eq_ignore_case;
 use octo_core::json::dom::Node;
 use octo_core::library::for_you_lists;
-use octo_core::radio::radio_provider;
 use octo_core::settings::GeneratedPlaylistSettings;
 use octo_core::settings::NoticeKind;
 use octo_subsonic::SubsonicReply;
@@ -30,7 +28,7 @@ use tracing::warn;
 use super::action_helpers::{
     RequestAborted, SubsonicCall, bootstrap_radio_profile, is_octo_playlist_id,
     is_successful_subsonic_response, materialize_station, playlist_names, playlist_stations,
-    queue_refresh_if_stale, xml_value,
+    queue_refresh_if_stale, serve_station_songs, suggested_sources, xml_value,
 };
 use crate::app::AppState;
 use crate::middleware::family_gate::{GateReading, Unverified};
@@ -768,72 +766,13 @@ async fn get_playlist_inner(state: &AppState, req: Request, aborted: &RequestAbo
             .into_response();
     }
 
-    let mut songs = materialize_station(state, &call.proxy, &station, &call.parameters).await;
-    let mut suggested: HashMap<String, String> = HashMap::new();
-    for song in &songs {
-        if let Some(by) = &song.suggested_by {
-            suggested.entry(song.id.clone()).or_insert_with(|| by.clone());
-        }
-    }
-    songs = state
+    let songs = materialize_station(state, &call.proxy, &station, &call.parameters).await;
+    let suggested = suggested_sources(&songs);
+    let songs = state
         .generated_playlists
         .blend_into_discovery(&username, &station, songs, &call.parameters)
         .await;
-
-    // Before the catalog swap below: these rows are this response's own, while a catalog
-    // row is shared with every other response that serves it.
-    state
-        .metadata_service
-        .complete_song_lengths_within(&mut songs, STATION_LENGTH_WAIT)
-        .await;
-
-    // A song this user's sync catalog also holds goes out as the catalog describes it:
-    // same album, and filed under the library's own artist where there is one. A syncing
-    // client stores whichever description it read last, so the two must not disagree.
-    let songs: Vec<_> = songs
-        .into_iter()
-        .map(|song| {
-            if song.is_local {
-                return song;
-            }
-            state
-                .sync_catalog
-                .try_get_song(&username, &song.id)
-                .unwrap_or(song)
-        })
-        .collect();
-    // The discovery blend and the catalog swap hand back other objects; the source rides on by
-    // id, on a copy, since a catalog row is shared with other responses.
-    let songs: Vec<_> = songs
-        .into_iter()
-        .map(|mut song| {
-            if let Some(by) = suggested.get(&song.id)
-                && song.suggested_by.as_ref() != Some(by)
-            {
-                song.suggested_by = Some(by.clone());
-            }
-            song
-        })
-        .collect();
-    // A station refetched by a syncing client is not the listener choosing it, so it never
-    // renews the window in which a start counts for radio.
-    state.radio_outcomes.served(
-        Some(&username),
-        songs.iter().map(|song| {
-            (
-                song.id.as_str(),
-                radio_provider::from_display_name(song.suggested_by.as_deref()),
-            )
-        }),
-        None,
-        false,
-    );
-    state
-        .radio_queues
-        .register(songs.iter().map(|song| song.id.clone()));
-    let metadata = Arc::clone(&state.metadata_service);
-    let prewarm = songs.clone();
-    tokio::spawn(async move { metadata.prewarm_you_tube_ids(&prewarm, 8).await });
+    let songs = serve_station_songs(state, &username, songs, &suggested).await;
     queue_refresh_if_stale(state, &username);
     builder
         .create_radio_playlist_response(format, &station, &songs)
@@ -1066,7 +1005,7 @@ fn playlist_error(state: &AppState, call: &SubsonicCall, error: PlaylistError) -
 /// Whether the request's sign-in is good, before Octo answers with something of the caller's
 /// own. While Family is on, the family gate's reading checks exactly the sign-in it read;
 /// otherwise Navidrome is pinged with the request's own parameters, as it always was.
-async fn signed_in(state: &AppState, call: &SubsonicCall, format: &str) -> bool {
+pub(super) async fn signed_in(state: &AppState, call: &SubsonicCall, format: &str) -> bool {
     if let Some(reading) = GateReading::of(&call.parts.extensions) {
         return reading.verify(state).await.is_ok();
     }

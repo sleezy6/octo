@@ -19,7 +19,7 @@ use crate::services::common::StarOnArrival;
 use crate::services::subsonic::{CredentialVerdict, IncomingRequest, SubsonicProxyService};
 
 /// The largest request body accepted, in bytes.
-const MAX_REQUEST_BODY: usize = 30_000_000;
+pub(crate) const MAX_REQUEST_BODY: usize = 30_000_000;
 
 /// One Subsonic request as an action reads it: the client's request (for the proxy, which
 /// forwards repeated keys and headers as they came), its parameters, and the request-scoped

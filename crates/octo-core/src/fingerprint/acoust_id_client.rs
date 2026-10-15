@@ -73,6 +73,9 @@ pub struct AcoustIdRecording {
     pub credits: Vec<AcoustIdCredit>,
     pub release: Option<AcoustIdRelease>,
     pub duration_seconds: Option<i32>,
+    /// The same length to the millisecond, as the music database lists it. Takes of one song
+    /// that share a fingerprint are often told apart only here.
+    pub duration_ms: Option<i64>,
 
     /// Every release of every group the recording is on, bounded, for the chooser.
     /// [`release`](Self::release) stays the one pick the old fields are read from.
@@ -385,10 +388,14 @@ fn parse_recordings(result: &Value) -> ElementResult<Vec<AcoustIdRecording>> {
             }
         }
 
-        let duration = match try_get_property(rec, "duration")? {
-            Some(d @ Value::Number(_)) => Some(dotnet::round(get_double(d)?, 0) as i32),
+        let exact = match try_get_property(rec, "duration")? {
+            Some(d @ Value::Number(_)) => Some(get_double(d)?),
             _ => None,
         };
+        let duration = exact.map(|seconds| dotnet::round(seconds, 0) as i32);
+        let duration_ms = exact
+            .filter(|seconds| *seconds > 0.0)
+            .map(|seconds| (seconds * 1000.0).round() as i64);
 
         let (album, year, detail) = pick_release(rec)?;
         recordings.push(AcoustIdRecording {
@@ -400,6 +407,7 @@ fn parse_recordings(result: &Value) -> ElementResult<Vec<AcoustIdRecording>> {
             credits,
             release: detail,
             duration_seconds: duration,
+            duration_ms,
             releases: all_releases(rec)?,
             isrcs: music_brainz_client::parse_isrcs(rec)?,
             sources: int(rec, "sources")?.unwrap_or(0),

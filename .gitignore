@@ -55,6 +55,8 @@ nunit-*.xml
 
 # Fichiers et dossiers à ignorer pour un projet .NET
 bin/
+# Cargo binaries (crates/*/src/bin) are source, not .NET output.
+!crates/*/src/bin/
 obj/
 *.user
 *.suo
@@ -93,6 +95,18 @@ __pycache__/
 # Rust build output. Each worktree keeps its own target/; never share one CARGO_TARGET_DIR.
 /target/
 
+# GeoNames' files for the image build, when downloaded beforehand (docker.yml does).
+/places-data/
+
 # Parity harness runs: the writable library copies and the box reports.
 parity/.run/
 /octo-cache/
+
+# Markdown notes, plans and reports stay local. Published: the READMEs, the Family
+# guide the README links to, the icon attribution, and known-diffs.md, which
+# parity.py reads.
+*.md
+!README.md
+!docs/family.md
+!docs/rust-migration/known-diffs.md
+!scripts/admin-icons/SOURCES.md

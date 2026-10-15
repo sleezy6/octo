@@ -11,8 +11,6 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportOverview {
-    pub spotify: SpotifyView,
-    pub reading: ReadView,
     pub lists: Vec<ListSummary>,
     pub trickle: TrickleView,
     pub library_problem: Option<String>,
@@ -29,46 +27,8 @@ pub struct ApprovalView {
     pub by: String,
 }
 
-/// The Spotify sign-in. Configured: a Client ID is set. OctoFinishes: the redirect URI is Octo's
-/// own address, so the browser comes back here by itself; otherwise the person pastes the
-/// address the browser ended on. EndsUtc: Spotify ends every sign-in six months after it was
-/// made.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpotifyView {
-    pub configured: bool,
-    pub connected: bool,
-    pub account: Option<String>,
-    pub problem: Option<String>,
-    pub redirect_uri: String,
-    pub redirect_problem: Option<String>,
-    pub octo_finishes: bool,
-    #[serde(with = "datetime::utc_option")]
-    pub ends_utc: Option<DateTime<Utc>>,
-}
-
-/// Reading lists from Spotify, which runs in the background after a sign-in or a refresh.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadView {
-    pub busy: bool,
-    pub step: Option<String>,
-    pub error: Option<String>,
-    #[serde(with = "datetime::utc_option")]
-    pub finished_utc: Option<DateTime<Utc>>,
-}
-
-impl ReadView {
-    pub fn idle() -> Self {
-        ReadView {
-            busy: false,
-            step: None,
-            error: None,
-            finished_utc: None,
-        }
-    }
-}
-
+/// One list. Partial says, in words, why it is not the whole source: a link that shows only its
+/// first songs, or a list saved from a Spotify account that is never read again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListSummary {

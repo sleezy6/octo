@@ -21,11 +21,14 @@ pub enum LibraryAction {
     WrongLyrics,
     /// The song is right but its album's cover is not: put in another, never this one again.
     WrongCover,
+    /// The song is one of several copies: fix them all as Library health does, keeping every
+    /// copy anyone starred or rated while Keep every rated copy is on.
+    FixDuplicates,
 }
 
 impl LibraryAction {
     /// Every action, in declaration order.
-    pub const ALL: [LibraryAction; 7] = [
+    pub const ALL: [LibraryAction; 8] = [
         LibraryAction::Delete,
         LibraryAction::WrongSong,
         LibraryAction::WrongVersion,
@@ -33,6 +36,7 @@ impl LibraryAction {
         LibraryAction::Keep,
         LibraryAction::WrongLyrics,
         LibraryAction::WrongCover,
+        LibraryAction::FixDuplicates,
     ];
 
     /// Whether the action answers about the song's lyrics or cover, leaving its audio alone.
@@ -73,6 +77,9 @@ impl LibraryAction {
             // No star by default: a rating someone already gave must not start asking for these.
             LibraryAction::WrongLyrics => ("Wrong lyrics", 0),
             LibraryAction::WrongCover => ("Wrong cover", 0),
+            // No star by default either: every star already asks for something, and this one
+            // removes files.
+            LibraryAction::FixDuplicates => ("Fix duplicates", 0),
         }
     }
 }
@@ -234,6 +241,26 @@ pub struct LibraryActionSettings {
     /// Environment variable: LIBRARY_ACTIONS_REVIEW_SWEEP_OCTO_DOWNLOADS
     pub review_sweep_octo_downloads: bool,
 
+    /// Let the sweep replace a file that clearly is another song, through Wrong song, instead
+    /// of asking. Off by default. Only a confident AcoustID match, at or above the download
+    /// threshold, to a recording whose title is not the file's own title counts; another take,
+    /// a wrong length and anything AcoustID was unsure of still ask in Review. Respects DryRun
+    /// and the allowlist, and runs as the person the sweep asks.
+    /// Environment variable: LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE
+    pub review_sweep_auto_replace: bool,
+
+    /// Most files the sweep replaces by itself in a UTC day (1 to 100, default 10). Past it, or
+    /// after three replacements fail in a day, the rest of the day's matches are asked about.
+    /// Environment variable: LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PER_DAY
+    pub review_sweep_auto_replace_per_day: i32,
+    /// How many library songs an hour have their tags checked against their audio: each is
+    /// fingerprinted in AcoustID's spare lane, and what disagrees shows in Library health under
+    /// "Tags that disagree with the audio". 0 is off. Only while nothing is downloading. Stray
+    /// spaces are taken off by itself when library actions may change files; everything else
+    /// waits for a person.
+    /// Environment variable: LIBRARY_ACTIONS_TAG_CHECK_PER_HOUR
+    pub tag_check_per_hour: i32,
+
     /// A "Duplicates" playlist per allowed user: recordings the library holds more than once,
     /// side by side, the copy worth keeping first. Octo only points them out; nothing is removed
     /// unless you remove it (#53).
@@ -269,6 +296,11 @@ pub struct LibraryActionSettings {
     /// find; Soulseek, Lidarr or Deezer uses only that one.
     /// Environment variable: LIBRARY_ACTIONS_UPGRADE_SOURCE
     pub upgrade_source: UpgradeSourceChoice,
+
+    /// When Library health fixes duplicates, every copy anyone starred or rated stays, and only
+    /// copies nobody starred or rated go to the trash. Off by default: the fix keeps one copy of
+    /// each song. Set from the switch on the dashboard's Library health page.
+    pub keep_rated_copies: bool,
 }
 
 impl Default for LibraryActionSettings {
@@ -291,6 +323,9 @@ impl Default for LibraryActionSettings {
             review_playlist_name: "Review".to_string(),
             review_sweep_per_hour: 0,
             review_sweep_octo_downloads: false,
+            review_sweep_auto_replace: false,
+            review_sweep_auto_replace_per_day: 10,
+            tag_check_per_hour: 60,
             duplicates_enabled: false,
             duplicates_playlist_name: "Duplicates".to_string(),
             duplicates_scan_hours: 24,
@@ -298,6 +333,7 @@ impl Default for LibraryActionSettings {
             ratings_scope: LibraryRatingScope::Auto,
             upgrade_per_week: 0,
             upgrade_source: UpgradeSourceChoice::Auto,
+            keep_rated_copies: false,
         }
     }
 }
@@ -320,6 +356,15 @@ impl LibraryActionSettings {
         } else {
             self.review_sweep_per_hour.min(360)
         }
+    }
+
+    pub fn effective_review_sweep_auto_replace_per_day(&self) -> i32 {
+        self.review_sweep_auto_replace_per_day.clamp(1, 100)
+    }
+
+    /// 0 is off; the same ceiling as the Review sweep, one file every ten seconds.
+    pub fn effective_tag_check_per_hour(&self) -> i32 {
+        self.tag_check_per_hour.clamp(0, 360)
     }
 
     pub fn effective_duplicates_scan_interval(&self) -> Duration {

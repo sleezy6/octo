@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use octo_core::common::artist_credit::primary_credit;
-use octo_core::common::navidrome_artist_key::navidrome_artist_text;
+use octo_core::common::navidrome_artist_key::{navidrome_artist_parts, navidrome_artist_text};
 use octo_core::common::{PathHelper, SongIdentity};
 pub use octo_core::fingerprint::music_brainz_client::CreditPart;
 use regex::Regex;
@@ -320,12 +320,37 @@ fn spellings(
         }
     }
 
+    // A credit Navidrome reads as several artists ("A; B") is not one artist's spelling: merging
+    // it with a credit Navidrome keeps whole would join or part artists, so it stays out.
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut combined: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for value in tracks.keys() {
         let key = SongIdentity::loose_key(value);
-        if !key.is_empty() {
+        if key.is_empty() {
+            continue;
+        }
+        if navidrome_artist_parts(std::slice::from_ref(value)).len() > 1 {
+            combined.entry(key).or_default().push(value.clone());
+        } else {
             groups.entry(key).or_default().push(value.clone());
         }
+    }
+    for (key, credits) in &combined {
+        let alike = credits.len() + groups.get(key).map_or(0, Vec::len);
+        if alike < 2
+            || !credits
+                .iter()
+                .chain(groups.get(key).into_iter().flatten())
+                .any(|v| in_scope.contains(v))
+        {
+            continue;
+        }
+        let why = if credits.len() == 1 {
+            "Navidrome lists this credit as several artists, so its spelling is left alone."
+        } else {
+            "Navidrome lists each of these credits as several artists, so their spelling is left alone."
+        };
+        out.skip(format!("combined|{key}"), "", quote_list(credits), why);
     }
 
     let mut spelling = Spelling::default();
@@ -872,7 +897,8 @@ fn retags(root: &str, files: &[TidyFile], spelling: &Spelling, folders: &FolderR
         } else if let Some(confirmed) = confirmed {
             confirmed.clone()
         } else {
-            before
+            // The artists Navidrome already lists for the file: "A; B" is two of them.
+            let credit: Vec<String> = before
                 .artist
                 .iter()
                 .map(|value| {
@@ -883,7 +909,8 @@ fn retags(root: &str, files: &[TidyFile], spelling: &Spelling, folders: &FolderR
                     }
                 })
                 .filter(|value| !value.is_empty())
-                .collect()
+                .collect();
+            navidrome_artist_parts(&credit)
         };
         let mut added: Vec<String> = Vec::new();
         for guest in guests_from_artist.iter().chain(&guests_from_title) {
@@ -1169,7 +1196,7 @@ fn show(values: &[String]) -> String {
     if values.is_empty() {
         "(none)".to_string()
     } else {
-        values.join("; ")
+        values.join(" \u{b7} ")
     }
 }
 

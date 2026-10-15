@@ -5,8 +5,9 @@
 use std::fmt;
 
 use crate::common::song_identity::SongIdentity;
-use crate::fingerprint::acoust_id_client::{AcoustIdLookup, AcoustIdRecording};
+use crate::fingerprint::acoust_id_client::{AcoustIdLookup, AcoustIdRecording, AcoustIdResult};
 use crate::models::domain::song::Song;
+use crate::models::download::acquisition_event::AcquisitionHeard;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum VerificationVerdict {
@@ -140,9 +141,239 @@ pub struct VerificationResult {
     /// in words for the log: an ISRC in the file's tags, or one on the MusicBrainz recording the
     /// fingerprint named. None otherwise.
     pub evidence: Option<String>,
+
+    /// The kind of take the recording named in `recording_id` is, when one was named.
+    pub kind: Option<crate::fingerprint::recording_identity::RecordingKind>,
+
+    /// The file's exact length is what chose `recording_id` among takes that share the
+    /// fingerprint. The tagger then tags from that recording and no other.
+    pub by_length: bool,
+
+    /// The take in `kind` is known: the exact length decided it, or every recording that agreed
+    /// with the request is that take.
+    pub kind_certain: bool,
+
+    /// `recording_id` was the only recording of the fingerprint that agreed with the song, so
+    /// no other take could be the file.
+    pub sole: bool,
+
+    /// The score an AcoustID answer had to reach to count, in 0..1, as the decision used it.
+    /// 0 when no answer was weighed.
+    pub threshold: f64,
+}
+
+/// How many of the other recordings AcoustID heard a check line keeps.
+pub const MAX_HEARD: usize = 3;
+
+/// A score in 0..1 as a whole percent, rounded down so it never reads as more than it was.
+pub fn whole_percent(fraction: f64) -> i32 {
+    (fraction * 100.0 + 1e-9).floor().clamp(0.0, 100.0) as i32
+}
+
+/// A threshold in 0..1 as the whole percent it was set as.
+pub fn threshold_percent(fraction: f64) -> i32 {
+    (fraction * 100.0).round().clamp(0.0, 100.0) as i32
 }
 
 impl VerificationResult {
+    /// The best score among AcoustID's results; None when it did not answer or listed none.
+    pub fn best_score(&self) -> Option<f64> {
+        self.lookup
+            .as_ref()?
+            .results
+            .iter()
+            .map(|r| r.score)
+            .reduce(f64::max)
+    }
+
+    /// Whether the verdict names a recording (a title or an artist).
+    pub fn names_recording(&self) -> bool {
+        self.matched_title.as_deref().is_some_and(|t| !t.is_empty())
+            || self.matched_artist.as_deref().is_some_and(|a| !a.is_empty())
+    }
+
+    /// The score to show beside the verdict: its own when it names a recording, otherwise the
+    /// best of AcoustID's results. None when AcoustID gave no score at all.
+    pub fn shown_score(&self) -> Option<f64> {
+        if self.names_recording() && self.score > 0.0 {
+            Some(self.score)
+        } else {
+            self.best_score()
+        }
+    }
+
+    /// What AcoustID matched, "Artist - Title": the recording the verdict names. None when it
+    /// named none, even when it heard something below the threshold.
+    pub fn matched_text(&self) -> Option<String> {
+        self.names_recording().then(|| {
+            format!(
+                "{} - {}",
+                self.matched_artist.as_deref().unwrap_or(""),
+                self.matched_title.as_deref().unwrap_or("")
+            )
+        })
+    }
+
+    /// The best recording AcoustID heard, "Artist - Title", when the verdict names none: what
+    /// came closest without counting as a match. None when the verdict names a recording or
+    /// AcoustID heard nothing.
+    pub fn closest_text(&self) -> Option<String> {
+        if self.names_recording() {
+            return None;
+        }
+        self.ranked_heard(|_| false)
+            .into_iter()
+            .next()
+            .map(|heard| format!("{} - {}", heard.artist, heard.title))
+    }
+
+    /// The recordings AcoustID heard other than the one the verdict names, best first, at most
+    /// [`MAX_HEARD`]. A result holding the named recording is left out whole.
+    pub fn heard(&self) -> Vec<AcquisitionHeard> {
+        let named_id = self.recording_id.as_deref().filter(|id| !id.is_empty());
+        let named_key = self.names_recording().then(|| {
+            heard_key(
+                self.matched_artist.as_deref().unwrap_or(""),
+                self.matched_title.as_deref().unwrap_or(""),
+            )
+        });
+        let mut heard = self.ranked_heard(|result| {
+            result.recordings.iter().any(|recording| {
+                named_id.is_some_and(|id| crate::common::dotnet::eq_ignore_case(id, &recording.recording_id))
+                    || named_key
+                        .as_ref()
+                        .is_some_and(|key| *key == heard_key(&recording.artist_credit(), &recording.title))
+            })
+        });
+        heard.truncate(MAX_HEARD);
+        heard
+    }
+
+    /// One recording per result, best score first (equal scores keep their order): the one
+    /// most submissions tie the audio to, the first listed on a tie. Results that name no
+    /// recording, and those `skip` refuses, are left out, and an artist and title already
+    /// listed is not listed again.
+    fn ranked_heard(&self, skip: impl Fn(&AcoustIdResult) -> bool) -> Vec<AcquisitionHeard> {
+        let Some(lookup) = &self.lookup else {
+            return Vec::new();
+        };
+        let mut results: Vec<&AcoustIdResult> = lookup
+            .results
+            .iter()
+            .filter(|r| !r.recordings.is_empty() && !skip(r))
+            .collect();
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let mut keys: Vec<String> = Vec::new();
+        let mut heard = Vec::new();
+        for result in results {
+            let Some(recording) = result.recordings.iter().rev().max_by_key(|r| r.sources) else {
+                continue;
+            };
+            let artist = recording.artist_credit();
+            let key = heard_key(&artist, &recording.title);
+            if keys.contains(&key) {
+                continue;
+            }
+            keys.push(key);
+            heard.push(AcquisitionHeard {
+                title: recording.title.clone(),
+                artist,
+                score: whole_percent(result.score),
+            });
+        }
+        heard
+    }
+
+    /// What AcoustID said about the file, in plain words with its numbers: "AcoustID: the same
+    /// recording, 92% sure (needs 85%)", "AcoustID says this is 'Artist - Title', 97% sure
+    /// (needs 85%)", "AcoustID: no match above 85% (best 61%)", "AcoustID has no entry for this
+    /// sound". What else stood behind the verdict (an ISRC) follows it. None when AcoustID was
+    /// not asked and nothing else decided, and for a file with no audio in it.
+    pub fn acoust_id_text(&self) -> Option<String> {
+        let needs = threshold_percent(self.threshold);
+        let sure = |score: f64| format!("{}% sure (needs {needs}%)", whole_percent(score));
+        let by_acoust_id = self.verdict == VerificationVerdict::Confirmed && self.r#match.is_some();
+        let said = match (self.verdict, self.reason) {
+            (VerificationVerdict::Mismatch, _) if !self.names_recording() => return None,
+            // A take `describe` already names is not named twice.
+            (VerificationVerdict::Mismatch, _)
+                if self.deny_reason.starts_with("is a live recording")
+                    && self.kind.is_none_or(|kind| {
+                        kind == crate::fingerprint::recording_identity::RecordingKind::Studio
+                    }) =>
+            {
+                Some(format!(
+                    "AcoustID says this is a live recording of {}, {}",
+                    self.describe(),
+                    sure(self.score)
+                ))
+            }
+            (VerificationVerdict::Mismatch, _) => Some(format!(
+                "AcoustID says this is {}, {}",
+                self.describe(),
+                sure(self.score)
+            )),
+            _ if by_acoust_id => Some(format!("AcoustID: the same recording, {}", sure(self.score))),
+            (VerificationVerdict::Inconclusive, InconclusiveReason::LengthOff) => {
+                let runs = self
+                    .r#match
+                    .as_ref()
+                    .and_then(|m| m.duration_seconds)
+                    .filter(|seconds| *seconds > 0);
+                Some(match runs {
+                    Some(seconds) => format!(
+                        "AcoustID: the same song, {}, but that recording runs {}:{:02}",
+                        sure(self.score),
+                        seconds / 60,
+                        seconds % 60
+                    ),
+                    None => format!(
+                        "AcoustID: the same song, {}, but not at this length",
+                        sure(self.score)
+                    ),
+                })
+            }
+            (VerificationVerdict::Inconclusive, _) if self.names_recording() => Some(format!(
+                "AcoustID says this is {}, {}",
+                self.describe(),
+                sure(self.score)
+            )),
+            _ => self.unsettled_text(needs),
+        };
+        match (said, self.evidence.as_deref().filter(|e| !e.is_empty())) {
+            (Some(said), Some(evidence)) if by_acoust_id => Some(format!("{said}, and {evidence}")),
+            (Some(said), Some(evidence)) => Some(format!("{said}, but {evidence}")),
+            (said, evidence) => said.or_else(|| evidence.map(str::to_string)),
+        }
+    }
+
+    /// What AcoustID's answer was when it named nothing that decided: no answer, no entry, or
+    /// nothing at the threshold.
+    fn unsettled_text(&self, needs: i32) -> Option<String> {
+        let Some(lookup) = &self.lookup else {
+            return match self.reason {
+                InconclusiveReason::LookupFailed => Some("AcoustID did not answer".to_string()),
+                InconclusiveReason::NotFingerprinted => {
+                    Some("AcoustID was not asked: the file could not be fingerprinted".to_string())
+                }
+                _ => None,
+            };
+        };
+        let Some(best) = lookup.results.iter().map(|r| r.score).reduce(f64::max) else {
+            return Some("AcoustID has no entry for this sound".to_string());
+        };
+        if best >= self.threshold {
+            return Some(format!(
+                "AcoustID knows this sound, {}% sure, but no recording is linked to it",
+                whole_percent(best)
+            ));
+        }
+        Some(format!(
+            "AcoustID: no match above {needs}% (best {}%)",
+            whole_percent(best)
+        ))
+    }
+
     /// `VerificationResult.Inconclusive`: verification is off.
     pub fn inconclusive() -> Self {
         Self {
@@ -177,10 +408,13 @@ impl VerificationResult {
     pub fn describe(&self) -> String {
         let artist = self.matched_artist.as_deref().unwrap_or("");
         let title = self.matched_title.as_deref().unwrap_or("");
-        if artist.is_empty() && title.is_empty() {
-            "a different recording".to_string()
-        } else {
-            format!("'{artist} - {title}'")
+        let take = self
+            .kind
+            .filter(|kind| *kind != crate::fingerprint::recording_identity::RecordingKind::Studio);
+        match take {
+            _ if artist.is_empty() && title.is_empty() => "a different recording".to_string(),
+            Some(kind) => format!("{} of '{artist} - {title}'", kind.described()),
+            None => format!("'{artist} - {title}'"),
         }
     }
 
@@ -258,6 +492,11 @@ impl VerificationResult {
             song.is_compilation = release.is_compilation;
         }
     }
+}
+
+/// An artist and title compared the way song names are: case, accents and punctuation aside.
+fn heard_key(artist: &str, title: &str) -> String {
+    format!("{}|{}", SongIdentity::key(artist), SongIdentity::key(title))
 }
 
 #[cfg(test)]

@@ -73,6 +73,9 @@ impl Respond for LibraryNavidrome {
             }
             "rest/getRandomSongs" => match query.get("fromYear").map(String::as_str) {
                 Some("1990") => ok(&format!(r#""randomSongs":{{"song":[{}]}}"#, songs(25, 2000, 5))),
+                Some("2019") if query.get("toYear").map(String::as_str) == Some("2019") => {
+                    ok(&format!(r#""randomSongs":{{"song":[{}]}}"#, songs(20, 4000, 1)))
+                }
                 None => ok(&format!(r#""randomSongs":{{"song":[{}]}}"#, songs(30, 3000, 0))),
                 Some(_) => ok(r#""randomSongs":{"song":[]}"#),
             },
@@ -100,13 +103,28 @@ impl Respond for LibraryNavidrome {
                 let rows: Vec<String> = (0..60)
                     .filter(|i| if alice { (0..20).contains(i) || (30..50).contains(i) } else { (30..55).contains(i) })
                     .map(|i| {
-                        let (artist, id) = if i < 30 { ("Rosalía", "arES") } else { ("Bad Bunny", "arPR") };
+                        let (artist, id, year) = if i < 30 {
+                            ("Rosalía", "arES", 2001)
+                        } else {
+                            ("Bad Bunny", "arPR", 2019)
+                        };
                         format!(
-                            r#"{{"id":"c{i}","title":"Song {i}","artist":"{artist}","artistId":"{id}","playCount":2,"played":"2026-09-01T00:00:00Z","userRating":4}}"#
+                            r#"{{"id":"c{i}","title":"Song {i}","artist":"{artist}","artistId":"{id}","year":{year},"playCount":2,"played":"2026-09-01T00:00:00Z","userRating":4}}"#
                         )
                     })
                     .collect();
                 ok(&format!(r#""searchResult3":{{"song":[{}]}}"#, rows.join(",")))
+            }
+            // Last.fm: Bad Bunny is like Rosalía, and like an artist the library does not hold.
+            "2.0" if query.get("method").map(String::as_str) == Some("artist.getsimilar") => {
+                let artist = query.get("artist").cloned().unwrap_or_default();
+                self.calls.lock().push(format!("similar {artist}"));
+                if artist == "Bad Bunny" {
+                    r#"{"similarartists":{"artist":[{"name":"Rosalía","match":"1"},{"name":"Not In The Library","match":"0.5"}]}}"#
+                        .to_string()
+                } else {
+                    r#"{"similarartists":{"artist":[]}}"#.to_string()
+                }
             }
             "rest/getArtists" => ok(
                 r#""artists":{"index":[{"name":"B","artist":[{"id":"arPR","name":"Bad Bunny","musicBrainzId":""}]},{"name":"R","artist":[{"id":"arES","name":"Rosalía","musicBrainzId":"mb-es"}]}]}"#,
@@ -419,6 +437,57 @@ mod response {
         assert_eq!(
             fields["coverArt"],
             Value::String(format!("{}_{version}c40", mix().id))
+        );
+    }
+
+    #[test]
+    fn every_kind_of_row_says_its_group_and_only_made_for_you_and_liked_say_their_list() {
+        let settings = GeneratedPlaylistSettings::default();
+        let cases = [
+            ("genre:Rock", "genre", "genre", None),
+            ("decade:1990", "decade", "decade", None),
+            ("year:1994", "year", "year", None),
+            ("country:ES", "country", "country", None),
+            ("artist:ar1", "artist", "artist", None),
+            ("for:newReleases", "newReleases", "forYou", Some("newReleases")),
+            ("for:rediscover", "rediscover", "forYou", Some("rediscover")),
+            ("for:deepCuts", "deepCuts", "forYou", Some("deepCuts")),
+            ("chart:popular", "chart", "chart", None),
+        ];
+        for (key, kind, group, list) in cases {
+            let row = GeneratedPlaylist {
+                key: key.into(),
+                kind: kind.into(),
+                ..mix()
+            };
+            let fields = builder().generated_playlist_fields(&row, &settings);
+            assert_eq!(fields["octoGroup"], group, "{key}");
+            assert_eq!(fields.get("octoList").and_then(Value::as_str), list, "{key}");
+
+            let reply = builder().create_generated_playlist_response("xml", &row, &settings, &[entry()]);
+            let xml = reply.text();
+            assert!(xml.contains(&format!(r#"octoGroup="{group}""#)), "{key}: {xml}");
+        }
+        // An artist mix's row counts the songs stored for it, as a Made for you list does.
+        let artist = GeneratedPlaylist {
+            key: "artist:ar1".into(),
+            kind: "artist".into(),
+            pool_size: 150,
+            ..mix()
+        };
+        assert_eq!(
+            builder().generated_playlist_fields(&artist, &settings)["songCount"],
+            150
+        );
+        assert_eq!(
+            builder().generated_playlist_fields(
+                &mix(),
+                &GeneratedPlaylistSettings {
+                    track_count: 10,
+                    ..Default::default()
+                }
+            )["songCount"],
+            10
         );
     }
 
@@ -814,4 +883,257 @@ async fn with_country_mixes_off_the_library_is_never_walked_and_musicbrainz_neve
             .any(|call| call.contains("u=admin") || call.starts_with("rest/getArtists"))
     );
     assert!(!fixture.dir.path().join("artist-countries.json").exists());
+}
+
+// ---- Year and artist mixes ------------------------------------------------------------------
+
+fn years_only() -> GeneratedPlaylistSettings {
+    GeneratedPlaylistSettings {
+        enabled: true,
+        genres: false,
+        decades: false,
+        years: true,
+        new_releases: false,
+        rediscover: false,
+        deep_cuts: false,
+        track_count: 10,
+        ..Default::default()
+    }
+}
+
+fn artists_only(count: i32) -> GeneratedPlaylistSettings {
+    GeneratedPlaylistSettings {
+        years: false,
+        artists: true,
+        artist_count: count,
+        ..years_only()
+    }
+}
+
+/// [`service`] with Last.fm at the stand-in, under a key.
+fn service_with_last_fm(
+    fixture: &Fixture,
+    settings: GeneratedPlaylistSettings,
+) -> Arc<GeneratedPlaylistService> {
+    let store = Arc::new(SettingsStore::for_tests(AppSettings {
+        subsonic: SubsonicSettings {
+            url: Some(fixture.server.uri()),
+            ..Default::default()
+        },
+        last_fm: octo_core::settings::LastFmSettings {
+            api_key: "lastfm-key".into(),
+            ..Default::default()
+        },
+        generated_playlists: settings,
+        ..Default::default()
+    }));
+    let last_fm = Arc::new(LastFmService::with_base_url(
+        store.clone(),
+        &format!("{}/2.0/", fixture.server.uri()),
+    ));
+    Arc::new(
+        GeneratedPlaylistService::new(
+            Some(fixture.dir.path().join("generated-playlists.json")),
+            SubsonicProxyService::new(store.clone()),
+            store,
+        )
+        .with_last_fm(last_fm),
+    )
+}
+
+/// How many times the listener's library was walked.
+fn walks(fixture: &Fixture) -> usize {
+    fixture
+        .navidrome
+        .calls
+        .lock()
+        .iter()
+        .filter(|call| call.starts_with("rest/search3") && call.contains("songOffset=0"))
+        .count()
+}
+
+#[tokio::test]
+async fn year_mixes_are_counted_from_one_walk_and_drawn_from_their_year() {
+    let fixture = fixture().await;
+    let service = service(&fixture, years_only());
+
+    let mixes = service.list("alice", &auth()).await;
+
+    // 20 songs each: the newer year first.
+    let shown: Vec<(&str, &str, &str, i32)> = mixes
+        .iter()
+        .map(|mix| {
+            (
+                mix.name.as_str(),
+                mix.kind.as_str(),
+                mix.label.as_str(),
+                mix.pool_size,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [("2019 Mix", "year", "2019", 20), ("2001 Mix", "year", "2001", 20)]
+    );
+    assert_eq!(walks(&fixture), 1);
+    assert_eq!(fixture.navidrome.genre_calls(), 0);
+    assert!(
+        !fixture
+            .navidrome
+            .calls
+            .lock()
+            .iter()
+            .any(|call| call.starts_with("rest/getRandomSongs"))
+    );
+
+    let songs = service
+        .materialize("alice", &mixes[0], &auth(), &CancellationToken::new())
+        .await
+        .expect("drawn");
+    assert_eq!(songs.len(), 10);
+    let calls = fixture.navidrome.calls.lock().clone();
+    let asked: Vec<&String> = calls
+        .iter()
+        .filter(|call| call.starts_with("rest/getRandomSongs"))
+        .collect();
+    assert_eq!(asked.len(), 1);
+    assert!(
+        asked[0].contains("fromYear=2019") && asked[0].contains("toYear=2019"),
+        "{asked:?}"
+    );
+}
+
+#[tokio::test]
+async fn year_mixes_off_never_walk_the_library() {
+    let fixture = fixture().await;
+    let service = service(
+        &fixture,
+        GeneratedPlaylistSettings {
+            years: false,
+            genres: true,
+            ..years_only()
+        },
+    );
+
+    let names: Vec<String> = service
+        .list("alice", &auth())
+        .await
+        .into_iter()
+        .map(|mix| mix.name)
+        .collect();
+
+    assert_eq!(names, ["Rock Mix"]);
+    assert_eq!(walks(&fixture), 0);
+}
+
+#[tokio::test]
+async fn an_artist_mix_without_last_fm_is_the_artists_own_songs_past_the_artist_cap() {
+    let fixture = fixture().await;
+    let service = service(&fixture, artists_only(1));
+
+    let mixes = service.list("alice", &auth()).await;
+
+    // Rosalía and Bad Bunny tie on plays; Bad Bunny is first by name.
+    assert_eq!(mixes.len(), 1, "{mixes:?}");
+    let mix = &mixes[0];
+    assert_eq!(
+        (
+            mix.name.as_str(),
+            mix.kind.as_str(),
+            mix.key.as_str(),
+            mix.pool_size
+        ),
+        ("Bad Bunny Mix", "artist", "artist:arPR", 10)
+    );
+    assert_eq!(mix.id, playlist_id("alice", "artist:arPR"));
+    let songs = service
+        .materialize("alice", mix, &auth(), &CancellationToken::new())
+        .await
+        .expect("drawn");
+    // Ten of his songs, though the artist cap is 3.
+    assert_eq!(songs.len(), 10);
+    assert!(
+        songs
+            .iter()
+            .all(|song| str_of(song, "artist") == Some("Bad Bunny"))
+    );
+    // Stored with the mix, so a read asks Navidrome for nothing and the cover sees the same.
+    assert_eq!(service.drawn("alice", mix).map(|songs| songs.len()), Some(10));
+    assert_eq!(walks(&fixture), 1);
+    assert!(
+        !fixture
+            .navidrome
+            .calls
+            .lock()
+            .iter()
+            .any(|call| call.starts_with("similar"))
+    );
+}
+
+#[tokio::test]
+async fn an_artist_mix_is_half_the_artist_and_half_the_artists_last_fm_calls_like_them() {
+    let fixture = fixture().await;
+    let service = service_with_last_fm(&fixture, artists_only(1));
+
+    let mixes = service.list("alice", &auth()).await;
+    let mix = mixes.first().expect("Bad Bunny Mix");
+    let songs = service
+        .materialize("alice", mix, &auth(), &CancellationToken::new())
+        .await
+        .expect("drawn");
+
+    let count = |artist: &str| {
+        songs
+            .iter()
+            .filter(|song| str_of(song, "artist") == Some(artist))
+            .count()
+    };
+    // Half of 10 would be 5 of Rosalía's, but the artist cap of 3 holds her to 3; Bad Bunny
+    // fills the rest.
+    assert_eq!((count("Bad Bunny"), count("Rosalía")), (7, 3));
+    // Rosalía's songs are alice's own, with her plays.
+    assert!(
+        songs
+            .iter()
+            .all(|song| song.get("playCount").and_then(node_i64) == Some(2))
+    );
+    assert_eq!(
+        fixture
+            .navidrome
+            .calls
+            .lock()
+            .iter()
+            .filter(|call| call.starts_with("similar"))
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["similar Bad Bunny"]
+    );
+}
+
+#[tokio::test]
+async fn artist_mixes_survive_a_restart_and_keep_when_they_began() {
+    let fixture = fixture().await;
+    let first = service(&fixture, artists_only(2));
+    let names: Vec<String> = first
+        .list("alice", &auth())
+        .await
+        .into_iter()
+        .map(|mix| mix.name)
+        .collect();
+    assert_eq!(names, ["Bad Bunny Mix", "Rosalía Mix"]);
+    let saved = std::fs::read_to_string(fixture.dir.path().join("generated-playlists.json")).expect("saved");
+    assert!(
+        saved.contains(r#""ArtistMixes":{"artist:arPR":{"Name":"Bad Bunny","Since":"#),
+        "{saved}"
+    );
+
+    let restarted = service(&fixture, artists_only(2));
+    let names: Vec<String> = restarted
+        .list("alice", &auth())
+        .await
+        .into_iter()
+        .map(|mix| mix.name)
+        .collect();
+    assert_eq!(names, ["Bad Bunny Mix", "Rosalía Mix"]);
+    assert_eq!(walks(&fixture), 1);
 }

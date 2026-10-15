@@ -968,7 +968,7 @@ fn station_cover_label(station: &LastFmRadioStation) -> Option<String> {
 }
 
 /// The songs whose covers color a station's cover: its seed artists' songs first (the
-/// artist of an artist station, the top seeds of Your Mix), then its first songs, one per
+/// artist of an artist station, the top seeds of Your Radio), then its first songs, one per
 /// album, four at most. Looked up like any song's cover outside the library.
 pub(crate) fn station_cover_seeds(state: &AppState, station: &LastFmRadioStation) -> Vec<CoverSeed> {
     let seed_artists: Vec<String> = match station.kind {

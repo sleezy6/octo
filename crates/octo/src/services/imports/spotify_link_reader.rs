@@ -9,7 +9,32 @@ use serde_json::Value;
 use tracing::info;
 
 use super::ImportTrack;
-use super::spotify_web_api::{ImportKeys, SpotifyException, seconds_of, str_of};
+use super::import_keys::{ImportKeys, seconds_of, str_of};
+
+/// A refusal from Spotify, in words a person can act on. Status is the HTTP status, when there
+/// was one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct SpotifyException {
+    pub message: String,
+    pub status: Option<u16>,
+}
+
+impl SpotifyException {
+    pub fn new(message: impl Into<String>) -> Self {
+        SpotifyException {
+            message: message.into(),
+            status: None,
+        }
+    }
+
+    pub fn with_status(message: impl Into<String>, status: u16) -> Self {
+        SpotifyException {
+            status: Some(status),
+            ..Self::new(message)
+        }
+    }
+}
 
 /// What a public link held: its name, picture and songs, and whether that was all of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +60,7 @@ static NEXT_DATA: LazyLock<Regex> = LazyLock::new(|| {
 /// Reads a public Spotify playlist or album from its link, with no sign-in, through the page
 /// Spotify serves for embedding it in other sites. That page carries the first 100 songs, with
 /// their title, artists and length (no album for a playlist), which is the most a link can give
-/// without an account. Larger lists say so, and the account sign-in or an exported file reads
-/// them whole.
+/// without an account. Larger lists say so, and an exported file reads them whole.
 pub struct SpotifyLinkReader {
     /// The named "spotify-embed" client (20 s, a browser-like user agent).
     http: reqwest::Client,
@@ -89,7 +113,7 @@ impl SpotifyLinkReader {
         if status == 404 {
             return Err(SpotifyException::with_status(
                 format!(
-                    "Spotify has no public {kind} at that link. A private playlist needs the Spotify sign-in."
+                    "Spotify has no public {kind} at that link. A private playlist comes in as a file: export it with TuneMyMusic."
                 ),
                 status,
             )
@@ -260,7 +284,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_private_playlists_link_says_it_needs_the_sign_in() {
+    async fn a_private_playlists_link_says_to_export_it_to_a_file() {
         let server = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(404))
@@ -271,7 +295,11 @@ pub(crate) mod tests {
             .read("https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M")
             .await
             .expect_err("refused");
-        assert!(error.to_string().contains("sign-in"), "{error}");
+        assert!(error.to_string().contains("TuneMyMusic"), "{error}");
+        assert_eq!(
+            error.downcast_ref::<SpotifyException>().and_then(|e| e.status),
+            Some(404)
+        );
         let calls = server.received_requests().await.expect("recording");
         assert_eq!(calls[0].url.path(), "/embed/playlist/37i9dQZF1DXcBWIGoYBM5M");
     }

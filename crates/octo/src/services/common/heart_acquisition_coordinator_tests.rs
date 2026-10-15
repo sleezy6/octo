@@ -645,3 +645,203 @@ async fn with_soulseek_off_a_soulseek_first_play_is_a_you_tube_play() {
         Some(DownloadSource::YouTube)
     );
 }
+
+// ---- A hearted song whose album follows it (DownloadAlbumOnSongStar) ----------------------
+
+/// A coordinator whose album walks go to `direct`, with a tracker and a short wait for the
+/// hearted song.
+fn following(
+    settings: SubsonicSettings,
+    queue: Arc<TrackAcquisitionQueue>,
+    direct: Arc<FakeDownloads>,
+    lidarr: Arc<FakeLidarr>,
+    tracker: Arc<AcquisitionTracker>,
+    max_wait: Duration,
+) -> Arc<HeartAcquisitionCoordinator> {
+    let coordinator = HeartAcquisitionCoordinator::new(
+        store(settings),
+        queue,
+        direct,
+        lidarr,
+        HeartCoordinatorExtras {
+            tracker: Some(tracker),
+            ..Default::default()
+        },
+    );
+    coordinator.set_landed_song_wait(LandedSongWait {
+        poll: Duration::from_millis(10),
+        max_wait,
+    });
+    coordinator
+}
+
+fn song_and_album_from_youtube() -> SubsonicSettings {
+    SubsonicSettings {
+        heart_download_sources: vec![step(HeartDownloadSource::YouTube, true, true)],
+        ..Default::default()
+    }
+}
+
+fn hearted(id: &str) -> Vec<(String, String)> {
+    vec![("soulseek".to_string(), id.to_string())]
+}
+
+fn begin_row(tracker: &AcquisitionTracker, id: &str) {
+    tracker.begin("soulseek", id, Some(id), Some("felix"), None, None, None);
+}
+
+#[tokio::test]
+async fn a_hearted_songs_album_waits_for_the_song_to_land_and_show() {
+    let queue = new_queue();
+    let direct = Arc::new(FakeDownloads::default());
+    let tracker = Arc::new(AcquisitionTracker::new(None, Clock::system()));
+    let coordinator = following(
+        song_and_album_from_youtube(),
+        queue.clone(),
+        direct.clone(),
+        Arc::new(FakeLidarr::default()),
+        tracker.clone(),
+        Duration::from_secs(30),
+    );
+    begin_row(&tracker, "song-id");
+
+    coordinator.queue_tracks_then_album_for(
+        &hearted("song-id"),
+        "soulseek",
+        "album-id",
+        Some("felix"),
+        Some("felix"),
+        AcquisitionTarget::Shared,
+    );
+
+    // The song goes down its own chain first, and the album waits for it.
+    let request = next_queued(&queue).await.expect("the song is queued");
+    assert_eq!(request.external_id, "song-id");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        direct.album_calls.lock().is_empty(),
+        "the album waits for the song"
+    );
+
+    // Landed, but not yet shown in the library: the album still waits.
+    queue.release(&request);
+    request.completion.try_set_result("/music/song.flac".to_string());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        direct.album_calls.lock().is_empty(),
+        "the album waits for the library"
+    );
+
+    tracker.complete("soulseek", "song-id", Some("nd-1"));
+    until(|| !direct.album_calls.lock().is_empty()).await;
+    let calls = direct.album_calls.lock().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        (calls[0].0.as_str(), calls[0].1.as_str(), calls[0].2),
+        ("soulseek", "album-id", DownloadSource::YouTube)
+    );
+    assert_eq!(calls[0].4, Some(vec!["felix".to_string()]));
+    assert!(next_queued(&queue).await.is_none(), "the song is asked for once");
+}
+
+#[tokio::test]
+async fn a_hearted_songs_album_waits_no_longer_than_the_limit() {
+    let queue = new_queue();
+    let direct = Arc::new(FakeDownloads::default());
+    let tracker = Arc::new(AcquisitionTracker::new(None, Clock::system()));
+    let coordinator = following(
+        song_and_album_from_youtube(),
+        queue.clone(),
+        direct.clone(),
+        Arc::new(FakeLidarr::default()),
+        tracker.clone(),
+        Duration::from_millis(200),
+    );
+    begin_row(&tracker, "song-id");
+
+    coordinator.queue_tracks_then_album_for(
+        &hearted("song-id"),
+        "soulseek",
+        "album-id",
+        None,
+        None,
+        AcquisitionTarget::Shared,
+    );
+    let request = next_queued(&queue).await.expect("the song is queued");
+    queue.release(&request);
+    request.completion.try_set_result("/music/song.flac".to_string());
+
+    // The song never shows in the library, and the album goes on once the wait is up.
+    until(|| !direct.album_calls.lock().is_empty()).await;
+    assert!(tracker.is_running("soulseek:song-id"));
+}
+
+#[tokio::test]
+async fn a_hearted_song_that_failed_still_brings_its_album() {
+    let queue = new_queue();
+    let direct = Arc::new(FakeDownloads::default());
+    let tracker = Arc::new(AcquisitionTracker::new(None, Clock::system()));
+    let coordinator = following(
+        song_and_album_from_youtube(),
+        queue.clone(),
+        direct.clone(),
+        Arc::new(FakeLidarr::default()),
+        tracker.clone(),
+        Duration::from_secs(30),
+    );
+    begin_row(&tracker, "song-id");
+
+    coordinator.queue_tracks_then_album_for(
+        &hearted("song-id"),
+        "soulseek",
+        "album-id",
+        None,
+        None,
+        AcquisitionTarget::Shared,
+    );
+    let request = next_queued(&queue).await.expect("the song is queued");
+    queue.release(&request);
+    request.completion.try_set_error(anyhow::anyhow!("no peers"));
+
+    // Nothing landed, so nothing is waited for.
+    until(|| !direct.album_calls.lock().is_empty()).await;
+}
+
+#[tokio::test]
+async fn a_hearted_song_lidarr_took_on_brings_no_album_walk() {
+    let queue = new_queue();
+    let direct = Arc::new(FakeDownloads::default());
+    let lidarr = Arc::new(FakeLidarr::default().tracks(|_, id, _| Ok(id == "song-id")));
+    let tracker = Arc::new(AcquisitionTracker::new(None, Clock::system()));
+    let coordinator = following(
+        SubsonicSettings {
+            heart_download_sources: vec![
+                step(HeartDownloadSource::Lidarr, true, false),
+                step(HeartDownloadSource::YouTube, false, true),
+            ],
+            ..Default::default()
+        },
+        queue.clone(),
+        direct.clone(),
+        lidarr.clone(),
+        tracker,
+        Duration::from_secs(30),
+    );
+
+    coordinator
+        .acquire_tracks_then_album(
+            &hearted("song-id"),
+            "soulseek",
+            "album-id",
+            None,
+            None,
+            &AcquisitionTarget::Shared,
+        )
+        .await;
+
+    // Lidarr brings the whole album, so no walk goes after it as well.
+    assert_eq!(lidarr.track_calls_for("soulseek", "song-id", true), 1);
+    assert_eq!(lidarr.calls(), 1, "Lidarr was asked for the song only");
+    assert!(direct.album_calls.lock().is_empty());
+    assert!(next_queued(&queue).await.is_none());
+}

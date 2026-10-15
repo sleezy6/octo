@@ -160,6 +160,16 @@ impl NavidromeIdentityService {
         }
     }
 
+    /// The user name of the admin identity, once an admin sign-in has been captured.
+    pub fn admin_user_name(&self) -> Option<String> {
+        self.inner
+            .state
+            .lock()
+            .username
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+    }
+
     /// Cache the identity from a native login response body. Only admin logins are kept:
     /// /api/library and startScan need admin, and a later non-admin sign-in must not overwrite
     /// a good admin identity. Every login's token is remembered against its username, for

@@ -15,7 +15,7 @@ use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, StreamExt};
 use indexmap::IndexMap;
 use octo_core::common::dotnet::{is_blank, is_null_or_white_space, ordinal_ignore_case_key};
-use octo_core::common::{Clock, SongIdentity};
+use octo_core::common::{Clock, SongIdentity, skipped_takes};
 use octo_core::json::element::{ElementResult, get_string, try_get_property};
 use octo_core::last_fm::last_fm_radio_track_resolver::is_same_recording;
 use octo_core::library::generated_playlist_service::dotnet_ticks;
@@ -495,7 +495,12 @@ impl SyncCatalogService {
         if username.is_empty() || stations.is_empty() {
             return futures::future::ready(SyncCatalog::empty()).boxed();
         }
-        let fingerprint = Self::fingerprint(stations, &self.settings.current().subsonic);
+        let settings = self.settings.current();
+        let fingerprint = Self::fingerprint(
+            stations,
+            &settings.subsonic,
+            settings.soulseek.skip_covers_and_instrumentals,
+        );
         let key = ordinal_ignore_case_key(username);
         let cached = self.catalogs.lock().get(&key).cloned();
         if let Some(cached) = cached
@@ -579,16 +584,27 @@ impl SyncCatalogService {
         }
     }
 
-    pub(crate) fn fingerprint(stations: &[LastFmRadioStation], settings: &SubsonicSettings) -> String {
+    /// What decides whether a built catalog still holds: each station's last change, the cap, the
+    /// explicit filter, and Skip covers and instrumentals (named only while it is on).
+    pub(crate) fn fingerprint(
+        stations: &[LastFmRadioStation],
+        settings: &SubsonicSettings,
+        skip_covers_and_instrumentals: bool,
+    ) -> String {
         let stations = stations
             .iter()
             .map(|station| format!("{}:{}", station.id, dotnet_ticks(station.changed_utc)))
             .collect::<Vec<_>>()
             .join("|");
         format!(
-            "{stations}#{}#{}",
+            "{stations}#{}#{}{}",
             settings.effective_sync_catalog_max_songs(),
-            explicit_filter_name(settings.explicit_filter)
+            explicit_filter_name(settings.explicit_filter),
+            if skip_covers_and_instrumentals {
+                "#SkipCoversAndInstrumentals"
+            } else {
+                ""
+            }
         )
     }
 
@@ -629,7 +645,9 @@ impl SyncCatalogService {
         fingerprint: &str,
         previous: Option<Arc<SyncCatalog>>,
     ) -> SyncCatalog {
-        let settings = self.settings.current().subsonic.clone();
+        let current = self.settings.current();
+        let settings = current.subsonic.clone();
+        let skip_covers_and_instrumentals = current.soulseek.skip_covers_and_instrumentals;
         let tracks = Self::interleave(stations, settings.effective_sync_catalog_max_songs());
         if tracks.is_empty() {
             return SyncCatalog::new(
@@ -702,6 +720,9 @@ impl SyncCatalogService {
             if settings.explicit_filter == ExplicitFilter::ExplicitOnly
                 && hit.explicit_content_lyrics == Some(3)
             {
+                continue;
+            }
+            if skipped_takes::hides_song(&hit, skip_covers_and_instrumentals) {
                 continue;
             }
 

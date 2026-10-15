@@ -64,7 +64,7 @@ pub struct LastFmSettings {
     /// Environment variable: LASTFM_ENABLE_STARTER_RADIO
     pub enable_starter_radio: bool,
 
-    /// Build the Discovery Mix, seeded from the listener's top tags.
+    /// Build the Discovery Radio, seeded from the listener's top tags.
     /// Environment variable: LASTFM_ENABLE_DISCOVERY_MIX
     pub enable_discovery_mix: bool,
 
@@ -104,7 +104,7 @@ pub struct LastFmSettings {
     pub radio_loudness_target_lufs: i32,
 
     pub history_retention_days: i32,
-    /// The share of Your Mix and of Starter Radio kept for music new to the listener, in
+    /// The share of Your Radio and of Starter Radio kept for music new to the listener, in
     /// percent (the dashboard's Discovery balance). Song radio does not use it: it places its
     /// outside songs at its own mix (last_fm_radio_placement).
     pub discovery_percent: i32,

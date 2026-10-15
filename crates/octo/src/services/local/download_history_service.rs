@@ -154,6 +154,7 @@ impl DownloadHistoryService {
             ),
             detail: None,
             candidates: None,
+            heard: None,
         });
         kept.extend(tail.iter().map(line));
         kept
@@ -353,6 +354,7 @@ mod tests {
                     })
                     .collect()
             }),
+            heard: None,
         }
     }
 

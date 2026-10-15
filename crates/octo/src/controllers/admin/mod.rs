@@ -166,6 +166,10 @@ pub(crate) mod test_app;
 mod admin_contract_tests;
 
 #[cfg(test)]
+#[path = "health_tags_tests.rs"]
+mod health_tags_tests;
+
+#[cfg(test)]
 #[path = "library_action_allow_download_tests.rs"]
 mod library_action_allow_download_tests;
 

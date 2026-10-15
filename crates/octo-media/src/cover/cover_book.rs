@@ -258,7 +258,8 @@ impl CoverBook {
     }
 
     /// A stand-in for the music's color when a list's songs give none: its genre's or decade's
-    /// hue. A trailing " Mix" or " Radio" is not part of the name, so "Rock Mix" finds Rock's.
+    /// hue. A trailing " Mix" or " Radio" is not part of the name, so "Rock Mix" finds Rock's,
+    /// and a year takes its decade's, so "1994 Mix" finds the 1990s'.
     pub fn list_hue(&self, name: Option<&str>) -> Option<(f64, f64)> {
         let name = name?;
         if name.trim().is_empty() {
@@ -273,9 +274,26 @@ impl CoverBook {
             if let Some(hue) = self.exact.get(&key).or_else(|| self.parts.get(&key)) {
                 return Some((*hue, self.list_chroma));
             }
+            if let Some(decade) = decade_of_year(candidate)
+                && let Some(hue) = self.exact.get(&song_identity_key(&decade))
+            {
+                return Some((*hue, self.list_chroma));
+            }
         }
         None
     }
+}
+
+/// "1990s" for a name that is a year such as "1994"; None for anything else.
+fn decade_of_year(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.len() != 4 || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i32 = name.parse().ok()?;
+    (1000..=2999)
+        .contains(&year)
+        .then(|| format!("{}s", year / 10 * 10))
 }
 
 fn without<'a>(name: &'a str, suffix: &str) -> &'a str {
@@ -301,5 +319,18 @@ mod tests {
         assert_eq!(song_identity_key("1990s"), "1990s");
         assert_eq!(song_identity_key("!!!"), "!!!");
         assert_eq!(song_identity_key("  "), "");
+    }
+
+    #[test]
+    fn a_year_mix_takes_its_decades_hue_and_an_artist_mix_none_of_its_own() {
+        let book = CoverBook::shipped();
+        let nineties = book.list_hue(Some("1990s Mix")).expect("the 1990s have a hue");
+        assert_eq!(book.list_hue(Some("1994 Mix")), Some(nineties));
+        assert_eq!(book.list_hue(Some("1994")), Some(nineties));
+        assert_eq!(decade_of_year("2003").as_deref(), Some("2000s"));
+        assert_eq!(decade_of_year("Blink-182"), None);
+        assert_eq!(decade_of_year("19945"), None);
+        // An artist's mix is colored by the artist's own covers; the name alone gives no hue.
+        assert_eq!(book.list_hue(Some("Radiohead Mix")), None);
     }
 }

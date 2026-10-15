@@ -38,7 +38,7 @@ pub mod download {
     pub mod download_info;
     pub mod download_status;
 
-    pub use acquisition_event::{AcquisitionCandidate, AcquisitionEvent};
+    pub use acquisition_event::{AcquisitionCandidate, AcquisitionEvent, AcquisitionHeard};
     pub use download_history_entry::DownloadHistoryEntry;
     pub use download_info::DownloadInfo;
     pub use download_status::DownloadStatus;

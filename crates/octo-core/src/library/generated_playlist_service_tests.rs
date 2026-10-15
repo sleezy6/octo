@@ -334,38 +334,52 @@ fn kinds_and_staleness_follow_the_settings() {
         ..Default::default()
     };
     let all = ExplicitFilter::All;
-    assert_eq!(kinds_of(&settings, all), "genre,,");
+    assert_eq!(kinds_of(&settings, all, false), "genre,,");
     let state = UserMixes {
         counts_utc: now(),
         kinds: "genre,,".into(),
         ..Default::default()
     };
-    assert!(!is_stale(&state, &settings, all, now()));
+    assert!(!is_stale(&state, &settings, all, false, now()));
     assert!(is_stale(
         &state,
         &settings,
         all,
+        false,
         now() + TimeDelta::hours(i64::from(settings.effective_refresh_hours()))
     ));
-    assert!(is_stale(&UserMixes::default(), &settings, all, now()));
+    assert!(is_stale(&UserMixes::default(), &settings, all, false, now()));
     // Made for you: on by default whatever the mixes switch says, and what decides each list is
     // part of the kinds, the explicit filter too.
     let defaults = GeneratedPlaylistSettings::default();
     assert_eq!(
-        kinds_of(&defaults, all),
+        kinds_of(&defaults, all, false),
         ",,newReleases+rediscover+deepCuts,w8a50x0,m6"
     );
     assert_eq!(
-        kinds_of(&defaults, ExplicitFilter::CleanOnly),
+        kinds_of(&defaults, ExplicitFilter::CleanOnly, false),
         ",,newReleases+rediscover+deepCuts,w8a50x2,m6"
     );
+    // Skip covers and instrumentals is part of New Releases' kinds only while it is on.
+    assert_eq!(
+        kinds_of(&defaults, all, true),
+        ",,newReleases+rediscover+deepCuts,w8a50x0s,m6"
+    );
+    let saved = UserMixes {
+        counts_utc: now(),
+        kinds: kinds_of(&defaults, all, false),
+        ..Default::default()
+    };
+    assert!(!is_stale(&saved, &defaults, all, false, now()));
+    assert!(is_stale(&saved, &defaults, all, true, now()));
     assert_eq!(
         kinds_of(
             &GeneratedPlaylistSettings {
                 new_releases: false,
                 ..defaults.clone()
             },
-            all
+            all,
+            false
         ),
         ",,rediscover+deepCuts,m6"
     );
@@ -399,17 +413,17 @@ fn country_mixes_are_part_of_the_kinds_only_when_on() {
         deep_cuts: false,
         ..Default::default()
     };
-    assert_eq!(kinds_of(&mixes, all), "genre,decade,");
+    assert_eq!(kinds_of(&mixes, all, false), "genre,decade,");
     let countries = GeneratedPlaylistSettings {
         country_mixes: true,
         ..mixes.clone()
     };
-    assert_eq!(kinds_of(&countries, all), "genre,decade,,country:");
+    assert_eq!(kinds_of(&countries, all, false), "genre,decade,,country:");
     let some = GeneratedPlaylistSettings {
         countries: "es,jp".into(),
         ..countries.clone()
     };
-    assert_eq!(kinds_of(&some, all), "genre,decade,,country:ES+JP");
+    assert_eq!(kinds_of(&some, all, false), "genre,decade,,country:ES+JP");
     // Only countries is still mixes; the country switch without the mixes switch is nothing.
     let only = GeneratedPlaylistSettings {
         genres: false,
@@ -422,7 +436,7 @@ fn country_mixes_are_part_of_the_kinds_only_when_on() {
         ..countries
     };
     assert!(!mixes_on(&off) && !country_mixes_on(&off));
-    assert_eq!(kinds_of(&off, all), ",,");
+    assert_eq!(kinds_of(&off, all, false), ",,");
 }
 
 #[test]
@@ -506,4 +520,221 @@ fn numbers_read_as_json_node_reads_them() {
     assert_eq!(nullable_int_of(&node, "e"), None);
     assert_eq!(nullable_int_of(&node, "f"), Some(i32::MAX));
     assert_eq!(int_of(&node, "missing"), 0);
+}
+
+// ---- Year and artist mixes ------------------------------------------------------------------
+
+#[test]
+fn a_year_key_describes_itself_and_an_artist_key_by_its_artist() {
+    assert_eq!(
+        describe(&year_key(1994)),
+        ("year".to_string(), "1994".to_string())
+    );
+    assert_eq!(year_key(1994), "year:1994");
+    assert_eq!(
+        describe(&artist_mix_key("ar-1")),
+        ("artist".to_string(), "ar-1".to_string())
+    );
+    assert_eq!(list_group("year"), "year");
+    assert_eq!(list_group("artist"), "artist");
+    assert_eq!(
+        list_group(crate::library::for_you_lists::DEEP_CUTS_KIND),
+        "forYou"
+    );
+    assert_eq!(list_group(crate::library::for_you_lists::LIKED_KIND), "liked");
+}
+
+#[test]
+fn year_and_artist_mixes_are_part_of_the_kinds_only_when_on() {
+    let all = ExplicitFilter::All;
+    let mixes = GeneratedPlaylistSettings {
+        enabled: true,
+        new_releases: false,
+        rediscover: false,
+        deep_cuts: false,
+        ..Default::default()
+    };
+    assert_eq!(kinds_of(&mixes, all, false), "genre,decade,");
+    let years = GeneratedPlaylistSettings {
+        years: true,
+        ..mixes.clone()
+    };
+    assert_eq!(kinds_of(&years, all, false), "genre,decade,,year");
+    let artists = GeneratedPlaylistSettings {
+        artists: true,
+        artist_count: 7,
+        ..years.clone()
+    };
+    assert_eq!(kinds_of(&artists, all, false), "genre,decade,,year,artist7");
+    // Years or artists alone are still mixes; their switches without the mixes switch are not.
+    let only = GeneratedPlaylistSettings {
+        genres: false,
+        decades: false,
+        ..artists.clone()
+    };
+    assert!(mixes_on(&only) && year_mixes_on(&only) && artist_mixes_on(&only));
+    let off = GeneratedPlaylistSettings {
+        enabled: false,
+        ..artists
+    };
+    assert!(!mixes_on(&off) && !year_mixes_on(&off) && !artist_mixes_on(&off));
+    assert_eq!(kinds_of(&off, all, false), ",,");
+}
+
+#[test]
+fn years_are_counted_from_the_walk_each_song_under_its_own_year() {
+    let walk: Vec<Node> = [
+        r#"{"id":"1","year":1994}"#,
+        r#"{"id":"2","year":1994}"#,
+        r#"{"id":"3","year":2003}"#,
+        r#"{"id":"4","year":0}"#,
+        r#"{"id":"5"}"#,
+        r#"{"id":"6","year":"1994"}"#,
+        r#"{"id":"7","year":1994.0}"#,
+    ]
+    .iter()
+    .map(|text| Node::parse(text).expect("a song parses"))
+    .collect();
+
+    let counts = count_years(&walk);
+
+    assert_eq!(
+        counts.into_iter().collect::<Vec<_>>(),
+        [("year:1994".to_string(), 3), ("year:2003".to_string(), 1)]
+    );
+}
+
+#[test]
+fn years_rank_by_songs_newest_first_on_ties_with_their_own_cap_and_thresholds() {
+    let settings = GeneratedPlaylistSettings {
+        max_playlists: 1,
+        max_year_playlists: 3,
+        ..Default::default()
+    };
+    let counts: IndexMap<String, i32> = [
+        ("genre:Rock", 40),
+        ("genre:Pop", 30),
+        ("year:1994", 30),
+        ("year:2001", 30),
+        ("year:1980", 60),
+        ("year:2010", 25),
+        ("year:2020", 15),
+    ]
+    .into_iter()
+    .map(|(key, count)| (key.to_string(), count))
+    .collect();
+
+    // Years never push a genre out, and a genre never pushes a year out.
+    assert_eq!(
+        active_mixes(&counts, &[], &settings),
+        ["genre:Rock", "year:1980", "year:2001", "year:1994"]
+    );
+    // A year already shown stays down to RemoveBelow; one that never was needs CreateAt.
+    let wide = GeneratedPlaylistSettings {
+        max_year_playlists: 30,
+        ..settings.clone()
+    };
+    assert_eq!(
+        active_mixes(&counts, &[], &wide),
+        ["genre:Rock", "year:1980", "year:2001", "year:1994", "year:2010"]
+    );
+    assert_eq!(
+        active_mixes(&counts, &["year:2020".to_string()], &wide),
+        [
+            "genre:Rock",
+            "year:1980",
+            "year:2001",
+            "year:1994",
+            "year:2010",
+            "year:2020"
+        ]
+    );
+    // MaxYearPlaylists is at least 1 and at most 30.
+    let none = GeneratedPlaylistSettings {
+        max_year_playlists: 0,
+        ..settings
+    };
+    assert_eq!(active_mixes(&counts, &[], &none), ["genre:Rock", "year:1980"]);
+}
+
+fn ranked(count: usize) -> Vec<String> {
+    (1..=count)
+        .map(|rank| artist_mix_key(&format!("ar{rank}")))
+        .collect()
+}
+
+fn began(keys: &[(&str, i64)]) -> IndexMap<String, DateTime<Utc>> {
+    keys.iter()
+        .map(|(key, days)| (artist_mix_key(key), now() - TimeDelta::days(*days)))
+        .collect()
+}
+
+#[test]
+fn an_artist_joins_in_the_top_count_and_never_below() {
+    let kept = kept_artist_mixes(&ranked(8), &IndexMap::new(), 5, now());
+    assert_eq!(kept, ranked(5));
+}
+
+#[test]
+fn an_artist_mix_stays_at_ranks_six_to_eight_and_goes_at_nine_only_after_seven_days() {
+    // ar1..ar5 lead now; the old mixes ar6, ar7 and ar8 are ranked 6 to 8, ar9 9th.
+    let previous = began(&[("ar6", 30), ("ar7", 30), ("ar8", 30), ("ar9", 30)]);
+    let kept = kept_artist_mixes(&ranked(9), &previous, 5, now());
+    assert_eq!(kept, ranked(8));
+
+    // At rank 9 a mix younger than seven days stays; at seven days it goes.
+    let young = began(&[("ar9", 6)]);
+    let kept = kept_artist_mixes(&ranked(9), &young, 5, now());
+    assert_eq!(
+        kept,
+        ranked(5)
+            .into_iter()
+            .chain([artist_mix_key("ar9")])
+            .collect::<Vec<_>>()
+    );
+    let week = began(&[("ar9", 7)]);
+    assert_eq!(kept_artist_mixes(&ranked(9), &week, 5, now()), ranked(5));
+}
+
+#[test]
+fn an_artist_mix_whose_artist_left_the_ranking_stays_its_first_week_after_the_ranked() {
+    let previous = began(&[("gone-new", 2), ("gone-old", 8), ("gone-newer", 1)]);
+    let kept = kept_artist_mixes(&ranked(3), &previous, 3, now());
+    assert_eq!(
+        kept,
+        ranked(3)
+            .into_iter()
+            .chain([artist_mix_key("gone-new"), artist_mix_key("gone-newer")])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn the_state_keeps_artist_mixes_and_leaves_them_out_of_the_file_while_there_are_none() {
+    let mut mixes = UserMixes {
+        counts_utc: now(),
+        kinds: "genre,,".into(),
+        ..Default::default()
+    };
+    let without = crate::json::to_string(&mixes);
+    assert!(!without.contains("ArtistMixes"), "{without}");
+
+    mixes.artist_mixes.insert(
+        artist_mix_key("ar1"),
+        ArtistMix {
+            name: "Radiohead".into(),
+            since: now(),
+            songs: vec![r#"{"id":"s1"}"#.into()],
+        },
+    );
+    let text = crate::json::to_string(&mixes);
+    assert!(
+        text.contains(r#""ArtistMixes":{"artist:ar1":{"Name":"Radiohead","Since":"#),
+        "{text}"
+    );
+    let read: UserMixes = serde_json::from_str(&text).expect("the state reads");
+    assert_eq!(read, mixes);
+    // A file from before artist mixes reads with none.
+    let old: UserMixes = serde_json::from_str(&without).expect("an older state reads");
+    assert!(old.artist_mixes.is_empty());
 }

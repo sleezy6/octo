@@ -258,7 +258,7 @@ impl Respond for Navidrome {
     }
 }
 
-/// A Your Mix station: twelve "Stranger" songs, an owned hit, a missing one on an owned album,
+/// A Your Radio station: twelve "Stranger" songs, an owned hit, a missing one on an owned album,
 /// and a single with no album.
 fn your_mix(changed_hour: u32) -> LastFmRadioStation {
     let track = |artist: &str, title: &str, album: Option<&str>, duration: i32| LastFmRadioTrack {
@@ -656,7 +656,11 @@ fn the_fingerprint_names_each_station_change_the_cap_and_the_filter() {
     };
     // 2026-09-01T02:00:00Z in ticks (100 ns units since 0001-01-01).
     assert_eq!(
-        SyncCatalogService::fingerprint(&stations, &settings),
+        SyncCatalogService::fingerprint(&stations, &settings, false),
         "or-your-mix:639238248000000000#50#CleanOnly"
+    );
+    assert_eq!(
+        SyncCatalogService::fingerprint(&stations, &settings, true),
+        "or-your-mix:639238248000000000#50#CleanOnly#SkipCoversAndInstrumentals"
     );
 }

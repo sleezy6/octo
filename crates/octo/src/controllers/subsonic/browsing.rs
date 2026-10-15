@@ -99,7 +99,7 @@ pub async fn get_artist(State(state): State<AppState>, req: Request) -> AppResul
     let id = call.param("id").to_string();
     let format = call.format();
     let builder = &state.subsonic_response_builder;
-    let metadata = &state.music_metadata;
+    let metadata = &state.metadata_service;
 
     if is_blank(&id) {
         return Ok(builder
@@ -228,7 +228,8 @@ pub async fn get_artist(State(state): State<AppState>, req: Request) -> AppResul
     }
 
     // An owned album is one the library has by the matcher's key, so "Discovery" in the
-    // library hides the catalog's "Discovery" however either is spelled or punctuated.
+    // library hides the catalog's "Discovery" however either is spelled or punctuated. One
+    // with an owned count was already weighed against the library and kept, so it stays.
     let local_album_names: HashSet<String> =
         local_album_titles.iter().map(|t| SongIdentity::key(t)).collect();
 
@@ -238,7 +239,9 @@ pub async fn get_artist(State(state): State<AppState>, req: Request) -> AppResul
 
     let mut merged_albums = local_albums;
     for deezer_album in &deezer_albums {
-        if !local_album_names.contains(&SongIdentity::key(&deezer_album.title)) {
+        if deezer_album.owned_count.is_some()
+            || !local_album_names.contains(&SongIdentity::key(&deezer_album.title))
+        {
             merged_albums.push(Value::Object(builder.convert_album_to_json(deezer_album)));
         }
     }

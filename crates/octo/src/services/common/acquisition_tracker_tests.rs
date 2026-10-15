@@ -772,3 +772,56 @@ fn the_key_is_the_provider_in_lower_case_and_the_id_as_given() {
     assert_eq!(only(&tracker, "alice").state, AcquisitionState::Searching);
     assert_eq!(AcquisitionState::Searching.wire_name(), "searching");
 }
+
+/// A check line keeps the other recordings AcoustID heard; a line without any keeps none.
+#[test]
+fn a_check_line_keeps_what_acoust_id_heard() {
+    let tracker = new_tracker();
+    tracker.begin(
+        "soulseek",
+        "t1",
+        None,
+        Some("alice"),
+        Some("Massive Attack"),
+        Some("Teardrop"),
+        None,
+    );
+    let heard = vec![AcquisitionHeard {
+        title: "Angel".into(),
+        artist: "Massive Attack".into(),
+        score: 40,
+    }];
+    tracker.log_heard(
+        "soulseek",
+        "t1",
+        acquisition_event_kinds::CHECK,
+        "Passed the checks",
+        Some("the right length; AcoustID: the same recording, 92% sure (needs 85%)"),
+        heard.clone(),
+    );
+    tracker.log_heard(
+        "soulseek",
+        "t1",
+        acquisition_event_kinds::NOTE,
+        "Nothing heard",
+        None,
+        Vec::new(),
+    );
+
+    let row = tracker.detail(&key_of("soulseek", "t1"), None).expect("the row");
+    let events = row.events.expect("the log");
+    let check = events
+        .iter()
+        .find(|e| e.text == "Passed the checks")
+        .expect("the check line");
+    assert_eq!(check.heard.as_ref(), Some(&heard));
+    assert_eq!(
+        check.detail.as_deref(),
+        Some("the right length; AcoustID: the same recording, 92% sure (needs 85%)")
+    );
+    let plain = events
+        .iter()
+        .find(|e| e.text == "Nothing heard")
+        .expect("the plain line");
+    assert_eq!(plain.heard, None);
+}

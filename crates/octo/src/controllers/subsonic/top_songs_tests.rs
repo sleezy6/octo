@@ -300,6 +300,9 @@ async fn get_playlists_lists_the_chart_lists_read_only() {
     let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
     // Alice has hearted a song, so her Liked Songs comes first.
     assert_eq!(names, vec!["Liked Songs", "Popular right now", "Best New Songs"]);
+    let groups: Vec<&str> = rows.iter().filter_map(|r| r["octoGroup"].as_str()).collect();
+    assert_eq!(groups, vec!["liked", "chart", "chart"]);
+    assert!(rows[1..].iter().all(|r| r.get("octoList").is_none()));
     let rows = &rows[1..];
     let popular = &rows[0];
     assert_eq!(popular["id"], popular_id().as_str());
@@ -352,6 +355,11 @@ async fn get_playlists_xml_lists_them_too() {
     assert!(xml.contains("name=\"Popular right now\""), "{xml}");
     assert!(xml.contains("readonly=\"true\""), "{xml}");
     assert!(xml.contains("octoCoverTitle=\"Popular\""), "{xml}");
+    let popular = xml
+        .split("<playlist ")
+        .find(|row| row.contains("name=\"Popular right now\""))
+        .expect("the Popular right now row");
+    assert!(popular.contains("octoGroup=\"chart\""), "{popular}");
 }
 
 #[tokio::test]
@@ -362,6 +370,7 @@ async fn get_playlist_library_songs_are_the_listeners_own_the_rest_outside() {
 
     let playlist = &answer["playlist"];
     assert_eq!(playlist["name"], "Popular right now");
+    assert_eq!(playlist["octoGroup"], "chart");
     let entries = playlist["entry"].as_array().unwrap();
     assert_eq!(entries.len(), 5);
     assert_eq!(playlist["songCount"], 5);

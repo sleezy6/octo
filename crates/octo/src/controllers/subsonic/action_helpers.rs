@@ -2,6 +2,7 @@
 //! the small private helpers, and the radio helpers the playlist, internet radio, search and
 //! native radio answers share.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -12,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::{TimeDelta, Utc};
 use indexmap::IndexMap;
-use octo_core::common::dotnet;
+use octo_core::common::{dotnet, skipped_takes};
 use octo_core::last_fm::last_fm_radio_refresh_policy;
 use octo_core::models::domain::Song;
 use octo_core::models::radio::{
@@ -677,7 +678,8 @@ pub async fn bootstrap_radio_profile(
 }
 
 /// A station's tracks as songs this listener can play: each resolved (the library's copy
-/// first), the explicit filter applied, Discovery Mix held to the Discovery balance's share of
+/// first), the explicit filter and Skip covers and instrumentals applied, Discovery Radio held
+/// to the Discovery balance's share of
 /// library songs, and back-to-back repeats of an artist or an album dropped.
 pub async fn materialize_station(
     state: &AppState,
@@ -685,6 +687,36 @@ pub async fn materialize_station(
     station: &LastFmRadioStation,
     parameters: &Parameters,
 ) -> Vec<Song> {
+    materialize_picks(
+        state,
+        proxy,
+        station,
+        &station.tracks,
+        &station.reserve,
+        parameters,
+        &HashSet::new(),
+        None,
+    )
+    .await
+    .into_iter()
+    .map(|(song, _)| song)
+    .collect()
+}
+
+/// [`materialize_station`] for any of a station's songs, each beside the station track it was
+/// resolved from: `tracks` resolved, `reserve` standing in for the library songs past Discovery
+/// Radio's share, every song whose id is in `skip` left out, and the spacing carried on from
+/// `previous` (the artist and album of the song played before these).
+pub async fn materialize_picks(
+    state: &AppState,
+    proxy: &SubsonicProxyService,
+    station: &LastFmRadioStation,
+    tracks: &[LastFmRadioTrack],
+    reserve: &[LastFmRadioTrack],
+    parameters: &Parameters,
+    skip: &HashSet<String>,
+    previous: Option<(&str, &str)>,
+) -> Vec<(Song, LastFmRadioTrack)> {
     let resolver = LastFmRadioTrackResolver::new(
         proxy.clone(),
         state.metadata_service.clone(),
@@ -697,27 +729,44 @@ pub async fn materialize_station(
         Some(&state.family_store),
         Some(&station.owner),
     );
-    let mut resolved = resolve_station_tracks(&resolver, &station.tracks, parameters, explicit_filter).await;
+    let skip_covers_and_instrumentals = snapshot.soulseek.skip_covers_and_instrumentals;
+    let mut resolved = resolve_station_tracks(
+        &resolver,
+        tracks,
+        parameters,
+        explicit_filter,
+        skip_covers_and_instrumentals,
+    )
+    .await;
+    resolved.retain(|(song, _)| !skip.contains(&song.id));
     if station.kind == LastFmRadioStationKind::Discovery {
         let cap = dotnet::round(
             resolved.len() as f64 * f64::from(snapshot.last_fm.effective_discovery_percent()) / 100.0,
             0,
         ) as usize;
-        keep_library_share(
-            &mut resolved,
-            cap,
-            &station.reserve,
-            |tracks: Vec<LastFmRadioTrack>| {
-                let resolver = &resolver;
-                async move { resolve_station_tracks(resolver, &tracks, parameters, explicit_filter).await }
-            },
-        )
+        keep_library_share(&mut resolved, cap, reserve, |tracks: Vec<LastFmRadioTrack>| {
+            let resolver = &resolver;
+            async move {
+                let mut songs = resolve_station_tracks(
+                    resolver,
+                    &tracks,
+                    parameters,
+                    explicit_filter,
+                    skip_covers_and_instrumentals,
+                )
+                .await;
+                songs.retain(|(song, _)| !skip.contains(&song.id));
+                songs
+            }
+        })
         .await;
     }
     let mut spaced = Vec::with_capacity(resolved.len());
-    let mut previous_artist: Option<String> = None;
-    let mut previous_album_key: Option<String> = None;
-    for song in resolved {
+    let mut previous_artist: Option<String> = previous.map(|(artist, _)| artist.to_string());
+    let mut previous_album_key: Option<String> = previous
+        .filter(|(_, album)| !dotnet::is_blank(album))
+        .map(|(artist, album)| format!("{artist}|{album}"));
+    for (song, track) in resolved {
         let album_key = (!dotnet::is_blank(&song.album)).then(|| format!("{}|{}", song.artist, song.album));
         let same_artist = previous_artist
             .as_deref()
@@ -732,42 +781,130 @@ pub async fn materialize_station(
         }
         previous_artist = Some(song.artist.clone());
         previous_album_key = album_key;
-        spaced.push(song);
+        spaced.push((song, track));
     }
     spaced
+}
+
+/// The source that suggested each song, by id, the first one for an id.
+pub fn suggested_sources(songs: &[Song]) -> HashMap<String, String> {
+    let mut suggested: HashMap<String, String> = HashMap::new();
+    for song in songs {
+        if let Some(by) = &song.suggested_by {
+            suggested.entry(song.id.clone()).or_insert_with(|| by.clone());
+        }
+    }
+    suggested
+}
+
+/// A station's resolved songs as they go out, and the record of serving them: lengths filled
+/// in, a song this listener's sync catalog holds as the catalog describes it (keeping the source
+/// in `suggested`), counted as served by radio, registered as radio songs, their YouTube ids
+/// warmed in the background, and remembered for the station's next ask.
+pub async fn serve_station_songs(
+    state: &AppState,
+    username: &str,
+    mut songs: Vec<Song>,
+    suggested: &HashMap<String, String>,
+) -> Vec<Song> {
+    // Before the catalog swap below: these rows are this response's own, while a catalog
+    // row is shared with every other response that serves it.
+    // Waits a little for lengths still unknown, so a player that reads a song's length once
+    // (iPhone players do) has it.
+    state
+        .metadata_service
+        .complete_song_lengths_within(&mut songs, super::playlists::STATION_LENGTH_WAIT)
+        .await;
+
+    // A song this user's sync catalog also holds goes out as the catalog describes it:
+    // same album, and filed under the library's own artist where there is one. A syncing
+    // client stores whichever description it read last, so the two must not disagree.
+    let songs: Vec<_> = songs
+        .into_iter()
+        .map(|song| {
+            if song.is_local {
+                return song;
+            }
+            state
+                .sync_catalog
+                .try_get_song(username, &song.id)
+                .unwrap_or(song)
+        })
+        .collect();
+    // The discovery blend and the catalog swap hand back other objects; the source rides on by
+    // id, on a copy, since a catalog row is shared with other responses.
+    let songs: Vec<_> = songs
+        .into_iter()
+        .map(|mut song| {
+            if let Some(by) = suggested.get(&song.id)
+                && song.suggested_by.as_ref() != Some(by)
+            {
+                song.suggested_by = Some(by.clone());
+            }
+            song
+        })
+        .collect();
+    // A station refetched by a syncing client is not the listener choosing it, so it never
+    // renews the window in which a start counts for radio.
+    state.radio_outcomes.served(
+        Some(username),
+        songs.iter().map(|song| {
+            (
+                song.id.as_str(),
+                radio_provider::from_display_name(song.suggested_by.as_deref()),
+            )
+        }),
+        None,
+        false,
+    );
+    state
+        .radio_queues
+        .register(songs.iter().map(|song| song.id.clone()));
+    state
+        .last_fm_radio_recommendations
+        .remember_served(username, &songs);
+    let metadata = Arc::clone(&state.metadata_service);
+    let prewarm = songs.clone();
+    tokio::spawn(async move { metadata.prewarm_you_tube_ids(&prewarm, 8).await });
+    songs
 }
 
 /// Holds a mix to at most `cap` library songs. Each library song past the first `cap` gives its
 /// place to the next outside song the reserve resolves to, in the reserve's order; when the
 /// reserve runs out, the library songs left keep their places, so a thin reserve still gives a
 /// full mix. The reserve is resolved only when a place needs it.
-async fn keep_library_share<F, Fut>(songs: &mut [Song], cap: usize, reserve: &[LastFmRadioTrack], resolve: F)
-where
+async fn keep_library_share<F, Fut>(
+    songs: &mut [(Song, LastFmRadioTrack)],
+    cap: usize,
+    reserve: &[LastFmRadioTrack],
+    resolve: F,
+) where
     F: Fn(Vec<LastFmRadioTrack>) -> Fut,
-    Fut: std::future::Future<Output = Vec<Song>>,
+    Fut: std::future::Future<Output = Vec<(Song, LastFmRadioTrack)>>,
 {
     let over: Vec<usize> = songs
         .iter()
         .enumerate()
-        .filter(|(_, song)| song.is_local)
+        .filter(|(_, (song, _))| song.is_local)
         .map(|(index, _)| index)
         .skip(cap)
         .collect();
     if over.is_empty() {
         return;
     }
-    let mut present: std::collections::HashSet<String> = songs.iter().map(|song| song.id.clone()).collect();
+    let mut present: std::collections::HashSet<String> =
+        songs.iter().map(|(song, _)| song.id.clone()).collect();
     let mut stand_ins = Vec::with_capacity(over.len());
     for chunk in reserve.chunks(over.len().max(4)) {
         if stand_ins.len() >= over.len() {
             break;
         }
-        for song in resolve(chunk.to_vec()).await {
+        for (song, track) in resolve(chunk.to_vec()).await {
             if stand_ins.len() >= over.len() {
                 break;
             }
             if !song.is_local && present.insert(song.id.clone()) {
-                stand_ins.push(song);
+                stand_ins.push((song, track));
             }
         }
     }
@@ -776,15 +913,17 @@ where
     }
 }
 
-/// Each track resolved, as a station plays it: the library's copy first, else the outside one;
-/// a sounds-alike song only from the library; the explicit filter applied. Tracks that resolve
-/// to nothing are left out.
+/// Each track resolved, as a station plays it, beside the track: the library's copy first, else
+/// the outside one; a sounds-alike song only from the library; the explicit filter applied, and
+/// outside cover, karaoke and instrumental takes left out while Skip covers and instrumentals is
+/// on. Tracks that resolve to nothing are left out.
 async fn resolve_station_tracks(
     resolver: &LastFmRadioTrackResolver,
     tracks: &[LastFmRadioTrack],
     parameters: &Parameters,
     explicit_filter: ExplicitFilter,
-) -> Vec<Song> {
+    skip_covers_and_instrumentals: bool,
+) -> Vec<(Song, LastFmRadioTrack)> {
     let gate = Semaphore::new(4);
     let tasks = tracks.iter().map(|track| {
         let gate = &gate;
@@ -818,21 +957,22 @@ async fn resolve_station_tracks(
             // A song that sounded like the seed was a library song; if it is gone, it is not
             // worth streaming a stranger's copy of it.
             if track.source == radio_provider::SOUNDS_ALIKE && !song.is_local {
-                return Song::default();
+                return (Song::default(), track.clone());
             }
             song.suggested_by = radio_provider::display_name(Some(&track.source)).map(str::to_string);
-            song
+            (song, track.clone())
         }
     });
     futures::future::join_all(tasks)
         .await
         .into_iter()
-        .filter(|song| !song.id.is_empty())
-        .filter(|song| match explicit_filter {
+        .filter(|(song, _)| !song.id.is_empty())
+        .filter(|(song, _)| match explicit_filter {
             ExplicitFilter::CleanOnly => song.explicit_content_lyrics != Some(1),
             ExplicitFilter::ExplicitOnly => song.explicit_content_lyrics != Some(3),
             ExplicitFilter::All => true,
         })
+        .filter(|(song, _)| !skipped_takes::hides_song(song, skip_covers_and_instrumentals))
         .collect()
 }
 

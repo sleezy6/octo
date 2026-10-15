@@ -11,6 +11,7 @@
 
 use octo_core::common::song_identity::SongIdentity;
 use octo_core::common::{dotnet, live_version, version_variant};
+use octo_core::fingerprint::recording_identity::RecordingKind;
 use octo_core::settings::SoulseekSettings;
 use octo_core::soulseek::SoulseekFileHit;
 use octo_core::soulseek::soulseek_download_service::DURATION_TOLERANCE_SECONDS;
@@ -174,8 +175,12 @@ fn take_of(
         .map(|path| version_variant::carried(path, artist))
         .unwrap_or_default();
 
+    // What the file's audio was found to be counts as much as what its name says.
+    let audio_live = target.audio_take == Some(RecordingKind::Live);
+    let audio_other = target.is_another_take() && !audio_live;
     let marked_title = title_live || !title_versions.is_empty();
-    let marked_album = album_live || !album_versions.is_empty() || !folder_versions.is_empty();
+    let marked_album =
+        album_live || !album_versions.is_empty() || !folder_versions.is_empty() || target.is_another_take();
     let title = if marked_title {
         let core = SongIdentity::parse_title(&target.title, artist).core;
         if dotnet::is_blank(&core) {
@@ -189,9 +194,9 @@ fn take_of(
     let album = if marked_album { None } else { target.album.clone() };
     let usual = usual_length(target, &title, album.as_deref(), cx);
 
-    let take = if title_live || album_live || folder_versions.contains("live") {
+    let take = if title_live || album_live || audio_live || folder_versions.contains("live") {
         OtherTake::Live
-    } else if marked_title || marked_album {
+    } else if marked_title || marked_album || audio_other {
         OtherTake::Version
     } else {
         let yours = target.duration.filter(|d| *d > 0)?;
@@ -220,6 +225,25 @@ fn take_of(
 pub fn check(target: &FindTarget, copy: &FoundCopy, cx: CheckContext<'_>) -> ReplaceCheck {
     let quality = quality_words(target, copy);
     let own = library_song(target);
+    // A library file that is another take, replaced by a copy of the plain song, takes the
+    // plain song's title and album: its own describe the take it was, and were they kept, the
+    // new file would carry them. Asked about, since the person's song changes take. Only once
+    // the file's audio was heard: a name alone ("(Radio Edit)", an album called "Live Through
+    // This") leaves a copy that fits the library song as it was.
+    if target.audio_take.is_some()
+        && let Some((take, plain)) = other_take(target, copy, cx)
+        && wrong_song(target, &plain, copy, cx).is_none()
+        && copy_is_plain(target, copy)
+    {
+        return ReplaceCheck::Confirm {
+            words: match &quality {
+                Some(quality) => format!("{} {quality} Replace yours anyway?", take_words(take)),
+                None => format!("{} Replace yours anyway?", take_words(take)),
+            },
+            song: plain,
+            take: Some(take),
+        };
+    }
     let Some(wrong) = wrong_song(target, &own, copy, cx) else {
         return match quality {
             None => ReplaceCheck::Fits,
@@ -241,15 +265,7 @@ pub fn check(target: &FindTarget, copy: &FoundCopy, cx: CheckContext<'_>) -> Rep
     if wrong_song(target, &plain, copy, cx).is_some() {
         return refused();
     }
-    let take_words = match take {
-        OtherTake::Live => "Yours looks like a live recording and this copy is the plain song.".to_string(),
-        OtherTake::Version => "Yours looks like another version and this copy is the plain song.".to_string(),
-        OtherTake::Length { yours, usual } => format!(
-            "Yours runs {} and this song usually runs {}, so yours looks like another take.",
-            soulseek_candidates::length_text(yours),
-            soulseek_candidates::length_text(usual)
-        ),
-    };
+    let take_words = take_words(take);
     let words = match quality {
         Some(quality) => format!("{take_words} {quality} Replace yours anyway?"),
         None => format!("{take_words} Replace yours anyway?"),
@@ -259,6 +275,30 @@ pub fn check(target: &FindTarget, copy: &FoundCopy, cx: CheckContext<'_>) -> Rep
         song: plain,
         take: Some(take),
     }
+}
+
+/// How the library file differs from the copy, in a sentence that asks nothing yet.
+fn take_words(take: OtherTake) -> String {
+    match take {
+        OtherTake::Live => "Yours looks like a live recording and this copy is the plain song.".to_string(),
+        OtherTake::Version => "Yours looks like another version and this copy is the plain song.".to_string(),
+        OtherTake::Length { yours, usual } => format!(
+            "Yours runs {} and this song usually runs {}, so yours looks like another take.",
+            soulseek_candidates::length_text(yours),
+            soulseek_candidates::length_text(usual)
+        ),
+    }
+}
+
+/// Whether a Soulseek copy shows no take of its own, by its name or its album folders: the plain
+/// song. A copy that is not a Soulseek file has no name to read and counts as plain.
+fn copy_is_plain(target: &FindTarget, copy: &FoundCopy) -> bool {
+    let Some(hit) = copy.pick.to_hit() else {
+        return true;
+    };
+    version_variant::carried(&hit.filename, Some(&target.artist))
+        .iter()
+        .all(|version| RecordingKind::of_marker(version).is_none())
 }
 
 /// The list's header line for a library file that is another take of the song.

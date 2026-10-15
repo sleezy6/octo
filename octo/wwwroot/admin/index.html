@@ -180,7 +180,7 @@
         <span id="update-banner-text"></span>
         <span class="update-banner-actions">
           <button type="button" class="btn btn-ghost" id="update-banner-notes">What's new</button>
-          <button type="button" class="btn btn-primary" data-open-tab="about">Update</button>
+          <button type="button" class="btn btn-primary" id="update-banner-go">Update</button>
           <button type="button" class="btn btn-ghost" id="update-banner-later">Later</button>
         </span>
       </div>
@@ -547,6 +547,14 @@
             </div>
             <div class="set-row">
               <div class="set-info">
+                <div class="set-info-t">Heart a song, get its album</div>
+                <div class="set-info-d">A heart on a song from outside your library also fetches the rest of its album, as a heart on the album would.</div>
+                <div class="set-info-more">The song comes first, and the album follows once the song is in your library. The album goes down the album-heart sources in Heart download priority, so at least one needs album hearts on. Songs you already have are skipped, and a song Lidarr takes brings its album by itself.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="f-download-album-on-song-star" name="Subsonic.DownloadAlbumOnSongStar" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info">
                 <div class="set-info-t">Record who asked</div>
                 <div class="set-info-d">Shows who hearted a song, in Fetched songs and in the download notification.</div>
                 <div class="set-info-more">Useful on a shared library. Turned off, names stay out of both, and entries already written keep theirs. A download in progress still remembers who asked, in memory only, so the app can show that person its progress.</div>
@@ -894,11 +902,11 @@
           </div>
           <form data-section="lastfm-personalized" class="set-card">
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Enable dynamic stations</div><div class="set-info-d">Starts with Starter Radio, then grows into Your Mix, discovery, artist, and genre stations.</div></div>
+              <div class="set-info"><div class="set-info-t">Enable dynamic stations</div><div class="set-info-d">Starts with Starter Radio, then grows into Your Radio, discovery, artist, and genre stations.</div></div>
               <label class="switch"><input type="checkbox" name="LastFm.EnablePersonalizedStations" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Your Mix</div><div class="set-info-d">The listener's own mix, drawn from what they actually play. Before Octo has learned enough this is Starter Radio, which is the only station a brand-new listener gets.</div></div>
+              <div class="set-info"><div class="set-info-t">Your Radio</div><div class="set-info-d">The listener's own station, drawn from what they actually play. Before Octo has learned enough this is Starter Radio, which is the only station a brand-new listener gets.</div></div>
               <label class="switch"><input type="checkbox" name="LastFm.EnableYourMix" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
@@ -906,7 +914,7 @@
               <label class="switch"><input type="checkbox" name="LastFm.EnableStarterRadio" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Discovery Mix</div><div class="set-info-d">One station of less-familiar music, seeded from the listener's most-played tags.</div></div>
+              <div class="set-info"><div class="set-info-t">Discovery Radio</div><div class="set-info-d">One station of less-familiar music, seeded from the listener's most-played tags.</div></div>
               <label class="switch"><input type="checkbox" name="LastFm.EnableDiscoveryMix" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row stack">
@@ -918,12 +926,12 @@
               <input class="set-input" name="LastFm.GenreStationCount" type="number" min="0" max="5" />
             </div>
             <div class="set-row stack">
-              <div class="set-info"><div class="set-info-t">Discovery balance</div><div class="set-info-d">Percentage of Your Mix reserved for less-familiar recommendations. Discovery Mix keeps the same share of songs from your library.</div></div>
+              <div class="set-info"><div class="set-info-t">Discovery balance</div><div class="set-info-d">Percentage of Your Radio reserved for less-familiar recommendations. Discovery Radio keeps the same share of songs from your library.</div></div>
               <input class="set-input" name="LastFm.DiscoveryPercent" type="number" min="0" max="100" />
             </div>
             <details class="radio-advanced">
               <summary>Personalization threshold and history</summary>
-              <div class="set-row stack"><div class="set-info"><div class="set-info-t">Completed plays before Your Mix</div><div class="set-info-d">Before this many completed plays, Octo offers Starter Radio. Afterward it can build Your Mix plus discovery, artist, and genre stations. Default: 10 plays.</div></div><input class="set-input" name="LastFm.MinimumPlays" type="number" min="3" max="100" /></div>
+              <div class="set-row stack"><div class="set-info"><div class="set-info-t">Completed plays before Your Radio</div><div class="set-info-d">Before this many completed plays, Octo offers Starter Radio. Afterward it can build Your Radio plus discovery, artist, and genre stations. Default: 10 plays.</div></div><input class="set-input" name="LastFm.MinimumPlays" type="number" min="3" max="100" /></div>
               <div class="set-row stack"><div class="set-info"><div class="set-info-t">Keep completed plays for (days)</div><div class="set-info-d">Older plays stop influencing dynamic stations and are removed from Octo's local listening history. Downloaded music is unaffected. Default: 90 days.</div></div><input class="set-input" name="LastFm.HistoryRetentionDays" type="number" min="7" max="365" /></div>
             </details>
           </form>
@@ -1543,7 +1551,7 @@
               <label class="switch"><input type="checkbox" name="GeneratedPlaylists.Enabled" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">A mix per genre</div><div class="set-info-d">From the genres your files carry. Years and blocklisted genres never get one.</div></div>
+              <div class="set-info"><div class="set-info-t">A mix per genre</div><div class="set-info-d">From the genres your files carry. Genres that are years, and blocklisted genres, never get one.</div></div>
               <label class="switch"><input type="checkbox" name="GeneratedPlaylists.Genres" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
@@ -1558,8 +1566,20 @@
               <div class="set-info"><div class="set-info-t">Countries <span class="set-opt">two-letter codes</span></div><div class="set-info-d">Only these countries get a mix, such as ES, JP. Empty means any country with enough songs.</div></div>
               <input class="set-input" name="GeneratedPlaylists.Countries" type="text" maxlength="200" placeholder="Any country" />
             </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Year mixes</div><div class="set-info-d">A mix per year, such as 1994 Mix, the years with the most songs first.</div><div class="set-info-more">Counted from each listener's library, up to 40,000 songs.</div></div>
+              <label class="switch"><input type="checkbox" name="GeneratedPlaylists.Years" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Artist mixes</div><div class="set-info-d">A mix for each listener's most played artists, such as Radiohead Mix: half the artist's songs, half songs by artists like them from your library.</div><div class="set-info-more">Last.fm names the artists like them. Without a Last.fm key, an artist mix is that artist's songs only. An artist keeps their mix while they stay near the top, so the mixes do not change with every week's plays.</div></div>
+              <label class="switch"><input type="checkbox" name="GeneratedPlaylists.Artists" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Artist mixes for the top <span class="set-opt">artists</span></div><div class="set-info-d">How many of each listener's most played artists get a mix.</div></div>
+              <input class="set-input" name="GeneratedPlaylists.ArtistCount" type="number" min="1" max="20" data-number="true" />
+            </div>
             <div class="set-row stack">
-              <div class="set-info"><div class="set-info-t">Name <span class="set-opt">{0} is the genre, decade or country</span></div><div class="set-info-d">A picture named after a mix in the <code>covers</code> folder beside <code>settings.json</code> replaces its cover.</div></div>
+              <div class="set-info"><div class="set-info-t">Name <span class="set-opt">{0} is the genre, decade, year, country or artist</span></div><div class="set-info-d">A picture named after a mix in the <code>covers</code> folder beside <code>settings.json</code> replaces its cover.</div></div>
               <input class="set-input" name="GeneratedPlaylists.NameFormat" maxlength="60" placeholder="{0} Mix" />
             </div>
             <details class="set-more">
@@ -1578,6 +1598,10 @@
               <div class="set-row">
                 <div class="set-info"><div class="set-info-t">At most <span class="set-opt">country mixes</span></div><div class="set-info-d">The largest first, on top of the genre and decade mixes, so a country never takes a genre's place.</div></div>
                 <input class="set-input" name="GeneratedPlaylists.MaxCountryPlaylists" type="number" min="1" max="100" data-number="true" />
+              </div>
+              <div class="set-row">
+                <div class="set-info"><div class="set-info-t">At most <span class="set-opt">year mixes</span></div><div class="set-info-d">The years with the most songs first, on top of the genre and decade mixes, so a year never takes a genre's place.</div></div>
+                <input class="set-input" name="GeneratedPlaylists.MaxYearPlaylists" type="number" min="1" max="30" data-number="true" />
               </div>
             </details>
           </form>
@@ -1601,7 +1625,7 @@
               <input class="set-input" name="GeneratedPlaylists.RefreshHours" type="number" min="1" max="336" data-number="true" />
             </div>
             <div class="set-row stack">
-              <div class="set-info"><div class="set-info-t">Kept for new songs <span class="set-opt">percent</span> / new for <span class="set-opt">days</span></div><div class="set-info-d">The share of each mix, and of Discovery Mix, kept for songs new to the listener. <strong>0 changes nothing</strong>, and is the default.</div><div class="set-info-more">New means never played, or added within the days given.</div></div>
+              <div class="set-info"><div class="set-info-t">Kept for new songs <span class="set-opt">percent</span> / new for <span class="set-opt">days</span></div><div class="set-info-d">The share of each mix, and of Discovery Radio, kept for songs new to the listener. <strong>0 changes nothing</strong>, and is the default.</div><div class="set-info-more">New means never played, or added within the days given.</div></div>
               <div class="set-grid2">
                 <input class="set-input" name="GeneratedPlaylists.NewShare" type="number" min="0" max="100" data-number="true" aria-label="Percent kept for new tracks" />
                 <input class="set-input" name="GeneratedPlaylists.NewDays" type="number" min="1" max="3650" data-number="true" aria-label="A track counts as new for this many days" />
@@ -1793,6 +1817,14 @@
               </div>
               <label class="switch"><input type="checkbox" name="Soulseek.VerifyDownloads" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Skip covers, karaoke and instrumentals</div>
+                <div class="set-info-d">Never downloads a cover, a karaoke backing track or an instrumental, and leaves them out of search, radio, mixes and charts. On by default.</div>
+                <div class="set-info-more"><p>Songs already in your library are always listed.</p><p>Off, a song whose title asks for a cover, a karaoke take or an instrumental gets one, and such songs from outside your library show in search, radio, mixes and charts again. A plain song never comes back as one either way.</p></div>
+              </div>
+              <label class="switch"><input type="checkbox" name="Soulseek.SkipCoversAndInstrumentals" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
             <div class="set-row stack">
               <div class="set-info">
                 <div class="set-info-t"><svg class="icon brand" aria-hidden="true"><use href="#b-acoustid"/></svg>AcoustID API key</div>
@@ -1808,6 +1840,10 @@
                 <div class="set-info-more"><strong>Raising this makes Octo more permissive</strong>, not less: weaker matches are ignored rather than acted on.</div>
               </div>
               <input class="set-input" name="Soulseek.MinMatchScore" type="number" min="50" max="99" />
+            </div>
+            <div class="set-row" id="recheck-offer" hidden>
+              <div class="set-info"><div class="set-info-t">Re-check Octo's downloads</div><div class="set-info-d">You changed how sure AcoustID must be. Re-check Octo's downloads?</div></div>
+              <button class="btn btn-ghost" type="button" data-recheck-octo><span>Re-check</span></button>
             </div>
             <div class="set-row">
               <div class="set-info">
@@ -2164,150 +2200,93 @@
         <header class="page-header">
           <div>
             <h1>Import</h1>
-            <p>Bring your playlists and liked songs from any music service, see which songs are missing here, keep your playlists as Navidrome playlists, and let Octo fetch the rest a few songs an hour.</p>
+            <p>Bring your playlists and liked songs from any music service. Octo shows which songs you already have, keeps your playlists in Navidrome, and fetches the rest a few songs an hour.</p>
           </div>
         </header>
 
         <div class="notice notice-warn" id="imp-library-problem" hidden></div>
 
-        <div class="set-section">
-          <div class="set-head">
-            <h3 class="set-title">Get my music</h3>
-            <p class="set-desc">TuneMyMusic exports your music from any service to a file for free. Pick your service for the steps, then bring the file back here.</p>
-          </div>
-          <div class="set-card imp-card">
-            <div class="imp-svc-grid" id="imp-services" role="group" aria-label="Your music service"></div>
-            <div class="imp-guide" id="imp-guide-steps" hidden>
-              <ol class="lfm-steps" id="imp-guide-list"></ol>
-              <a class="btn btn-primary" id="imp-guide-open" href="https://www.tunemymusic.com/" target="_blank" rel="noopener noreferrer"><svg class="icon" aria-hidden="true"><use href="#i-arrow-square-out"/></svg><span>Open TuneMyMusic</span></a>
-            </div>
-            <div class="set-row stack">
-              <div class="set-info">
-                <div class="set-info-t">Upload the file</div>
-                <div class="set-info-d">The CSV or TXT from TuneMyMusic, a CSV from <a href="https://exportify.app" target="_blank" rel="noopener">Exportify</a> or Soundiiz, or the zip from Spotify's own <a href="https://www.spotify.com/account/privacy/" target="_blank" rel="noopener">Download your data</a>, which holds every playlist whole.</div>
-                <div class="set-info-more">Any CSV with a title column and an artist column works, and so does a plain list with one Artist - Title a line. Importing a newer file updates the list of the same name.</div>
-              </div>
-              <div class="lfm-connect-row">
-                <input class="set-input" id="imp-file" type="file" accept=".csv,.txt,.json,.zip,text/csv,text/plain,application/json,application/zip" aria-label="File to import" />
-                <button class="btn" id="imp-file-add" type="button">Import</button>
-              </div>
-            </div>
-            <div class="set-row stack">
-              <div class="set-info">
-                <div class="set-info-t">Paste a list</div>
-                <div class="set-info-d">One song a line, written Artist - Title. Octo reads Title - Artist too when that names more of your library.</div>
-              </div>
-              <input class="set-input" id="imp-paste-name" type="text" autocomplete="off" placeholder="Pasted list" aria-label="Name for the pasted list" />
-              <textarea class="set-input imp-paste-box" id="imp-paste-text" rows="6" spellcheck="false" placeholder="Massive Attack - Teardrop" aria-label="Songs, one a line"></textarea>
-              <div class="imp-actions">
-                <button class="btn" id="imp-paste-add" type="button">Import the list</button>
-              </div>
+        <div class="set-section" id="imp-for-section" hidden>
+          <div class="set-card">
+            <div class="set-row imp-for-row">
+              <label class="set-info" for="imp-for"><span class="set-info-t">Import for</span><span class="set-info-d" id="imp-for-line">Lists, playlists and fetched songs go to the person you pick.</span></label>
+              <div class="set-ctrl"><select class="set-input" id="imp-for"></select></div>
             </div>
           </div>
         </div>
 
         <div class="set-section">
           <div class="set-head">
-            <h3 class="set-title">Spotify account</h3>
-            <p class="set-desc">Octo reads your liked songs and playlists through a Spotify app of your own. It only reads; nothing on Spotify changes.</p>
+            <h3 class="set-title">Where is your music now?</h3>
+            <p class="set-desc">Pick the service you use, and Octo shows the way to bring its playlists and liked songs here.</p>
           </div>
-          <div class="set-card">
-            <div class="set-row">
-              <div class="set-info">
-                <div class="set-info-t" id="imp-account-title">Not connected</div>
-                <div class="set-info-d" id="imp-account-line">Loading…</div>
-              </div>
-              <div class="imp-actions">
-                <button class="btn" type="button" id="imp-read" hidden>Read again</button>
-                <button class="btn" type="button" id="imp-disconnect" hidden>Disconnect</button>
-                <button class="btn btn-primary" type="button" id="imp-connect">Connect Spotify</button>
-              </div>
-            </div>
-            <div class="set-row stack" id="imp-paste-row" hidden>
-              <div class="set-info">
-                <div class="set-info-t">Paste where Spotify sent you</div>
-                <div class="set-info-d">Once you allow Octo, Spotify sends your browser to an address that will not open. That is expected. Copy the whole address from the address bar and paste it here.</div>
-              </div>
-              <div class="lfm-connect-row">
-                <input class="set-input" id="imp-paste" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1/callback?code=…" aria-label="The address Spotify sent you to" />
-                <button class="btn btn-primary" id="imp-finish" type="button">Finish</button>
-              </div>
-            </div>
-          </div>
-          <form data-section="imports" class="set-card" id="imports-form">
-            <details class="set-more" id="imp-guide">
-              <summary>Set up your Spotify app</summary>
-              <div class="set-row stack">
-                <div class="set-info">
-                  <ol class="lfm-steps">
-                    <li>Signed in to Spotify, open the <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">developer dashboard</a> and choose <strong>Create app</strong>. Spotify asks that the account that owns the app has Premium.</li>
-                    <li>Any name will do, such as Octo. Tick <strong>Web API</strong>.</li>
-                    <li>Under <strong>Redirect URIs</strong>, add exactly <code id="imp-redirect-shown">http://127.0.0.1/callback</code> and save.</li>
-                    <li>Under <strong>User Management</strong>, add the email of every Spotify account that will connect, up to five. Your own account is there already.</li>
-                    <li>Copy the <strong>Client ID</strong> into the field below and save. There is no secret to copy.</li>
-                  </ol>
+          <div class="set-card imp-card">
+            <div class="imp-svc-grid" id="imp-services" role="group" aria-label="Where your music is now"></div>
+
+            <div class="imp-panel" id="imp-panel" hidden>
+              <div class="imp-panel-head">
+                <span class="imp-panel-logo" id="imp-panel-logo" aria-hidden="true"></span>
+                <div class="imp-panel-words">
+                  <h4 id="imp-panel-title"></h4>
+                  <p id="imp-panel-sub"></p>
                 </div>
               </div>
-            </details>
-            <div class="set-row stack">
-              <div class="set-info">
-                <div class="set-info-t">Client ID</div>
-                <div class="set-info-d">From your Spotify app's settings. Not a secret: Octo signs in with PKCE, which needs none.</div>
+
+              <ol class="imp-steps" id="imp-guide-list" hidden></ol>
+              <a class="btn btn-primary imp-guide-open" id="imp-guide-open" href="https://www.tunemymusic.com/" target="_blank" rel="noopener noreferrer" hidden><svg class="icon" aria-hidden="true"><use href="#i-arrow-square-out"/></svg><span>Open TuneMyMusic</span></a>
+
+              <div class="imp-paste-box" id="imp-paste-box" hidden>
+                <input class="set-input" id="imp-paste-name" type="text" autocomplete="off" placeholder="Name the list" aria-label="Name for the pasted list" />
+                <textarea class="set-input imp-paste-text" id="imp-paste-text" rows="7" spellcheck="false" placeholder="Massive Attack - Teardrop&#10;Portishead - Roads" aria-label="Songs, one a line"></textarea>
+                <div class="imp-actions">
+                  <span class="imp-paste-count" id="imp-paste-count"></span>
+                  <button class="btn btn-primary" id="imp-paste-add" type="button">Import the list</button>
+                </div>
               </div>
-              <input class="set-input" name="Imports.SpotifyClientId" type="text" autocomplete="off" spellcheck="false" placeholder="32 letters and numbers" />
-            </div>
-            <div class="set-row stack">
-              <div class="set-info">
-                <div class="set-info-t">Redirect URI</div>
-                <div class="set-info-d">Exactly as it is on your Spotify app. Spotify takes https, or http on 127.0.0.1, never localhost.</div>
-                <div class="set-info-more">The default, with no port, also lets the Octo apps sign in. If Octo has an https address of its own, use that address followed by <code>/imports/spotify/callback</code>, and Octo finishes the sign-in by itself with nothing to paste.</div>
+
+              <div class="imp-drop" id="imp-drop" hidden>
+                <input class="imp-file-input" id="imp-file" type="file" accept=".csv,.txt,.json,.zip,text/csv,text/plain,application/json,application/zip" aria-describedby="imp-drop-hint" />
+                <label class="imp-drop-idle" for="imp-file" id="imp-drop-idle">
+                  <svg class="icon imp-drop-glyph" aria-hidden="true"><use href="#i-file-arrow-up"/></svg>
+                  <span class="imp-drop-main imp-drop-mouse">Drop the file here, or <span class="imp-drop-pick">choose it</span></span>
+                  <span class="imp-drop-main imp-drop-touch"><span class="imp-drop-pick">Choose the file</span></span>
+                  <span class="imp-drop-hint" id="imp-drop-hint">A CSV or TXT file</span>
+                </label>
+                <div class="imp-drop-run" id="imp-drop-run" role="status" aria-live="polite" hidden>
+                  <div class="imp-drop-file">
+                    <svg class="icon" aria-hidden="true"><use href="#i-file-text"/></svg>
+                    <span class="imp-drop-name" id="imp-drop-name"></span>
+                    <span class="imp-drop-size" id="imp-drop-size"></span>
+                  </div>
+                  <ol class="imp-phases" id="imp-phases"></ol>
+                  <div class="act-bar imp-drop-bar" id="imp-drop-bar"><span></span></div>
+                </div>
               </div>
-              <input class="set-input" name="Imports.SpotifyRedirectUri" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1/callback" />
-            </div>
-            <div class="set-row">
-              <div class="set-info">
-                <div class="set-info-t">Songs an hour</div>
-                <div class="set-info-d">How many missing songs Octo starts fetching in an hour, at most. 0 stops it.</div>
-                <div class="set-info-more">It waits while anyone's own downloads run, and while Soulseek is out, so a heart never waits behind it.</div>
+
+              <div class="imp-ways" id="imp-spotify" hidden>
+                <div class="imp-way stack">
+                  <div class="imp-way-text">
+                    <div class="set-info-t">Or a public playlist or album</div>
+                    <div class="set-info-d">Share, then Copy link, on Spotify. No sign-in needed, though a link shows Octo only the first 100 songs.</div>
+                  </div>
+                  <div class="lfm-connect-row">
+                    <input class="set-input" id="imp-link" type="url" autocomplete="off" spellcheck="false" placeholder="https://open.spotify.com/playlist/…" aria-label="Spotify playlist or album link" />
+                    <button class="btn" id="imp-link-add" type="button">Add</button>
+                  </div>
+                </div>
               </div>
-              <input class="set-input imp-num" name="Imports.SongsPerHour" type="number" min="0" max="600" step="1" />
+
+              <div class="imp-result" id="imp-result" role="status" aria-live="polite" hidden></div>
             </div>
-            <div class="set-row">
-              <div class="set-info">
-                <div class="set-info-t">Read lists again every</div>
-                <div class="set-info-d">Hours. Only lists kept as a playlist or getting their missing songs, so new songs on Spotify reach them. 0 reads them only when you ask.</div>
-              </div>
-              <input class="set-input imp-num" name="Imports.RefreshHours" type="number" min="0" max="168" step="1" />
-            </div>
-          </form>
+          </div>
         </div>
 
         <div class="set-section">
           <div class="set-head">
-            <h3 class="set-title">From a Spotify link</h3>
-            <p class="set-desc">A public playlist or album by its link, with no sign-in.</p>
+            <h3 class="set-title" id="imp-lists-title">Your lists</h3>
+            <p class="set-desc">Open a list to see its songs. <strong>Keep as playlist</strong> makes a Navidrome playlist of it in its own order. <strong>Get missing songs</strong> fetches the songs you do not have yet, and any added to it later.</p>
           </div>
-          <div class="set-card">
-            <div class="set-row stack">
-              <div class="set-info">
-                <div class="set-info-t">Public link</div>
-                <div class="set-info-d">Share, then Copy link, on a Spotify playlist or album. A link shows Octo only the first 100 songs.</div>
-              </div>
-              <div class="lfm-connect-row">
-                <input class="set-input" id="imp-link" type="url" autocomplete="off" spellcheck="false" placeholder="https://open.spotify.com/playlist/…" aria-label="Spotify playlist or album link" />
-                <button class="btn" id="imp-link-add" type="button">Add</button>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="set-section">
-          <div class="set-head">
-            <h3 class="set-title">Your lists</h3>
-            <p class="set-desc"><strong>Keep as playlist</strong> makes a Navidrome playlist of the songs you have, in the list's order, and adds the rest as they arrive. <strong>Get missing songs</strong> hands the rest to the trickle below, and every song added to the list later too.</p>
-          </div>
-          <div class="set-card imp-card">
-            <p class="set-info-d imp-reading" id="imp-reading" hidden></p>
+          <div class="set-card imp-card imp-lists-card">
             <div id="imp-lists" aria-live="polite"></div>
           </div>
           <div class="set-card imp-card" id="imp-detail" hidden></div>
@@ -2315,8 +2294,8 @@
 
         <div class="set-section">
           <div class="set-head">
-            <h3 class="set-title">Trickle</h3>
-            <p class="set-desc">Fetches missing songs one at a time, the way a heart does: your library is checked first, then each download source in its order.</p>
+            <h3 class="set-title">Getting missing songs</h3>
+            <p class="set-desc">One song at a time, the way a heart does: your library is checked first, then each download source in its order.</p>
           </div>
           <div class="set-card imp-card">
             <div class="set-row">
@@ -2333,6 +2312,27 @@
             <div id="imp-trickle-rows"></div>
           </div>
         </div>
+
+        <details class="set-section imp-settings" id="imp-settings">
+          <summary class="imp-settings-summary"><svg class="icon" aria-hidden="true"><use href="#i-gear-six"/></svg><span>Import settings</span><span class="imp-settings-sub">How fast missing songs are fetched</span></summary>
+          <form data-section="imports" class="set-card" id="imports-form">
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Songs an hour</div>
+                <div class="set-info-d">How many missing songs Octo starts fetching in an hour, at most. 0 stops it.</div>
+                <div class="set-info-more">It waits while anyone's own downloads run, and while Soulseek is out, so a heart never waits behind it.</div>
+              </div>
+              <input class="set-input imp-num" name="Imports.SongsPerHour" type="number" min="0" max="600" step="1" />
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Read lists again every</div>
+                <div class="set-info-d">Hours. Only lists from a link that are kept as a playlist or getting their missing songs, so new songs there reach them. 0 reads them only when you ask.</div>
+              </div>
+              <input class="set-input imp-num" name="Imports.RefreshHours" type="number" min="0" max="168" step="1" />
+            </div>
+          </form>
+        </details>
       </section>
 
       <section data-pane="lossy">
@@ -2379,7 +2379,7 @@
         <header class="page-header">
           <div>
             <h1>Library health</h1>
-            <p id="health-overview">Second copies, albums split apart and missing tags, found the way the Octo app finds them. Every fix shows what it changes before anything is written.</p>
+            <p id="health-overview">Second copies, albums split apart, missing tags and tags that disagree with the audio. Every fix shows what it changes before anything is written.</p>
           </div>
           <button class="btn btn-ghost btn-icon" type="button" id="health-refresh" aria-label="Check again" title="Check again">
             <svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg>
@@ -2481,7 +2481,7 @@
               <label class="switch"><input type="checkbox" name="LibraryActions.ReviewEnabled" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Check the library <span class="set-opt">songs an hour</span></div><div class="set-info-d">Also asks about songs that were already there. 0 is off.</div><div class="set-info-more"><p>Only while nothing is downloading, and only the library keeper is asked: the Navidrome admin if they are on the allowlist, otherwise its first name. It stops while 50 of these questions wait for an answer.</p><p>Besides what Review already asks, it asks when AcoustID is sure a song is something else, or when a song runs much longer or shorter than the recording. Nothing is ever acted on by itself.</p></div></div>
+              <div class="set-info"><div class="set-info-t">Check the library <span class="set-opt">songs an hour</span></div><div class="set-info-d">Also asks about songs that were already there. 0 is off.</div><div class="set-info-more"><p>Only while nothing is downloading, and only the library keeper is asked: the Navidrome admin if they are on the allowlist, otherwise its first name. It stops while 50 of these questions wait for an answer.</p><p>Besides what Review already asks, it asks when AcoustID is sure a song is something else, or when a song runs much longer or shorter than the recording. Nothing is acted on by itself unless you turn on replacing below.</p></div></div>
               <input class="set-input" name="LibraryActions.ReviewSweepPerHour" type="number" min="0" max="360" data-number="true" />
             </div>
             <div class="set-row">
@@ -2489,9 +2489,21 @@
               <label class="switch"><input type="checkbox" name="LibraryActions.ReviewSweepOctoDownloads" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Replace a download that clearly is another song</div><div class="set-info-d">Octo fetches the right song through Wrong song instead of asking. Off by default.</div><div class="set-info-more"><p>Only when AcoustID is at least as sure as the minimum match score under Verify downloads, and names a song with another title by another artist, on a file whose artist and title tags are set. Another take or a remaster of the same song, the same artist's song under a title written another way, a file with no tags, a file whose ISRC is also on the song AcoustID heard or cannot be checked, a song you starred or rated, a song of the wrong length, and anything AcoustID is not sure of are still asked about in Review.</p><p>Needs Wrong song on and dry run off. It asks as the library keeper, and Review keeps a note of what Octo heard and how sure it was.</p></div></div>
+              <label class="switch"><input type="checkbox" name="LibraryActions.ReviewSweepAutoReplace" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">At most <span class="set-opt">a day</span></div><div class="set-info-d">How many songs Octo replaces by itself in a day. The rest wait in Review, as do the rest of a day with three replacements that failed.</div></div>
+              <input class="set-input" name="LibraryActions.ReviewSweepAutoReplacePerDay" type="number" min="1" max="100" data-number="true" />
+            </div>
+            <div class="set-row">
               <div class="set-info"><div class="set-info-t">Library check</div><div class="set-info-d" id="review-sweep-status">Not loaded yet.</div></div>
               <button class="btn btn-ghost" type="button" id="review-sweep-toggle"><span>Pause</span></button>
               <button class="btn btn-ghost" type="button" id="review-sweep-reset"><svg class="icon" aria-hidden="true"><use href="#i-arrow-counter-clockwise"/></svg><span>Start over</span></button>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Re-check Octo's downloads</div><div class="set-info-d" id="review-sweep-recheck-status">Checks every song Octo downloaded once more, then stops. Useful after changing the minimum match score.</div><div class="set-info-more">At least 60 songs an hour, even with the library check at 0. Songs already answered in Review are not asked about again.</div></div>
+              <button class="btn btn-ghost" type="button" id="review-sweep-recheck" data-recheck-octo><span>Re-check</span></button>
             </div>
             <details class="set-more">
               <summary>Playlist name and size</summary>
@@ -2513,12 +2525,30 @@
 
         <div class="set-section">
           <div class="set-head">
+            <h3 class="set-title">Tags against the audio</h3>
+            <p class="set-desc">Octo listens to the songs in your library and checks their tags say what the audio is. What disagrees shows in Library health.</p>
+          </div>
+          <form data-section="library-actions-tags" class="set-card">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Check <span class="set-opt">songs an hour</span></div><div class="set-info-d">0 is off. Only while nothing is downloading.</div><div class="set-info-more"><p>Each song is fingerprinted with AcoustID, and its exact length picks the one recording it is. Then its tags are held against that recording: an album that names another take, a live or instrumental take titled plainly, ids of another recording, a live copy beside the studio copy.</p><p>Stray spaces in titles and albums are taken off by the check itself when library actions may change files. Everything else waits for you in Library health, where every fix can be undone.</p></div></div>
+              <input class="set-input" name="LibraryActions.TagCheckPerHour" type="number" min="0" max="360" data-number="true" />
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Tag check</div><div class="set-info-d" id="tag-check-status">Not loaded yet.</div></div>
+              <button class="btn btn-ghost" type="button" id="tag-check-toggle"><span>Pause</span></button>
+              <button class="btn btn-ghost" type="button" id="tag-check-reset"><svg class="icon" aria-hidden="true"><use href="#i-arrow-counter-clockwise"/></svg><span>Start over</span></button>
+            </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
             <h3 class="set-title">Duplicates</h3>
             <p class="set-desc">Songs your library holds more than once, side by side in a playlist, the best copy first. Needs library actions on.</p>
           </div>
           <form data-section="library-actions-duplicates" class="set-card">
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Duplicates playlist</div><div class="set-info-d">Octo only points the copies out; you decide which goes.</div><div class="set-info-more"><p>Lossless comes before lossy, then the higher bitrate. Two files count as copies only when they carry the same MusicBrainz recording and are the same version, so a live take, a remix or a radio edit never is one.</p><p>Remove a copy you do not want with an action playlist. Keep, or taking a copy out of the playlist, means the copies are on purpose and stops Octo asking.</p></div></div>
+              <div class="set-info"><div class="set-info-t">Duplicates playlist</div><div class="set-info-d">Octo only points the copies out; you decide which goes.</div><div class="set-info-more"><p>Lossless comes before lossy, then the higher bitrate. Two files count as copies only when they carry the same MusicBrainz recording and are the same version, so a live take, a remix or a radio edit never is one.</p><p>Remove a copy you do not want with an action playlist. Keep, or taking a copy out of the playlist, means the copies are on purpose and stops Octo asking.</p><p>To fix songs from any app, switch on the Fix duplicates action below: adding any copy of a song to its playlist fixes that song, and adding the whole Duplicates playlist fixes every song in it. With Keep every rated copy on (Library health page), a copy anyone hearted or rated always stays. Both playlists describe this in the app.</p></div></div>
               <label class="switch"><input type="checkbox" name="LibraryActions.DuplicatesEnabled" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
@@ -2542,7 +2572,7 @@
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title">The actions</h3>
-            <p class="set-desc">Seven actions. Rename each one, switch it on, and choose the star rating that asks for it; 0 stars leaves it playlist-only. Keep removes nothing: it answers Review with &ldquo;this is right&rdquo;. Wrong lyrics and Wrong cover change only the lyrics or the album&rsquo;s cover, never the song itself, and start with no star.</p>
+            <p class="set-desc">Eight actions. Rename each one, switch it on, and choose the star rating that asks for it; 0 stars leaves it playlist-only. Keep removes nothing: it answers Review with &ldquo;this is right&rdquo;. Wrong lyrics and Wrong cover change only the lyrics or the album&rsquo;s cover, never the song itself, and start with no star. Fix duplicates fixes every copy of a song from any app, the way Library health&rsquo;s Fix these copies does: add any one copy to its playlist. With Keep every rated copy on (Library health page), every copy anyone hearted or rated stays. It starts with no star and needs Delete on.</p>
           </div>
           <form data-section="library-actions-list" class="set-card" id="library-actions-list-form">
             <div id="library-action-list" class="genre-mapping-list"></div>
@@ -2636,6 +2666,20 @@
               <button class="btn btn-ghost" type="button" id="notices-refresh">Show questions</button>
             </div>
             <div id="notices-list"></div>
+          </div>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Ratings Octo did not act on</h3>
+            <p class="set-desc">The last 50 star ratings that asked for an action and got none, or only a rehearsal, and why. Kept until Octo restarts.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Recent ratings</div><div class="set-info-d">Needs your Navidrome admin sign-in, like the history above.</div></div>
+              <button class="btn btn-ghost" type="button" id="ignored-ratings-refresh">Show ratings</button>
+            </div>
+            <div id="ignored-ratings-list"></div>
           </div>
         </div>
       </section>
@@ -2951,7 +2995,7 @@
           <p>Octo sits in front of your Navidrome library and adds discovery and downloads to it. Search shows songs you don't own beside your own. Radio on any song finds more through Last.fm and plays previews from YouTube. Heart a song you don't own and Octo fetches it through Soulseek, YouTube or your own Lidarr.</p>
         </div>
 
-        <div class="info-card" id="update-card">
+        <div class="info-card" id="update-card" tabindex="-1">
           <h3 class="info-card-title">Version</h3>
           <p>This is Octo <code id="meta-version">unknown</code>. Please include it in any bug report. Releases are named by date, so <code>2026.07.29</code> is the release cut that day.</p>
           <p class="update-line" id="update-line" aria-live="polite">Looking for new releases…</p>
@@ -2999,6 +3043,11 @@
         <div class="info-card">
           <h3 class="info-card-title">When a restart is needed</h3>
           <p>Settings marked <span class="restart-badge restart-badge-inline">Restart</span> take effect after Octo restarts; everything else applies within about a second of saving. Anything waiting on a restart is listed at the top of every page, and <strong>Restart</strong> in the sidebar applies it.</p>
+        </div>
+
+        <div class="info-card">
+          <h3 class="info-card-title">Credits</h3>
+          <p>Place data from <a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a> (<a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>), converted and simplified by Octo. The apps use it to find live radio near a postal code or a city.</p>
         </div>
       </section>
 

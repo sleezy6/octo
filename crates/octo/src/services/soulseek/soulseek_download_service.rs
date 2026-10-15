@@ -19,7 +19,8 @@ use std::time::{Duration, Instant, SystemTime};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::TryStreamExt;
-use octo_core::common::{dotnet, live_version};
+use octo_core::common::dotnet;
+use octo_core::fingerprint::recording_identity::RecordingKind;
 use octo_core::fingerprint::{InconclusiveReason, VerificationResult, VerificationVerdict};
 use octo_core::models::domain::{Album, Song};
 use octo_core::notifications::{NotificationEvent, NotificationEventType};
@@ -339,7 +340,7 @@ impl SoulseekDownloadService {
                 routing.artist.as_deref(),
                 routing.title.as_deref(),
                 song.isrc.as_deref().or(routing.isrc.as_deref()),
-                !live_version::requested(routing.title.as_deref(), routing.album.as_deref()),
+                &self.verification.takes_for_routing(routing),
             )
             .await;
         if verdict.verdict == VerificationVerdict::Mismatch {
@@ -348,12 +349,28 @@ impl SoulseekDownloadService {
                 verdict.describe(),
                 percent(verdict.score)
             );
+            base.log_song_step_heard(
+                song,
+                acquisition_event_kinds::CHECK,
+                &mismatch_text(&verdict),
+                Some("Not the song asked for; thrown away"),
+                verdict.heard(),
+            );
             // Swept with the job folders when it cannot be removed now.
             let _ = std::fs::remove_file(&local);
             return Err(file_not_found(format!(
                 "AcoustID identified Lidarr's file as {}",
                 verdict.describe()
             )));
+        }
+        if let Some(said) = verdict.acoust_id_text() {
+            base.log_song_step_heard(
+                song,
+                acquisition_event_kinds::CHECK,
+                "Checked the recording",
+                Some(&sentence(&said)),
+                verdict.heard(),
+            );
         }
         let spectrum = self
             .verification
@@ -561,7 +578,7 @@ impl SoulseekDownloadService {
                 r.artist.as_deref(),
                 r.title.as_deref(),
                 song.isrc.as_deref().or(r.isrc.as_deref()),
-                false,
+                &self.verification.takes_for_routing(&r),
             )
             .await;
         if verdict.verdict == VerificationVerdict::Mismatch {
@@ -577,15 +594,25 @@ impl SoulseekDownloadService {
                 "AcoustID says the YouTube file for '{artist} - {title}' is {}; keeping it and asking about it",
                 verdict.describe()
             );
-            base.log_step(
+            base.log_step_heard(
                 &track_key,
                 acquisition_event_kinds::CHECK,
-                &format!("AcoustID says this is {}", verdict.describe()),
+                &mismatch_text(&verdict),
                 Some("YouTube has no other copy, so it is kept and goes to your Review playlist"),
+                verdict.heard(),
             );
             verdict.verdict = VerificationVerdict::Inconclusive;
             verdict.reason = InconclusiveReason::SourceDisagreed;
         } else {
+            if let Some(said) = verdict.acoust_id_text() {
+                base.log_step_heard(
+                    &track_key,
+                    acquisition_event_kinds::CHECK,
+                    "Checked the recording",
+                    Some(&sentence(&said)),
+                    verdict.heard(),
+                );
+            }
             verdict.apply_tags_to(song);
         }
         song.verification = Some(Box::new(verdict));
@@ -804,7 +831,7 @@ impl SoulseekDownloadService {
                 r.artist.as_deref(),
                 r.title.as_deref(),
                 song.isrc.as_deref().or(r.isrc.as_deref()),
-                false,
+                &self.verification.takes_for_routing(&r),
             )
             .await;
         if verdict.verdict == VerificationVerdict::Mismatch {
@@ -1436,6 +1463,9 @@ impl SoulseekDownloadService {
         let excluded = self.excluded_folders().await;
 
         let mut last_error: Option<String> = None;
+        // The last file AcoustID refused, as the error it left and the reason in words ("is a
+        // live recording, from 'X'"), so a failure that ends on it leads with why.
+        let mut last_refusal: Option<(String, String)> = None;
         let mut start_announced = false;
 
         // A file that claims to be lossless and whose spectrum says it was made from a lossy
@@ -1445,7 +1475,7 @@ impl SoulseekDownloadService {
         let mut reserve: Option<TranscodedReserve> = None;
 
         let isrc = download.song.isrc.clone().or(routing.isrc.clone());
-        let refuse_live = !live_version::requested(routing.title.as_deref(), routing.album.as_deref());
+        let takes = self.verification.takes_for_routing(routing);
 
         // Every peer tried, across the album folder's copy and the search after it.
         let mut tried = 0;
@@ -1753,7 +1783,7 @@ impl SoulseekDownloadService {
                             routing.artist.as_deref(),
                             routing.title.as_deref(),
                             isrc.as_deref(),
-                            refuse_live,
+                            &takes,
                         )
                         .await;
                     // fpcalc reports a file that is not there as undecodable audio, which is a Mismatch.
@@ -1771,7 +1801,7 @@ impl SoulseekDownloadService {
                                 routing.artist.as_deref(),
                                 routing.title.as_deref(),
                                 isrc.as_deref(),
-                                refuse_live,
+                                &takes,
                             )
                             .await;
                     }
@@ -1800,13 +1830,24 @@ impl SoulseekDownloadService {
                         );
                         discard_rejected_download(&local_path, attempt_started_utc);
                         self.deny_candidate(hit, routing, &verdict.deny_reason);
-                        base.log_step(
+                        base.log_step_heard(
                             &track_key,
                             acquisition_event_kinds::CHECK,
-                            &format!("AcoustID says this is {}", verdict.describe()),
-                            Some("Not the song asked for; thrown away"),
+                            &mismatch_text(&verdict),
+                            Some(
+                                if verdict.kind.is_some_and(|kind| kind != RecordingKind::Studio) {
+                                    "Not the take asked for; thrown away"
+                                } else {
+                                    "Not the song asked for; thrown away"
+                                },
+                            ),
+                            verdict.heard(),
                         );
-                        last_error = Some(format!("AcoustID identified the file as {}", verdict.describe()));
+                        let identified = format!("AcoustID identified the file as {}", verdict.describe());
+                        if !verdict.deny_reason.is_empty() {
+                            last_refusal = Some((identified.clone(), verdict.deny_reason.clone()));
+                        }
+                        last_error = Some(identified);
                         continue;
                     }
 
@@ -1912,15 +1953,16 @@ impl SoulseekDownloadService {
                             ""
                         }
                     );
-                    base.log_step(
+                    base.log_step_heard(
                         &track_key,
                         acquisition_event_kinds::CHECK,
                         "Passed the checks",
                         Some(&checks_passed_text(
-                            verdict.verdict == VerificationVerdict::Confirmed,
+                            &verdict,
                             !spectrum.is_likely_lossy() && self.settings.detect_transcodes,
                             picked_unmatched,
                         )),
+                        verdict.heard(),
                     );
                     return Ok(accept(&mut download.song, local_path, hit, verdict, None));
                 }
@@ -2049,8 +2091,20 @@ impl SoulseekDownloadService {
             last_error = Some("the copy held back is no longer on disk".into());
         }
 
+        // The first sentence is what a person is shown, so a failure that ended on a refused file
+        // leads with why it was refused.
+        let refused = last_refusal
+            .filter(|(error, _)| last_error.as_deref() == Some(error.as_str()))
+            .map(|(_, reason)| reason);
+        let lead = match (refused, tried) {
+            (Some(reason), 1) => format!("The Soulseek copy of '{artist} - {title}' {reason}"),
+            (Some(reason), _) => {
+                format!("All {tried} Soulseek copies of '{artist} - {title}' failed; the last one {reason}")
+            }
+            (None, _) => format!("All {tried} Soulseek peer attempts failed for '{artist} - {title}'"),
+        };
         anyhow::bail!(
-            "All {tried} Soulseek peer attempts failed for '{artist} - {title}'. Last error: {}. \
+            "{lead}. Last error: {}. \
              If slskd shows these transfers as Completed, slskd's downloads directory is not the directory Octo watches ({}); \
              set SLSKD_DOWNLOADS_DIR=/music on the slskd container (see issue #17).",
             last_error.unwrap_or_default(),
@@ -2059,23 +2113,49 @@ impl SoulseekDownloadService {
     }
 }
 
-/// The checks a kept file passed, in words. Without AcoustID's word, the file's name and length
-/// are what stand behind it, except for a copy someone picked whose name or folder did not match
-/// the song: then it is their pick, and the log says so rather than claim a check that never
-/// passed.
-pub fn checks_passed_text(confirmed: bool, really_lossless: bool, picked_unmatched: bool) -> String {
-    let mut parts = vec!["the right length"];
-    parts.push(if confirmed {
-        "AcoustID: the same recording"
-    } else if picked_unmatched {
-        "AcoustID could not say, and its name or folder did not fit the song: kept because you picked it"
+/// The checks a kept file passed, in words, with AcoustID's numbers when it answered. Without
+/// AcoustID's word, the file's name and length are what stand behind it, except for a copy
+/// someone picked whose name or folder did not match the song: then it is their pick, and the
+/// log says so rather than claim a check that never passed. A file kept on its ISRC says so.
+pub fn checks_passed_text(
+    verdict: &VerificationResult,
+    really_lossless: bool,
+    picked_unmatched: bool,
+) -> String {
+    let said = verdict.acoust_id_text();
+    let acoust_id = if verdict.verdict == VerificationVerdict::Confirmed {
+        said.unwrap_or_else(|| "AcoustID: the same recording".to_string())
     } else {
-        "AcoustID could not say, so the name and length decide"
-    });
+        let said = said.unwrap_or_else(|| "AcoustID could not say".to_string());
+        if verdict.evidence.as_deref().is_some_and(|e| !e.is_empty()) {
+            said
+        } else if picked_unmatched {
+            format!("{said}, and its name or folder did not fit the song: kept because you picked it")
+        } else {
+            format!("{said}, so the name and length decide")
+        }
+    };
+    let mut parts = vec!["the right length".to_string(), acoust_id];
     if really_lossless {
-        parts.push("the spectrum: really lossless");
+        parts.push("the spectrum: really lossless".to_string());
     }
     parts.join("; ")
+}
+
+/// The line for a file AcoustID named as another recording, with how sure it was.
+pub fn mismatch_text(verdict: &VerificationResult) -> String {
+    verdict
+        .acoust_id_text()
+        .unwrap_or_else(|| format!("AcoustID says this is {}", verdict.describe()))
+}
+
+/// The words with their first letter upper-cased, for a line of their own.
+fn sentence(words: &str) -> String {
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// How many peers a list of files comes from, any case.
@@ -2153,6 +2233,21 @@ impl SoulseekDownloadService {
             ranked,
             queries: asked,
         })
+    }
+
+    /// What take a file already in the library is, by its audio: the studio take, a live take,
+    /// an instrumental. None when fingerprinting is off or nothing was decided.
+    pub async fn take_of_file(&self, path: &str, artist: &str, title: &str) -> Option<RecordingKind> {
+        if !self.verification.is_fingerprinting_enabled() {
+            return None;
+        }
+        let verdict = self
+            .verification
+            .verify_in_background(path, Some(artist), Some(title))
+            .await;
+        (verdict.verdict == VerificationVerdict::Confirmed)
+            .then_some(verdict.kind)
+            .flatten()
     }
 
     /// The rejected-peer list Find songs judges copies against.

@@ -199,6 +199,9 @@ pub struct TagEvidence {
     pub fingerprint_threshold: f64,
     /// Compared ordinally, ignoring case.
     pub fingerprinted_recording_ids: IgnoreCaseSet,
+    /// The one recording the file's audio was found to be, when verification decided it. The
+    /// album is then chosen among that recording's releases only.
+    pub identity: Option<crate::fingerprint::recording_identity::Identity>,
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use crate::common::dotnet::{
     eq_ignore_case, is_blank, is_digit_utf16, is_letter_utf16, to_lower_invariant, utf16_len,
 };
 use crate::common::song_identity::{ArtistAgreement, SongIdentity, SongVerdict};
+use crate::fingerprint::recording_identity::RecordingKind;
 use crate::fingerprint::track_match_comparer::TrackMatchComparer;
 use crate::tagging::matching_settings::MatchingSettings;
 use crate::tagging::tag_evidence::{ReleaseCandidate, TagEvidence, TagSource};
@@ -80,6 +81,7 @@ impl ReleaseDistance {
     pub const SOURCE_WEIGHT: f64 = 2.0;
     pub const YEAR_WEIGHT: f64 = 1.0;
     pub const COUNTRY_WEIGHT: f64 = 0.5;
+    pub const TAKE_WEIGHT: f64 = 6.0;
 
     pub const LENGTH_GRACE_SECONDS: i32 = 5;
     pub const LENGTH_MAX_SECONDS: i32 = 30;
@@ -116,6 +118,22 @@ impl ReleaseDistance {
             Self::artist_penalty(&request.artist, &candidate.artist_credit, &candidate.artists),
             Self::ARTIST_WEIGHT,
         );
+
+        // A release whose name says it is another take than the audio ("The Black Parade
+        // (instrumentals)" for the studio take) is never the file's album, whatever else agrees.
+        if let Some(identity) = &evidence.identity {
+            let asked = RecordingKind::requested_by(&request.title);
+            let names_another = [
+                candidate.release_title.as_deref(),
+                candidate.group_title.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|title| identity.contradicted_by(title, &asked).is_some());
+            if names_another {
+                distance.add("take", 1.0, Self::TAKE_WEIGHT);
+            }
+        }
 
         if file.duration_seconds > 0
             && let Some(length) = candidate.length_seconds.filter(|&length| length > 0)

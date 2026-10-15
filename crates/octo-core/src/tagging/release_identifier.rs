@@ -25,6 +25,7 @@ use tracing::debug;
 use crate::common::dotnet::{eq_ignore_case, is_blank};
 use crate::common::song_identity::SongIdentity;
 use crate::fingerprint::acoust_id_client::AcoustIdLookup;
+use crate::fingerprint::recording_identity::{self, Identity, RecordingKind};
 use crate::metadata::deezer_metadata_service::{CatalogCandidates, FullTrackMeta};
 use crate::models::domain::song::Song;
 use crate::settings::SettingsStore;
@@ -218,7 +219,12 @@ impl ReleaseIdentifier {
         let lookup = song.verification.as_ref().and_then(|v| v.lookup.as_ref());
         let threshold = settings.fingerprint_threshold;
         let fingerprinted = Self::fingerprinted_ids(lookup, threshold);
+        let identity = Identity::of(song.verification.as_deref());
+        let request = Self::without_contradicted_album(request, identity.as_ref(), &mut notes);
         let mut candidates = CandidateSources::from_fingerprint(lookup, threshold);
+        if let (Some(identity), Some(lookup)) = (&identity, lookup) {
+            Self::keep_identified_takes(&mut candidates, identity, lookup, &mut notes);
+        }
 
         let music_brainz = self
             .music_brainz
@@ -323,6 +329,7 @@ impl ReleaseIdentifier {
             file,
             fingerprint_threshold: threshold,
             fingerprinted_recording_ids: fingerprinted,
+            identity,
         };
         let mut plan = ReleaseChooser::choose(&evidence, &candidates, &settings, None);
         plan.catalog_best = catalog_best;
@@ -388,6 +395,71 @@ impl ReleaseIdentifier {
         plan.stage_seconds
             .insert("identify".to_string(), started.elapsed().as_secs_f64());
         Ok(plan)
+    }
+
+    /// The request without an album that names a take the audio is not: a replacement held to
+    /// "The Black Parade (instrumentals)" whose audio is the studio take is not tagged onto the
+    /// promo of instrumentals. The album is a hint about the file, never a wish for a take.
+    pub fn without_contradicted_album(
+        mut request: TagRequest,
+        identity: Option<&Identity>,
+        notes: &mut Vec<String>,
+    ) -> TagRequest {
+        let (Some(identity), Some(album)) = (identity, request.album.clone()) else {
+            return request;
+        };
+        let asked = RecordingKind::requested_by(&request.title);
+        if let Some(named) = identity.contradicted_by(&album, &asked) {
+            notes.push(format!(
+                "the album '{album}' names {}, which this file is not, so it was not used",
+                named.described()
+            ));
+            request.album = None;
+            request.track = None;
+            request.disc = None;
+        }
+        request
+    }
+
+    /// Leaves out the fingerprint's releases of recordings the audio is not: every other
+    /// recording when the exact length chose this one, otherwise those of another kind of take.
+    /// The album then always comes from the recording the file is.
+    pub fn keep_identified_takes(
+        candidates: &mut Vec<ReleaseCandidate>,
+        identity: &Identity,
+        lookup: &AcoustIdLookup,
+        notes: &mut Vec<String>,
+    ) {
+        let kinds: std::collections::HashMap<String, RecordingKind> = lookup
+            .results
+            .iter()
+            .flat_map(|result| &result.recordings)
+            .map(|recording| {
+                (
+                    crate::common::dotnet::to_lower_invariant(&recording.recording_id),
+                    recording_identity::kind_of(recording, None),
+                )
+            })
+            .collect();
+        let before = candidates.len();
+        candidates.retain(|candidate| {
+            candidate.source != TagSource::Fingerprint
+                || candidate.recording_id.as_deref().is_none_or(|id| {
+                    let kind = kinds
+                        .get(&crate::common::dotnet::to_lower_invariant(id))
+                        .copied()
+                        .unwrap_or(RecordingKind::Studio);
+                    identity.admits(id, kind)
+                })
+        });
+        let dropped = before - candidates.len();
+        if dropped > 0 {
+            notes.push(format!(
+                "the audio is {} ({}); {dropped} releases of other takes were left out",
+                identity.kind.described(),
+                identity.recording_id
+            ));
+        }
     }
 
     /// The release lookup within its own budget: None when the budget runs out.

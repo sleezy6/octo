@@ -31,6 +31,7 @@ use crate::app::{AppState, TestServices};
 use crate::http::pipeline::App;
 use crate::services::i_download_service::{AudioStream, DirectStreamInfo, IDownloadService};
 use crate::services::last_fm::icy_metadata_stream::DEFAULT_INTERVAL;
+use crate::services::last_fm::last_fm_radio_recommendation_service::STATION_MEMORY;
 use crate::services::last_fm::{ILastFmRadioAudioTranscoder, IRadioTuneInSelector};
 use crate::services::library::ReplacementHandoff;
 use octo_core::models::download::DownloadInfo;
@@ -299,6 +300,11 @@ impl Respond for RadioUpstream {
                 }
                 let search = query_value(request, "query").unwrap_or_default();
                 let lower = search.to_lowercase();
+                if lower.contains("halo") {
+                    return json(&ok_json(
+                        r#""searchResult3":{"song":[{"id":"local-halo","artist":"Beyoncé","title":"Halo","album":"I Am... Sasha Fierce","duration":180}]}"#,
+                    ));
+                }
                 let ordinal = if lower.contains("four") {
                     "four"
                 } else if lower.contains("three") {
@@ -489,7 +495,7 @@ impl RadioFixture {
             &[LastFmRadioStation {
                 id: self.station_id(),
                 key: "your-mix".into(),
-                name: "Your Mix".into(),
+                name: "Your Radio".into(),
                 owner: "alice".into(),
                 kind: LastFmRadioStationKind::YourMix,
                 personalized: true,
@@ -526,7 +532,7 @@ impl RadioFixture {
                 LastFmRadioStation {
                     id: station_id("alice", "discovery"),
                     key: "discovery".into(),
-                    name: "Discovery Mix".into(),
+                    name: "Discovery Radio".into(),
                     owner: "alice".into(),
                     kind: LastFmRadioStationKind::Discovery,
                     personalized: true,
@@ -552,7 +558,7 @@ impl RadioFixture {
         get_string(&self.app, uri).await
     }
 
-    /// The stream URL the station list published for "Your Mix".
+    /// The stream URL the station list published for "Your Radio".
     async fn your_mix_stream_path(&self) -> String {
         let body = self
             .station_list("/rest/getInternetRadioStations?u=alice&t=token&s=salt&f=json")
@@ -562,8 +568,8 @@ impl RadioFixture {
             .as_array()
             .unwrap()
             .iter()
-            .find(|item| item["name"] == "Your Mix")
-            .expect("Your Mix is listed")["streamUrl"]
+            .find(|item| item["name"] == "Your Radio")
+            .expect("Your Radio is listed")["streamUrl"]
             .as_str()
             .unwrap()
             .to_string();
@@ -656,12 +662,45 @@ async fn subsonic_playlist_list_merges_ready_station_after_successful_authentica
         assert_eq!(response.status, StatusCode::OK, "{format}");
         let body = &response.body;
         assert!(body.contains("Native Playlist"), "{format}: {body}");
-        assert!(body.contains("Your Mix"), "{format}: {body}");
+        assert!(body.contains("Your Radio"), "{format}: {body}");
         assert!(body.contains(&fixture.station_id()), "{format}");
         assert!(
-            body.find("Native Playlist").unwrap() < body.find("Your Mix").unwrap(),
+            body.find("Native Playlist").unwrap() < body.find("Your Radio").unwrap(),
             "{format}"
         );
+        // The station's row says it is a station; Navidrome's own playlist says nothing.
+        // Rows are found by the station's id and the playlist's name.
+        let station_id = fixture.station_id();
+        if format == "json" {
+            let document = response.json();
+            let rows = document["subsonic-response"]["playlists"]["playlist"]
+                .as_array()
+                .unwrap_or_else(|| panic!("a playlist list: {body}"));
+            let station = rows
+                .iter()
+                .find(|row| row["id"] == station_id.as_str())
+                .unwrap_or_else(|| panic!("the station's row: {body}"));
+            let native = rows
+                .iter()
+                .find(|row| row["name"] == "Native Playlist")
+                .unwrap_or_else(|| panic!("the playlist's row: {body}"));
+            assert_eq!(station["octoGroup"], "station", "{body}");
+            assert!(native.get("octoGroup").is_none(), "{body}");
+        } else {
+            // A row's attributes, up to the end of its opening tag.
+            let row = |marker: &str| -> &str {
+                body.split("<playlist ")
+                    .skip(1)
+                    .map(|row| row.split('>').next().unwrap_or(row))
+                    .find(|row| row.contains(marker))
+                    .unwrap_or_else(|| panic!("a row with {marker}: {body}"))
+            };
+            assert!(
+                row(&format!(r#"id="{station_id}""#)).contains(r#"octoGroup="station""#),
+                "{body}"
+            );
+            assert!(!row(r#"name="Native Playlist""#).contains("octoGroup"), "{body}");
+        }
     }
 }
 
@@ -678,10 +717,14 @@ async fn subsonic_playlist_detail_is_owned_read_only_stable_and_prewarmed() {
             .await;
         assert_eq!(response.status, StatusCode::OK);
         let body = &response.body;
-        assert!(body.contains("Your Mix"), "{format}: {body}");
+        assert!(body.contains("Your Radio"), "{format}: {body}");
         assert!(body.contains("local-one"), "{format}: {body}");
         assert!(body.contains("readonly"), "{format}");
         assert!(body.contains("validUntil"), "{format}");
+        assert!(
+            body.contains(r#""octoGroup":"station""#) || body.contains(r#"octoGroup="station""#),
+            "{format}: {body}"
+        );
         let metadata = fixture.metadata.clone();
         until("the prewarm", || !metadata.prewarms.lock().is_empty()).await;
         assert_eq!(*fixture.metadata.prewarms.lock(), [8], "{format}");
@@ -699,7 +742,7 @@ async fn subsonic_playlist_detail_rejects_wrong_user_and_reserved_mutations() {
         ))
         .await
         .body;
-    assert!(!wrong_owner.contains("Your Mix"), "{wrong_owner}");
+    assert!(!wrong_owner.contains("Your Radio"), "{wrong_owner}");
 
     for endpoint in ["updatePlaylist", "deletePlaylist"] {
         let body = fixture
@@ -720,7 +763,7 @@ async fn authentication_failure_does_not_expose_stations() {
     let fixture = RadioFixture::new(Options::default()).await;
     fixture.install_station("");
     let list = fixture.get("/rest/getPlaylists?u=bad&f=json").await.body;
-    assert!(!list.contains("Your Mix"), "{list}");
+    assert!(!list.contains("Your Radio"), "{list}");
     assert!(list.contains("failed"), "{list}");
 }
 
@@ -766,6 +809,68 @@ async fn playlist_materialization_applies_configured_explicit_filter() {
         .collect();
     assert!(!ids.contains(&"explicit"), "{ids:?}");
     assert!(ids.contains(&"clean"), "{ids:?}");
+}
+
+#[tokio::test]
+async fn playlist_materialization_follows_skip_covers_and_instrumentals_as_it_is_set_now() {
+    let metadata = TestMetadata::answering(|artist, title, duration| {
+        let title = match title {
+            "Song One" => "Song One (Instrumental)",
+            "Song Two" => "Song Two (Karaoke Version)",
+            "Song Four" => "Song Four (Cover)",
+            other => other,
+        };
+        vec![Song {
+            id: format!("ext-{title}"),
+            artist: artist.into(),
+            title: title.into(),
+            album: "Album".into(),
+            duration,
+            is_local: false,
+            ..Default::default()
+        }]
+    });
+    let fixture = RadioFixture::with_metadata(Options::default(), metadata).await;
+    fixture
+        .upstream
+        .return_no_local_matches
+        .store(true, Ordering::SeqCst);
+    fixture.install_station("");
+    let entries = || async {
+        let body = fixture
+            .get(&format!(
+                "/rest/getPlaylist?id={}&u=alice&t=token&s=salt&f=json",
+                fixture.station_id()
+            ))
+            .await
+            .json();
+        body["subsonic-response"]["playlist"]["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|song| song["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let takes = [
+        "ext-Song One (Instrumental)".to_string(),
+        "ext-Song Two (Karaoke Version)".to_string(),
+        "ext-Song Four (Cover)".to_string(),
+    ];
+
+    // On by default.
+    let skipped = entries().await;
+    for take in &takes {
+        assert!(!skipped.contains(take), "{take} in {skipped:?}");
+    }
+    assert!(skipped.contains(&"ext-Song Three".to_string()), "{skipped:?}");
+
+    let mut off = fixture.state.settings.current().as_ref().clone();
+    off.soulseek.skip_covers_and_instrumentals = false;
+    fixture.state.settings.set(off);
+    let listed = entries().await;
+    for take in &takes {
+        assert!(listed.contains(take), "{take} in {listed:?}");
+    }
 }
 
 #[tokio::test]
@@ -849,7 +954,7 @@ async fn internet_radio_list_merges_ordinary_and_generated_stations_with_opaque_
         .await
         .body;
         assert!(body.contains("Native Radio"), "{format}: {body}");
-        assert!(body.contains("Your Mix"), "{format}: {body}");
+        assert!(body.contains("Your Radio"), "{format}: {body}");
         assert!(body.contains("/radio/stream/"), "{format}");
         let cover = if format == "json" {
             format!("\"coverArt\":\"{}\"", fixture.station_id())
@@ -872,10 +977,10 @@ async fn internet_radio_list_publishes_starter_in_same_response_then_warms_runwa
     fixture.install_station("");
     let url = "/rest/getInternetRadioStations?u=alice&t=token&s=salt&f=json";
 
-    assert!(fixture.station_list(url).await.contains("Your Mix"));
+    assert!(fixture.station_list(url).await.contains("Your Radio"));
     fixture.wait_for_calls(READY_POOL_SIZE).await;
     assert_eq!(fixture.transcoder.calls(), READY_POOL_SIZE);
-    assert!(fixture.station_list(url).await.contains("Your Mix"));
+    assert!(fixture.station_list(url).await.contains("Your Radio"));
     assert_eq!(fixture.transcoder.calls(), READY_POOL_SIZE);
 }
 
@@ -898,7 +1003,7 @@ async fn startup_warm_caches_persisted_station_before_client_lists_it() {
     let body = fixture
         .station_list("/rest/getInternetRadioStations?u=alice&t=token&s=salt&f=json")
         .await;
-    assert!(body.contains("Your Mix"));
+    assert!(body.contains("Your Radio"));
     assert_eq!(fixture.transcoder.calls(), READY_POOL_SIZE);
 }
 
@@ -929,7 +1034,7 @@ async fn internet_radio_list_waits_for_starter_and_publishes_in_that_same_respon
     assert!(!listing.is_finished());
 
     gate.set();
-    assert!(listing.await.unwrap().contains("Your Mix"));
+    assert!(listing.await.unwrap().contains("Your Radio"));
 }
 
 #[tokio::test]
@@ -950,20 +1055,20 @@ async fn internet_radio_list_answers_inside_the_starter_bound_and_publishes_on_t
     tokio::time::timeout(Duration::from_secs(10), fixture.transcoder.started().wait())
         .await
         .expect("the starter began");
-    assert!(!first.contains("Your Mix"), "{first}");
+    assert!(!first.contains("Your Radio"), "{first}");
 
     // The transcode the first request stopped waiting for is still the one that
     // makes the station ready; nothing has to start it again.
     gate.set();
     let mut second = String::new();
     for _ in 0..100 {
-        if second.contains("Your Mix") {
+        if second.contains("Your Radio") {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         second = fixture.station_list(url).await;
     }
-    assert!(second.contains("Your Mix"), "{second}");
+    assert!(second.contains("Your Radio"), "{second}");
 }
 
 #[tokio::test]
@@ -1009,8 +1114,8 @@ async fn internet_radio_list_returns_ready_stations_without_waiting_for_cache_mi
     let started = tokio::time::timeout(Duration::from_secs(10), fixture.transcoder.started().wait()).await;
     gate.set();
     let body = listing.expect("the listing did not wait for the cold station");
-    assert!(body.contains("Your Mix"), "{body}");
-    assert!(!body.contains("Discovery Mix"), "{body}");
+    assert!(body.contains("Your Radio"), "{body}");
+    assert!(!body.contains("Discovery Radio"), "{body}");
     started.expect("the cold station is warming");
 }
 
@@ -1045,11 +1150,11 @@ async fn playlist_and_internet_radio_publication_are_independent_and_reserved_ra
         .get("/rest/getPlaylists?u=alice&t=token&s=salt&f=json")
         .await
         .body;
-    assert!(!playlists.contains("Your Mix"), "{playlists}");
+    assert!(!playlists.contains("Your Radio"), "{playlists}");
     let radios = fixture
         .station_list("/rest/getInternetRadioStations?u=alice&t=token&s=salt&f=json")
         .await;
-    assert!(radios.contains("Your Mix"), "{radios}");
+    assert!(radios.contains("Your Radio"), "{radios}");
     let mutation = fixture
         .get(&format!(
             "/rest/deleteInternetRadioStation?id={}&u=alice&t=token&s=salt&f=json",
@@ -1182,10 +1287,10 @@ async fn internet_radio_preparation_skips_failed_source_and_caches_playable_fall
     fixture.install_station("");
     let url = "/rest/getInternetRadioStations?u=alice&t=token&s=salt&f=json";
     let list = fixture.station_list(url).await;
-    assert!(list.contains("Your Mix"), "{list}");
+    assert!(list.contains("Your Radio"), "{list}");
     fixture.wait_for_calls(READY_POOL_SIZE + 1).await;
     assert_eq!(fixture.transcoder.calls(), READY_POOL_SIZE + 1);
-    assert!(fixture.station_list(url).await.contains("Your Mix"));
+    assert!(fixture.station_list(url).await.contains("Your Radio"));
     assert_eq!(fixture.transcoder.calls(), READY_POOL_SIZE + 1);
     let station = fixture
         .state
@@ -1249,7 +1354,7 @@ async fn feishin_list_detail_and_paged_tracks_have_native_shape_headers_and_owne
     )
     .await;
     assert_eq!(detail.status, StatusCode::OK);
-    assert_eq!(detail.json()["name"], "Your Mix");
+    assert_eq!(detail.json()["name"], "Your Radio");
 
     let tracks = send(
         &fixture.app,
@@ -1420,7 +1525,7 @@ async fn a_station_song_says_the_source_its_station_was_built_with() {
     }
 }
 
-/// A Discovery Mix of ten: six library songs and four outside ones, and a reserve of outside
+/// A Discovery Radio of ten: six library songs and four outside ones, and a reserve of outside
 /// songs after them.
 fn install_discovery(fixture: &RadioFixture, reserve: &[(&str, &str)]) -> String {
     let track = |artist: &str, title: &str| LastFmRadioTrack {
@@ -1435,7 +1540,7 @@ fn install_discovery(fixture: &RadioFixture, reserve: &[(&str, &str)]) -> String
         &[LastFmRadioStation {
             id: id.clone(),
             key: "discovery".into(),
-            name: "Discovery Mix".into(),
+            name: "Discovery Radio".into(),
             owner: "alice".into(),
             kind: LastFmRadioStationKind::Discovery,
             personalized: true,
@@ -1484,7 +1589,7 @@ fn library_ids(entries: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-// At the default Discovery balance of 35, a Discovery Mix of ten keeps four library songs (3.5
+// At the default Discovery balance of 35, a Discovery Radio of ten keeps four library songs (3.5
 // rounds to even); the library songs past them give their places to the reserve's outside songs.
 #[tokio::test]
 async fn discovery_mix_keeps_library_songs_to_the_discovery_balance_share() {
@@ -1557,4 +1662,335 @@ async fn a_reset_history_is_not_learned_again_from_stars_at_the_next_playlist_li
         },
     ));
     assert_eq!(radio.get_user("alice").plays.len(), 1);
+}
+
+// ---------------------------------------------------------------------------------------
+// getStationSongs (octoStations)
+// ---------------------------------------------------------------------------------------
+
+/// Your Radio of four with two songs in reserve, and `played` songs alice played before, which the
+/// mix goes on with once its own songs are queued. Every song not in the library is found
+/// outside; no radio source but Last.fm (without a key) is on.
+async fn station_songs_fixture(played: i64) -> RadioFixture {
+    let fixture = RadioFixture::with_metadata(Options::default(), outside_copies()).await;
+    let mut settings = fixture.state.settings.current().as_ref().clone();
+    settings.radio_sources.you_tube_music = false;
+    settings.radio_sources.listen_brainz = false;
+    settings.radio_sources.sounds_alike = false;
+    fixture.state.settings.set(settings);
+    fixture.install_station("");
+    let mut station = fixture
+        .state
+        .last_fm_radio_state
+        .find_station("alice", &fixture.station_id())
+        .expect("installed");
+    station.reserve = ["A", "B"]
+        .iter()
+        .map(|letter| LastFmRadioTrack {
+            artist: format!("Reserve Artist {letter}"),
+            title: format!("Reserve Song {letter}"),
+            duration: Some(200),
+            ..Default::default()
+        })
+        .collect();
+    fixture
+        .state
+        .last_fm_radio_state
+        .replace_stations("alice", &[station]);
+    for index in 0..played {
+        fixture.state.last_fm_radio_state.record_play(
+            "alice",
+            octo_core::models::radio::LastFmRadioPlay {
+                artist: format!("Played Artist {index}"),
+                title: format!("Played Song {index}"),
+                duration: Some(200),
+                played_at_utc: Utc::now() - TimeDelta::hours(index + 1),
+                ..Default::default()
+            },
+        );
+    }
+    fixture
+}
+
+/// getStationSongs for alice's Your Radio, as JSON, with `query` after the sign-in.
+async fn station_songs(fixture: &RadioFixture, query: &str) -> serde_json::Value {
+    let body = get_string(
+        &fixture.app,
+        &format!(
+            "/rest/getStationSongs?id={}&u=alice&t=token&s=salt&f=json{query}",
+            fixture.station_id()
+        ),
+    )
+    .await;
+    serde_json::from_str(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}"))
+}
+
+fn entry_ids(answer: &serde_json::Value) -> Vec<String> {
+    answer["subsonic-response"]["stationSongs"]["entry"]
+        .as_array()
+        .unwrap_or_else(|| panic!("entries: {answer}"))
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("an id").to_string())
+        .collect()
+}
+
+/// The ids as repeated `after` parameters.
+fn after(ids: &[String]) -> String {
+    ids.iter()
+        .map(|id| format!("&after={}", id.replace(' ', "%20")))
+        .collect()
+}
+
+const STORED: [&str; 4] = ["local-one", "local-two", "local-three", "local-four"];
+
+/// A clock for the station memory, and what moves it a day on: after that only `after` keeps
+/// the songs served so far out.
+fn movable_memory(fixture: &RadioFixture) -> impl Fn() {
+    let now = Arc::new(Mutex::new(Utc::now()));
+    let clock_now = Arc::clone(&now);
+    fixture
+        .state
+        .last_fm_radio_recommendations
+        .set_clock(octo_core::common::Clock::new(move || *clock_now.lock()));
+    move || *now.lock() += STATION_MEMORY + TimeDelta::hours(1)
+}
+
+#[tokio::test]
+async fn station_songs_start_with_the_stored_tracks_in_order() {
+    let fixture = station_songs_fixture(10).await;
+
+    let four = station_songs(&fixture, "&count=4").await;
+    assert_eq!(four["subsonic-response"]["status"], "ok", "{four}");
+    let station = &four["subsonic-response"]["stationSongs"];
+    assert_eq!(station["id"], fixture.station_id().as_str());
+    assert_eq!(station["name"], "Your Radio");
+    assert_eq!(entry_ids(&four), STORED);
+
+    // Asked for more, a first page answers with what the station holds: its songs, then its
+    // reserve, then whatever songs alike the station has found by then, never waiting for more.
+    // The rest are found in the background for the page after it.
+    let fresh = station_songs_fixture(10).await;
+    let first = entry_ids(&station_songs(&fresh, "").await);
+    assert_eq!(first[..4], STORED);
+    assert!(first[4].contains("Reserve Song A"), "{first:?}");
+    assert!(first[5].contains("Reserve Song B"), "{first:?}");
+    fresh.state.last_fm_radio_recommendations.settled().await;
+    let next = entry_ids(&station_songs(&fresh, &after(&first)).await);
+    assert_eq!(first.len() + next.len(), 4 + 2 + 10, "{first:?} then {next:?}");
+    for id in &next {
+        assert!(id.contains("Played Song"), "{id} in {next:?}");
+        assert!(!first.contains(id), "{id} came back");
+    }
+}
+
+#[tokio::test]
+async fn a_station_song_served_once_is_not_served_again_without_being_listed() {
+    let fixture = station_songs_fixture(10).await;
+    let first = entry_ids(&station_songs(&fixture, "&count=4").await);
+    assert_eq!(first, STORED);
+    fixture.state.last_fm_radio_recommendations.settled().await;
+
+    // The next call lists nothing in `after`; the station remembers what it served.
+    let second = entry_ids(&station_songs(&fixture, "&count=50").await);
+    assert_eq!(second.len(), 2 + 10, "{second:?}");
+    for id in &second {
+        assert!(!first.contains(id), "{id} was served already: {second:?}");
+    }
+}
+
+#[tokio::test]
+async fn after_every_stored_and_reserve_song_come_new_songs_never_one_already_queued() {
+    let fixture = station_songs_fixture(10).await;
+    let forget = movable_memory(&fixture);
+    let stored = entry_ids(&station_songs(&fixture, "&count=6").await);
+    assert_eq!(stored[..4], STORED);
+    assert!(stored[4].contains("Reserve Song A"), "{stored:?}");
+    assert!(stored[5].contains("Reserve Song B"), "{stored:?}");
+
+    // Only `after` keeps them out now.
+    forget();
+    let new = entry_ids(&station_songs(&fixture, &format!("&count=50{}", after(&stored))).await);
+    assert_eq!(new.len(), 10, "{new:?}");
+    for id in &new {
+        assert!(id.contains("Played Song"), "{id} in {new:?}");
+        assert!(!stored.contains(id), "{id} was queued already");
+    }
+}
+
+#[tokio::test]
+async fn station_song_pages_follow_one_another_without_repeats() {
+    let fixture = station_songs_fixture(10).await;
+    let forget = movable_memory(&fixture);
+    let stored = entry_ids(&station_songs(&fixture, "&count=6").await);
+
+    forget();
+    let first = entry_ids(&station_songs(&fixture, &format!("&count=3{}", after(&stored))).await);
+    let queued: Vec<String> = stored.iter().chain(&first).cloned().collect();
+    forget();
+    let second = entry_ids(&station_songs(&fixture, &format!("&count=3{}", after(&queued))).await);
+
+    assert_eq!(first.len(), 3, "{first:?}");
+    assert_eq!(second.len(), 3, "{second:?}");
+    for id in &first {
+        assert!(!stored.contains(id), "{id} came back: {stored:?} then {first:?}");
+    }
+    for id in &second {
+        assert!(!queued.contains(id), "{id} came back: {first:?} then {second:?}");
+    }
+}
+
+#[tokio::test]
+async fn station_songs_count_is_held_between_one_and_a_hundred() {
+    let fixture = station_songs_fixture(120).await;
+    assert_eq!(entry_ids(&station_songs(&fixture, "&count=0").await), STORED[..1]);
+    let most = entry_ids(&station_songs(&fixture, "&count=500&after=local-one").await);
+    assert_eq!(most.len(), 100, "{most:?}");
+    let mut distinct = most.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 100);
+}
+
+/// A station song the library spells otherwise ("Beyonce" in the station, "Beyoncé" in the
+/// library) is remembered by the station's own spelling, so it is not served again.
+#[tokio::test]
+async fn a_station_song_the_library_spells_otherwise_is_not_served_again() {
+    let fixture = station_songs_fixture(10).await;
+    let mut station = fixture
+        .state
+        .last_fm_radio_state
+        .find_station("alice", &fixture.station_id())
+        .expect("installed");
+    station.tracks.insert(
+        0,
+        LastFmRadioTrack {
+            artist: "Beyonce".into(),
+            title: "Halo".into(),
+            duration: Some(180),
+            ..Default::default()
+        },
+    );
+    fixture
+        .state
+        .last_fm_radio_state
+        .replace_stations("alice", std::slice::from_ref(&station));
+
+    let first = station_songs(&fixture, "&count=1").await;
+    let entry = &first["subsonic-response"]["stationSongs"]["entry"][0];
+    assert_eq!(entry["id"], "local-halo", "{first}");
+    assert_eq!(entry["artist"], "Beyoncé", "{first}");
+    let served = fixture
+        .state
+        .last_fm_radio_recommendations
+        .station_served("alice", &fixture.station_id());
+    assert_eq!(served.len(), 1);
+    assert_eq!(served[0].artist, "Beyonce");
+
+    let second = entry_ids(&station_songs(&fixture, "&count=4").await);
+    assert_eq!(second, STORED, "{second:?}");
+}
+
+#[tokio::test]
+async fn station_songs_of_a_station_that_is_not_the_callers_say_it_is_gone() {
+    let fixture = station_songs_fixture(0).await;
+    for (who, id) in [
+        ("alice", "or00000000000000000000".to_string()),
+        ("bob", fixture.station_id()),
+    ] {
+        let body = get_string(
+            &fixture.app,
+            &format!("/rest/getStationSongs?id={id}&u={who}&t=token&s=salt&f=json"),
+        )
+        .await;
+        let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(answer["subsonic-response"]["status"], "failed", "{body}");
+        assert_eq!(answer["subsonic-response"]["error"]["code"], 70, "{body}");
+        assert_eq!(
+            answer["subsonic-response"]["error"]["message"], "That station isn't on this server any more.",
+            "{body}"
+        );
+    }
+    // Stations not served as playlists are not there either.
+    let mut off = fixture.state.settings.current().as_ref().clone();
+    off.last_fm.expose_radio_as_playlists = false;
+    fixture.state.settings.set(off);
+    let body = get_string(
+        &fixture.app,
+        &format!(
+            "/rest/getStationSongs?id={}&u=alice&t=token&s=salt&f=json",
+            fixture.station_id()
+        ),
+    )
+    .await;
+    assert!(body.contains("\"code\":70"), "{body}");
+    // A failed sign-in is told so before anything about the station.
+    let refused = fixture
+        .get(&format!(
+            "/rest/getStationSongs?id={}&u=bad&f=json",
+            fixture.station_id()
+        ))
+        .await
+        .body;
+    assert!(refused.contains("\"code\":40"), "{refused}");
+}
+
+#[tokio::test]
+async fn station_songs_answer_in_xml_and_by_post_too() {
+    let fixture = station_songs_fixture(0).await;
+    let body = fixture
+        .get(&format!(
+            "/rest/getStationSongs.view?id={}&u=alice&t=token&s=salt&f=xml&count=2",
+            fixture.station_id()
+        ))
+        .await
+        .body;
+    assert!(body.contains("status=\"ok\""), "{body}");
+    assert!(
+        body.contains(&format!(
+            "<stationSongs id=\"{}\" name=\"Your Radio\">",
+            fixture.station_id()
+        )),
+        "{body}"
+    );
+    assert_eq!(body.matches("<entry ").count(), 2, "{body}");
+    assert!(body.contains("id=\"local-one\""), "{body}");
+    assert!(!body.contains("<song "), "{body}");
+
+    // Only `after` keeps the two served above out now.
+    let forget = movable_memory(&fixture);
+    forget();
+    let posted = send(
+        &fixture.app,
+        Method::POST,
+        "/rest/getStationSongs",
+        &[("Content-Type", "application/x-www-form-urlencoded")],
+        Body::from(format!(
+            "id={}&u=alice&t=token&s=salt&f=json&count=1&after=local-one&after=local-two",
+            fixture.station_id()
+        )),
+    )
+    .await;
+    assert!(posted.body.contains("\"stationSongs\""), "{}", posted.body);
+    // The two songs listed in `after` are not served again.
+    assert!(posted.body.contains("local-three"), "{}", posted.body);
+}
+
+#[tokio::test]
+async fn the_stations_extension_is_listed_while_stations_are_served_as_playlists() {
+    for (radio, playlists, listed) in [(true, true, true), (true, false, false), (false, true, false)] {
+        let fixture = RadioFixture::new(Options {
+            expose_playlists: playlists,
+            ..Default::default()
+        })
+        .await;
+        let mut settings = fixture.state.settings.current().as_ref().clone();
+        settings.last_fm.enable_radio = radio;
+        fixture.state.settings.set(settings);
+        let body = get_string(&fixture.app, "/rest/getOpenSubsonicExtensions?f=json").await;
+        assert_eq!(
+            body.contains("octoStations"),
+            listed,
+            "radio {radio}, playlists {playlists}: {body}"
+        );
+    }
 }

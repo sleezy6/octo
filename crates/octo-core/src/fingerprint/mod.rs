@@ -3,6 +3,7 @@
 
 pub mod acoust_id_client;
 pub mod music_brainz_client;
+pub mod recording_identity;
 pub mod track_match_comparer;
 pub mod verification;
 

@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::settings::{DownloadSource, HeartDownloadSource, SettingsStore};
@@ -10,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::TrackAcquisitionQueue;
+use super::acquisition_tracker::key_of;
 use super::{
     AcquisitionState, AcquisitionTarget, AcquisitionTracker, HeldAcquisition, HeldKind, SoulseekHoldStore,
     StarOnArrival,
@@ -81,6 +83,27 @@ pub struct HeartAcquisitionCoordinator {
     // Set once Family's services exist; without them every heart and play goes to the shared
     // library, as always.
     family: OnceLock<FamilyHooks>,
+
+    // How long a song heart's album waits for the hearted song to show in the library.
+    landed_wait: Mutex<LandedSongWait>,
+}
+
+/// How long the album walk that follows a song heart waits for the hearted song to show in the
+/// library, and how often it looks. The walk skips the songs the library already has, so one
+/// that started while the hearted song was still on its way in would fetch that song again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LandedSongWait {
+    pub poll: Duration,
+    pub max_wait: Duration,
+}
+
+impl Default for LandedSongWait {
+    fn default() -> Self {
+        LandedSongWait {
+            poll: Duration::from_secs(2),
+            max_wait: Duration::from_secs(3 * 60),
+        }
+    }
 }
 
 impl HeartAcquisitionCoordinator {
@@ -102,7 +125,14 @@ impl HeartAcquisitionCoordinator {
             held_plays: Mutex::new(HashSet::new()),
             lidarr_plays: Mutex::new(HashSet::new()),
             family: OnceLock::new(),
+            landed_wait: Mutex::new(LandedSongWait::default()),
         })
+    }
+
+    /// Changes how long a song heart's album waits for the hearted song.
+    #[cfg(test)]
+    pub fn set_landed_song_wait(&self, wait: LandedSongWait) {
+        *self.landed_wait.lock() = wait;
     }
 
     /// Gives the coordinator Family's services. Once only; a second call changes nothing.
@@ -394,6 +424,120 @@ impl HeartAcquisitionCoordinator {
                 .acquire_album_for_member(&provider, &album_id, requested_by.as_deref(), &user, true)
                 .await;
         });
+    }
+
+    /// Hearted songs whose album follows them (DownloadAlbumOnSongStar). Each song goes down the
+    /// song chain first, then the album goes down the album chain, as an album heart would,
+    /// once the songs that landed show in the library (waiting at most [`LandedSongWait`]), so
+    /// the walk skips them rather than fetching them again. When Lidarr took a song on it
+    /// brings the whole album, so the walk is left out. A member's album songs are not starred
+    /// for them: only the songs they hearted are. `owner` is who the album's progress list
+    /// belongs to.
+    pub fn queue_tracks_then_album_for(
+        self: &Arc<Self>,
+        songs: &[(String, String)],
+        provider: &str,
+        album_external_id: &str,
+        requested_by: Option<&str>,
+        owner: Option<&str>,
+        target: AcquisitionTarget,
+    ) {
+        let coordinator = Arc::clone(self);
+        let songs = songs.to_vec();
+        let (provider, album_id, requested_by) = owned3(provider, album_external_id, requested_by);
+        let owner = owner.map(str::to_string);
+        tokio::spawn(async move {
+            coordinator
+                .acquire_tracks_then_album(
+                    &songs,
+                    &provider,
+                    &album_id,
+                    requested_by.as_deref(),
+                    owner.as_deref(),
+                    &target,
+                )
+                .await;
+        });
+    }
+
+    /// [`Self::queue_tracks_then_album_for`], run to its end.
+    pub async fn acquire_tracks_then_album(
+        &self,
+        songs: &[(String, String)],
+        provider: &str,
+        album_external_id: &str,
+        requested_by: Option<&str>,
+        owner: Option<&str>,
+        target: &AcquisitionTarget,
+    ) {
+        let chains = songs.iter().map(|(song_provider, external_id)| async move {
+            let outcome = self
+                .acquire_track_outcome(song_provider, external_id, requested_by, None, target)
+                .await;
+            (song_provider, external_id, outcome)
+        });
+        let mut landed = Vec::new();
+        let mut lidarr = false;
+        for (song_provider, external_id, outcome) in futures::future::join_all(chains).await {
+            match outcome {
+                Ok(TrackOutcome::Landed(_)) => landed.push(key_of(song_provider, external_id)),
+                Ok(TrackOutcome::HandedToLidarr) => lidarr = true,
+                Ok(TrackOutcome::AlreadyThere | TrackOutcome::Failed(_)) => {}
+                Err(e) => warn!("Hearted song {song_provider}:{external_id} failed: {e}"),
+            }
+        }
+        if lidarr {
+            info!(
+                "Lidarr took on a hearted song, and with it its album; album {album_external_id} is not walked as well"
+            );
+            return;
+        }
+        self.wait_for_landed(&landed, album_external_id).await;
+
+        info!("Hearted song's album {album_external_id} goes down the album-heart chain");
+        if let Some(tracker) = self.tracker() {
+            tracker.begin_album(provider, album_external_id, owner);
+        }
+        match target {
+            AcquisitionTarget::Shared => {
+                if let Err(e) = self
+                    .acquire_album(provider, album_external_id, requested_by, None)
+                    .await
+                {
+                    warn!("Album {provider}:{album_external_id} of a hearted song failed: {e}");
+                }
+            }
+            AcquisitionTarget::Member(user) => {
+                self.acquire_album_for_member(provider, album_external_id, requested_by, user, false)
+                    .await;
+            }
+        }
+    }
+
+    /// Waits until none of these rows (songs that landed) is still on its way into the library,
+    /// at most [`LandedSongWait::max_wait`]. The library answers held from before they landed
+    /// are forgotten, so the album walk asks the library again.
+    async fn wait_for_landed(&self, rows: &[String], album_external_id: &str) {
+        if rows.is_empty() {
+            return;
+        }
+        if let Some(tracker) = self.tracker() {
+            let wait = *self.landed_wait.lock();
+            let started = tokio::time::Instant::now();
+            while rows.iter().any(|key| tracker.is_running(key)) {
+                if started.elapsed() >= wait.max_wait {
+                    info!(
+                        "The hearted song is not in the library after {} s; album {album_external_id} goes on without waiting longer",
+                        wait.max_wait.as_secs()
+                    );
+                    break;
+                }
+                tokio::time::sleep(wait.poll).await;
+            }
+        }
+        if let Some(owned) = &self.extras.owned {
+            owned.forget();
+        }
     }
 
     /// Every song of an outside album into `user`'s own library, one heart chain each (no

@@ -1,7 +1,7 @@
 //! The reconcile decision for one person's notice playlist, and the worker that fills and tidies
 //! the playlists Octo asks through (#47) and sends back the answers AcoustID can use.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{TimeDelta, Utc};
@@ -10,9 +10,11 @@ use octo_core::common::dotnet;
 use octo_core::fingerprint::acoust_id_client::AcoustIdSubmission;
 use octo_core::fingerprint::verification::InconclusiveReason;
 use octo_core::settings::{LibraryActionSettings, NoticeKind, SettingsStore, SoulseekSettings};
+use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use super::duplicate_fixer::duplicates_comment;
 use super::library_action_playlist_worker::PlaylistRow;
 use super::notice_queue::{NamedEnum, NoticeEntry, NoticeOrigin, NoticeQueue, NoticeState};
 use super::{NavidromePlaylistApi, NavidromeSongPathResolver};
@@ -165,6 +167,8 @@ pub struct NoticePlaylistWorker {
     music_brainz: Arc<MusicBrainzClient>,
     /// The library action and Soulseek settings, read at each sweep.
     settings: Arc<SettingsStore>,
+    /// The description each notice playlist was last given, by playlist id.
+    comments: Mutex<HashMap<String, String>>,
 }
 
 impl NoticePlaylistWorker {
@@ -188,6 +192,25 @@ impl NoticePlaylistWorker {
             acoust_id,
             music_brainz,
             settings,
+            comments: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Gives the playlist `comment` as its description, once per text: apps show it under the
+    /// playlist's name, so a person who never opens the dashboard reads what to do there.
+    async fn describe(&self, playlist_id: &str, comment: &str) {
+        if self
+            .comments
+            .lock()
+            .get(playlist_id)
+            .is_some_and(|said| said == comment)
+        {
+            return;
+        }
+        if self.api.set_comment(playlist_id, comment).await {
+            self.comments
+                .lock()
+                .insert(playlist_id.to_string(), comment.to_string());
         }
     }
 
@@ -272,6 +295,9 @@ impl NoticePlaylistWorker {
         }) else {
             return Ok(());
         };
+        if kind == NoticeKind::Duplicates {
+            self.describe(&playlist.id, &duplicates_comment(settings)).await;
+        }
 
         let tracks = self.api.list_tracks(&playlist.id).await;
         let present: HashSet<String> = tracks.iter().map(|track| track.media_file_id.clone()).collect();

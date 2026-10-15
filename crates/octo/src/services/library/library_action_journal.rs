@@ -70,6 +70,7 @@ pub fn action_name(action: LibraryAction) -> &'static str {
         LibraryAction::Keep => "Keep",
         LibraryAction::WrongLyrics => "WrongLyrics",
         LibraryAction::WrongCover => "WrongCover",
+        LibraryAction::FixDuplicates => "FixDuplicates",
     }
 }
 

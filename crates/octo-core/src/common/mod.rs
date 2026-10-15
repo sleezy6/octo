@@ -18,6 +18,7 @@ pub mod path_helper;
 pub mod playlist_id_helper;
 pub mod romanize;
 pub mod single_flight;
+pub mod skipped_takes;
 pub mod song_identity;
 pub mod song_versions;
 pub mod supersedable_build_coordinator;

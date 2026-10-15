@@ -670,28 +670,6 @@ input[type="number"].set-input { max-width: 160px; }
 .set-section { margin-bottom: var(--s-section); scroll-margin-top: var(--s-xl); }
 .set-title:focus-visible { outline-offset: 4px; border-radius: var(--r-row); }
 
-/* On this page: links to a long page's sections, under its header. */
-.page-toc {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--s-s);
-  margin: calc(-1 * var(--s-page)) 0 var(--s-section);
-}
-.page-toc a {
-  display: inline-flex;
-  align-items: center;
-  height: var(--h-s);
-  padding: 0 var(--s-l);
-  border-radius: var(--r-pill);
-  font-size: var(--t-meta);
-  font-weight: 500;
-  color: var(--text-secondary);
-  background: var(--glaze-film);
-  box-shadow: var(--glaze-rest);
-  text-decoration: none;
-  transition: color var(--t-hover) var(--ease), box-shadow var(--t-hover) var(--ease);
-}
-.page-toc a:hover { color: var(--ink); box-shadow: var(--glaze-lifted); text-decoration: none; }
 .set-head { padding: 0 var(--s-2xs) var(--s-l); }
 .set-title {
   margin: 0;
@@ -1270,29 +1248,222 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 }
 
 /* ── Import: the services, one list's songs, the trickle ── */
-.imp-actions { display: flex; flex-wrap: wrap; gap: var(--s-m); justify-content: flex-end; }
-.imp-svc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--s-m); }
+.imp-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-m); justify-content: flex-end; }
+
+/* Where your music is now: one tile a service, its own badge on it, like an app icon. */
+.imp-svc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: var(--s-m); }
 .imp-svc {
-  display: flex; align-items: center; gap: var(--s-m); min-height: 44px; padding: 10px 14px;
-  border: 1px solid var(--border); border-radius: var(--r-control); background: var(--accent-tonal);
-  color: var(--ink); font-weight: 500; text-align: left; cursor: pointer;
-  transition: background var(--t-hover), border-color var(--t-hover);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-m);
+  min-height: 104px;
+  padding: var(--s-l) var(--s-m);
+  border: none;
+  border-radius: var(--r-control);
+  background: var(--nest);
+  box-shadow: var(--nest-rim);
+  color: var(--ink-1);
+  font: inherit;
+  font-size: var(--t-meta);
+  font-weight: 500;
+  text-align: center;
+  cursor: pointer;
+  transition: background-color var(--t-hover) var(--ease), box-shadow var(--t-hover) var(--ease), transform var(--t-press) var(--ease);
 }
-.imp-svc:hover { border-color: var(--border-strong); }
-.imp-svc-name { overflow-wrap: anywhere; }
-.imp-svc-check { display: none; flex: none; }
-.imp-svc.selected { background: var(--accent-fill); color: var(--accent-ink); border-color: var(--accent-fill); }
+.imp-svc:hover { background: rgba(255, 255, 255, 0.10); color: var(--ink); }
+.imp-svc:active { transform: scale(0.97); }
+.imp-svc .imp-logo { width: 44px; height: 44px; transition: transform var(--t-card) var(--ease-over); }
+.imp-svc:hover .imp-logo { transform: translateY(-1px) scale(1.04); }
+.imp-svc-name { overflow-wrap: anywhere; line-height: 1.25; }
+.imp-svc-check {
+  position: absolute;
+  top: var(--s-s);
+  right: var(--s-s);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--r-pill);
+  background: var(--accent-ink);
+}
+.imp-svc-check .icon { width: 13px; height: 13px; color: var(--accent); }
+.imp-svc.selected,
+.imp-svc.selected:hover { background: var(--accent-fill); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), 0 6px 18px rgba(0, 0, 0, 0.30); color: var(--accent-ink); font-weight: 650; }
 .imp-svc.selected .imp-svc-check { display: inline-flex; }
-.imp-svc.selected .imp-svc-check .icon { color: var(--accent-ink); }
-.imp-guide { display: flex; flex-direction: column; align-items: flex-start; gap: var(--s-m); }
-.fam-card .imp-guide { margin-top: var(--s-l); }
-.imp-guide .lfm-steps { margin: 0; }
-.imp-paste-box { width: 100%; min-height: 120px; }
+
+/* Import for: whose lists, playlists and fetched songs the page works on. */
+.imp-for-row .set-ctrl select { min-width: 220px; }
+@media (max-width: 760px) {
+  .imp-for-row { flex-direction: column; align-items: stretch; }
+  .imp-for-row .set-ctrl, .imp-for-row .set-ctrl select { width: 100%; min-width: 0; min-height: 44px; }
+}
+
+/* A badge stands on its own color; the two ways in that are not a service get a glass one. */
+.imp-logo { display: inline-flex; flex: none; width: 32px; height: 32px; border-radius: 24%; }
+.icon.imp-logo { fill: initial; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.30); }
+.imp-logo-plain { align-items: center; justify-content: center; background: rgba(255, 255, 255, 0.12); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12); color: var(--ink); }
+.imp-logo-plain .icon { width: 55%; height: 55%; }
+.imp-logo-l { width: 40px; height: 40px; }
+.imp-logo-s { width: 28px; height: 28px; }
+
+/* The way in, for the tile picked. */
+.imp-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-xl);
+  padding: var(--s-2xl);
+  border-radius: var(--r-control);
+  background: var(--inset);
+  animation: pane-in var(--t-card) var(--ease);
+}
+.imp-panel-head { display: flex; align-items: center; gap: var(--s-l); }
+.imp-panel-words { min-width: 0; }
+.imp-panel-words h4 { margin: 0; font-size: var(--t-section); font-weight: 700; color: var(--ink); }
+.imp-panel-words p { margin: var(--s-2xs) 0 0; font-size: var(--t-meta); color: var(--text-muted); line-height: 1.5; max-width: 72ch; }
+
+.imp-steps { display: flex; flex-direction: column; gap: var(--s-m); margin: 0; padding: 0; list-style: none; counter-reset: imp-step; }
+.imp-steps li { display: flex; align-items: flex-start; gap: var(--s-l); counter-increment: imp-step; font-size: var(--t-table); color: var(--ink-1); line-height: 1.5; }
+.imp-steps li::before {
+  content: counter(imp-step);
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--r-pill);
+  background: var(--accent-wash);
+  box-shadow: inset 0 0 0 1px var(--accent-line);
+  color: var(--accent);
+  font-size: var(--t-label);
+  font-weight: 700;
+}
+.imp-steps li > span { padding-top: 2px; }
+.imp-guide-open { align-self: flex-start; }
+
+.imp-ways { display: flex; flex-direction: column; gap: var(--s-l); }
+.imp-way { display: flex; align-items: center; justify-content: space-between; gap: var(--s-xl); padding: var(--s-l) var(--s-xl); border-radius: var(--r-control); background: var(--nest); box-shadow: var(--nest-rim); }
+.imp-way.stack { flex-direction: column; align-items: stretch; gap: var(--s-m); }
+.imp-way-text { min-width: 0; }
+
+.imp-paste-box { display: flex; flex-direction: column; gap: var(--s-m); }
+.imp-paste-text { width: 100%; min-height: 150px; font-family: var(--mono); font-size: var(--t-meta); line-height: 1.6; resize: vertical; }
+.imp-paste-count { margin-right: auto; font-size: var(--t-meta); color: var(--text-muted); }
+
+/* The drop area: the whole box takes a click or a dropped file; while a file goes it shows each step. */
+.imp-drop { position: relative; }
+.imp-file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.imp-drop-idle {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-s);
+  padding: var(--s-section) var(--s-xl);
+  border: 1.5px dashed rgba(255, 255, 255, 0.22);
+  border-radius: var(--r-control);
+  text-align: center;
+  cursor: pointer;
+  transition: border-color var(--t-hover) var(--ease), background-color var(--t-hover) var(--ease);
+}
+.imp-drop-idle:hover, .imp-drop.dragging .imp-drop-idle { border-color: var(--accent); background: var(--accent-wash); }
+.imp-file-input:focus-visible + .imp-drop-idle { outline: 2px solid var(--focus); outline-offset: 2px; }
+.imp-drop-glyph { width: 30px; height: 30px; color: var(--ink-2); transition: transform var(--t-card) var(--ease-over), color var(--t-hover) var(--ease); }
+.imp-drop.dragging .imp-drop-glyph { transform: translateY(-3px) scale(1.08); color: var(--accent); }
+.imp-drop-main { font-size: var(--t-body); font-weight: 500; color: var(--ink); }
+.imp-drop-pick { color: var(--accent-hover); text-decoration: underline; text-decoration-color: var(--accent-line); text-underline-offset: 3px; }
+.imp-drop-hint { font-size: var(--t-meta); color: var(--text-muted); }
+/* A phone cannot drag a file in, so there the box only offers to choose one. */
+.imp-drop-touch { display: none; }
+@media (pointer: coarse) {
+  .imp-drop-mouse { display: none; }
+  .imp-drop-touch { display: inline; }
+}
+.imp-drop-run { display: flex; flex-direction: column; gap: var(--s-l); padding: var(--s-xl) var(--s-2xl); border-radius: var(--r-control); background: var(--nest); box-shadow: var(--nest-rim); }
+.imp-drop-file { display: flex; align-items: center; gap: var(--s-m); min-width: 0; font-size: var(--t-table); color: var(--ink); }
+.imp-drop-file .icon { width: 18px; height: 18px; flex: none; color: var(--ink-2); }
+.imp-drop-name { min-width: 0; overflow-wrap: anywhere; font-weight: 500; }
+.imp-drop-size { flex: none; margin-left: auto; font-size: var(--t-meta); color: var(--text-muted); }
+.imp-phases { display: flex; flex-direction: column; gap: var(--s-s); margin: 0; padding: 0; list-style: none; }
+.imp-phases li { display: flex; align-items: center; gap: var(--s-m); font-size: var(--t-meta); color: var(--text-faint); }
+.imp-phases li .icon { width: 16px; height: 16px; flex: none; }
+.imp-phases li.now { color: var(--ink); }
+.imp-phases li.now .icon { color: var(--accent); }
+.imp-phases li.done { color: var(--text-muted); }
+.imp-phases li.done .icon { color: var(--good); }
+.imp-phases .spin { animation: spin 0.9s linear infinite; }
+.imp-phase-detail { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--text-muted); }
+.imp-drop-bar { margin: 0; }
+
+/* What came of it: the counts that matter, and what to do next. */
+.imp-result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-l);
+  padding: var(--s-xl) var(--s-2xl);
+  border-radius: var(--r-control);
+  background: var(--nest);
+  box-shadow: var(--nest-rim);
+  animation: pane-in var(--t-card) var(--ease);
+}
+.imp-result-head { display: flex; align-items: flex-start; gap: var(--s-l); }
+.imp-result-head > .icon { width: 22px; height: 22px; flex: none; color: var(--good); }
+.imp-result.failed .imp-result-head > .icon { color: #ff7b72; }
+.imp-result.failed { box-shadow: inset 0 0 0 1px var(--bad-line); background: var(--bad-wash); }
+.imp-result-head strong { display: block; font-size: var(--t-body); color: var(--ink); overflow-wrap: anywhere; }
+.imp-result-head p { margin: var(--s-2xs) 0 0; font-size: var(--t-meta); color: var(--text-muted); line-height: 1.5; overflow-wrap: anywhere; }
+.imp-result-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s-m); }
+.imp-stat { display: flex; flex-direction: column; gap: var(--s-2xs); padding: var(--s-l) var(--s-xl); border-radius: var(--r-row); background: rgba(0, 0, 0, 0.18); }
+.imp-stat-n { font-size: 26px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.imp-stat-l { font-size: var(--t-meta); color: var(--text-muted); }
+.imp-result-meter { margin-top: 0; height: 4px; }
+.imp-result-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-m); }
+.imp-result-note { display: inline-flex; align-items: center; gap: var(--s-s); font-size: var(--t-meta); color: var(--good); }
+.imp-result-note .icon { width: 15px; height: 15px; }
+
+/* Your lists: each name beside where it came from. */
+.imp-list-name { display: flex; align-items: center; gap: var(--s-l); min-width: 0; }
+.imp-list-words { display: flex; flex-direction: column; min-width: 0; }
+
+/* Import settings: folded away under the page. */
+.imp-settings > summary { list-style: none; }
+.imp-settings > summary::-webkit-details-marker { display: none; }
+.imp-settings-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-m) var(--s-l);
+  padding: var(--s-l) var(--s-xl);
+  border-radius: var(--r-control);
+  color: var(--ink-1);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color var(--t-hover) var(--ease), color var(--t-hover) var(--ease);
+}
+.imp-settings-summary:hover { background: var(--hover); color: var(--ink); }
+.imp-settings-summary .icon { width: 18px; height: 18px; transition: transform var(--t-card) var(--ease); }
+.imp-settings[open] .imp-settings-summary .icon { transform: rotate(60deg); }
+.imp-settings-sub { font-size: var(--t-meta); font-weight: 400; color: var(--text-muted); }
+.imp-settings[open] > .set-card { margin-top: var(--s-m); }
+@media (prefers-reduced-motion: reduce) {
+  .imp-svc, .imp-svc .imp-logo, .imp-drop-glyph, .imp-settings-summary .icon { transition: none; }
+  .imp-panel, .imp-result { animation: none; }
+  .imp-phases .spin { animation: none; }
+}
+@container (max-width: 520px) {
+  .imp-svc-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .imp-svc { min-height: 92px; }
+  .imp-svc .imp-logo { width: 38px; height: 38px; }
+  .imp-panel { padding: var(--s-xl); }
+  .imp-way { flex-direction: column; align-items: stretch; }
+  .imp-way .imp-actions { justify-content: flex-start; }
+}
 .imp-card { padding: var(--s-xl); display: flex; flex-direction: column; gap: var(--s-l); }
 .set-card.imp-card > :not([hidden]):not([type="hidden"]) ~ :not([type="hidden"]) { border-top: 0; }
 .imp-card > .set-row { padding: 0; }
-.imp-reading { margin: 0; }
-.imp-reading.imp-error { color: #ff7b72; }
 .imp-row { grid-template-columns: minmax(0, 2.2fr) minmax(0, 1.6fr) 92px 104px 136px; gap: var(--s-l); align-items: center; }
 .imp-row.picked, .imp-track.picked { background: var(--accent-selected); }
 .imp-row .key, .imp-track .key, .imp-trickle-row .key { font-family: inherit; color: var(--ink); overflow-wrap: anywhere; }
@@ -1787,6 +1958,9 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .health-diff .config-row .value { font-family: inherit; word-break: normal; overflow-wrap: anywhere; }
 .health-diff .config-row.changes .value:last-child { color: var(--accent); font-weight: 600; }
 .health-picks { display: flex; flex-direction: column; gap: var(--s-s); }
+.health-fate ul { margin: var(--s-xs) 0 0; padding-left: var(--s-xl); display: flex; flex-direction: column; gap: var(--s-xs); }
+.health-fate li { overflow-wrap: anywhere; color: var(--text-secondary); }
+.health-fate .dl-badge { margin-left: var(--s-xs); }
 .health-choice { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-s); }
 .health-choice .btn[aria-pressed="true"] { background: rgb(var(--accent-rgb) / 0.16); color: var(--accent); }
 .health-preview-actions { margin: 0; padding: 0; border: 0; background: none; justify-content: flex-end; }
@@ -2209,8 +2383,9 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
   .sidebar-nav-item { width: auto; flex: 0 0 auto; white-space: nowrap; margin-top: 0; height: 40px; padding: 0 12px; }
   .content { padding: var(--s-page) var(--s-xl) 64px; }
   :root { --t-title: 28px; }
-  .set-section { scroll-margin-top: 136px; }
-  .page-toc { margin-top: calc(-1 * var(--s-l)); }
+  /* The sidebar strip stays stuck to the top, so every jump to a spot on the page stops below it.
+   * --strip-h is the strip's measured height, set by admin.js; it grows when its rows wrap. */
+  html { scroll-padding-top: var(--strip-h, 120px); }
   .page-header { flex-wrap: wrap; gap: var(--s-l); }
   .page-header > div { flex-basis: calc(100% - 60px); }
   .page-icon { width: 40px; height: 40px; }
@@ -2326,6 +2501,14 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 }
 .update-command .btn { flex: 0 0 auto; }
 .info-card p.update-fine { font-size: var(--t-meta); color: var(--text-muted); }
+/* The banner's button lands here: the card clears the top of the page and its edge lights up. */
+#update-card { scroll-margin-top: var(--s-xl); }
+#update-card:focus:not(:focus-visible) { outline: none; }
+#update-card.is-pointed { animation: card-pointed 1.8s var(--ease) forwards; }
+@keyframes card-pointed {
+  0%, 45% { outline: 2px solid var(--accent); outline-offset: 4px; }
+  100% { outline: 2px solid transparent; outline-offset: 4px; }
+}
 .info-card .update-helper-old { margin: var(--s-l) 0 0; }
 .info-card .update-helper-old p { font-size: var(--t-meta); color: var(--ink-1); margin-bottom: 0; }
 .update-helper-old .update-command { margin-bottom: 0; }

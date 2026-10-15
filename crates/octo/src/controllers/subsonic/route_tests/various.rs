@@ -629,7 +629,7 @@ async fn get_playlist_station_rows_without_a_length_carry_one_in_the_first_respo
         &[LastFmRadioStation {
             id: station_id("alice", "your-mix"),
             key: "your-mix".into(),
-            name: "Your Mix".into(),
+            name: "Your Radio".into(),
             owner: "alice".into(),
             kind: LastFmRadioStationKind::YourMix,
             personalized: true,
@@ -681,7 +681,7 @@ async fn get_song_an_outside_song_carries_its_remembered_length_or_none() {
         &[LastFmRadioStation {
             id: station_id("alice", "your-mix"),
             key: "your-mix".into(),
-            name: "Your Mix".into(),
+            name: "Your Radio".into(),
             owner: "alice".into(),
             kind: LastFmRadioStationKind::YourMix,
             personalized: true,
@@ -947,7 +947,7 @@ async fn station_song_ids(fixture: &LengthFixture, songs: &[(&str, &str)]) -> Ha
         &[LastFmRadioStation {
             id: station_id("alice", "your-mix"),
             key: "your-mix".into(),
-            name: "Your Mix".into(),
+            name: "Your Radio".into(),
             owner: "alice".into(),
             kind: LastFmRadioStationKind::YourMix,
             personalized: true,

@@ -455,6 +455,34 @@ async fn match_library_finds_the_same_recording_only_and_gives_a_library_song_to
     assert_eq!(asked.load(Ordering::SeqCst), 4);
 }
 
+#[test]
+fn skip_covers_and_instrumentals_leaves_outside_takes_off_a_list_and_the_next_rows_fill_it() {
+    let rows = vec![
+        top(1, "Adele", "Hello"),
+        top(2, "Adele", "Rolling in the Deep (Instrumental)"),
+        top(3, "Adele", "Skyfall (Karaoke Version)"),
+        top(4, "Catfish and the Bottlemen", "Karaoke Queen"),
+        top(5, "Adele", "Someone Like You"),
+    ];
+    let ranks = |rows: &[TopSong]| rows.iter().map(|row| row.rank).collect::<Vec<_>>();
+
+    // Off: the first three rows, as always.
+    let off = TopSongsService::rows_to_match(&rows, 3, false);
+    assert_eq!(ranks(&off), [1, 2, 3]);
+    let (shown, _) = TopSongsService::shown_rows(off, vec![None; 3], 3, false);
+    assert_eq!(ranks(&shown), [1, 2, 3]);
+
+    // On: the two takes are matched too, and left out unless the library has them.
+    let on = TopSongsService::rows_to_match(&rows, 3, true);
+    assert_eq!(ranks(&on), [1, 2, 3, 4, 5]);
+    let (shown, _) = TopSongsService::shown_rows(on.clone(), vec![None; 5], 3, true);
+    assert_eq!(ranks(&shown), [1, 4, 5], "a name is not a take; ranks are kept");
+    let owned = vec![None, None, Some(json!({"id": "nd-skyfall"})), None, None];
+    let (shown, library) = TopSongsService::shown_rows(on, owned, 3, true);
+    assert_eq!(ranks(&shown), [1, 3, 4], "the library's own copy is listed");
+    assert_eq!(library[1].as_ref().unwrap()["id"], "nd-skyfall");
+}
+
 #[tokio::test]
 async fn match_library_never_searches_more_than_four_at_once() {
     let rows: Vec<TopSong> = (1..=20).map(|i| top(i, "Artist", &format!("Song {i}"))).collect();

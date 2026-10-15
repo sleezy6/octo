@@ -682,3 +682,157 @@ fn pre_score_prefers_a_plain_album_then_the_earliest_first_release_then_pressing
     );
     assert_eq!(ReleaseIdentifier::pre_score(&[]), None);
 }
+
+// ---- the album comes from the take the audio is ------------------------------------------------
+
+/// "Welcome to the Black Parade" as AcoustID answered it: the studio take on the album, the
+/// instrumental on a promo CD of instrumentals in the same release group, and a live take.
+fn parade_lookup() -> AcoustIdLookup {
+    let take = |id: &str, seconds: i32, releases: Vec<AcoustIdRelease>| AcoustIdRecording {
+        duration_seconds: Some(seconds),
+        sources: 10,
+        releases,
+        ..AcoustIdRecording::new(
+            id,
+            "Welcome to the Black Parade",
+            ["My Chemical Romance"],
+            None,
+            None,
+        )
+    };
+    let promo = AcoustIdRelease {
+        title: Some("The Black Parade (instrumentals)".into()),
+        group_title: Some("The Black Parade".into()),
+        ..release("r-promo", "g-parade", "x", "2006-11-01", &[])
+    };
+    let promo = AcoustIdRelease {
+        title: Some("The Black Parade (instrumentals)".into()),
+        ..promo
+    };
+    AcoustIdLookup::new(
+        true,
+        None,
+        vec![AcoustIdResult::new(
+            0.97,
+            vec![
+                take(
+                    "rec-studio",
+                    311,
+                    vec![release(
+                        "r-album",
+                        "g-parade",
+                        "The Black Parade",
+                        "2006-10-23",
+                        &[],
+                    )],
+                ),
+                take("rec-instrumental", 310, vec![promo]),
+                take(
+                    "rec-live",
+                    305,
+                    vec![release(
+                        "r-live",
+                        "g-dead",
+                        "The Black Parade Is Dead!",
+                        "2008-06-30",
+                        &["Live"],
+                    )],
+                ),
+            ],
+        )],
+    )
+}
+
+fn parade_song(recording: &str, kind: RecordingKind, by_length: bool) -> Song {
+    Song {
+        artist: "My Chemical Romance".into(),
+        title: "Welcome to the Black Parade".into(),
+        verification: Some(Box::new(VerificationResult {
+            verdict: VerificationVerdict::Confirmed,
+            recording_id: Some(recording.into()),
+            kind: Some(kind),
+            by_length,
+            kind_certain: by_length,
+            lookup: Some(parade_lookup()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+}
+
+async fn identify_held_to(song: &Song, album: &str) -> TagPlan {
+    let file = FileFacts {
+        duration_seconds: 311,
+        extension: ".flac".into(),
+        ..Default::default()
+    };
+    let identifier = identifier(AppSettings::default(), None, None, file);
+    let request = ReleaseIdentifier::request_for(song, &song.artist, &song.title, Some(album), Some(5));
+    identifier
+        .identify::<()>(
+            song,
+            request,
+            "/m/parade.flac",
+            true,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("not canceled")
+}
+
+#[tokio::test]
+async fn a_replacement_held_to_the_instrumentals_album_is_tagged_from_its_own_studio_take() {
+    // The replace of 2026-10-11: studio audio, held to the album the old copy was wrongly given.
+    let plan = identify_held_to(
+        &parade_song("rec-studio", RecordingKind::Studio, true),
+        "The Black Parade (instrumentals)",
+    )
+    .await;
+    let chosen = &plan.chosen.as_ref().expect("a release").candidate;
+    assert_eq!(chosen.release_id.as_deref(), Some("r-album"));
+    assert_eq!(chosen.recording_id.as_deref(), Some("rec-studio"));
+    assert!(
+        plan.notes
+            .iter()
+            .any(|n| n.contains("names an instrumental, which this file is not")),
+        "{:?}",
+        plan.notes
+    );
+    // Not one release of another take is left to choose from.
+    assert!(plan.ranked.iter().all(
+        |r| r.candidate.recording_id.as_deref() != Some("rec-instrumental")
+            && r.candidate.recording_id.as_deref() != Some("rec-live")
+    ));
+}
+
+#[tokio::test]
+async fn a_live_take_is_tagged_from_its_live_album() {
+    let plan = identify_held_to(
+        &parade_song("rec-live", RecordingKind::Live, true),
+        "The Black Parade",
+    )
+    .await;
+    let chosen = &plan.chosen.as_ref().expect("a release").candidate;
+    assert_eq!(chosen.release_id.as_deref(), Some("r-live"));
+    assert_eq!(chosen.recording_id.as_deref(), Some("rec-live"));
+}
+
+#[test]
+fn an_album_naming_the_take_the_audio_is_stays() {
+    let identity = Identity {
+        recording_id: "rec-instrumental".into(),
+        kind: RecordingKind::Instrumental,
+        by_length: true,
+        kind_certain: true,
+    };
+    let request = TagRequest {
+        title: "Welcome to the Black Parade".into(),
+        album: Some("The Black Parade (instrumentals)".into()),
+        ..Default::default()
+    };
+    let mut notes = Vec::new();
+    let kept = ReleaseIdentifier::without_contradicted_album(request, Some(&identity), &mut notes);
+    assert_eq!(kept.album.as_deref(), Some("The Black Parade (instrumentals)"));
+    assert!(notes.is_empty());
+}

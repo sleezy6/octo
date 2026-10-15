@@ -2,7 +2,7 @@
 //! each a read-only playlist for every listener, so every Subsonic app gets them beside the radio
 //! stations and mixes. A song the listener's library has is their own copy, as Navidrome
 //! describes it to them; the rest are outside songs that play right away and are added with a
-//! heart, while search discovery is on and the explicit filter lets them.
+//! heart, while search discovery is on and the explicit filter and Skip covers and instrumentals let them.
 //!
 //! Per listener because the library match is theirs, and made with their own sign-in inside
 //! their own request, as the mixes are: Octo keeps no one's Navidrome password. A list holds
@@ -25,7 +25,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::charts::chart_settings::{self, ChartKind, OVERALL};
 use octo_core::charts::top_songs::{library_hit, library_query, one_row_per_library_song};
-use octo_core::common::Clock;
+use octo_core::common::{Clock, skipped_takes};
 use octo_core::library::generated_playlist_service::{period_index, playlist_id, user_key};
 use octo_core::models::domain::Song;
 use octo_core::models::radio::{LastFmRadioStation, LastFmRadioTrack};
@@ -394,9 +394,12 @@ impl ChartPlaylistService {
     }
 
     /// What decides whether a made list still holds: outside songs shown or not, which of them
-    /// the listener's explicit filter lets through, and whose charts they are.
+    /// the listener's explicit filter and Skip covers and instrumentals let through, and whose charts they
+    /// are.
     async fn rule(&self, username: &str) -> String {
-        let subsonic = self.inner.settings.current().subsonic.clone();
+        let settings = self.inner.settings.current();
+        let subsonic = settings.subsonic.clone();
+        let skip_covers_and_instrumentals = settings.soulseek.skip_covers_and_instrumentals;
         let country = self
             .inner
             .top_songs
@@ -404,9 +407,14 @@ impl ChartPlaylistService {
             .await
             .unwrap_or_else(|| "auto".into());
         format!(
-            "{}|{:?}|{country}",
+            "{}|{:?}|{country}{}",
             subsonic.enable_search_discovery,
-            self.explicit_filter_for(username)
+            self.explicit_filter_for(username),
+            if skip_covers_and_instrumentals {
+                "|skip-covers-and-instrumentals"
+            } else {
+                ""
+            }
         )
     }
 
@@ -470,19 +478,20 @@ impl ChartPlaylistService {
     /// they may be shown.
     async fn make(&self, username: &str, auth: Parameters, period: i64, rule: String) -> bool {
         let user = user_key(username);
-        let subsonic = self.inner.settings.current().subsonic.clone();
+        let settings = self.inner.settings.current();
+        let subsonic = settings.subsonic.clone();
+        let skip_covers_and_instrumentals = settings.soulseek.skip_covers_and_instrumentals;
         let explicit_filter = self.explicit_filter_for(username);
         let mut searched: HashMap<String, Option<Vec<Value>>> = HashMap::new();
         let mut trouble = false;
         let mut any = false;
         for (chart, name) in self.charts_on().await {
             let list = self.inner.top_songs.chart(&chart).await;
-            let rows: Vec<TopSong> = list
-                .songs
-                .iter()
-                .take(chart_settings::max_songs(&chart))
-                .cloned()
-                .collect();
+            let count = chart_settings::max_songs(&chart);
+            // A row more for each outside take Skip covers, karaoke and instrumentals leaves out,
+            // so the next rows take their places, as on getTopSongs.
+            let rows: Vec<TopSong> =
+                TopSongsService::rows_to_match(&list.songs, count, skip_covers_and_instrumentals);
             if rows.is_empty() {
                 trouble = true;
                 info!("{name} for {username}: the chart did not answer, the last list stays");
@@ -546,6 +555,8 @@ impl ChartPlaylistService {
                 &library,
                 subsonic.enable_search_discovery,
                 explicit_filter,
+                skip_covers_and_instrumentals,
+                count,
                 |song| Value::Object(self.inner.responses.convert_song_to_json(song)),
             );
             let hash = entries_hash(&entries);
@@ -597,21 +608,31 @@ impl ChartPlaylistService {
 }
 
 /// The list in chart order: the library's song where the row has one, else the outside song when
-/// outside songs may be shown and the explicit filter lets it through. The filter is the one
-/// stations follow: a list Octo picks follows it, a search does not.
+/// outside songs may be shown, the explicit filter lets it through, and it is no cover, instrumental or
+/// karaoke take Skip covers and instrumentals leaves out. The filter is the one stations follow: a list Octo
+/// picks follows it, a search does not. At most `count` songs: `rows` may run past that, so a row
+/// left out is made up by the next one.
 pub fn assemble(
     rows: &[TopSong],
     library: &[Option<Value>],
     outside_shown: bool,
     filter: ExplicitFilter,
+    skip_covers_and_instrumentals: bool,
+    count: usize,
     as_json: impl Fn(&Song) -> Value,
 ) -> (Vec<Value>, Vec<Song>) {
     let mut entries = Vec::new();
     let mut outside = Vec::new();
     for (i, row) in rows.iter().enumerate() {
+        if entries.len() >= count {
+            break;
+        }
         if let Some(owned) = library.get(i).and_then(Option::as_ref) {
             entries.push(owned.clone());
-        } else if outside_shown && passes(&row.song, filter) {
+        } else if outside_shown
+            && passes(&row.song, filter)
+            && !skipped_takes::hides_song(&row.song, skip_covers_and_instrumentals)
+        {
             entries.push(as_json(&row.song));
             outside.push(row.song.clone());
         }

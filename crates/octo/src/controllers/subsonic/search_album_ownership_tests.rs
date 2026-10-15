@@ -648,3 +648,113 @@ async fn a_members_own_album_stands_in_for_its_outside_version_in_their_own_sear
     assert_eq!(sams["isExternal"], true, "{sams}");
     assert_eq!(sams["ownedCount"], 0, "{sams}");
 }
+
+/// The drake library with one song of MAID OF HONOUR, which Navidrome files as a one-song album
+/// of that very name on the artist page.
+#[derive(Clone)]
+struct WithOneMaidSong;
+
+const ONE_MAID_SONG_ID: &str = "al-maid-one";
+
+fn one_maid_song_row() -> LibrarySongRow {
+    LibrarySongRow {
+        id: "s-maid-one".into(),
+        path: "/music/Drake/MAID OF HONOUR/Which One.flac".into(),
+        size: 1,
+        suffix: "flac".into(),
+        bit_rate: 900,
+        title: "Which One".into(),
+        artist: "Drake".into(),
+        duration: Some(169),
+        album: Some("MAID OF HONOUR".into()),
+        album_id: Some(ONE_MAID_SONG_ID.into()),
+        album_artist: Some("Drake".into()),
+        ..Default::default()
+    }
+}
+
+impl Respond for WithOneMaidSong {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        if request.url.path().ends_with("/rest/getArtist") {
+            return json_reply(
+                json!({"subsonic-response": {"status": "ok", "version": "1.16.1", "artist": {
+                "id": "ar-drake", "name": "Drake", "albumCount": 3, "album": [
+                    {"id": "al-fomo", "name": "HABIBTI (FOMO)", "artist": "Drake", "songCount": 15},
+                    {"id": "al-takecare", "name": "Take Care", "artist": "Drake", "songCount": 2},
+                    {"id": ONE_MAID_SONG_ID, "name": "MAID OF HONOUR", "artist": "Drake", "songCount": 1}]}}}),
+            );
+        }
+        FakeNavidrome.respond(request)
+    }
+}
+
+/// One hearted song of MAID OF HONOUR files a one-song album of that name. The artist page
+/// lists it, and still lists the catalog album beside it with the one song it holds, so the
+/// whole album can be found and hearted.
+#[tokio::test]
+async fn artist_page_keeps_an_album_beside_its_one_song_namesake() {
+    let navidrome = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(WithOneMaidSong)
+        .mount(&navidrome)
+        .await;
+    let deezer = MockServer::start().await;
+    Mock::given(any()).respond_with(FakeDeezer).mount(&deezer).await;
+    let mut rows = drake::LIBRARY.clone();
+    rows.push(one_maid_song_row());
+    let snapshot = Arc::new(LibrarySnapshot::with(
+        Arc::new(move |start, count| {
+            let rows = rows.clone();
+            Box::pin(async move {
+                let page: Vec<LibrarySongRow> = rows
+                    .iter()
+                    .skip(start as usize)
+                    .take(count as usize)
+                    .cloned()
+                    .collect();
+                let held = page.len();
+                Some((page, held))
+            })
+        }),
+        Clock::system(),
+    ));
+    let state = AppState::for_tests_with(
+        AppSettings {
+            subsonic: SubsonicSettings {
+                url: Some(navidrome.uri()),
+                auto_detect_download_path: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        TestServices {
+            deezer_base_url: Some(deezer.uri()),
+            library_snapshot: Some(snapshot),
+            ..Default::default()
+        },
+    );
+
+    let uri = format!("/rest/getArtist.view?{AUTH}&f=json&id=ar-drake");
+    let reply = get(&app(&state), &uri).await;
+    assert!(reply.status.is_success(), "{uri}: {}", reply.text());
+    let body: Value = serde_json::from_str(&reply.text()).expect("JSON");
+    let albums = body["subsonic-response"]["artist"]["album"]
+        .as_array()
+        .expect("albums");
+    let maid: Vec<(&str, bool, Option<i64>)> = albums
+        .iter()
+        .filter(|a| text_of(a, "name") == "MAID OF HONOUR")
+        .map(|a| {
+            (
+                text_of(a, "id"),
+                a["isExternal"].as_bool().unwrap_or(false),
+                a["ownedCount"].as_i64(),
+            )
+        })
+        .collect();
+
+    assert_eq!(maid.len(), 2, "{albums:?}");
+    assert_eq!(maid[0], (ONE_MAID_SONG_ID, false, None), "{albums:?}");
+    assert!(maid[1].1, "{albums:?}");
+    assert_eq!(maid[1].2, Some(1), "{albums:?}");
+}

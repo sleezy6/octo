@@ -252,6 +252,27 @@ fn merge_search_results_xml_deduplicates_album_against_local() {
     assert_eq!(merged.1.len(), 2);
 }
 
+/// An outside album with an owned count was already weighed against the library and kept: a
+/// one-song namesake in the library does not hide it, in JSON or XML.
+#[test]
+fn merge_search_results_keeps_a_counted_album_beside_its_namesake() {
+    let mut counted = rainbows();
+    counted.albums[0].owned_count = Some(1);
+
+    let local_json = json_rows(vec![
+        json!({"id": "local1", "name": "In Rainbows", "artist": "Radiohead"}),
+    ]);
+    let merged = mapper().merge_search_results(vec![], local_json, vec![], &counted, &[], true, None);
+    assert_eq!(merged.1.len(), 3);
+
+    let local_xml = vec![xml_row(
+        "album",
+        &[("id", "local1"), ("name", "In Rainbows"), ("artist", "Radiohead")],
+    )];
+    let merged = mapper().merge_search_results(vec![], local_xml, vec![], &counted, &[], false, None);
+    assert_eq!(merged.1.len(), 3);
+}
+
 #[test]
 fn merge_search_results_xml_merges_songs_correctly() {
     let local = vec![xml_row("song", &[("id", "local1"), ("title", "Local Song")])];

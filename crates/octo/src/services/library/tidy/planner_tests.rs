@@ -607,6 +607,48 @@ fn an_id3v23_artist_frame_holding_a_slash_is_left_alone() {
     assert!(skip_saying(&plan, "ID3v2.3").is_some());
 }
 
+#[test]
+fn a_semicolon_credit_already_naming_the_guest_changes_nothing() {
+    for artist in ["SAYGRACE; G\u{2010}Eazy", "SAYGRACE; G-Eazy"] {
+        let plan = plan_of(&[song("SAYGRACE/You Don't Own Me/You Don't Own Me.flac", artist)
+            .album_artist("SAYGRACE")
+            .title("You Don't Own Me (feat. G-Eazy)")]);
+        assert!(plan.retags.is_empty(), "{artist}");
+        assert!(row_of(&plan, TidyKind::Guest).is_none(), "{artist}");
+    }
+}
+
+#[test]
+fn a_semicolon_credit_gets_a_new_guest_after_its_own_artists() {
+    let plan = plan_of(&[song("A/X/01 - S.flac", "A; B").title("S (feat. C)")]);
+    assert_eq!(plan.retags[0].after.artists, ["A", "B", "C"]);
+    assert_eq!(plan.retags[0].after.artist, ["A; B"]);
+    assert_eq!(
+        row_of(&plan, TidyKind::Guest).unwrap().after,
+        "A \u{b7} B \u{b7} C"
+    );
+}
+
+#[test]
+fn a_slash_credit_is_split_like_navidrome() {
+    let plan = plan_of(&[song("A/X/01 - S.flac", "A / B").title("S (feat. C)")]);
+    assert_eq!(plan.retags[0].after.artists, ["A", "B", "C"]);
+}
+
+#[test]
+fn a_credit_navidrome_reads_as_several_artists_is_never_a_spelling() {
+    let files = [
+        song("SAYGRACE/A/01 - S.flac", "SAYGRACE; G\u{2010}Eazy"),
+        song("SAYGRACE/B/01 - T.flac", "SAYGRACE, G-Eazy"),
+        song("SAYGRACE/C/01 - U.flac", "SAYGRACE, G-Eazy"),
+    ];
+    let plan = plan_of(&files);
+    assert!(row_of(&plan, TidyKind::Rename).is_none());
+    assert!(row_of(&plan, TidyKind::Respell).is_none());
+    assert!(plan.retags.is_empty());
+    assert!(skip_saying(&plan, "several artists").is_some());
+}
+
 // ---- boundaries -----------------------------------------------------------------------------
 
 #[test]

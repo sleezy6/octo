@@ -358,7 +358,7 @@ pub fn shape_with_reserve(
 
 /// The walk behind [`shape`] and [`shape_with_reserve`]: it takes up to `reach` times the
 /// station's size, and everything past the size is the reserve.
-fn shape_walk(
+pub fn shape_walk(
     candidates: Vec<Candidate>,
     plays: &[LastFmRadioPlay],
     settings: &LastFmSettings,
@@ -473,7 +473,7 @@ fn shape_walk(
         ..
     } = walk;
     let reserve = output.split_off(output.len().min(target.max(0) as usize));
-    // Your Mix (and Starter Radio): the familiar tracks and the discoveries take turns at random
+    // Your Radio (and Starter Radio): the familiar tracks and the discoveries take turns at random
     // at the discovery share (last_fm_radio_placement), instead of the walk's order putting the
     // familiar first. The share is paced to what the walk took, so a short walk ends on no block
     // of discoveries. The placement keeps the walk's artist and title gaps. It is handed the
@@ -512,7 +512,7 @@ fn shape_walk(
     }
 }
 
-/// A Your Mix track with what its placement needs: whether it is familiar, and the walk's
+/// A Your Radio track with what its placement needs: whether it is familiar, and the walk's
 /// artist and title keys.
 type Placed = (LastFmRadioTrack, bool, String, String);
 
@@ -538,7 +538,7 @@ struct Walk<'a> {
     per_source: HashMap<String, i32>,
     familiar_taken: i32,
     output: Vec<LastFmRadioTrack>,
-    /// Beside each output track: whether it is a familiar one, for Your Mix's placement.
+    /// Beside each output track: whether it is a familiar one, for Your Radio's placement.
     familiar_flags: Vec<bool>,
     output_artists: Vec<String>,
     output_titles: Vec<String>,
@@ -742,7 +742,7 @@ pub fn score_artists(plays: &[LastFmRadioPlay], now: DateTime<Utc>) -> Vec<(Stri
     scores
 }
 
-/// Discovery Mix walks Last.fm's similar-artist graph out from the listener's
+/// Discovery Radio walks Last.fm's similar-artist graph out from the listener's
 /// [`FRONTIER_SEEDS`] strongest artists, [`FRONTIER_NEIGHBOURS`] neighbours each, then one more
 /// step from the [`SECOND_STEP_SEEDS`] best new artists at [`SECOND_STEP_WEIGHT`]. The
 /// [`FRONTIER_ARTISTS`] best new artists give [`FRONTIER_TRACKS_EACH`] top songs each, and at
@@ -1152,9 +1152,9 @@ mod tests {
         }
     }
 
-    /// Decision D10 (radio placement, 2026-10-08): Your Mix places its familiar tracks and its
-    /// discoveries at random at the discovery share, so the familiar ones no longer gather at
-    /// the front, and the order is not the apps' old every-third-song schedule either.
+    /// Your Radio places its familiar tracks and its discoveries at random at the discovery
+    /// share, so the familiar ones do not gather at the front, and the order is not a fixed
+    /// every-third-song schedule either.
     #[test]
     fn your_mix_mixes_familiar_and_discovery_throughout() {
         let settings = LastFmSettings {
@@ -1211,10 +1211,10 @@ mod tests {
         );
     }
 
-    /// The Check Mode finding M1 (2026-10-08): a walk that falls short of its quota, 5 familiar
-    /// tracks and 18 discoveries where Your Mix wants 32 and 18 of 50, was placed at the quota's
-    /// 36% and ended on 16 discoveries in a row. Paced to what the walk took, it ends on 6 at
-    /// most over 200 seeds, and no more than 2 familiar tracks come in a row.
+    /// A walk that falls short of its quota, 5 familiar tracks and 18 discoveries where Your
+    /// Radio wants 32 and 18 of 50, is paced to what the walk took rather than at the quota's
+    /// 36%: it ends on 6 discoveries in a row at most over 200 seeds, and no more than 2
+    /// familiar tracks come in a row.
     #[test]
     fn a_short_your_mix_walk_ends_on_no_long_run_of_discoveries() {
         let settings = LastFmSettings {

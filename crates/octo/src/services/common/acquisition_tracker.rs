@@ -15,7 +15,7 @@ use futures::future::BoxFuture;
 use octo_core::common::Clock;
 use octo_core::common::acquisition_tracker::{fraction_of, user_safe};
 use octo_core::common::dotnet::{self, compare_ordinal_ignore_case, eq_ignore_case, to_lower_invariant};
-use octo_core::models::download::{AcquisitionCandidate, AcquisitionEvent};
+use octo_core::models::download::{AcquisitionCandidate, AcquisitionEvent, AcquisitionHeard};
 use parking_lot::Mutex;
 use tracing::{debug, info};
 
@@ -819,6 +819,20 @@ impl AcquisitionTracker {
 
     /// One line in a row's log, for this run of it.
     pub fn log(&self, provider: &str, external_id: &str, kind: &str, text: &str, detail: Option<&str>) {
+        self.log_heard(provider, external_id, kind, text, detail, Vec::new());
+    }
+
+    /// One line in a row's log with the other recordings AcoustID heard in the file, kept only
+    /// when there are any.
+    pub fn log_heard(
+        &self,
+        provider: &str,
+        external_id: &str,
+        kind: &str,
+        text: &str,
+        detail: Option<&str>,
+        heard: Vec<AcquisitionHeard>,
+    ) {
         if blank(provider) || blank(external_id) || blank(text) {
             return;
         }
@@ -830,6 +844,11 @@ impl AcquisitionTracker {
                 return;
             };
             add(entry, now, kind, text, detail, None);
+            if !heard.is_empty()
+                && let Some(line) = entry.events.last_mut()
+            {
+                line.heard = Some(heard);
+            }
             entry.finished()
         };
         if after_end {
@@ -1344,6 +1363,7 @@ fn add(
         text: text.trim().to_string(),
         detail: detail.filter(|d| !blank(d)).map(|d| d.trim().to_string()),
         candidates: candidates.filter(|copies| !copies.is_empty()),
+        heard: None,
     });
     if entry.events.len() > AcquisitionTracker::MAX_EVENTS {
         entry.events.remove(1);

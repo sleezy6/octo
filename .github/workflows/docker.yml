@@ -101,12 +101,37 @@ jobs:
     with:
       csharp: false
 
+  # GeoNames' postal codes for the octo image's place data, downloaded once per run so the amd64
+  # and arm64 images are built from the same files. The Dockerfile takes them from places-data/
+  # in the build context, keyed by their content, so a run on main takes the data as GeoNames
+  # has it that day and converts it again only when it changed.
+  places:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download GeoNames' postal codes
+        run: |
+          mkdir -p places-data
+          for file in allCountries.zip readme.txt; do
+            curl -fsSL --retry 5 --retry-all-errors -o "places-data/$file" "https://download.geonames.org/export/zip/$file"
+          done
+          unzip -l places-data/allCountries.zip allCountries.txt
+          ls -l places-data
+
+      - name: Keep them for the builds
+        uses: actions/upload-artifact@v7
+        with:
+          name: places-data
+          path: places-data/*
+          if-no-files-found: error
+          retention-days: 1
+
   # Each image for each platform, built on a runner of that platform: arm64 on GitHub's own
   # arm64 runners (free for public repositories) rather than under QEMU, where compiling
   # octo-sonic (Rust and FFmpeg) took many times longer. Each pushes its image by digest
   # only; the merge job below puts the two platforms under the real tags.
   build:
-    needs: [versions, checks]
+    needs: [versions, checks, places]
     runs-on: ${{ matrix.platform.runner }}
 
     strategy:
@@ -118,16 +143,23 @@ jobs:
         image:
           # The Rust server (Dockerfile at the top of the repo). Its Rust compile is most of
           # this workflow's time; the cargo-chef layer of third-party crates is cached.
+          # Only its build takes the place data, and it fails without it.
           - name: octo
             context: .
             suffix: ""
+            places: true
+            build_args: PLACES_REQUIRED=1
           - name: yt-dlp-shim
             context: ./yt-dlp-shim
             suffix: -yt-dlp-shim
+            places: false
+            build_args: ""
           # The Sounds alike reader (Rust).
           - name: octo-sonic
             context: ./sonic
             suffix: -sonic
+            places: false
+            build_args: ""
         # amd64 only on this private fork: GitHub's arm64 runners are free for public
         # repositories only, and the server it runs on is amd64. Add the arm64 line back
         # (arch: arm64, runner: ubuntu-24.04-arm) and set PLATFORMS to 2 below for both.
@@ -142,6 +174,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Fetch the place data
+        if: matrix.image.places
+        uses: actions/download-artifact@v8
+        with:
+          name: places-data
+          path: places-data
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -169,6 +208,7 @@ jobs:
           context: ${{ matrix.image.context }}
           platforms: linux/${{ matrix.platform.arch }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ matrix.image.build_args }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image.suffix }},push-by-digest=true,name-canonical=true,push=true
           # A scope per image and platform, so the builds running side by side never fight
           # over the same cache entries.

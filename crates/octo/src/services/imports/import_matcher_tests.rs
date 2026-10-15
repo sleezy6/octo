@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::super::spotify_web_api::ImportKeys;
+use super::super::import_keys::ImportKeys;
 use super::super::test_support::row;
 use super::*;
 

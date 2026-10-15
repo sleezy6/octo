@@ -88,6 +88,104 @@ mod tests {
         );
     }
 
+    /// A log line as 2026.10.13 reads it: no Heard.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    #[allow(dead_code)]
+    struct LineBefore {
+        #[serde(
+            default = "crate::json::datetime::min_value",
+            with = "crate::json::datetime::utc"
+        )]
+        at: chrono::DateTime<chrono::Utc>,
+        #[serde(default, deserialize_with = "crate::models::null_as_default")]
+        kind: String,
+        #[serde(default, deserialize_with = "crate::models::null_as_default")]
+        text: String,
+        #[serde(default)]
+        detail: Option<String>,
+        #[serde(default)]
+        candidates: Option<Vec<super::super::acquisition_event::AcquisitionCandidate>>,
+    }
+
+    /// The entry as 2026.10.13 reads it.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "PascalCase", default)]
+    #[allow(dead_code)]
+    #[derive(Default)]
+    struct EntryBefore {
+        #[serde(deserialize_with = "crate::models::null_as_default")]
+        artist: String,
+        #[serde(deserialize_with = "crate::models::null_as_default")]
+        title: String,
+        album: Option<String>,
+        #[serde(deserialize_with = "crate::models::null_as_default")]
+        path: String,
+        #[serde(deserialize_with = "crate::models::null_as_default")]
+        format: String,
+        #[serde(deserialize_with = "crate::models::null_as_default")]
+        source: String,
+        cover_art_url: Option<String>,
+        size_bytes: i64,
+        transcoded_from: Option<String>,
+        tagging: Option<TagReport>,
+        #[serde(deserialize_with = "crate::models::null_as_default")]
+        downloaded_at: String,
+        requested_by: Option<Vec<String>>,
+        key: Option<String>,
+        log: Option<Vec<LineBefore>>,
+    }
+
+    /// A history file whose check line keeps what AcoustID heard still loads where Heard is
+    /// unknown (a parse error there would start the history fresh), and a line without it is
+    /// written as before.
+    #[test]
+    fn a_history_file_with_heard_recordings_still_loads_in_the_entry_before_them() {
+        use super::super::acquisition_event::{AcquisitionEvent, AcquisitionHeard};
+
+        let check = AcquisitionEvent {
+            at: chrono::DateTime::from_timestamp(1_760_000_000, 0).expect("a time"),
+            kind: "check".into(),
+            text: "Passed the checks".into(),
+            detail: Some(
+                "the right length; AcoustID: no match above 85% (best 61%), so the name and length decide"
+                    .into(),
+            ),
+            candidates: None,
+            heard: Some(vec![AcquisitionHeard {
+                title: "Teardrop".into(),
+                artist: "Massive Attack".into(),
+                score: 61,
+            }]),
+        };
+        let plain = AcquisitionEvent {
+            heard: None,
+            text: "Found 3 copies".into(),
+            ..check.clone()
+        };
+        let entries = vec![DownloadHistoryEntry {
+            artist: "Massive Attack".into(),
+            title: "Teardrop".into(),
+            log: Some(vec![check.clone(), plain]),
+            ..Default::default()
+        }];
+        let text = crate::json::to_string_without_nulls(&entries);
+        assert!(
+            text.contains(r#""Heard":[{"Title":"Teardrop","Artist":"Massive Attack","Score":61}]"#),
+            "{text}"
+        );
+        assert_eq!(text.matches("\"Heard\"").count(), 1, "{text}");
+
+        let before: Vec<EntryBefore> = serde_json::from_str(&text).expect("the older entry reads it");
+        let log = before[0].log.as_ref().expect("the log");
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].text, "Passed the checks");
+        assert_eq!(log[0].detail, check.detail);
+
+        let again: Vec<DownloadHistoryEntry> = serde_json::from_str(&text).expect("reads back");
+        assert_eq!(again, entries);
+    }
+
     #[test]
     fn a_null_in_a_string_field_still_reads() {
         // A hand-edited null in a string field must not lose the whole log.

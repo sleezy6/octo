@@ -1,8 +1,8 @@
 //! Library health on the server, for the dashboard.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -10,7 +10,9 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use indexmap::IndexMap;
 use octo_core::common::Clock;
+use octo_core::common::dotnet::eq_ignore_case;
 use octo_core::settings::{LibraryAction, SettingsStore};
+use octo_subsonic::SubsonicCredential;
 use parking_lot::Mutex;
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
@@ -18,10 +20,11 @@ use tracing::{debug, error, info, warn};
 use super::health_fixes::{self as fixes, FixAnswer, FixOutcome, FixStep, TagChange, fix_actions as actions};
 use super::health_words::{self as words, count_text};
 use super::keep_marks::{self, KeepMarks};
-use super::library_health::{self as health, HealthCheck, HealthReport};
+use super::library_health::{self as health, HealthCheck, HealthReport, IHealthFields};
 use super::server_song_fields::ServerSongFields;
 use crate::services::family::library_index::row_full_path;
 use crate::services::family::{LibraryScope, ScopeResolver};
+use crate::services::library::duplicate_fixer::{DuplicateFixAnswer, DuplicateFixer};
 use crate::services::library::library_tag_edits::{self as tag_edits, song_tag_fields};
 use crate::services::library::{
     LibraryActionExecutor, LibraryActionRequest, LibraryActionState, LibraryAlbumIndex, LibraryEditOutcome,
@@ -219,6 +222,16 @@ pub struct LibraryHealthService {
     settle_for: Mutex<TimeDelta>,
     seams: Mutex<HealthSeams>,
     state: Mutex<State>,
+    /// Fixes asked for from a star or an action playlist, waiting for the run going now.
+    pending: Mutex<Vec<PendingFix>>,
+}
+
+/// One song's copies to fix, asked for from a star or an action playlist.
+struct PendingFix {
+    user: String,
+    title: String,
+    copies: Vec<String>,
+    steps: Vec<FixStep>,
 }
 
 impl LibraryHealthService {
@@ -244,6 +257,7 @@ impl LibraryHealthService {
             settle_for: Mutex::new(Self::SETTLE_FOR),
             seams: Mutex::new(HealthSeams::default()),
             state: Mutex::new(State::default()),
+            pending: Mutex::new(Vec::new()),
         }
     }
 
@@ -498,7 +512,8 @@ impl LibraryHealthService {
                 return Some(format!("Unknown change \"{}\".", step.action));
             }
             if step.action == actions::RETAG {
-                let params = step.params();
+                let mut params = step.params();
+                params.shift_remove(actions::FILE_STAMP);
                 if params.is_empty() {
                     return Some(format!("No tags to write for {}.", step.title));
                 }
@@ -533,7 +548,10 @@ impl LibraryHealthService {
                         song_tag_fields::canonical(key).map(|tag| (tag.to_string(), Some(value.clone())))
                     })
                     .collect();
-                if let Some(bad) = tag_edits::invalid(&changes) {
+                // A move with no tags to write besides is a move all the same.
+                if !changes.is_empty()
+                    && let Some(bad) = tag_edits::invalid(&changes)
+                {
                     return Some(bad);
                 }
             }
@@ -696,6 +714,10 @@ impl LibraryHealthService {
         let mut failed: Vec<(FixStep, String)> = Vec::new();
         let mut rehearsed = false;
         let mut stopped = false;
+        let mut kept_rated = 0;
+        if let Some(keep) = &self.services.keep_marks {
+            keep.begin_run();
+        }
         {
             let _hold = self.rescan.hold();
             for step in steps {
@@ -708,9 +730,17 @@ impl LibraryHealthService {
                     Ok(answer) => answer,
                     Err(e) => FixAnswer::new("failed", Some(&e.to_string())),
                 };
+                let kept = matches!(
+                    answer.detail.as_deref(),
+                    Some(keep_marks::RATED_SINCE | keep_marks::MARKS_UNREAD)
+                );
                 match answer.state.as_str() {
                     "applied" => done.push(step),
                     "rehearsed" => rehearsed = true,
+                    "skipped" if kept => {
+                        kept_rated += 1;
+                        unchanged.push(step);
+                    }
                     "skipped" if fixes::is_nothing_to_do(answer.detail.as_deref()) => unchanged.push(step),
                     state => {
                         let why = answer
@@ -724,7 +754,16 @@ impl LibraryHealthService {
                 run.one_done();
             }
         }
-        let notes = self.finish_moves(&run, &mut done, &mut failed).await;
+        let mut notes = self.finish_moves(&run, &mut done, &mut failed).await;
+        if kept_rated > 0 {
+            notes.insert(
+                0,
+                format!(
+                    "Kept {} someone starred or rated since the preview, or whose marks could not be read.",
+                    words::count_text(kept_rated, "copy", "copies")
+                ),
+            );
+        }
         let any_done = !done.is_empty();
         let outcome = FixOutcome {
             done,
@@ -789,11 +828,13 @@ impl LibraryHealthService {
         if any_done {
             self.schedule_read();
         }
+        self.start_pending();
     }
 
-    /// The end of a run that moved sound between copies: each move is checked until Navidrome
-    /// keeps the song as the same one, and one it does not keep was put back, so it counts as
-    /// failed. Songs put back get their playlist places back. Answers what is worth saying.
+    /// The end of a run: each move of sound between copies is checked until Navidrome keeps the
+    /// song as the same one, and one it does not keep was put back, so it counts as failed. Songs
+    /// put back get their playlist places back. Answers what is worth saying, the marks carried
+    /// over included.
     async fn finish_moves(
         &self,
         run: &HealthRun,
@@ -810,10 +851,10 @@ impl LibraryHealthService {
                 .collect()
         };
         let (moved, back) = (ids(actions::MOVE_SOUND), ids(actions::MOVE_BACK));
-        if moved.is_empty() && back.is_empty() {
-            return Vec::new();
+        if !moved.is_empty() || !back.is_empty() {
+            run.step(Some(keep_marks::CHECKING.to_string()));
         }
-        run.step(Some(keep_marks::CHECKING.to_string()));
+        // Also puts back the playlist places of copies put back, and says what the carries left.
         let (put_back, notes) = keep.finish_run(&moved, &back).await;
         for (id, why) in put_back {
             if let Some(at) = done
@@ -824,6 +865,163 @@ impl LibraryHealthService {
             }
         }
         notes
+    }
+
+    // ---- fixes asked for from any app ---------------------------------------------------------
+
+    /// Fixes every copy of the song `song_id` is one of, as `user` asked from a star or an action
+    /// playlist: the same plan Fix these copies makes, keeping every rated copy while Keep every
+    /// rated copy is on, run as a fix of its own once no other run is going. `credential` is the
+    /// sign-in of a star rating that asked; that rating is taken off first, so it never counts as
+    /// a mark that keeps the copy.
+    pub async fn fix_copies_of(
+        self: &Arc<Self>,
+        song_id: &str,
+        user: &str,
+        credential: Option<&SubsonicCredential>,
+    ) -> DuplicateFixAnswer {
+        let waiting = self
+            .pending
+            .lock()
+            .iter()
+            .any(|fix| fix.copies.iter().any(|copy| copy == song_id));
+        if waiting {
+            return DuplicateFixAnswer::said(
+                LibraryActionState::Applied,
+                "The copies of this song are waiting to be fixed already.",
+            );
+        }
+        let keep = self.services.keep_marks.clone();
+        if let (Some(credential), Some(keep)) = (credential, &keep) {
+            keep.clear_rating_as(credential, song_id).await;
+        }
+        let Some(found) = self.report(false).await else {
+            return DuplicateFixAnswer::said(
+                LibraryActionState::Failed,
+                "Octo could not read your library from Navidrome.",
+            );
+        };
+        let Some(set) = found
+            .report
+            .duplicates
+            .iter()
+            .find(|set| set.copies.iter().any(|copy| copy.id == song_id))
+        else {
+            return DuplicateFixAnswer::said(
+                LibraryActionState::Skipped,
+                "Octo does not see another copy of this song.",
+            );
+        };
+        let can = self.abilities(user);
+        if !can.remove {
+            return DuplicateFixAnswer::said(
+                LibraryActionState::Skipped,
+                can.why.unwrap_or_else(|| {
+                    "Removing songs is off: turn on the Delete action under Library actions.".to_string()
+                }),
+            );
+        }
+        let keep_rated = self.settings.current().library_actions.keep_rated_copies;
+        let keeper = keep.filter(|_| can.edit);
+        let (uses, marks) = match &keeper {
+            Some(keep) => (
+                keep.playlist_uses().await.unwrap_or_default(),
+                Some(keep.read_set(set).await),
+            ),
+            None => (keep_marks::PlaylistUses::default(), None),
+        };
+        // Without a way to read who starred or rated each copy, none can be promised to stay.
+        if keep_rated && marks.is_none() {
+            return DuplicateFixAnswer::said(
+                LibraryActionState::Skipped,
+                "This server cannot read who starred or rated each copy.",
+            );
+        }
+        let copies: Vec<String> = set.copies.iter().map(|copy| copy.id.clone()).collect();
+        let title = set.best().title.clone();
+        let planned = {
+            let fields: &dyn IHealthFields<Row> = &*found.fields;
+            keep_marks::plan_with_marks(set, fields, marks.as_ref(), &uses, keep_rated, None).map(|fix| {
+                let mut steps = fixes::duplicate_steps(&fix, fields, None);
+                if keep_rated {
+                    fixes::only_unrated(&mut steps);
+                }
+                (steps, fix.remove.len() + usize::from(fix.audio.is_some()))
+            })
+        };
+        let Some((steps, gone)) = planned else {
+            return DuplicateFixAnswer {
+                state: LibraryActionState::Applied,
+                detail: words::ALL_RATED.to_string(),
+                copies,
+                all_kept: true,
+            };
+        };
+        info!(
+            "{user} asked from an app to fix the {} copies of {title}: {gone} to go",
+            copies.len()
+        );
+        self.pending.lock().push(PendingFix {
+            user: user.to_string(),
+            title: title.clone(),
+            copies: copies.clone(),
+            steps,
+        });
+        self.start_pending();
+        DuplicateFixAnswer {
+            state: LibraryActionState::Applied,
+            detail: format!(
+                "Fixing the copies of {title}: {} to the trash.",
+                count_text(gone, "copy goes", "copies go")
+            ),
+            copies,
+            all_kept: false,
+        }
+    }
+
+    /// Starts the fixes asked for from apps, one person's at a time, once no run is going.
+    fn start_pending(self: &Arc<Self>) {
+        if self.run().is_some_and(|run| run.is_running()) {
+            return;
+        }
+        let taken: Vec<PendingFix> = {
+            let mut pending = self.pending.lock();
+            let Some(user) = pending.first().map(|fix| fix.user.clone()) else {
+                return;
+            };
+            let mut taken: Vec<PendingFix> = Vec::new();
+            let mut steps = 0;
+            let mut index = 0;
+            while index < pending.len() {
+                let fits = taken.is_empty() || steps + pending[index].steps.len() <= Self::MAX_STEPS;
+                if eq_ignore_case(&pending[index].user, &user) && fits {
+                    steps += pending[index].steps.len();
+                    taken.push(pending.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            taken
+        };
+        let user = taken[0].user.clone();
+        let label = match taken.as_slice() {
+            [one] => format!("Fixing the copies of {}", one.title),
+            many => format!(
+                "Fixing the copies of {} asked for from apps",
+                count_text(many.len(), "song", "songs")
+            ),
+        };
+        let steps: Vec<FixStep> = taken.iter().flat_map(|fix| fix.steps.clone()).collect();
+        if self
+            .start_fix(&label, Some(HealthCheck::Duplicates), steps, &user)
+            .is_some()
+        {
+            // Another run started first: these wait for its end.
+            let mut pending = self.pending.lock();
+            for (at, fix) in taken.into_iter().enumerate() {
+                pending.insert(at, fix);
+            }
+        }
     }
 
     async fn lookup(self: Arc<Self>, run: Arc<HealthRun>, songs: Vec<(String, String)>) {
@@ -908,12 +1106,29 @@ impl LibraryHealthService {
                 return Ok(FixAnswer::new("skipped", Some("Library actions are off.")));
             };
             let copy = matches!(step.param("copy"), Some("true" | "1"));
+            // A copy removed for another names the copy that stays, which takes its marks.
+            let into = step
+                .param(keep_marks::INTO)
+                .map(str::trim)
+                .filter(|into| !into.is_empty() && *into != step.id);
+            let only_unrated = keep_marks::flag(step.param(keep_marks::UNRATED_ONLY));
+            let keep = self.services.keep_marks.as_ref();
+            let marks = match keep {
+                Some(keep) if into.is_some() || only_unrated => Some(keep.marks(&step.id).await),
+                _ => None,
+            };
+            if only_unrated && let Some(why) = marks.as_deref().and_then(keep_marks::kept_because) {
+                return Ok(FixAnswer::new("skipped", Some(why)));
+            }
             let mut request = LibraryActionRequest::new(LibraryAction::Delete, step.id.clone(), user);
             request.only_a_copy = copy;
             let outcome = executor.apply(request).await?;
             // The executor never asks for a scan itself; the run's one scan covers it.
             if outcome.state == LibraryActionState::Applied {
                 self.rescan.soon();
+                if let (Some(keep), Some(into), Some(marks)) = (keep, into, marks.as_deref()) {
+                    keep.carry(&step.id, &step.title, into, marks).await;
+                }
             }
             let state = match outcome.state {
                 LibraryActionState::Applied => "applied",
@@ -935,15 +1150,20 @@ impl LibraryHealthService {
         };
         let result: LibraryEditOutcome = match step.action.as_str() {
             actions::RETAG => {
-                let changes: IndexMap<String, Option<String>> = step
-                    .params()
+                let mut params = step.params();
+                let expected_stamp = params
+                    .shift_remove(actions::FILE_STAMP)
+                    .filter(|stamp| !stamp.trim().is_empty());
+                let changes: IndexMap<String, Option<String>> = params
                     .into_iter()
                     .map(|(key, value)| {
                         let tag = song_tag_fields::canonical(&key).map_or(key, str::to_string);
                         (tag, Some(value))
                     })
                     .collect();
-                edits.retag(&step.id, user, changes).await
+                edits
+                    .retag_unchanged(&step.id, user, changes, expected_stamp.as_deref())
+                    .await
             }
             actions::JOIN_ALBUM => {
                 edits
@@ -952,7 +1172,16 @@ impl LibraryHealthService {
             }
             actions::COVER => edits.add_cover(&step.id, user, false).await,
             actions::UNDO => edits.undo(&step.id, user).await,
-            actions::RESTORE => edits.restore(&step.id, user).await,
+            actions::RESTORE => {
+                let restored = edits.restore(&step.id, user).await;
+                // A copy back again takes off the copy that stayed what its removal put there.
+                if restored.state == "applied"
+                    && let Some(keep) = &self.services.keep_marks
+                {
+                    keep.uncarry(&step.id, &step.title).await;
+                }
+                restored
+            }
             other => LibraryEditOutcome::new("failed", format!("Unknown change \"{other}\".")),
         };
         Ok(FixAnswer {
@@ -971,6 +1200,35 @@ impl LibraryHealthService {
                 debug!("Library health re-read failed: the library could not be read");
             }
         });
+    }
+}
+
+/// Library health's duplicate fix, for the Fix duplicates action of the stars and action
+/// playlists.
+pub struct HealthDuplicateFixer(Weak<LibraryHealthService>);
+
+impl HealthDuplicateFixer {
+    pub fn new(health: &Arc<LibraryHealthService>) -> Self {
+        HealthDuplicateFixer(Arc::downgrade(health))
+    }
+}
+
+impl DuplicateFixer for HealthDuplicateFixer {
+    fn fix_copies_of<'a>(
+        &'a self,
+        navidrome_id: &'a str,
+        user: &'a str,
+        credential: Option<&'a SubsonicCredential>,
+    ) -> BoxFuture<'a, DuplicateFixAnswer> {
+        Box::pin(async move {
+            match self.0.upgrade() {
+                Some(health) => health.fix_copies_of(navidrome_id, user, credential).await,
+                None => DuplicateFixAnswer::said(
+                    LibraryActionState::Skipped,
+                    "This server cannot fix duplicates.",
+                ),
+            }
+        })
     }
 }
 

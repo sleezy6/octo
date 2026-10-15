@@ -268,6 +268,12 @@ impl Id3Tag {
         })
     }
 
+    /// Takes off every unique file identifier of this owner.
+    pub(crate) fn remove_ufid(&mut self, owner: &str) {
+        self.frames
+            .retain(|frame| !matches!(frame, Frame::UniqueFileIdentifier(ufid) if ufid.owner == owner));
+    }
+
     /// `UniqueFileIdentifierFrame.Get(tag, owner, true).Identifier = identifier`.
     pub(crate) fn set_ufid(&mut self, owner: &str, identifier: &[u8]) {
         for frame in &mut self.frames {

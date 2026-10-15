@@ -4,7 +4,10 @@
 //! best-sounding audio moves onto that path under that copy's own identity tags, and the
 //! best-sounding copy's old file goes to the trash. Playlist entries of the copy that went are
 //! moved onto the one that stayed, each in its own place, once Navidrome shows the moved song as
-//! the same song; when it does not, both copies go back as they were.
+//! the same song; when it does not, both copies go back as they were. Every copy a fix removes
+//! has its stars, ratings and playlist places carried onto the copy that stays, and putting it
+//! back takes them off again. With every rated copy kept, a copy anyone starred or rated is never
+//! removed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -51,11 +54,133 @@ pub fn marks_score(marks: &SongMarks) -> i64 {
     starred + rated + marks.plays.clamp(0, 50)
 }
 
-/// The marks people other than the admin left on a song, each person's read with their own
-/// sign-in.
+/// Whether one reader starred or rated a song. Plays and playlist places are not counted here:
+/// a fix moves playlist places to the copy that stays.
+pub fn starred_or_rated(marks: &SongMarks) -> bool {
+    marks.starred || marks.rating > 0
+}
+
+/// Who left marks on a song: the admin Octo signs in as, or a Family member by name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Reader {
+    Admin,
+    Member(String),
+}
+
+/// One reader's marks on one song, or None when they could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReaderMarks {
+    pub reader: Reader,
+    pub marks: Option<SongMarks>,
+}
+
+impl ReaderMarks {
+    pub fn read(reader: Reader, marks: SongMarks) -> Self {
+        ReaderMarks {
+            reader,
+            marks: Some(marks),
+        }
+    }
+}
+
+/// What every reader left on each copy of a set, by copy id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetMarks(pub HashMap<String, Vec<ReaderMarks>>);
+
+impl SetMarks {
+    /// Every reader's marks on one copy.
+    pub fn of(&self, id: &str) -> &[ReaderMarks] {
+        self.0.get(id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every reader's marks on one copy, summed; marks that could not be read count nothing.
+    pub fn score(&self, id: &str) -> i64 {
+        self.of(id)
+            .iter()
+            .filter_map(|read| read.marks.as_ref())
+            .map(marks_score)
+            .sum()
+    }
+
+    /// Whether someone starred or rated the copy.
+    pub fn starred_or_rated(&self, id: &str) -> bool {
+        self.of(id)
+            .iter()
+            .filter_map(|read| read.marks.as_ref())
+            .any(starred_or_rated)
+    }
+
+    /// Whether some reader's marks on the copy could not be read.
+    pub fn unread(&self, id: &str) -> bool {
+        self.of(id).iter().any(|read| read.marks.is_none())
+    }
+
+    /// Whether the copy has to stay when every rated copy is kept: someone starred or rated it,
+    /// or someone's marks on it could not be read, so it may be rated.
+    pub fn keeps(&self, id: &str) -> bool {
+        self.starred_or_rated(id) || self.unread(id)
+    }
+
+    /// Each copy's score, by id.
+    pub fn scores(&self) -> HashMap<String, i64> {
+        self.0.keys().map(|id| (id.clone(), self.score(id))).collect()
+    }
+}
+
+/// The marks people other than the admin left on a song, each person's read and written with
+/// their own sign-in.
 pub trait MemberMarks: Send + Sync {
-    /// Each member's marks on one song; a member whose marks cannot be read is left out.
-    fn marks_of<'a>(&'a self, song_id: &'a str) -> BoxFuture<'a, Vec<SongMarks>>;
+    /// Each member's marks on one song by name; None for a member whose marks could not be read.
+    fn marks_of<'a>(&'a self, song_id: &'a str) -> BoxFuture<'a, Vec<(String, Option<SongMarks>)>>;
+    /// Sets one member's rating on a song, 0 to clear it. True when Navidrome said ok.
+    fn set_rating<'a>(&'a self, member: &'a str, song_id: &'a str, rating: i32) -> BoxFuture<'a, bool>;
+    /// Stars or unstars a song as one member. True when Navidrome said ok.
+    fn set_starred<'a>(&'a self, member: &'a str, song_id: &'a str, starred: bool) -> BoxFuture<'a, bool>;
+}
+
+/// What carrying one copy's marks onto another changes, per reader: the higher of the two
+/// ratings, and a star when either copy had one. Each rating raised comes with the rating the
+/// kept copy had and the one it gets. Marks that could not be read carry nothing, and plays are
+/// never carried.
+pub fn carry_plan(from: &[ReaderMarks], into: &[ReaderMarks]) -> (Vec<(Reader, i32, i32)>, Vec<Reader>) {
+    let mut ratings = Vec::new();
+    let mut stars = Vec::new();
+    for read in from {
+        let Some(gone) = &read.marks else {
+            continue;
+        };
+        let kept = into.iter().find(|other| other.reader == read.reader);
+        // The kept copy's marks for this reader must be known before anything is written over them.
+        let Some(kept) = kept.map_or(Some(SongMarks::default()), |kept| kept.marks) else {
+            continue;
+        };
+        if gone.rating > kept.rating {
+            ratings.push((read.reader.clone(), kept.rating, gone.rating));
+        }
+        if gone.starred && !kept.starred {
+            stars.push(read.reader.clone());
+        }
+    }
+    (ratings, stars)
+}
+
+/// Marks carried from a removed copy onto the kept one, so Put back can take them off again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Carried {
+    /// The kept copy.
+    pub into: String,
+    /// Each reader whose rating on the kept copy was raised: the rating it had, and the one set.
+    pub ratings: Vec<(Reader, i32, i32)>,
+    /// Each reader who has the kept copy starred because they starred the removed one.
+    pub stars: Vec<Reader>,
+    /// The playlist places moved from the removed copy onto the kept one: playlist and position.
+    pub places: Vec<(String, usize)>,
+}
+
+impl Carried {
+    fn is_empty(&self) -> bool {
+        self.ratings.is_empty() && self.stars.is_empty() && self.places.is_empty()
+    }
 }
 
 /// Why the copy that keeps its id was picked.
@@ -157,6 +282,74 @@ pub fn plan(
     }
 }
 
+/// The copy of a set whose id keeps the most people's marks, from marks already read: among
+/// every copy, or with `rated_only` among the copies someone starred or rated.
+pub fn pick(
+    set: &DuplicateSet<Row>,
+    marks: &SetMarks,
+    uses: &PlaylistUses,
+    rated_only: bool,
+) -> Option<TargetPick> {
+    let copies: Vec<CopyRef> = set
+        .copies
+        .iter()
+        .filter(|copy| !rated_only || marks.keeps(&copy.id))
+        .map(|copy| CopyRef {
+            id: copy.id.clone(),
+            created: copy.added_utc,
+        })
+        .collect();
+    pick_target(&copies, &marks.scores(), &uses.0)
+}
+
+/// The plan for a set of copies from every reader's marks, when they were read: with
+/// `keep_rated`, the one that keeps every rated copy (None when every copy is rated); without,
+/// the one that keeps people's marks, or the copy a person `picked`. With no marks read, the
+/// best copy or the picked one.
+pub fn plan_with_marks(
+    set: &DuplicateSet<Row>,
+    fields: &dyn IHealthFields<Row>,
+    marks: Option<&SetMarks>,
+    uses: &PlaylistUses,
+    keep_rated: bool,
+    picked: Option<&Row>,
+) -> Option<DuplicateFix<Row>> {
+    match (marks, keep_rated) {
+        (Some(marks), true) => plan_keeping_rated(set, fields, marks, uses, picked),
+        (Some(marks), false) => Some(match picked {
+            Some(keep) => fixes::duplicate_fix(set, fields, Some(keep)),
+            None => plan(set, fields, pick(set, marks, uses, false).as_ref()),
+        }),
+        (None, _) => Some(fixes::duplicate_fix(set, fields, picked)),
+    }
+}
+
+/// The plan for a set of copies that keeps every copy someone starred or rated, or None when
+/// nothing would go because every copy is starred or rated. Without a rated copy, the plan that
+/// keeps people's marks. When the best-sounding copy is rated, it is the copy kept first; when it
+/// is not, the best sound moves into the rated copy with the most marks, as the plan that keeps
+/// people's marks does. `picked` is the copy a person picked to keep first. Every other rated
+/// copy stays as it is, and a copy whose marks could not be read for everyone stays too; when
+/// such copies are the only ones kept for that reason, the best sound stays in its own copy.
+pub fn plan_keeping_rated(
+    set: &DuplicateSet<Row>,
+    fields: &dyn IHealthFields<Row>,
+    marks: &SetMarks,
+    uses: &PlaylistUses,
+    picked: Option<&Row>,
+) -> Option<DuplicateFix<Row>> {
+    let rated = |copy: &Row| marks.keeps(&copy.id);
+    let any_rated = set.copies.iter().any(&rated);
+    let mut fix = match picked {
+        Some(keep) => fixes::duplicate_fix(set, fields, Some(keep)),
+        None if !any_rated => plan(set, fields, pick(set, marks, uses, false).as_ref()),
+        None if rated(set.best()) => fixes::duplicate_fix(set, fields, None),
+        None => plan(set, fields, pick(set, marks, uses, true).as_ref()),
+    };
+    fixes::keep_as_well(&mut fix, fields, rated);
+    (!fix.remove.is_empty() || fix.audio.is_some()).then_some(fix)
+}
+
 /// The ARTISTS field Navidrome reads every track artist from.
 const ARTISTS: TagField = TagField {
     id3_frame: None,
@@ -254,6 +447,10 @@ struct Moved {
     modified: Option<SystemTime>,
     /// The playlist places moved from the dropped copy to the kept one: playlist and position.
     rewritten: Vec<(String, usize)>,
+    /// Every reader's marks on the best-sounding copy, read before it went.
+    audio_marks: Vec<ReaderMarks>,
+    /// The stars and ratings carried from the best-sounding copy onto the kept one.
+    carried: Carried,
 }
 
 /// How the playlist entries of one song moved onto another.
@@ -271,8 +468,39 @@ pub struct Rewrite {
 pub const FORMAT_DIFFERS: &str = "The best-sounding copy is a different format, so moving it would change the song's path and lose its marks. Nothing changed.";
 pub const CHANGED_SINCE: &str = "The file has changed since, so it was left as it is.";
 pub const CHECKING: &str = "Checking that Navidrome kept the moved songs";
+/// A step that removes only an unrated copy found it starred or rated now.
+pub const RATED_SINCE: &str = "Kept: someone starred or rated this copy since the preview.";
+/// A step that removes only an unrated copy could not read everyone's marks on it.
+pub const MARKS_UNREAD: &str = "Kept: Octo could not read everyone's stars and ratings on this copy.";
 
-/// Fixing duplicates by keeping the best sound in the copy people marked.
+/// The step parameter that has a remove or a move go only while nobody starred or rated the copy
+/// that goes.
+pub const UNRATED_ONLY: &str = "unratedOnly";
+/// The step parameter that names the copy a removed copy's marks move to.
+pub const INTO: &str = "into";
+
+/// Whether a step's parameter is set.
+pub fn flag(value: Option<&str>) -> bool {
+    matches!(value, Some("true" | "1" | "True"))
+}
+
+/// Why a step that removes only an unrated copy leaves this one, or None when it may go.
+pub fn kept_because(marks: &[ReaderMarks]) -> Option<&'static str> {
+    if marks
+        .iter()
+        .filter_map(|read| read.marks.as_ref())
+        .any(starred_or_rated)
+    {
+        Some(RATED_SINCE)
+    } else if marks.iter().any(|read| read.marks.is_none()) {
+        Some(MARKS_UNREAD)
+    } else {
+        None
+    }
+}
+
+/// Fixing duplicates by keeping the best sound in the copy people marked, and carrying the marks
+/// of every copy that goes onto the one that stays.
 pub struct KeepMarks {
     api: Arc<NavidromePlaylistApi>,
     resolver: Arc<NavidromeSongPathResolver>,
@@ -281,10 +509,18 @@ pub struct KeepMarks {
     library: Arc<dyn ILocalLibraryService>,
     executor: Arc<LibraryActionExecutor>,
     settings: Arc<SettingsStore>,
-    members: Option<Arc<dyn MemberMarks>>,
+    members: Mutex<Option<Arc<dyn MemberMarks>>>,
     write_gate: Option<LibraryWriteGate>,
     moves: Mutex<HashMap<String, Moved>>,
     returning: Mutex<HashMap<String, Moved>>,
+    /// What was carried from each removed copy, by its id, until it is put back.
+    carries: Mutex<HashMap<String, Carried>>,
+    /// Copies put back whose playlist places go back at the end of the run.
+    uncarrying: Mutex<Vec<(String, Carried)>>,
+    /// Every song's playlist entries, read once a run.
+    uses: Mutex<Option<PlaylistUses>>,
+    /// Things worth saying at the end of the run.
+    notes: Mutex<Vec<String>>,
 }
 
 /// What [`KeepMarks`] is built from.
@@ -312,11 +548,35 @@ impl KeepMarks {
             library: parts.library,
             executor: parts.executor,
             settings: parts.settings,
-            members: parts.members,
+            members: Mutex::new(parts.members),
             write_gate: parts.write_gate,
             moves: Mutex::new(HashMap::new()),
             returning: Mutex::new(HashMap::new()),
+            carries: Mutex::new(HashMap::new()),
+            uncarrying: Mutex::new(Vec::new()),
+            uses: Mutex::new(None),
+            notes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Reads and writes Family members' marks through `members` from now on.
+    pub fn use_members(&self, members: Arc<dyn MemberMarks>) {
+        *self.members.lock() = Some(members);
+    }
+
+    fn members(&self) -> Option<Arc<dyn MemberMarks>> {
+        self.members.lock().clone()
+    }
+
+    /// A new run: playlists are read again, and nothing from the last run is left to say.
+    pub fn begin_run(&self) {
+        *self.uses.lock() = None;
+        self.notes.lock().clear();
+    }
+
+    /// What is worth saying about the run, taken.
+    pub fn take_notes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.notes.lock())
     }
 
     // ---- which copy keeps its id ----------------------------------------------------------
@@ -337,22 +597,40 @@ impl KeepMarks {
         Some(PlaylistUses(uses))
     }
 
+    /// Every reader's marks on one song: the admin's own, then each member's.
+    pub async fn marks(&self, song_id: &str) -> Vec<ReaderMarks> {
+        let members = self.members();
+        let (admin, members) = futures::join!(self.api.song_marks(song_id), async {
+            match &members {
+                Some(members) => members.marks_of(song_id).await,
+                None => Vec::new(),
+            }
+        });
+        std::iter::once(ReaderMarks {
+            reader: Reader::Admin,
+            marks: admin,
+        })
+        .chain(members.into_iter().map(|(name, marks)| ReaderMarks {
+            reader: Reader::Member(name),
+            marks,
+        }))
+        .collect()
+    }
+
     /// Every reader's marks on one copy, summed: the admin's own, then each member's.
     pub async fn score(&self, song_id: &str) -> i64 {
-        let mut score = self
-            .api
-            .song_marks(song_id)
+        self.marks(song_id)
             .await
-            .map_or(0, |marks| marks_score(&marks));
-        if let Some(members) = &self.members {
-            score += members
-                .marks_of(song_id)
-                .await
-                .iter()
-                .map(marks_score)
-                .sum::<i64>();
-        }
-        score
+            .iter()
+            .filter_map(|read| read.marks.as_ref())
+            .map(marks_score)
+            .sum()
+    }
+
+    /// Every reader's marks on each copy of a set, read side by side.
+    pub async fn read_set(&self, set: &DuplicateSet<Row>) -> SetMarks {
+        let read = join_all(set.copies.iter().map(|copy| self.marks(&copy.id))).await;
+        SetMarks(set.copies.iter().map(|copy| copy.id.clone()).zip(read).collect())
     }
 
     /// The copy of `copies` whose id keeps the most people's marks.
@@ -368,15 +646,177 @@ impl KeepMarks {
 
     /// The copy of a set of duplicates whose id keeps the most people's marks.
     pub async fn pick_for(&self, set: &DuplicateSet<Row>, uses: &PlaylistUses) -> Option<TargetPick> {
-        let copies: Vec<CopyRef> = set
-            .copies
+        pick(set, &self.read_set(set).await, uses, false)
+    }
+
+    /// Takes off the rating whoever `credential` signs in as gave `song_id`.
+    pub async fn clear_rating_as(
+        &self,
+        credential: &octo_subsonic::SubsonicCredential,
+        song_id: &str,
+    ) -> bool {
+        self.api.set_rating_as(credential, song_id, 0).await
+    }
+
+    // ---- carrying marks over --------------------------------------------------------------
+
+    async fn set_rating(&self, reader: &Reader, song_id: &str, rating: i32) -> bool {
+        match reader {
+            Reader::Admin => self.api.set_admin_rating(song_id, rating).await,
+            Reader::Member(name) => match self.members() {
+                Some(members) => members.set_rating(name, song_id, rating).await,
+                None => false,
+            },
+        }
+    }
+
+    async fn set_starred(&self, reader: &Reader, song_id: &str, starred: bool) -> bool {
+        match reader {
+            Reader::Admin => self.api.set_admin_starred(song_id, starred).await,
+            Reader::Member(name) => match self.members() {
+                Some(members) => members.set_starred(name, song_id, starred).await,
+                None => false,
+            },
+        }
+    }
+
+    /// Whether `song_id` has an entry in a playlist people made, from one read of the playlists
+    /// a run. True when the playlists could not be read, so the rewrite looks for itself.
+    async fn listed(&self, song_id: &str) -> bool {
+        let known = self.uses.lock().clone();
+        let uses = match known {
+            Some(uses) => uses,
+            None => match self.playlist_uses().await {
+                Some(uses) => {
+                    *self.uses.lock() = Some(uses.clone());
+                    uses
+                }
+                None => return true,
+            },
+        };
+        uses.0.get(song_id).copied().unwrap_or(0) > 0
+    }
+
+    /// Puts `from`'s stars and ratings on `into` for each reader, the higher rating and a star
+    /// when either had one, given every reader's marks on `from` read before it went. Answers
+    /// what was put on, and how many could not be.
+    async fn carry_marks(&self, from_marks: &[ReaderMarks], into: &str) -> (Carried, usize) {
+        let mut carried = Carried {
+            into: into.to_string(),
+            ..Carried::default()
+        };
+        let worth = from_marks
             .iter()
-            .map(|copy| CopyRef {
-                id: copy.id.clone(),
-                created: copy.added_utc,
-            })
-            .collect();
-        self.marked_target(&copies, uses).await
+            .filter_map(|read| read.marks.as_ref())
+            .any(starred_or_rated);
+        if !worth {
+            return (carried, 0);
+        }
+        let into_marks = self.marks(into).await;
+        let (ratings, stars) = carry_plan(from_marks, &into_marks);
+        let mut failed = 0;
+        for (reader, before, rating) in ratings {
+            if self.set_rating(&reader, into, rating).await {
+                carried.ratings.push((reader, before, rating));
+            } else {
+                failed += 1;
+            }
+        }
+        for reader in stars {
+            if self.set_starred(&reader, into, true).await {
+                carried.stars.push(reader);
+            } else {
+                failed += 1;
+            }
+        }
+        (carried, failed)
+    }
+
+    /// After `from` was removed as a copy of `into`: every reader's star and rating on `from`
+    /// goes onto `into` (the higher rating, a star when either had one) and each of `from`'s
+    /// playlist places becomes `into`'s, in the same place. Plays stay with `from`: Navidrome
+    /// adds plays only one at a time, as listens it also passes on to Last.fm or ListenBrainz,
+    /// and never takes one away. Remembered so putting `from` back takes it all off again.
+    pub async fn carry(&self, from: &str, title: &str, into: &str, from_marks: &[ReaderMarks]) {
+        let (mut carried, failed) = self.carry_marks(from_marks, into).await;
+        let mut notes = Vec::new();
+        if failed > 0 {
+            notes.push(format!(
+                "Some stars or ratings of {title} could not be moved to the copy that stays."
+            ));
+        }
+        if self.listed(from).await {
+            let rewrite = self.rewrite(from, into, None).await;
+            notes.extend(rewrite_notes(title, &rewrite));
+            carried.places = rewrite.moved;
+        }
+        self.notes.lock().extend(notes);
+        if !carried.is_empty() {
+            info!(
+                "Carried {} rating(s), {} star(s) and {} playlist place(s) from {from} onto {into}",
+                carried.ratings.len(),
+                carried.stars.len(),
+                carried.places.len()
+            );
+            self.carries.lock().insert(from.to_string(), carried);
+        }
+    }
+
+    /// Takes off the kept copy what a carry put on it: each rating raised goes back to what it
+    /// was and each star added comes off, only while the kept copy still says what the carry
+    /// set, so a mark someone gave since stays. Answers how many could not be taken off.
+    async fn take_off(&self, carried: &Carried) -> usize {
+        if carried.ratings.is_empty() && carried.stars.is_empty() {
+            return 0;
+        }
+        let now = self.marks(&carried.into).await;
+        let current = |reader: &Reader| {
+            now.iter()
+                .find(|read| &read.reader == reader)
+                .and_then(|read| read.marks)
+        };
+        let mut failed = 0;
+        for (reader, before, set) in &carried.ratings {
+            match current(reader) {
+                Some(marks) if marks.rating == *set => {
+                    if !self.set_rating(reader, &carried.into, *before).await {
+                        failed += 1;
+                    }
+                }
+                Some(_) => {}
+                None => failed += 1,
+            }
+        }
+        for reader in &carried.stars {
+            match current(reader) {
+                Some(marks) if marks.starred => {
+                    if !self.set_starred(reader, &carried.into, false).await {
+                        failed += 1;
+                    }
+                }
+                Some(_) => {}
+                None => failed += 1,
+            }
+        }
+        failed
+    }
+
+    /// After `from` was put back: what its removal carried onto the copy that stayed comes off
+    /// again. Its stars, ratings and plays are its own again as soon as it is back, since
+    /// Navidrome keeps them with its path; its playlist places go back at the end of the run,
+    /// once Navidrome shows it again ([`Self::finish_run`]).
+    pub async fn uncarry(&self, from: &str, title: &str) {
+        let Some(carried) = self.carries.lock().remove(from) else {
+            return;
+        };
+        if self.take_off(&carried).await > 0 {
+            self.notes.lock().push(format!(
+                "Some stars or ratings moved over from {title} could not be taken off the copy that stayed."
+            ));
+        }
+        if !carried.places.is_empty() {
+            self.uncarrying.lock().push((from.to_string(), carried));
+        }
     }
 
     // ---- the move -------------------------------------------------------------------------
@@ -445,6 +885,12 @@ impl KeepMarks {
         }
         if target_id == audio_id {
             return FixAnswer::new("skipped", Some("The best sound is already in that copy."));
+        }
+        let audio_marks = self.marks(audio_id).await;
+        if flag(tags.get(UNRATED_ONLY).map(String::as_str))
+            && let Some(why) = kept_because(&audio_marks)
+        {
+            return FixAnswer::new("skipped", Some(why));
         }
         let (target, audio) = (
             self.resolver.resolve(target_id).await,
@@ -637,6 +1083,8 @@ impl KeepMarks {
                 size: metadata.as_ref().map_or(0, std::fs::Metadata::len),
                 modified: metadata.and_then(|m| m.modified().ok()),
                 rewritten: Vec::new(),
+                audio_marks,
+                carried: Carried::default(),
             },
         );
         FixAnswer::new("applied", Some(&words))
@@ -661,6 +1109,12 @@ impl KeepMarks {
         match self.put_back(&moved, &format!("Put back by {user}.")).await {
             Ok(()) => {
                 self.moves.lock().remove(target_id);
+                if self.take_off(&moved.carried).await > 0 {
+                    self.notes.lock().push(format!(
+                        "Some stars or ratings moved over from the other copy of {} could not be taken off it.",
+                        moved.target.title
+                    ));
+                }
                 if !moved.rewritten.is_empty() {
                     self.returning.lock().insert(target_id.to_string(), moved);
                 }
@@ -825,8 +1279,16 @@ impl KeepMarks {
             }
             let rewrite = self.rewrite(&record.audio.navidrome_id, &id, None).await;
             notes.extend(rewrite_notes(&record.target.title, &rewrite));
+            let (carried, unmoved) = self.carry_marks(&record.audio_marks, &id).await;
+            if unmoved > 0 {
+                notes.push(format!(
+                    "Some stars or ratings of the other copy of {} could not be moved to the copy that stays.",
+                    record.target.title
+                ));
+            }
             if let Some(stored) = self.moves.lock().get_mut(&id) {
                 stored.rewritten = rewrite.moved;
+                stored.carried = carried;
             }
         }
         let returning: Vec<Moved> = {
@@ -860,6 +1322,31 @@ impl KeepMarks {
                 ));
             }
         }
+        let uncarrying: Vec<(String, Carried)> = std::mem::take(&mut *self.uncarrying.lock());
+        for (from, carried) in uncarrying {
+            let back = self.resolver.resolve(&from).await;
+            let shown = match &back {
+                Some(file) => self.executor.wait_until_shown(&from, &file.absolute_path).await,
+                None => false,
+            };
+            let title = back
+                .as_ref()
+                .map_or_else(|| from.clone(), |file| file.title.clone());
+            if !shown {
+                notes.push(format!(
+                    "Navidrome has not shown {title} again yet, so its playlist places stay with the other copy."
+                ));
+                continue;
+            }
+            let rewrite = self.rewrite(&carried.into, &from, Some(&carried.places)).await;
+            if !rewrite.failed.is_empty() {
+                notes.push(format!(
+                    "Some playlist places of {title} could not be put back, in {}.",
+                    rewrite.failed.join(", ")
+                ));
+            }
+        }
+        notes.extend(self.take_notes());
         (failed, notes)
     }
 
@@ -1023,11 +1510,12 @@ fn file_name(path: &str) -> String {
         .map_or_else(|| path.to_string(), |name| name.to_string_lossy().into_owned())
 }
 
-/// Whether a step's tag names are all ones a fix may write, apart from `from`.
+/// Whether a step's tag names are all ones a fix may write, apart from `from` and
+/// `unratedOnly`.
 pub fn unknown_tag(tags: &IndexMap<String, String>) -> Option<&str> {
     tags.keys()
         .map(String::as_str)
-        .filter(|key| *key != "from")
+        .filter(|key| *key != "from" && *key != UNRATED_ONLY)
         .find(|key| song_tag_fields::canonical(key).is_none() || is_blank(key))
 }
 

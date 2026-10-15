@@ -1101,3 +1101,54 @@ async fn a_held_addition_is_a_request_approving_adds_it_and_declining_drops_it()
         [Some(OUTSIDE.to_string())]
     );
 }
+
+// ---- radio stations ----
+
+/// A family member gets the songs of their own stations only: the owner's station, asked for by
+/// its id, is not there for them.
+#[tokio::test]
+async fn a_member_gets_songs_of_their_own_stations_only() {
+    use octo_core::last_fm::last_fm_radio_state_store::station_id;
+    use octo_core::models::radio::{LastFmRadioStation, LastFmRadioStationKind, LastFmRadioTrack};
+
+    let f = fixture(true).await;
+    for owner in ["winters", "alex"] {
+        f.state.last_fm_radio_state.replace_stations(
+            owner,
+            &[LastFmRadioStation {
+                id: station_id(owner, "your-mix"),
+                key: "your-mix".into(),
+                name: "Your Radio".into(),
+                owner: owner.into(),
+                kind: LastFmRadioStationKind::YourMix,
+                personalized: true,
+                tracks: vec![LastFmRadioTrack {
+                    artist: "ar-shared".into(),
+                    title: "s-clean".into(),
+                    duration: Some(200),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        );
+    }
+    let ask = |user: &'static str, owner: &str| {
+        let rest = format!("getStationSongs?id={}&count=1", station_id(owner, "your-mix"));
+        let f = &f;
+        async move { f.json(user, &rest).await }
+    };
+
+    let own = ask("alex", "alex").await;
+    assert_eq!(own["status"], "ok", "{own}");
+    assert_eq!(
+        own["stationSongs"]["entry"].as_array().map(Vec::len),
+        Some(1),
+        "{own}"
+    );
+    let owners = ask("alex", "winters").await;
+    assert_eq!(owners["status"], "failed", "{owners}");
+    assert_eq!(owners["error"]["code"], 70, "{owners}");
+    let theirs = ask("winters", "winters").await;
+    assert_eq!(theirs["status"], "ok", "{theirs}");
+    assert_eq!(ask("winters", "alex").await["error"]["code"], 70);
+}

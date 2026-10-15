@@ -28,8 +28,9 @@ pub const FIRST_DECADE: i32 = 1950;
 pub const MAX_GENRE_PAGES: i32 = 4;
 pub const BLEND_CANDIDATES: i32 = 200;
 
-/// One genre or decade mix, as one listener sees it for the current draw. `kind` is "genre" or
-/// "decade"; `key` is "genre:Rock" or "decade:1990".
+/// One mix, as one listener sees it for the current draw. `kind` is "genre", "decade", "year",
+/// "country" or "artist"; `key` is "genre:Rock", "decade:1990", "year:1994", "country:ES" or
+/// "artist:<Navidrome artist id>".
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GeneratedPlaylist {
     pub id: String,
@@ -62,6 +63,13 @@ pub struct UserMixes {
     /// know, so they are fetched from the catalog's own image host.
     #[serde(deserialize_with = "null_as_default")]
     pub for_you_covers: Vec<String>,
+    /// Each artist mix by its key: who it is, since when it has been a mix, and its songs. Left
+    /// out of the file while there are none.
+    #[serde(
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "IndexMap::is_empty"
+    )]
+    pub artist_mixes: IndexMap<String, ArtistMix>,
 }
 
 impl Default for UserMixes {
@@ -74,8 +82,22 @@ impl Default for UserMixes {
             kinds: String::new(),
             for_you: IndexMap::new(),
             for_you_covers: Vec::new(),
+            artist_mixes: IndexMap::new(),
         }
     }
+}
+
+/// One artist mix as stored: the artist's name, when it first became a mix, and the songs of
+/// the current draw as Subsonic song JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ArtistMix {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub name: String,
+    #[serde(with = "datetime::utc")]
+    pub since: DateTime<Utc>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub songs: Vec<String>,
 }
 
 /// The file: `{"Users": {"<trimmed lower-cased user>": UserMixes}}`. `users` is None when the
@@ -100,9 +122,13 @@ pub fn dotnet_ticks(value: DateTime<Utc>) -> i64 {
 /// Which kinds the counts and lists were made for: "genre,decade" for the mixes (each only when
 /// the mixes are on), then the Made for you lists that are on
 /// ("newReleases+rediscover+deepCuts"), and what decides their contents: New Releases' weeks,
-/// artists and the server's explicit filter, Rediscover's months. A change to any of them makes
-/// the lists again.
-pub fn kinds_of(settings: &GeneratedPlaylistSettings, explicit_filter: ExplicitFilter) -> String {
+/// artists, the server's explicit filter and Skip covers and instrumentals, Rediscover's months. A change to
+/// any of them makes the lists again.
+pub fn kinds_of(
+    settings: &GeneratedPlaylistSettings,
+    explicit_filter: ExplicitFilter,
+    skip_covers_and_instrumentals: bool,
+) -> String {
     let mixes = mixes_on(settings);
     let for_you: Vec<&str> = crate::library::for_you_lists::KINDS
         .iter()
@@ -122,10 +148,14 @@ pub fn kinds_of(settings: &GeneratedPlaylistSettings, explicit_filter: ExplicitF
             ExplicitFilter::ExplicitOnly => 1,
             ExplicitFilter::CleanOnly => 2,
         };
+        // Skip covers, karaoke and instrumentals adds a mark only when on. It is on unless turned
+        // off, so New Releases saved before the setting existed are made again once, and lists
+        // made with it off still compare equal.
         kinds.push_str(&format!(
-            ",w{}a{}x{filter}",
+            ",w{}a{}x{filter}{}",
             settings.effective_new_release_weeks(),
-            settings.effective_new_release_artists()
+            settings.effective_new_release_artists(),
+            if skip_covers_and_instrumentals { "s" } else { "" }
         ));
     }
     if settings.rediscover {
@@ -134,12 +164,126 @@ pub fn kinds_of(settings: &GeneratedPlaylistSettings, explicit_filter: ExplicitF
     if mixes && settings.country_mixes {
         kinds.push_str(&format!(",country:{}", settings.country_codes().join("+")));
     }
+    if mixes && settings.years {
+        kinds.push_str(",year");
+    }
+    if mixes && settings.artists {
+        kinds.push_str(&format!(",artist{}", settings.effective_artist_count()));
+    }
     kinds
 }
 
-/// The mixes are on: the switch, and one of the kinds (genre, decade, country).
+/// The mixes are on: the switch, and one of the kinds (genre, decade, country, year, artist).
 pub fn mixes_on(settings: &GeneratedPlaylistSettings) -> bool {
-    settings.enabled && (settings.genres || settings.decades || settings.country_mixes)
+    settings.enabled
+        && (settings.genres
+            || settings.decades
+            || settings.country_mixes
+            || settings.years
+            || settings.artists)
+}
+
+/// The year mixes are on: the mixes switch and the year switch.
+pub fn year_mixes_on(settings: &GeneratedPlaylistSettings) -> bool {
+    settings.enabled && settings.years
+}
+
+/// The artist mixes are on: the mixes switch and the artist switch.
+pub fn artist_mixes_on(settings: &GeneratedPlaylistSettings) -> bool {
+    settings.enabled && settings.artists
+}
+
+/// What starts a year mix's key.
+pub const YEAR_PREFIX: &str = "year:";
+
+/// What starts an artist mix's key.
+pub const ARTIST_PREFIX: &str = "artist:";
+
+/// The key of a year's mix: "year:1994".
+pub fn year_key(year: i32) -> String {
+    format!("{YEAR_PREFIX}{year}")
+}
+
+/// The key of an artist's mix: "artist:" and the artist's key in the listener's walk (the
+/// Navidrome artist id, or the name's key for a song with none).
+pub fn artist_mix_key(artist: &str) -> String {
+    format!("{ARTIST_PREFIX}{artist}")
+}
+
+/// An artist mix stays while its artist ranks within this many places past the artist count.
+pub const ARTIST_MIX_SLACK: usize = 3;
+
+/// An artist mix that has fallen out of the ranking still stays until it is this old.
+pub const ARTIST_MIX_KEEP_DAYS: i64 = 7;
+
+/// Which artist mixes a listener has, by key, in rank order. An artist joins once they rank
+/// within `count` and stays while they rank within `count` plus [`ARTIST_MIX_SLACK`]; one that
+/// falls further goes only once its mix is [`ARTIST_MIX_KEEP_DAYS`] old, so a listener's
+/// artist mixes do not come and go with every week's plays. `ranked` is the listener's most
+/// played artists' mix keys, best first; `began` is when each current artist mix began.
+/// Mixes kept although their artist is no longer ranked come last, in the order they began.
+pub fn kept_artist_mixes(
+    ranked: &[String],
+    began: &IndexMap<String, DateTime<Utc>>,
+    count: usize,
+    now_utc: DateTime<Utc>,
+) -> Vec<String> {
+    let young = |key: &str| {
+        began
+            .get(key)
+            .is_some_and(|since| now_utc - *since < TimeDelta::days(ARTIST_MIX_KEEP_DAYS))
+    };
+    let mut kept: Vec<String> = ranked
+        .iter()
+        .enumerate()
+        .filter(|(index, key)| {
+            let rank = index + 1;
+            if began.contains_key(key.as_str()) {
+                rank <= count + ARTIST_MIX_SLACK || young(key.as_str())
+            } else {
+                rank <= count
+            }
+        })
+        .map(|(_, key)| key.clone())
+        .collect();
+    let mut unranked: Vec<(&String, &DateTime<Utc>)> = began
+        .iter()
+        .filter(|(key, _)| !ranked.contains(*key) && young(key.as_str()))
+        .collect();
+    unranked.sort_by(|a, b| a.1.cmp(b.1).then_with(|| compare_ordinal(a.0, b.0)));
+    kept.extend(unranked.into_iter().map(|(key, _)| key.clone()));
+    kept
+}
+
+/// Songs per year mix, from one walk of the library: each song counted under its year when it
+/// has one.
+pub fn count_years(songs: &[Node]) -> IndexMap<String, i32> {
+    let mut counts: IndexMap<String, i32> = IndexMap::new();
+    for year in songs
+        .iter()
+        .filter_map(|song| nullable_int_of(song, "year"))
+        .filter(|year| *year > 0)
+    {
+        *counts.entry(year_key(year)).or_default() += 1;
+    }
+    counts
+}
+
+/// What `octoGroup` says a station row is.
+pub const STATION_GROUP: &str = "station";
+
+/// What `octoGroup` says a Made for you list is.
+pub const FOR_YOU_GROUP: &str = "forYou";
+
+/// The group an Octo list row belongs to, as `octoGroup` names it, from the list's kind: the
+/// kind itself ("genre", "decade", "year", "country", "artist", "chart", "liked"), and
+/// "forYou" for the three Made for you lists.
+pub fn list_group(kind: &str) -> &str {
+    if crate::library::for_you_lists::is_for_you(kind) {
+        FOR_YOU_GROUP
+    } else {
+        kind
+    }
 }
 
 /// The country mixes are on: the mixes switch and the country switch.
@@ -171,18 +315,26 @@ pub fn is_stale(
     state: &UserMixes,
     settings: &GeneratedPlaylistSettings,
     explicit_filter: ExplicitFilter,
+    skip_covers_and_instrumentals: bool,
     now_utc: DateTime<Utc>,
 ) -> bool {
     now_utc - state.counts_utc >= TimeDelta::hours(i64::from(settings.effective_refresh_hours()))
-        || state.kinds != kinds_of(settings, explicit_filter)
+        || state.kinds != kinds_of(settings, explicit_filter, skip_covers_and_instrumentals)
 }
 
 /// ("decade", "1990s") for "decade:1990", ("genre", "Rock") for "genre:Rock", ("country",
-/// "Spain") for "country:ES".
+/// "Spain") for "country:ES", ("year", "1994") for "year:1994". An artist mix's key holds no
+/// name, so ("artist", the artist's key) is all it says; the name is stored with the mix.
 pub fn describe(key: &str) -> (String, String) {
     if let Some(code) = key.strip_prefix(COUNTRY_PREFIX) {
         let name = crate::common::countries::english_name(code).unwrap_or(code);
         return ("country".to_string(), name.to_string());
+    }
+    if let Some(year) = key.strip_prefix(YEAR_PREFIX) {
+        return ("year".to_string(), year.to_string());
+    }
+    if let Some(artist) = key.strip_prefix(ARTIST_PREFIX) {
+        return ("artist".to_string(), artist.to_string());
     }
     match key.strip_prefix("decade:") {
         Some(decade) => ("decade".to_string(), format!("{decade}s")),
@@ -258,17 +410,26 @@ pub fn apply_hysteresis(
 }
 
 /// Which mixes a listener has: genres and decades by [`apply_hysteresis`] up to MaxPlaylists,
-/// then countries by the same thresholds up to MaxCountryPlaylists, so a country never takes a
-/// genre's place.
+/// then countries by the same thresholds up to MaxCountryPlaylists, then years by the same
+/// thresholds up to MaxYearPlaylists, so neither a country nor a year ever takes a genre's
+/// place. Artist mixes are not counted and are never here.
 pub fn active_mixes(
     counts: &IndexMap<String, i32>,
     previously_active: &[String],
     settings: &GeneratedPlaylistSettings,
 ) -> Vec<String> {
-    let (countries, others): (IndexMap<String, i32>, IndexMap<String, i32>) = counts
-        .iter()
-        .map(|(key, count)| (key.clone(), *count))
-        .partition(|(key, _)| key.starts_with(COUNTRY_PREFIX));
+    let mut countries: IndexMap<String, i32> = IndexMap::new();
+    let mut years: IndexMap<String, i32> = IndexMap::new();
+    let mut others: IndexMap<String, i32> = IndexMap::new();
+    for (key, count) in counts {
+        if key.starts_with(COUNTRY_PREFIX) {
+            countries.insert(key.clone(), *count);
+        } else if key.starts_with(YEAR_PREFIX) {
+            years.insert(key.clone(), *count);
+        } else if !key.starts_with(ARTIST_PREFIX) {
+            others.insert(key.clone(), *count);
+        }
+    }
     let create_at = settings.effective_create_at();
     let remove_below = settings.effective_remove_below();
     let mut active = apply_hysteresis(
@@ -287,7 +448,52 @@ pub fn active_mixes(
             settings.effective_max_country_playlists(),
         ));
     }
+    if !years.is_empty() {
+        active.extend(active_years(
+            &years,
+            previously_active,
+            create_at,
+            remove_below,
+            settings.effective_max_year_playlists(),
+        ));
+    }
     active
+}
+
+/// [`apply_hysteresis`] for year mixes: the same thresholds, the years with the most songs
+/// first and, between years with as many, the newest first.
+fn active_years(
+    counts: &IndexMap<String, i32>,
+    previously_active: &[String],
+    create_at: i32,
+    remove_below: i32,
+    max: i32,
+) -> Vec<String> {
+    let year = |key: &str| {
+        key.strip_prefix(YEAR_PREFIX)
+            .and_then(|year| year.parse::<i32>().ok())
+            .unwrap_or(0)
+    };
+    let mut kept: Vec<(&String, i32)> = counts
+        .iter()
+        .filter(|(key, count)| {
+            if previously_active.contains(key) {
+                **count >= remove_below
+            } else {
+                **count >= create_at
+            }
+        })
+        .map(|(key, count)| (key, *count))
+        .collect();
+    kept.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| year(b.0.as_str()).cmp(&year(a.0.as_str())))
+            .then_with(|| compare_ordinal(a.0, b.0))
+    });
+    kept.into_iter()
+        .take(max.max(0) as usize)
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 /// Songs per country mix: each song counted under its artist's country when that is known

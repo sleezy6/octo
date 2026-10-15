@@ -43,9 +43,19 @@ pub struct StarNavidrome {
 #[derive(Clone)]
 struct Hold {
     key: String,
+    /// The id the song was starred by, when the hold is for one starred song.
+    song_id: Option<String>,
     credential: SubsonicCredential,
     who: String,
     held_at: DateTime<Utc>,
+}
+
+/// An outside song someone starred whose download has not landed yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingStar {
+    /// The id the song was starred by.
+    pub song_id: String,
+    pub starred_at: DateTime<Utc>,
 }
 
 #[derive(Default)]
@@ -171,9 +181,80 @@ impl StarOnArrival {
         self.add(
             false,
             acquisition_tracker::key_of(provider, external_id),
+            None,
             credential,
             who,
         );
+    }
+
+    /// [`Self::hold_song`] for a song starred by `song_id`, which the starrer's starred lists
+    /// show until the download lands ([`Self::waiting_songs`]).
+    pub fn hold_starred_song(
+        &self,
+        provider: &str,
+        external_id: &str,
+        song_id: &str,
+        credential: &SubsonicCredential,
+        who: Option<&str>,
+    ) {
+        self.add(
+            false,
+            acquisition_tracker::key_of(provider, external_id),
+            Some(song_id.to_string()),
+            credential,
+            who,
+        );
+    }
+
+    /// The name a hold is filed under: `who`, or for an API key that names nobody, part of the
+    /// fingerprint of the sign-in as it is held.
+    pub fn holder_name(credential: &SubsonicCredential, who: Option<&str>) -> String {
+        match who.filter(|w| !dotnet::is_blank(w)) {
+            Some(who) => who.trim().to_string(),
+            None => format!("API key {}", &credential.without_password().fingerprint()[..8]),
+        }
+    }
+
+    /// Whether any starred song is waiting for its download.
+    pub fn holds_any_song(&self) -> bool {
+        !self.holds.lock().songs.is_empty()
+    }
+
+    /// Whether anyone's star waits on this song.
+    pub fn holds_song(&self, provider: &str, external_id: &str) -> bool {
+        let key = acquisition_tracker::key_of(provider, external_id);
+        self.holds.lock().songs.iter().any(|hold| hold.key == key)
+    }
+
+    /// The starred songs still waiting for their download for the person filed as `who`
+    /// ([`Self::holder_name`]), oldest first.
+    pub fn waiting_songs(&self, who: &str) -> Vec<WaitingStar> {
+        let now = self.now();
+        let mut holds = self.holds.lock();
+        prune(&mut holds, now);
+        holds
+            .songs
+            .iter()
+            .filter(|hold| eq_ignore_case(&hold.who, who))
+            .filter_map(|hold| {
+                Some(WaitingStar {
+                    song_id: hold.song_id.clone()?,
+                    starred_at: hold.held_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Drops the star `who` gave this song, for an unstar before it landed. True when one was
+    /// held. The download goes on; only the favorite is no longer given.
+    pub fn release_song(&self, provider: &str, external_id: &str, who: &str) -> bool {
+        let key = acquisition_tracker::key_of(provider, external_id);
+        let mut holds = self.holds.lock();
+        let before = holds.songs.len();
+        holds
+            .songs
+            .retain(|hold| !(hold.key == key && eq_ignore_case(&hold.who, who)));
+        holds.songs.len() != before
     }
 
     pub fn hold_album(
@@ -186,19 +267,24 @@ impl StarOnArrival {
         self.add(
             true,
             acquisition_tracker::key_of(provider, album_id),
+            None,
             credential,
             who,
         );
     }
 
-    fn add(&self, album: bool, key: String, credential: &SubsonicCredential, who: Option<&str>) {
+    fn add(
+        &self,
+        album: bool,
+        key: String,
+        song_id: Option<String>,
+        credential: &SubsonicCredential,
+        who: Option<&str>,
+    ) {
+        // An API key names nobody until Navidrome says, so part of its fingerprint stands in.
+        let name = Self::holder_name(credential, who);
         // Held for up to a day, so a password is swapped for a token made from it first.
         let credential = credential.without_password();
-        // An API key names nobody until Navidrome says, so part of its fingerprint stands in.
-        let name = match who.filter(|w| !dotnet::is_blank(w)) {
-            Some(who) => who.trim().to_string(),
-            None => format!("API key {}", &credential.fingerprint()[..8]),
-        };
         let now = self.now();
         let mut holds = self.holds.lock();
         prune(&mut holds, now);
@@ -211,6 +297,7 @@ impl StarOnArrival {
         list.retain(|hold| !(hold.key == key && eq_ignore_case(&hold.who, &name)));
         list.push(Hold {
             key,
+            song_id,
             credential,
             who: name,
             held_at: now,

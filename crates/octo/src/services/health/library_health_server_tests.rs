@@ -380,8 +380,10 @@ fn the_duplicate_plan_removes_copies_as_copies_after_filling_the_kept_one() {
             IndexMap::from([("year".to_string(), "1998".to_string())])
         )
     );
-    assert_eq!(steps[1], FixStep::remove_copy("mp3", "Teardrop"));
+    // The removed copy names the one that stays, which takes its stars, ratings and playlist places.
+    assert_eq!(steps[1], FixStep::remove_copy_into("mp3", "Teardrop", "flac"));
     assert_eq!(steps[1].param("copy"), Some("true"));
+    assert_eq!(steps[1].param("into"), Some("flac"));
 }
 
 #[test]

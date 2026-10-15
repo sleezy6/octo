@@ -8,9 +8,11 @@ pub mod info;
 pub mod internet_radio;
 pub mod native;
 pub mod ping;
+pub mod places;
 pub mod playlists;
 pub mod search;
 pub mod similar_songs;
+pub mod stations;
 pub mod top_songs;
 pub mod transitions;
 
@@ -48,6 +50,8 @@ mod fresh_marks_tests;
 #[cfg(test)]
 mod library_edit_tests;
 #[cfg(test)]
+mod list_groups_tests;
+#[cfg(test)]
 mod lyrics_endpoint_tests;
 #[cfg(test)]
 mod marked_lists_tests;
@@ -55,6 +59,8 @@ mod marked_lists_tests;
 mod media_tests;
 #[cfg(test)]
 mod merged_browsing_tests;
+#[cfg(test)]
+pub(crate) mod places_tests;
 #[cfg(test)]
 mod radio_ban_tests;
 #[cfg(test)]
@@ -160,4 +166,6 @@ pub fn routes() -> RouteSet {
         .merge(family::routes())
         .merge(transitions::routes())
         .merge(animated_artwork::routes())
+        .merge(stations::routes())
+        .merge(places::routes())
 }

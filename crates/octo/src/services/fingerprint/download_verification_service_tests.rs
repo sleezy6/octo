@@ -29,7 +29,7 @@ fn decide(lookup: &AcoustIdLookup, artist: &str, title: &str, authoritative: boo
         THRESHOLD,
         authoritative,
         0,
-        false,
+        &Takes::Any,
     )
 }
 
@@ -282,7 +282,7 @@ fn decide_below_threshold_says_why_and_names_the_one_agreeing_candidate() {
         THRESHOLD,
         false,
         330,
-        false,
+        &Takes::Any,
     );
 
     assert_eq!(verdict.verdict, VerificationVerdict::Inconclusive);
@@ -305,7 +305,7 @@ fn decide_two_agreeing_candidates_names_none() {
         THRESHOLD,
         false,
         315,
-        false,
+        &Takes::Any,
     );
 
     assert_eq!(verdict.candidate_recording_id, None);
@@ -322,7 +322,7 @@ fn decide_candidate_of_the_wrong_length_is_not_named() {
         THRESHOLD,
         false,
         330,
-        false,
+        &Takes::Any,
     );
 
     assert_eq!(verdict.candidate_recording_id, None);
@@ -733,7 +733,11 @@ fn decide_live(lookup: &AcoustIdLookup, refuse_live: bool) -> VerificationResult
         0.85,
         true,
         0,
-        refuse_live,
+        &(if refuse_live {
+            Takes::Only(Default::default())
+        } else {
+            Takes::Any
+        }),
     )
 }
 
@@ -834,7 +838,13 @@ async fn the_preview_verifier_answers_through_the_service() {
     settings.set(AppSettings::default());
     assert_eq!(
         service
-            .verify("/nowhere.flac", Some("A"), Some("T"), Some(ISRC), true)
+            .verify(
+                "/nowhere.flac",
+                Some("A"),
+                Some("T"),
+                Some(ISRC),
+                &Takes::Only(Default::default())
+            )
             .await,
         VerificationResult::inconclusive()
     );
@@ -861,7 +871,7 @@ fn decide_at(lookup: &AcoustIdLookup, artist: &str, title: &str, seconds: i32) -
         THRESHOLD,
         false,
         seconds,
-        false,
+        &Takes::Any,
     )
 }
 
@@ -1036,4 +1046,527 @@ fn the_isrc_of_a_stray_link_does_not_confirm_it() {
     );
 
     assert_eq!(verdict.verdict, VerificationVerdict::Mismatch);
+}
+
+// ---- the numbers in the log -----------------------------------------------------------------
+
+#[test]
+fn every_decision_carries_the_threshold_it_was_held_to() {
+    let lookup = ok(vec![result(
+        0.61,
+        vec![recording("Teardrop", "Massive Attack", None, None)],
+    )]);
+    let verdict = DownloadVerificationService::decide(
+        &lookup,
+        Some("Massive Attack"),
+        Some("Teardrop"),
+        0.7,
+        false,
+        0,
+        &Takes::Any,
+    );
+    assert_eq!(verdict.threshold, 0.7);
+    assert_eq!(
+        verdict.acoust_id_text().as_deref(),
+        Some("AcoustID: no match above 70% (best 61%)")
+    );
+}
+
+#[test]
+fn a_confirmed_match_says_how_sure_acoust_id_was_and_what_it_needed() {
+    let verdict = decide(
+        &ok(vec![result(
+            0.92,
+            vec![recording("Teardrop", "Massive Attack", None, None)],
+        )]),
+        "Massive Attack",
+        "Teardrop",
+        false,
+    );
+    assert_eq!(verdict.verdict, VerificationVerdict::Confirmed);
+    assert_eq!(
+        verdict.acoust_id_text().as_deref(),
+        Some("AcoustID: the same recording, 92% sure (needs 85%)")
+    );
+    // The recording named is not heard again.
+    assert!(verdict.heard().is_empty());
+}
+
+#[test]
+fn a_match_below_the_threshold_names_the_best_score_and_keeps_what_it_heard() {
+    let verdict = decide(
+        &ok(vec![
+            result(0.40, vec![recording("Angel", "Massive Attack", None, None)]),
+            result(0.61, vec![recording("Teardrop", "Massive Attack", None, None)]),
+        ]),
+        "Massive Attack",
+        "Teardrop",
+        false,
+    );
+    assert_eq!(verdict.reason, InconclusiveReason::BelowThreshold);
+    assert_eq!(
+        verdict.acoust_id_text().as_deref(),
+        Some("AcoustID: no match above 85% (best 61%)")
+    );
+    let heard: Vec<String> = verdict.heard().iter().map(|h| h.describe()).collect();
+    assert_eq!(
+        heard,
+        [
+            "Massive Attack - Teardrop, 61% sure",
+            "Massive Attack - Angel, 40% sure"
+        ]
+    );
+    assert_eq!(verdict.shown_score(), Some(0.61));
+    // Nothing counted as a match, so it names no match, only what came closest.
+    assert_eq!(verdict.matched_text(), None);
+    assert_eq!(
+        verdict.closest_text().as_deref(),
+        Some("Massive Attack - Teardrop")
+    );
+}
+
+#[test]
+fn a_mismatch_names_the_recording_and_how_sure_acoust_id_was() {
+    let verdict = decide(
+        &ok(vec![
+            result(0.97, vec![recording("Angel", "Massive Attack", None, None)]),
+            result(
+                0.30,
+                vec![recording("Unfinished Sympathy", "Massive Attack", None, None)],
+            ),
+        ]),
+        "Massive Attack",
+        "Teardrop",
+        false,
+    );
+    assert_eq!(verdict.verdict, VerificationVerdict::Mismatch);
+    assert_eq!(
+        verdict.acoust_id_text().as_deref(),
+        Some("AcoustID says this is 'Massive Attack - Angel', 97% sure (needs 85%)")
+    );
+    let heard: Vec<String> = verdict.heard().iter().map(|h| h.describe()).collect();
+    assert_eq!(heard, ["Massive Attack - Unfinished Sympathy, 30% sure"]);
+}
+
+#[test]
+fn a_live_take_says_it_is_one() {
+    let mut live = recording("Teardrop", "Massive Attack", Some("Live at the BBC"), None);
+    live.releases = vec![AcoustIdRelease {
+        title: Some("Live at the BBC".into()),
+        secondary_types: vec!["Live".into()],
+        ..Default::default()
+    }];
+    let verdict = DownloadVerificationService::decide(
+        &ok(vec![result(0.95, vec![live])]),
+        Some("Massive Attack"),
+        Some("Teardrop"),
+        THRESHOLD,
+        false,
+        0,
+        &Takes::Only(Default::default()),
+    );
+    assert_eq!(verdict.verdict, VerificationVerdict::Mismatch);
+    assert_eq!(
+        verdict.acoust_id_text().as_deref(),
+        Some("AcoustID says this is a live recording of 'Massive Attack - Teardrop', 95% sure (needs 85%)")
+    );
+}
+
+#[test]
+fn no_entry_says_acoust_id_has_never_heard_the_sound() {
+    let verdict = VerificationResult {
+        reason: InconclusiveReason::NoEntry,
+        lookup: Some(ok(Vec::new())),
+        threshold: THRESHOLD,
+        ..Default::default()
+    };
+    assert_eq!(
+        verdict.acoust_id_text().as_deref(),
+        Some("AcoustID has no entry for this sound")
+    );
+    assert_eq!(verdict.shown_score(), None);
+    assert!(verdict.heard().is_empty());
+
+    // A sound AcoustID knows that no recording is linked to.
+    let known = decide(
+        &ok(vec![result(0.9, Vec::new())]),
+        "Massive Attack",
+        "Teardrop",
+        false,
+    );
+    assert_eq!(known.reason, InconclusiveReason::NoEntry);
+    assert_eq!(
+        known.acoust_id_text().as_deref(),
+        Some("AcoustID knows this sound, 90% sure, but no recording is linked to it")
+    );
+}
+
+#[test]
+fn a_length_off_match_says_how_long_the_recording_runs() {
+    let mut long = recording("Teardrop", "Massive Attack", None, None);
+    long.duration_seconds = Some(400);
+    let verdict = DownloadVerificationService::decide(
+        &ok(vec![result(0.93, vec![long])]),
+        Some("Massive Attack"),
+        Some("Teardrop"),
+        THRESHOLD,
+        false,
+        330,
+        &Takes::Any,
+    );
+    assert_eq!(verdict.reason, InconclusiveReason::LengthOff);
+    assert_eq!(
+        verdict.acoust_id_text().as_deref(),
+        Some("AcoustID: the same song, 93% sure (needs 85%), but that recording runs 6:40")
+    );
+}
+
+#[test]
+fn a_file_kept_on_its_isrc_says_what_acoust_id_said_first() {
+    let below = decide(
+        &ok(vec![result(
+            0.61,
+            vec![recording("Teardrop", "Massive Attack", None, None)],
+        )]),
+        "Massive Attack",
+        "Teardrop",
+        false,
+    );
+    let kept = DownloadVerificationService::with_tagged_isrc(below, Some("GBAAA9800001"), true);
+    assert_eq!(kept.verdict, VerificationVerdict::Confirmed);
+    assert_eq!(
+        kept.acoust_id_text().as_deref(),
+        Some(
+            "AcoustID: no match above 85% (best 61%), but the file's own tags carry the requested ISRC GBAAA9800001"
+        )
+    );
+
+    // Without a lookup at all the ISRC alone speaks.
+    let alone = DownloadVerificationService::with_tagged_isrc(
+        VerificationResult::default(),
+        Some("GBAAA9800001"),
+        true,
+    );
+    assert_eq!(
+        alone.acoust_id_text().as_deref(),
+        Some("the file's own tags carry the requested ISRC GBAAA9800001")
+    );
+}
+
+#[test]
+fn nothing_is_said_when_acoust_id_was_not_asked() {
+    assert_eq!(VerificationResult::inconclusive().acoust_id_text(), None);
+    assert_eq!(
+        reason(InconclusiveReason::LookupFailed)
+            .acoust_id_text()
+            .as_deref(),
+        Some("AcoustID did not answer")
+    );
+    // A file with no audio is said elsewhere.
+    let undecodable = VerificationResult {
+        verdict: VerificationVerdict::Mismatch,
+        deny_reason: "delivered a file with no decodable audio".into(),
+        ..Default::default()
+    };
+    assert_eq!(undecodable.acoust_id_text(), None);
+}
+
+#[test]
+fn heard_keeps_three_best_first_and_each_song_once() {
+    let mut popular = recording("Angel", "Massive Attack", None, None);
+    popular.sources = 9;
+    let mut stray = recording("Teardrop", "Massive Attack", None, None);
+    stray.sources = 1;
+    let verdict = decide(
+        &ok(vec![
+            result(0.70, vec![stray, popular]),
+            result(0.65, vec![recording("Angel", "massive attack", None, None)]),
+            result(
+                0.50,
+                vec![recording("Safe from Harm", "Massive Attack", None, None)],
+            ),
+            result(0.45, Vec::new()),
+            result(
+                0.40,
+                vec![recording("Inertia Creeps", "Massive Attack", None, None)],
+            ),
+            result(0.20, vec![recording("Karmacoma", "Massive Attack", None, None)]),
+        ]),
+        "Massive Attack",
+        "Teardrop",
+        false,
+    );
+    let heard: Vec<String> = verdict.heard().iter().map(|h| h.describe()).collect();
+    assert_eq!(
+        heard,
+        [
+            "Massive Attack - Angel, 70% sure",
+            "Massive Attack - Safe from Harm, 50% sure",
+            "Massive Attack - Inertia Creeps, 40% sure"
+        ]
+    );
+}
+
+// ---- takes that share one fingerprint ----------------------------------------------------------
+
+/// "Welcome to the Black Parade" as AcoustID answered it on 2026-10-12: one fingerprint tied to
+/// the studio take, a live take and the instrumental from a promo CD of instrumentals, all titled
+/// the same.
+fn parade() -> AcoustIdLookup {
+    use octo_core::fingerprint::AcoustIdRelease;
+    let take = |id: &str, ms: i64, release: Option<&str>, group: &str, secondary: &[&str]| {
+        let mut recording = AcoustIdRecording::new(
+            id,
+            "Welcome to the Black Parade",
+            ["My Chemical Romance"],
+            Some(group),
+            Some(2006),
+        );
+        recording.duration_seconds = Some(((ms as f64) / 1000.0).round() as i32);
+        recording.duration_ms = Some(ms);
+        recording.sources = 10;
+        recording.releases = vec![AcoustIdRelease {
+            title: release.map(str::to_string),
+            group_title: Some(group.to_string()),
+            secondary_types: secondary.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }];
+        recording
+    };
+    ok(vec![result(
+        0.97,
+        vec![
+            take("studio", 311_106, None, "The Black Parade", &[]),
+            take(
+                "instrumental",
+                309_684,
+                Some("The Black Parade (instrumentals)"),
+                "The Black Parade",
+                &[],
+            ),
+            take("live", 305_426, None, "The Black Parade Is Dead!", &["Live"]),
+        ],
+    )])
+}
+
+fn parade_verdict(file_ms: i64, takes: &Takes) -> VerificationResult {
+    DownloadVerificationService::decide_with(
+        &parade(),
+        Some("My Chemical Romance"),
+        Some("Welcome to the Black Parade"),
+        THRESHOLD,
+        true,
+        ((file_ms as f64 / 1000.0).round() as i32, Some(file_ms)),
+        takes,
+        &FactsById::new(),
+    )
+}
+
+fn plain_download() -> Takes {
+    Takes::Only(Default::default())
+}
+
+#[test]
+fn the_exact_length_names_the_live_take_and_a_plain_download_refuses_it() {
+    let verdict = parade_verdict(305_427, &plain_download());
+    assert_eq!(verdict.verdict, VerificationVerdict::Mismatch);
+    assert_eq!(verdict.recording_id.as_deref(), Some("live"));
+    assert_eq!(
+        verdict.deny_reason,
+        "is a live recording, from 'The Black Parade Is Dead!'"
+    );
+    assert!(verdict.by_length);
+}
+
+#[test]
+fn an_instrumental_the_fingerprint_names_alone_is_refused() {
+    let mut lookup = parade();
+    lookup.results[0]
+        .recordings
+        .retain(|recording| recording.recording_id == "instrumental");
+    let verdict = DownloadVerificationService::decide_with(
+        &lookup,
+        Some("My Chemical Romance"),
+        Some("Welcome to the Black Parade"),
+        THRESHOLD,
+        true,
+        (310, Some(309_690)),
+        &plain_download(),
+        &FactsById::new(),
+    );
+    assert_eq!(verdict.verdict, VerificationVerdict::Mismatch);
+    assert_eq!(
+        verdict.deny_reason,
+        "is an instrumental, from 'The Black Parade (instrumentals)'"
+    );
+    assert!(verdict.kind_certain);
+}
+
+#[test]
+fn takes_a_remaster_apart_are_not_decided_by_length_and_the_studio_take_stands() {
+    // 1.4 s between the studio take and the instrumental is within what a remaster drifts.
+    for file_ms in [311_107, 309_690] {
+        let verdict = parade_verdict(file_ms, &plain_download());
+        assert_eq!(verdict.verdict, VerificationVerdict::Confirmed, "{file_ms}");
+        assert_eq!(verdict.recording_id.as_deref(), Some("studio"));
+        assert_eq!(verdict.kind, Some(RecordingKind::Studio));
+        assert!(!verdict.by_length && !verdict.kind_certain);
+    }
+}
+
+#[test]
+fn a_song_already_in_the_library_is_named_for_what_it_is_and_kept() {
+    // The Review sweep asks with any take allowed: the live copy is kept, and named live.
+    let verdict = parade_verdict(305_427, &Takes::Any);
+    assert_eq!(verdict.verdict, VerificationVerdict::Confirmed);
+    assert_eq!(verdict.recording_id.as_deref(), Some("live"));
+    assert_eq!(verdict.kind, Some(RecordingKind::Live));
+}
+
+#[test]
+fn with_no_decisive_length_a_plain_download_is_the_studio_take() {
+    let verdict = parade_verdict(309_000, &plain_download());
+    assert_eq!(verdict.verdict, VerificationVerdict::Confirmed);
+    assert_eq!(verdict.recording_id.as_deref(), Some("studio"));
+    assert!(!verdict.by_length);
+}
+
+#[test]
+fn a_request_for_the_instrumental_takes_it_unless_covers_and_instrumentals_are_skipped() {
+    let asked = Takes::for_request(
+        Some("Welcome to the Black Parade (Instrumental)"),
+        None,
+        &Default::default(),
+    );
+    let lookup = parade();
+    let verdict = DownloadVerificationService::decide_with(
+        &lookup,
+        Some("My Chemical Romance"),
+        Some("Welcome to the Black Parade (Instrumental)"),
+        THRESHOLD,
+        true,
+        (310, Some(309_690)),
+        &asked,
+        &FactsById::new(),
+    );
+    // The recording's own title reads plainly, so the title comparer may not call it the
+    // instrumental asked for; what matters is that the instrumental is never refused here.
+    assert_ne!(
+        verdict.deny_reason,
+        "is an instrumental, from 'The Black Parade (instrumentals)'"
+    );
+
+    let skipped = Takes::for_request(
+        Some("Welcome to the Black Parade (Instrumental)"),
+        None,
+        &std::collections::BTreeSet::from(octo_core::common::skipped_takes::SKIPPED),
+    );
+    assert!(skipped.refuses(RecordingKind::Instrumental));
+}
+
+/// Skip covers and instrumentals, on by default, refuses a cover, a karaoke take and an
+/// instrumental even when the title asks for one. Off, only a title that asks gets one.
+#[test]
+fn takes_follow_skip_covers_and_instrumentals() {
+    use octo_core::settings::{AppSettings, SoulseekSettings};
+
+    use crate::services::fingerprint::{AcoustIdRateLimitHandler, AcoustIdRateLimiter};
+
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings::default()));
+    let client = Arc::new(AcoustIdClient::new(Arc::new(AcoustIdRateLimitHandler::new(
+        Arc::new(AcoustIdRateLimiter::new()),
+    ))));
+    let service = DownloadVerificationService::new(
+        Arc::new(AudioFingerprinter::new()),
+        client,
+        Arc::clone(&settings),
+        None,
+        None,
+    );
+    let skipped = [
+        RecordingKind::Cover,
+        RecordingKind::Karaoke,
+        RecordingKind::Instrumental,
+    ];
+
+    assert!(
+        settings.current().soulseek.skip_covers_and_instrumentals,
+        "on by default"
+    );
+    for title in [
+        "Hello (Acoustic Cover)",
+        "Hello (Karaoke Version)",
+        "Hello (Instrumental)",
+        "Hello",
+    ] {
+        let takes = service.takes_for(Some(title), None);
+        for kind in skipped {
+            assert!(takes.refuses(kind), "{title}: {kind:?}");
+        }
+        assert!(!takes.refuses(RecordingKind::Studio), "{title}");
+    }
+
+    settings.set(AppSettings {
+        soulseek: SoulseekSettings {
+            skip_covers_and_instrumentals: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let plain = service.takes_for(Some("Hello"), None);
+    for kind in skipped {
+        assert!(plain.refuses(kind), "a plain request never gets {kind:?}");
+    }
+    assert!(
+        !service
+            .takes_for(Some("Hello (Acoustic Cover)"), None)
+            .refuses(RecordingKind::Cover)
+    );
+    assert!(
+        !service
+            .takes_for(Some("Hello (Karaoke Version)"), None)
+            .refuses(RecordingKind::Karaoke)
+    );
+    assert!(
+        !service
+            .takes_for(Some("Hello (Instrumental)"), None)
+            .refuses(RecordingKind::Instrumental)
+    );
+    assert!(
+        service
+            .takes_for(Some("Hello (Acoustic Cover)"), None)
+            .refuses(RecordingKind::Instrumental)
+    );
+}
+
+#[test]
+fn an_instrumental_only_the_database_note_names_is_refused() {
+    use octo_core::fingerprint::recording_identity::RecordingFacts;
+    let mut recording = recording("So What", "dvsn", Some("A Muse in Her Feelings"), Some(2020));
+    recording.recording_id = "inst".to_string();
+    let lookup = ok(vec![result(0.95, vec![recording])]);
+    let mut facts = FactsById::new();
+    facts.insert(
+        "inst".to_string(),
+        RecordingFacts {
+            recording_id: "inst".to_string(),
+            disambiguation: Some("instrumental".to_string()),
+            ..Default::default()
+        },
+    );
+    let verdict = DownloadVerificationService::decide_with(
+        &lookup,
+        Some("dvsn"),
+        Some("So What"),
+        THRESHOLD,
+        true,
+        (195, Some(194_969)),
+        &plain_download(),
+        &facts,
+    );
+    assert_eq!(verdict.verdict, VerificationVerdict::Mismatch);
+    assert_eq!(
+        verdict.deny_reason,
+        "is an instrumental, from 'A Muse in Her Feelings'"
+    );
 }

@@ -459,49 +459,18 @@ fn find_running_then_found_then_gone() {
 }
 
 #[test]
-fn imports_reading_and_trickle() {
-    let reading = imports(
-        &ImportsActivity {
-            reading_busy: true,
-            reading_step: Some("Reading Liked Songs".into()),
-            trickle_downloading: 2,
-            trickle_done: 1200,
-            trickle_queued: 30,
-            ..Default::default()
-        },
-        now(),
-    );
-    assert_eq!(reading.len(), 2);
+fn imports_trickle() {
+    let fetching = imports(&ImportsActivity {
+        trickle_downloading: 2,
+        trickle_done: 1200,
+        trickle_queued: 30,
+    });
+    assert_eq!(fetching.len(), 1);
     assert_eq!(
-        (reading[0].id.as_str(), reading[0].detail.as_deref()),
-        ("imports:read", Some("Reading Liked Songs"))
+        (fetching[0].id.as_str(), fetching[0].detail.as_deref()),
+        ("imports:trickle", Some("1,200 done, 30 to go"))
     );
-    assert_eq!(reading[1].detail.as_deref(), Some("1,200 done, 30 to go"));
-
-    let at = now() - TimeDelta::seconds(10);
-    let failed = imports(
-        &ImportsActivity {
-            reading_error: Some("Spotify said no.".into()),
-            reading_finished_utc: Some(at),
-            ..Default::default()
-        },
-        now(),
-    );
-    assert_eq!(failed[0].state, "failed");
-    assert_eq!(failed[0].id, format!("imports:read:{}", dotnet_ticks(at)));
-
-    let read = imports(
-        &ImportsActivity {
-            reading_finished_utc: Some(at),
-            ..Default::default()
-        },
-        now(),
-    );
-    assert_eq!(
-        (read[0].title.as_str(), read[0].state),
-        ("Read your Spotify lists", "done")
-    );
-    assert!(imports(&ImportsActivity::default(), now()).is_empty());
+    assert!(imports(&ImportsActivity::default()).is_empty());
 }
 
 #[test]

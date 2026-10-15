@@ -651,6 +651,43 @@ async fn retag_a_stray_space_is_a_change_so_a_split_album_can_be_mended() {
 }
 
 #[tokio::test]
+async fn retag_from_a_file_replaced_since_its_tags_were_read_writes_nothing() {
+    use crate::services::library::library_edit_service::CHANGED_SINCE_TEXT;
+    use crate::services::library::library_identity_sweep::stamp_of;
+
+    let f = Factory::new().await;
+    let path = f.song("s1", "A/B/Song.flac", "Song", "A", "Mezzanine ");
+    let read = stamp_of(&path.to_string_lossy()).expect("a stamp");
+    let changes = || indexmap::IndexMap::from([("album".to_string(), Some("Mezzanine".to_string()))]);
+
+    // A replace lands after the tags were read: same tags, a newer file.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("opens")
+        .set_modified(SystemTime::now() + Duration::from_secs(300))
+        .expect("the time set");
+    let refused = f
+        .state
+        .library_edits
+        .retag_unchanged("s1", "alice", changes(), Some(&read))
+        .await;
+    assert_eq!(refused.state, "skipped");
+    assert_eq!(refused.detail.as_deref(), Some(CHANGED_SINCE_TEXT));
+    assert_eq!(tag(&path, "album").as_deref(), Some("Mezzanine "));
+
+    // Read again, the file is written.
+    let now = stamp_of(&path.to_string_lossy()).expect("a stamp");
+    let written = f
+        .state
+        .library_edits
+        .retag_unchanged("s1", "alice", changes(), Some(&now))
+        .await;
+    assert_eq!(written.state, "applied", "{:?}", written.detail);
+    assert_eq!(tag(&path, "album").as_deref(), Some("Mezzanine"));
+}
+
+#[tokio::test]
 async fn retag_a_value_a_tag_cannot_hold_writes_nothing() {
     for query in ["year=abc", "title=", "track=0", "isrc=nope"] {
         let f = Factory::new().await;

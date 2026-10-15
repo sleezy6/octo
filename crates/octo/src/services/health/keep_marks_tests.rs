@@ -28,6 +28,7 @@ use crate::services::health::library_health::{self as health, HealthCheck};
 use crate::services::health::library_health_service::{HealthRun, LibraryHealthService, Row};
 use crate::services::library::LibrarySongRow;
 use crate::services::library::library_tag_edits as tag_edits;
+use crate::services::library::{LibraryActionRequest, LibraryActionState};
 
 // ---- which copy keeps its id ----------------------------------------------------------------
 
@@ -225,6 +226,7 @@ struct FakeSong {
     missing: bool,
     title: String,
     starred: bool,
+    rating: i32,
     plays: i64,
     created: String,
 }
@@ -235,6 +237,7 @@ struct FakePlaylist {
     name: String,
     smart: bool,
     tracks: Vec<String>,
+    comment: String,
 }
 
 #[derive(Default)]
@@ -293,7 +296,39 @@ impl Respond for Answers {
             });
         let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
         if path == "/auth/login" {
-            return json_answer(&json!({"token": "admin-jwt", "isAdmin": true, "username": "admin"}));
+            return json_answer(&json!({
+                "token": "admin-jwt", "isAdmin": true, "username": "admin",
+                "subsonicSalt": "salt", "subsonicToken": "token",
+            }));
+        }
+        if let Some(endpoint) = path.strip_prefix("/rest/") {
+            // The admin's own stars and ratings, as Navidrome's Subsonic API sets them.
+            let first = |name: &str| query.get(name).and_then(|values| values.first().cloned());
+            if endpoint == "updatePlaylist" {
+                let mut playlists = fake.playlists.lock();
+                let Some(playlist) =
+                    first("playlistId").and_then(|id| playlists.iter_mut().find(|p| p.id == id))
+                else {
+                    return json_answer(
+                        &json!({"subsonic-response": {"status": "failed", "error": {"code": 70}}}),
+                    );
+                };
+                playlist.comment = first("comment").unwrap_or_default();
+                return json_answer(&json!({"subsonic-response": {"status": "ok"}}));
+            }
+            let mut songs = fake.songs.lock();
+            let Some(song) = first("id").and_then(|id| songs.get_mut(&id)) else {
+                return json_answer(
+                    &json!({"subsonic-response": {"status": "failed", "error": {"code": 70}}}),
+                );
+            };
+            match endpoint {
+                "setRating" => song.rating = first("rating").and_then(|r| r.parse().ok()).unwrap_or(0),
+                "star" => song.starred = true,
+                "unstar" => song.starred = false,
+                _ => return ResponseTemplate::new(404),
+            }
+            return json_answer(&json!({"subsonic-response": {"status": "ok"}}));
         }
         if let Some(id) = path.strip_prefix("/api/song/") {
             let songs = fake.songs.lock();
@@ -303,7 +338,7 @@ impl Respond for Answers {
             return json_answer(&json!({
                 "id": id, "path": song.relative, "libraryPath": fake.library_path, "size": song.size,
                 "suffix": "flac", "title": song.title, "artist": "Massive Attack", "album": "Mezzanine",
-                "duration": 2, "missing": song.missing, "starred": song.starred, "rating": 0,
+                "duration": 2, "missing": song.missing, "starred": song.starred, "rating": song.rating,
                 "playCount": song.plays, "createdAt": song.created,
             }));
         }
@@ -314,7 +349,7 @@ impl Respond for Answers {
                 .iter()
                 .map(|p| {
                     json!({
-                        "id": p.id, "name": p.name, "ownerName": "bob", "sync": false,
+                        "id": p.id, "name": p.name, "ownerName": "alice", "sync": false,
                         "rules": if p.smart { json!({"all": [{"is": {"loved": true}}]}) } else { Value::Null },
                     })
                 })
@@ -403,6 +438,8 @@ impl Respond for Answers {
 struct Factory {
     state: AppState,
     navidrome: Arc<FakeNavidrome>,
+    /// The library as Library health reads it.
+    rows: Arc<Mutex<Vec<LibrarySongRow>>>,
     root: PathBuf,
     _server: MockServer,
     _dir: tempfile::TempDir,
@@ -444,9 +481,27 @@ impl Factory {
             },
             ..Default::default()
         };
+        let rows: Arc<Mutex<Vec<LibrarySongRow>>> = Arc::default();
+        let read = Arc::clone(&rows);
+        let read_page: crate::services::library::library_snapshot::ReadPage =
+            Arc::new(move |start: i32, count: i32| {
+                let all = read.lock().clone();
+                let page: Vec<LibrarySongRow> = all
+                    .iter()
+                    .skip(start.max(0) as usize)
+                    .take(count.max(0) as usize)
+                    .cloned()
+                    .collect();
+                let total = all.len();
+                async move { Some((page, total)) }.boxed()
+            });
         let state = AppState::for_tests_with(
             settings,
             TestServices {
+                library_snapshot: Some(Arc::new(crate::services::library::LibrarySnapshot::with(
+                    read_page,
+                    octo_core::common::Clock::system(),
+                ))),
                 config_dir: Some(dir.path().join("config")),
                 raw_settings: vec![("Library:DownloadPath".into(), root.to_string_lossy().into_owned())],
                 ..Default::default()
@@ -465,6 +520,7 @@ impl Factory {
         Factory {
             state,
             navidrome,
+            rows,
             root,
             _server: server,
             _dir: dir,
@@ -502,6 +558,7 @@ impl Factory {
                 missing: false,
                 title: tags.title.to_string(),
                 starred,
+                rating: 0,
                 plays: 0,
                 created: created.to_rfc3339(),
             },
@@ -535,6 +592,7 @@ impl Factory {
             name: name.into(),
             smart,
             tracks: tracks.iter().map(|t| t.to_string()).collect(),
+            comment: String::new(),
         });
     }
 
@@ -1105,5 +1163,803 @@ async fn moving_the_sound_waits_for_no_library_action_on_either_copy() {
             .library_action_executor
             .claim_songs(&[&a_path.to_string_lossy(), &b_path.to_string_lossy()])
             .is_some()
+    );
+}
+
+// ---- every rated copy kept -------------------------------------------------------------------
+
+/// A copy as the library read lists it, with no file behind it.
+fn row(id: &str, relative: &str, bits: i32, day: u32) -> Row {
+    Arc::new(LibrarySongRow {
+        id: id.into(),
+        path: relative.into(),
+        size: 1000,
+        suffix: Path::new(relative)
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        bit_rate: if bits > 16 { 2000 } else { 900 },
+        title: "Teardrop".into(),
+        artist: "Massive Attack".into(),
+        duration: Some(330),
+        seconds: Some(330.0),
+        album: Some("Mezzanine".into()),
+        album_id: Some("al".into()),
+        album_artist: Some("Massive Attack".into()),
+        bit_depth: Some(bits),
+        sample_rate: Some(if bits > 16 { 96000 } else { 44100 }),
+        added_utc: at(day),
+        ..Default::default()
+    })
+}
+
+fn starred() -> SongMarks {
+    SongMarks {
+        starred: true,
+        ..Default::default()
+    }
+}
+
+fn rated(rating: i32) -> SongMarks {
+    SongMarks {
+        rating,
+        ..Default::default()
+    }
+}
+
+fn played(plays: i64) -> SongMarks {
+    SongMarks {
+        plays,
+        ..Default::default()
+    }
+}
+
+fn kim() -> Reader {
+    Reader::Member("kim".into())
+}
+
+/// Every reader's marks on each copy: the admin's and kim's, none where not named.
+fn set_marks(rows: &[Row], given: &[(&str, Reader, Option<SongMarks>)]) -> SetMarks {
+    SetMarks(
+        rows.iter()
+            .map(|copy| {
+                let reads = [Reader::Admin, kim()]
+                    .into_iter()
+                    .map(|reader| {
+                        let marks = given
+                            .iter()
+                            .find(|(id, who, _)| *id == copy.id && *who == reader)
+                            .map_or(Some(SongMarks::default()), |(_, _, marks)| *marks);
+                        ReaderMarks { reader, marks }
+                    })
+                    .collect();
+                (copy.id.clone(), reads)
+            })
+            .collect(),
+    )
+}
+
+/// What a plan keeps first, whose sound moves in, what else stays and what goes.
+type RatedShape = (String, Option<String>, Vec<String>, Vec<String>);
+
+/// The plan for the one set `rows` make with every rated copy kept, or None when nothing would
+/// go.
+fn rated_plan(rows: &[Row], marks: &SetMarks, picked: Option<&str>) -> Option<RatedShape> {
+    let fields = ServerSongFields::new(rows.iter().map(|row| &**row));
+    let report = health::check(rows, &fields);
+    assert_eq!(report.duplicates.len(), 1, "one set of copies");
+    let set = &report.duplicates[0];
+    let picked = picked.and_then(|id| set.copies.iter().find(|copy| copy.id == id));
+    let fix = plan_keeping_rated(set, &fields, marks, &PlaylistUses::default(), picked)?;
+    let ids = |copies: &[Row]| {
+        let mut ids: Vec<String> = copies.iter().map(|copy| copy.id.clone()).collect();
+        ids.sort();
+        ids
+    };
+    Some((
+        fix.keep.id.clone(),
+        fix.audio.as_ref().map(|audio| audio.id.clone()),
+        ids(&fix.also_kept),
+        ids(&fix.remove),
+    ))
+}
+
+const A_BEST: &str = "Massive Attack/Mezzanine (Deluxe)/07 Teardrop.flac";
+const B_FLAC: &str = "Massive Attack/Mezzanine/03 Teardrop.flac";
+const C_FLAC: &str = "Massive Attack/Singles/01 Teardrop.flac";
+
+#[test]
+fn with_one_rated_copy_the_best_sound_moves_into_it_and_the_unrated_copies_go() {
+    let rows = [
+        row("A", A_BEST, 24, 20),
+        row("B", B_FLAC, 16, 1),
+        row("C", C_FLAC, 16, 5),
+    ];
+    // C has the most plays, but only B is rated.
+    let marks = set_marks(
+        &rows,
+        &[
+            ("B", Reader::Admin, Some(rated(4))),
+            ("C", Reader::Admin, Some(played(40))),
+        ],
+    );
+    let (keep, audio, also, remove) = rated_plan(&rows, &marks, None).expect("a plan");
+    assert_eq!(keep, "B");
+    assert_eq!(audio.as_deref(), Some("A"));
+    assert!(also.is_empty());
+    assert_eq!(remove, ["C"]);
+}
+
+#[test]
+fn every_rated_copy_stays_and_only_the_unmarked_ones_go() {
+    let rows = [
+        row("A", A_BEST, 24, 20),
+        row("B", B_FLAC, 16, 1),
+        row("C", C_FLAC, 16, 5),
+    ];
+    // A, the best sound, is starred by a Family member; B is rated by the admin.
+    let marks = set_marks(
+        &rows,
+        &[
+            ("A", kim(), Some(starred())),
+            ("B", Reader::Admin, Some(rated(2))),
+        ],
+    );
+    let (keep, audio, also, remove) = rated_plan(&rows, &marks, None).expect("a plan");
+    assert_eq!((keep.as_str(), audio), ("A", None));
+    assert_eq!(also, ["B"]);
+    assert_eq!(remove, ["C"]);
+}
+
+#[test]
+fn two_rated_copies_keep_the_best_sound_in_the_most_marked_one() {
+    let rows = [
+        row("A", A_BEST, 24, 20),
+        row("B", B_FLAC, 16, 1),
+        row("C", C_FLAC, 16, 5),
+    ];
+    let marks = set_marks(
+        &rows,
+        &[
+            ("B", Reader::Admin, Some(rated(5))),
+            ("B", kim(), Some(starred())),
+            ("C", kim(), Some(rated(3))),
+        ],
+    );
+    let (keep, audio, also, remove) = rated_plan(&rows, &marks, None).expect("a plan");
+    assert_eq!((keep.as_str(), audio.as_deref()), ("B", Some("A")));
+    assert_eq!(also, ["C"]);
+    assert!(
+        remove.is_empty(),
+        "the best sound's own file is the only one that goes"
+    );
+}
+
+#[test]
+fn a_set_where_every_copy_is_rated_is_left_alone() {
+    let rows = [row("A", A_BEST, 24, 20), row("B", B_FLAC, 16, 1)];
+    let marks = set_marks(
+        &rows,
+        &[
+            ("A", Reader::Admin, Some(starred())),
+            ("B", kim(), Some(rated(1))),
+        ],
+    );
+    assert_eq!(rated_plan(&rows, &marks, None), None);
+}
+
+#[test]
+fn with_no_rated_copy_the_fix_is_the_one_that_keeps_peoples_marks() {
+    let rows = [row("A", A_BEST, 24, 20), row("B", B_FLAC, 16, 1)];
+    let marks = set_marks(&rows, &[("B", Reader::Admin, Some(played(12)))]);
+    let (keep, audio, also, remove) = rated_plan(&rows, &marks, None).expect("a plan");
+    assert_eq!((keep.as_str(), audio.as_deref()), ("B", Some("A")));
+    assert!(also.is_empty() && remove.is_empty());
+}
+
+#[test]
+fn a_copy_whose_marks_could_not_be_read_stays() {
+    let rows = [
+        row("A", A_BEST, 24, 20),
+        row("B", B_FLAC, 16, 1),
+        row("C", C_FLAC, 16, 5),
+    ];
+    let marks = set_marks(&rows, &[("C", kim(), None)]);
+    let (keep, audio, also, remove) = rated_plan(&rows, &marks, None).expect("a plan");
+    // Nothing known marks C, so the best sound is kept in its own copy and C stays beside it.
+    assert_eq!((keep.as_str(), audio), ("A", None));
+    assert_eq!(also, ["C"]);
+    assert_eq!(remove, ["B"]);
+}
+
+#[test]
+fn a_copy_a_person_picked_is_kept_first_and_the_rated_ones_stay_too() {
+    let rows = [
+        row("A", A_BEST, 24, 20),
+        row("B", B_FLAC, 16, 1),
+        row("C", C_FLAC, 16, 5),
+    ];
+    let marks = set_marks(&rows, &[("B", Reader::Admin, Some(rated(3)))]);
+    let (keep, audio, also, remove) = rated_plan(&rows, &marks, Some("C")).expect("a plan");
+    assert_eq!((keep.as_str(), audio), ("C", None));
+    assert_eq!(also, ["B"]);
+    assert_eq!(remove, ["A"]);
+}
+
+#[test]
+fn the_steps_go_only_while_the_copy_that_goes_is_unrated_and_name_the_copy_that_stays() {
+    let rows = [
+        row("A", A_BEST, 24, 20),
+        row("B", B_FLAC, 16, 1),
+        row("C", C_FLAC, 16, 5),
+    ];
+    let fields = ServerSongFields::new(rows.iter().map(|row| &**row));
+    let report = health::check(&rows, &fields);
+    let marks = set_marks(&rows, &[("B", Reader::Admin, Some(rated(4)))]);
+    let fix = plan_keeping_rated(
+        &report.duplicates[0],
+        &fields,
+        &marks,
+        &PlaylistUses::default(),
+        None,
+    )
+    .expect("a plan");
+    let mut steps = fixes::duplicate_steps(&fix, &fields, None);
+    fixes::only_unrated(&mut steps);
+    let shape: Vec<(&str, &str, Option<&str>, Option<&str>)> = steps
+        .iter()
+        .map(|step| {
+            (
+                step.action.as_str(),
+                step.id.as_str(),
+                step.param(INTO).or(step.param("from")),
+                step.param(UNRATED_ONLY),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (fix_actions::MOVE_SOUND, "B", Some("A"), Some("true")),
+            (fix_actions::REMOVE, "C", Some("B"), Some("true")),
+        ]
+    );
+    // The move's own check lets the flag through, and a move with no tags to write is valid.
+    assert_eq!(LibraryHealthService::invalid(&steps), None);
+    let bare = FixStep::move_sound("B", "Teardrop", "A", &[]);
+    assert_eq!(LibraryHealthService::invalid(&[bare]), None);
+}
+
+#[test]
+fn carrying_marks_gives_the_higher_rating_and_any_star_and_never_plays() {
+    let from = [
+        ReaderMarks::read(
+            Reader::Admin,
+            SongMarks {
+                starred: true,
+                rating: 5,
+                plays: 30,
+            },
+        ),
+        ReaderMarks::read(kim(), rated(2)),
+        ReaderMarks {
+            reader: Reader::Member("lee".into()),
+            marks: None,
+        },
+    ];
+    let into = [
+        ReaderMarks::read(Reader::Admin, rated(3)),
+        ReaderMarks::read(kim(), rated(4)),
+    ];
+    let (ratings, stars) = carry_plan(&from, &into);
+    assert_eq!(ratings, [(Reader::Admin, 3, 5)]);
+    assert_eq!(stars, [Reader::Admin]);
+    // Nothing is written over marks on the kept copy that could not be read.
+    let unread = [
+        ReaderMarks {
+            reader: Reader::Admin,
+            marks: None,
+        },
+        ReaderMarks {
+            reader: kim(),
+            marks: None,
+        },
+    ];
+    assert_eq!(carry_plan(&from, &unread), (Vec::new(), Vec::new()));
+}
+
+#[test]
+fn a_remove_that_waits_for_no_rating_says_why_it_kept_a_copy() {
+    assert_eq!(kept_because(&[ReaderMarks::read(Reader::Admin, played(9))]), None);
+    assert_eq!(
+        kept_because(&[ReaderMarks::read(kim(), rated(1))]),
+        Some(RATED_SINCE)
+    );
+    assert_eq!(
+        kept_because(&[ReaderMarks {
+            reader: Reader::Admin,
+            marks: None
+        }]),
+        Some(MARKS_UNREAD)
+    );
+}
+
+#[test]
+fn the_keep_rated_words_are_plain_and_use_no_dash() {
+    use crate::services::health::health_words as words;
+    let lines = [
+        words::KEEP_RATED_LABEL.to_string(),
+        words::KEEP_RATED_MEANING.to_string(),
+        words::KEEP_RATED_MORE.to_string(),
+        words::RATED_KEPT_IN_PREVIEW.to_string(),
+        words::ALL_RATED.to_string(),
+        words::also_keeps_rated(1),
+        words::also_keeps_rated(2),
+        words::skipped_rated(3),
+        RATED_SINCE.to_string(),
+        MARKS_UNREAD.to_string(),
+        words::fix_meaning(HealthCheck::Duplicates).to_string(),
+    ];
+    for line in &lines {
+        assert!(
+            !(line.contains('\u{2014}') || line.contains('\u{2013}') || line.contains(" - ")),
+            "{line}"
+        );
+        assert!(!line.to_lowercase().contains("lossless"), "{line}");
+        assert!(!line.contains("favourite"), "{line}");
+    }
+    assert_eq!(
+        words::also_keeps_rated(1),
+        "Also keeps 1 other copy someone starred or rated, as it is."
+    );
+    assert_eq!(
+        words::marks_words(1, 4, 2, 2, false).as_deref(),
+        Some("Starred, rated 4 stars by 2 people")
+    );
+    assert_eq!(words::marks_words(0, 0, 0, 0, false), None);
+    assert_eq!(
+        words::marks_words(0, 0, 0, 0, true).as_deref(),
+        Some("Some marks could not be read, so it stays")
+    );
+}
+
+// ---- marks carried over, through a real run ---------------------------------------------------
+
+/// Family members' marks, kept here.
+#[derive(Default)]
+struct FakeMembers {
+    marks: Mutex<HashMap<(String, String), SongMarks>>,
+}
+
+impl FakeMembers {
+    fn set(&self, member: &str, song: &str, marks: SongMarks) {
+        self.marks
+            .lock()
+            .insert((member.to_string(), song.to_string()), marks);
+    }
+
+    fn get(&self, member: &str, song: &str) -> SongMarks {
+        self.marks
+            .lock()
+            .get(&(member.to_string(), song.to_string()))
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+impl MemberMarks for FakeMembers {
+    fn marks_of<'a>(&'a self, song_id: &'a str) -> BoxFuture<'a, Vec<(String, Option<SongMarks>)>> {
+        Box::pin(async move { vec![("kim".to_string(), Some(self.get("kim", song_id)))] })
+    }
+
+    fn set_rating<'a>(&'a self, member: &'a str, song_id: &'a str, rating: i32) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let mut marks = self.get(member, song_id);
+            marks.rating = rating;
+            self.set(member, song_id, marks);
+            true
+        })
+    }
+
+    fn set_starred<'a>(&'a self, member: &'a str, song_id: &'a str, starred: bool) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let mut marks = self.get(member, song_id);
+            marks.starred = starred;
+            self.set(member, song_id, marks);
+            true
+        })
+    }
+}
+
+impl Factory {
+    fn members(&self) -> Arc<FakeMembers> {
+        let members = Arc::new(FakeMembers::default());
+        self.keep()
+            .use_members(Arc::clone(&members) as Arc<dyn MemberMarks>);
+        members
+    }
+
+    /// The admin's own rating and plays on a song.
+    fn mark(&self, id: &str, rating: i32, plays: i64) {
+        let mut songs = self.navidrome.songs.lock();
+        let song = songs.get_mut(id).expect("a song");
+        song.rating = rating;
+        song.plays = plays;
+    }
+
+    /// The admin's own star and rating on a song.
+    fn admin(&self, id: &str) -> (bool, i32) {
+        let songs = self.navidrome.songs.lock();
+        let song = songs.get(id).expect("a song");
+        (song.starred, song.rating)
+    }
+
+    /// The plan for the one set `rows` make with every rated copy kept, and its steps.
+    async fn rated_steps(&self, rows: &[Row]) -> Option<(fixes::DuplicateFix<Row>, Vec<FixStep>)> {
+        let fields = ServerSongFields::new(rows.iter().map(|row| &**row));
+        let report = health::check(rows, &fields);
+        let set = &report.duplicates[0];
+        let keep = self.keep();
+        let uses = keep.playlist_uses().await.unwrap_or_default();
+        let marks = keep.read_set(set).await;
+        let fix = plan_keeping_rated(set, &fields, &marks, &uses, None)?;
+        let mut steps = fixes::duplicate_steps(&fix, &fields, None);
+        fixes::only_unrated(&mut steps);
+        Some((fix, steps))
+    }
+}
+
+#[tokio::test]
+async fn a_removed_copys_stars_ratings_and_playlist_places_move_to_the_kept_one_and_undo_takes_them_off() {
+    let f = Factory::new().await;
+    let members = f.members();
+    // A: the best sound, starred and rated 2 by the admin, played often. B: rated 4 by the
+    // admin, starred by kim, in a playlist.
+    let a = f.copy("A", A_BEST, &BEST, 24, 1, true);
+    let b = f.copy("B", B_FLAC, &MARKED, 16, 20, false);
+    f.mark("A", 2, 30);
+    f.mark("B", 4, 0);
+    members.set("kim", "B", starred());
+    f.playlist("p1", "Evening", false, &["x", "B", "y"]);
+
+    let (fix, steps) = f.plan(&[a, b]).await;
+    assert_eq!((fix.keep.id.as_str(), fix.audio.is_none()), ("A", true));
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| (s.action.as_str(), s.id.as_str(), s.param(INTO)))
+            .collect::<Vec<_>>(),
+        [(fix_actions::REMOVE, "B", Some("A"))]
+    );
+
+    let run = f.run(steps).await;
+    let outcome = run.progress().outcome.expect("an outcome");
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert!(!f.root.join(B_FLAC).exists());
+    // The higher rating and kim's star are on the kept copy; B's place in the playlist is A's.
+    assert_eq!(f.admin("A"), (true, 4));
+    assert!(members.get("kim", "A").starred);
+    assert_eq!(f.navidrome.tracks("p1"), ["x", "A", "y"]);
+    // B's own marks are left as they were, for when it comes back.
+    assert_eq!(f.admin("B"), (false, 4));
+    assert!(members.get("kim", "B").starred);
+
+    let undo = f.undo().await;
+    let outcome = undo.progress().outcome.expect("an outcome");
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert!(f.root.join(B_FLAC).exists());
+    assert_eq!(f.admin("A"), (true, 2));
+    assert!(!members.get("kim", "A").starred);
+    assert_eq!(f.navidrome.tracks("p1"), ["x", "B", "y"]);
+}
+
+#[tokio::test]
+async fn undo_leaves_a_mark_someone_changed_since_the_fix() {
+    let f = Factory::new().await;
+    let a = f.copy("A", A_BEST, &BEST, 24, 1, true);
+    let b = f.copy("B", B_FLAC, &MARKED, 16, 20, false);
+    f.mark("A", 2, 30);
+    f.mark("B", 4, 0);
+    let (_, steps) = f.plan(&[a, b]).await;
+    f.run(steps).await;
+    assert_eq!(f.admin("A"), (true, 4));
+
+    // Someone rates the kept copy 5 after the fix.
+    f.mark("A", 5, 30);
+    f.undo().await;
+
+    assert_eq!(f.admin("A"), (true, 5));
+}
+
+#[tokio::test]
+async fn moving_the_sound_carries_the_other_copys_rating_and_undo_takes_it_off() {
+    let f = Factory::new().await;
+    let members = f.members();
+    // B is the marked copy (starred, played); A, the best sound, is rated by kim.
+    let a = f.copy("A", A_BEST, &BEST, 24, 20, false);
+    let b = f.copy("B", B_FLAC, &MARKED, 16, 1, true);
+    f.mark("B", 0, 20);
+    members.set("kim", "A", rated(3));
+
+    let (fix, steps) = f.plan(&[a, b]).await;
+    assert_eq!(
+        (fix.keep.id.as_str(), fix.audio.as_ref().map(|a| a.id.as_str())),
+        ("B", Some("A"))
+    );
+    f.run(steps).await;
+    assert_eq!(members.get("kim", "B").rating, 3);
+
+    f.undo().await;
+    assert_eq!(members.get("kim", "B").rating, 0);
+    assert_eq!(members.get("kim", "A").rating, 3);
+}
+
+#[tokio::test]
+async fn with_every_rated_copy_kept_a_rated_copy_never_goes() {
+    let f = Factory::new().await;
+    let members = f.members();
+    let a = f.copy("A", A_BEST, &BEST, 24, 20, false);
+    let b = f.copy("B", B_FLAC, &MARKED, 16, 1, false);
+    let c = f.copy("C", C_FLAC, &MARKED, 16, 5, false);
+    // A, the best sound, is rated by kim; B by the admin; C by nobody, though often played.
+    members.set("kim", "A", rated(5));
+    f.mark("B", 3, 0);
+    f.mark("C", 0, 45);
+
+    let (fix, steps) = f.rated_steps(&[a, b, c]).await.expect("a plan");
+    assert_eq!(fix.keep.id, "A");
+    assert_eq!(
+        fix.also_kept
+            .iter()
+            .map(|copy| copy.id.as_str())
+            .collect::<Vec<_>>(),
+        ["B"]
+    );
+    assert_eq!(steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["C"]);
+
+    let run = f.run(steps).await;
+    let outcome = run.progress().outcome.expect("an outcome");
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert!(f.root.join(A_BEST).exists());
+    assert!(f.root.join(B_FLAC).exists());
+    assert!(!f.root.join(C_FLAC).exists());
+}
+
+#[tokio::test]
+async fn a_copy_rated_after_the_preview_is_kept_when_the_fix_runs() {
+    let f = Factory::new().await;
+    let members = f.members();
+    let a = f.copy("A", A_BEST, &BEST, 24, 20, false);
+    let b = f.copy("B", B_FLAC, &MARKED, 16, 1, false);
+    let c = f.copy("C", C_FLAC, &MARKED, 16, 5, false);
+    f.mark("A", 4, 0);
+
+    let (_, steps) = f.rated_steps(&[a, b, c]).await.expect("a plan");
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    // kim stars B between the preview and the fix.
+    members.set("kim", "B", starred());
+
+    let run = f.run(steps).await;
+    let outcome = run.progress().outcome.expect("an outcome");
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert_eq!(
+        outcome
+            .unchanged
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>(),
+        ["B"]
+    );
+    assert!(f.root.join(B_FLAC).exists());
+    assert!(!f.root.join(C_FLAC).exists());
+    assert!(
+        outcome
+            .summary()
+            .contains("Kept 1 copy someone starred or rated since the preview"),
+        "{}",
+        outcome.summary()
+    );
+}
+
+#[tokio::test]
+async fn a_set_where_every_copy_is_rated_has_no_steps() {
+    let f = Factory::new().await;
+    let members = f.members();
+    let a = f.copy("A", A_BEST, &BEST, 24, 20, true);
+    let b = f.copy("B", B_FLAC, &MARKED, 16, 1, false);
+    members.set("kim", "B", rated(1));
+    assert!(f.rated_steps(&[a, b]).await.is_none());
+}
+
+// ---- Fix duplicates from any app -------------------------------------------------------------
+
+impl Factory {
+    /// Keep every rated copy on, ratings on, and Fix duplicates on (with `star`, if any) beside
+    /// Delete.
+    fn fix_from_apps(&self, star: Option<i32>) {
+        let mut settings = (*self.state.settings.current()).clone();
+        let actions = &mut settings.library_actions;
+        actions.keep_rated_copies = true;
+        actions.ratings_enabled = true;
+        actions.duplicates_enabled = true;
+        actions.actions = vec![
+            LibraryActionDefinition {
+                action: LibraryAction::Delete,
+                enabled: true,
+                ..Default::default()
+            },
+            LibraryActionDefinition {
+                action: LibraryAction::WrongVersion,
+                enabled: false,
+                rating: Some(0),
+                ..Default::default()
+            },
+            LibraryActionDefinition {
+                action: LibraryAction::FixDuplicates,
+                enabled: true,
+                rating: star,
+                ..Default::default()
+            },
+        ];
+        self.state.settings.set(settings);
+    }
+
+    /// The action playlist worker over this state, for one sweep.
+    fn playlist_worker(&self) -> crate::services::library::LibraryActionPlaylistWorker {
+        crate::services::library::LibraryActionPlaylistWorker::new(
+            Arc::clone(&self.state.library_action_executor),
+            Arc::clone(&self.state.library_action_journal),
+            Arc::clone(&self.state.library_action_quarantine),
+            Arc::clone(&self.state.navidrome_song_path_resolver),
+            self.state.navidrome_identity.clone(),
+            Arc::clone(&self.state.navidrome_playlist_api),
+            Arc::clone(&self.state.settings),
+        )
+    }
+
+    /// The library read as Library health sees it: these rows.
+    fn library(&self, rows: &[Row]) {
+        *self.rows.lock() = rows.iter().map(|row| (**row).clone()).collect();
+    }
+}
+
+#[tokio::test]
+async fn adding_a_copy_to_the_fix_duplicates_playlist_fixes_the_song_and_keeps_rated_copies() {
+    let f = Factory::new().await;
+    let members = f.members();
+    f.fix_from_apps(None);
+    let a = f.copy("A", A_BEST, &BEST, 24, 20, false);
+    let b = f.copy("B", B_FLAC, &MARKED, 16, 1, false);
+    let c = f.copy("C", C_FLAC, &MARKED, 16, 5, false);
+    // kim gave B a heart; nobody marked A or C.
+    members.set("kim", "B", starred());
+    f.library(&[a, b, c]);
+    let fix = "\u{1F6E0} Fix duplicates";
+    f.playlist("fix", fix, false, &["C"]);
+
+    f.playlist_worker()
+        .sweep(&tokio_util::sync::CancellationToken::new())
+        .await;
+    let run = f.finished().await;
+
+    let outcome = run.progress().outcome.expect("an outcome");
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    // B, the hearted copy, stays and takes the best sound; C goes; A's own file goes.
+    assert!(f.root.join(B_FLAC).exists());
+    assert_eq!(tag(&f.root.join(B_FLAC), "genre").as_deref(), Some("best copy"));
+    assert!(!f.root.join(C_FLAC).exists());
+    assert!(!f.root.join(A_BEST).exists());
+    // The song left the action playlist, which says what adding a song to it does.
+    assert!(f.navidrome.tracks("fix").is_empty());
+    let comment = f.navidrome.playlists.lock()[0].comment.clone();
+    assert!(
+        comment.contains("anyone gave a heart or a star rating stays"),
+        "{comment}"
+    );
+}
+
+#[tokio::test]
+async fn the_fix_duplicates_star_takes_its_own_rating_off_so_it_never_keeps_the_copy() {
+    let f = Factory::new().await;
+    let members = f.members();
+    f.fix_from_apps(Some(3));
+    let a = f.copy("A", A_BEST, &BEST, 24, 20, false);
+    let b = f.copy("B", B_FLAC, &MARKED, 16, 1, false);
+    members.set("kim", "A", rated(4));
+    // Three stars on B ask for the fix; they are not a mark that keeps B.
+    f.mark("B", 3, 0);
+    f.library(&[a, b]);
+
+    let sign_in: [(String, String); 3] = [
+        ("u".into(), "alice".into()),
+        ("t".into(), "token".into()),
+        ("s".into(), "salt".into()),
+    ];
+    let request = LibraryActionRequest::new(LibraryAction::FixDuplicates, "B", "alice").with_credential(
+        octo_subsonic::SubsonicCredential::from(sign_in.iter().map(|(k, v)| (k, v))),
+    );
+    let outcome = f
+        .state
+        .library_action_executor
+        .apply(request)
+        .await
+        .expect("an outcome");
+    assert_eq!(outcome.state, LibraryActionState::Applied, "{outcome:?}");
+    f.finished().await;
+
+    assert_eq!(f.admin("B").1, 0);
+    assert!(!f.root.join(B_FLAC).exists());
+    assert!(f.root.join(A_BEST).exists());
+}
+
+#[tokio::test]
+async fn fix_duplicates_on_a_song_whose_copies_are_all_rated_keeps_them_and_answers_the_question() {
+    let f = Factory::new().await;
+    let members = f.members();
+    f.fix_from_apps(None);
+    let a = f.copy("A", A_BEST, &BEST, 24, 20, true);
+    let b = f.copy("B", B_FLAC, &MARKED, 16, 1, false);
+    members.set("kim", "B", rated(2));
+    f.library(&[a, b]);
+
+    let outcome = f
+        .state
+        .library_action_executor
+        .apply(LibraryActionRequest::new(
+            LibraryAction::FixDuplicates,
+            "A",
+            "alice",
+        ))
+        .await
+        .expect("an outcome");
+
+    assert_eq!(outcome.state, LibraryActionState::Applied, "{outcome:?}");
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("Every copy is starred or rated"))
+    );
+    assert!(f.state.library_health.run().is_none(), "nothing ran");
+    assert!(f.root.join(A_BEST).exists() && f.root.join(B_FLAC).exists());
+}
+
+#[tokio::test]
+async fn fix_duplicates_needs_delete_on_and_a_second_copy() {
+    let f = Factory::new().await;
+    f.fix_from_apps(None);
+    let a = f.copy("A", A_BEST, &BEST, 24, 20, false);
+    f.library(&[a]);
+    let ask = || LibraryActionRequest::new(LibraryAction::FixDuplicates, "A", "alice");
+
+    let alone = f
+        .state
+        .library_action_executor
+        .apply(ask())
+        .await
+        .expect("an outcome");
+    assert_eq!(alone.state, LibraryActionState::Skipped);
+    assert_eq!(
+        alone.detail.as_deref(),
+        Some("Octo does not see another copy of this song.")
+    );
+
+    let mut settings = (*f.state.settings.current()).clone();
+    settings
+        .library_actions
+        .actions
+        .retain(|action| action.action != LibraryAction::Delete);
+    f.state.settings.set(settings);
+    let off = f
+        .state
+        .library_action_executor
+        .apply(ask())
+        .await
+        .expect("an outcome");
+    assert_eq!(off.state, LibraryActionState::Skipped);
+    assert!(
+        off.detail
+            .as_deref()
+            .is_some_and(|d| d.contains("turn on the Delete action"))
     );
 }

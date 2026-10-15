@@ -41,7 +41,7 @@ pub use heart_acquisition_coordinator::{
 pub use song_finder::{SongFinder, SongFinderServices};
 pub use soulseek_hold_resumer::SoulseekHoldResumer;
 pub use soulseek_hold_store::{HeldAcquisition, HeldKind, SoulseekHoldStore};
-pub use star_on_arrival::{StarNavidrome, StarOnArrival};
+pub use star_on_arrival::{StarNavidrome, StarOnArrival, WaitingStar};
 pub use top_songs_service::{ChartFetch, TopList, TopSong, TopSongsService};
 pub use track_acquisition_queue::{
     AcquisitionOutcome, AcquisitionPlace, AcquisitionRequest, AcquisitionTarget, Completion,

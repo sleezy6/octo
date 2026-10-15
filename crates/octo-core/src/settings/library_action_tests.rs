@@ -69,7 +69,7 @@ fn effective_actions_back_fills_every_action_and_keeps_configured_names() {
 
     let actions = settings.effective_actions();
 
-    assert_eq!(actions.len(), 7);
+    assert_eq!(actions.len(), 8);
     let delete = find(&actions, LibraryAction::Delete);
     assert_eq!(delete.name, "Bin it");
     assert!(delete.enabled);
@@ -94,7 +94,8 @@ fn effective_actions_drops_a_duplicate_effective_title() {
         ..Default::default()
     };
 
-    assert_eq!(settings.effective_actions().len(), 6);
+    // Eight actions, less the one whose title repeats.
+    assert_eq!(settings.effective_actions().len(), 7);
 }
 
 #[test]
@@ -415,8 +416,37 @@ fn library_action_indexes_match_the_journal_numbers() {
     assert_eq!(LibraryAction::from_index(3), Some(LibraryAction::BetterQuality));
     assert_eq!(LibraryAction::from_index(5), Some(LibraryAction::WrongLyrics));
     assert_eq!(LibraryAction::from_index(6), Some(LibraryAction::WrongCover));
-    assert_eq!(LibraryAction::from_index(7), None);
+    assert_eq!(LibraryAction::from_index(7), Some(LibraryAction::FixDuplicates));
+    assert_eq!(LibraryAction::from_index(8), None);
     assert_eq!(LibraryAction::from_index(-1), None);
+}
+
+/// Fix duplicates comes last, so every number the journal already holds keeps its meaning, and
+/// it starts off and unmapped: it removes files, and every star already asks for something.
+#[test]
+fn fix_duplicates_comes_last_unmapped_and_off() {
+    let actions = LibraryActionSettings {
+        duplicates_enabled: true,
+        ..Default::default()
+    }
+    .effective_actions();
+    let fix = find(&actions, LibraryAction::FixDuplicates);
+    assert_eq!(fix.name, "Fix duplicates");
+    assert_eq!(fix.rating, Some(0));
+    assert!(!fix.enabled);
+    assert_eq!(LibraryAction::FixDuplicates.as_index(), 7);
+    // Mapped to a star nobody else uses, a rating asks for it.
+    let settings = LibraryActionSettings {
+        actions: vec![
+            def(LibraryAction::WrongVersion, "", true, Some(0)),
+            def(LibraryAction::FixDuplicates, "", true, Some(3)),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        settings.action_for_rating(3).map(|action| action.action),
+        Some(LibraryAction::FixDuplicates)
+    );
 }
 
 /// The journal stores actions as numbers, so the two answers about a song's lyrics and cover
@@ -440,4 +470,30 @@ fn wrong_lyrics_and_wrong_cover_come_after_keep_unmapped_and_off() {
         assert!(!entry.enabled);
     }
     assert_eq!(settings.mapped_ratings(), [5]);
+}
+
+/// The sweep replaces nothing by itself unless switched on, and its daily cap stays between 1
+/// and 100.
+#[test]
+fn review_sweep_auto_replace_is_off_by_default_and_its_cap_clamped() {
+    let defaults = LibraryActionSettings::default();
+    assert!(!defaults.review_sweep_auto_replace);
+    assert_eq!(defaults.effective_review_sweep_auto_replace_per_day(), 10);
+
+    let low = LibraryActionSettings {
+        review_sweep_auto_replace_per_day: 0,
+        ..Default::default()
+    };
+    assert_eq!(low.effective_review_sweep_auto_replace_per_day(), 1);
+    let high = LibraryActionSettings {
+        review_sweep_auto_replace_per_day: 5000,
+        ..Default::default()
+    };
+    assert_eq!(high.effective_review_sweep_auto_replace_per_day(), 100);
+
+    let read: LibraryActionSettings =
+        serde_json::from_str(r#"{"ReviewSweepAutoReplace":true,"ReviewSweepAutoReplacePerDay":3}"#)
+            .expect("the keys read");
+    assert!(read.review_sweep_auto_replace);
+    assert_eq!(read.review_sweep_auto_replace_per_day, 3);
 }

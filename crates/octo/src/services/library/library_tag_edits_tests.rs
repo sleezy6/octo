@@ -207,6 +207,97 @@ fn clearing_an_isrc_takes_it_off_the_file() {
     }
 }
 
+const RECORDING: &str = "28982738-0000-4000-8000-000000000001";
+const TRACK: &str = "7a7a7a7a-0000-4000-8000-000000000005";
+const RELEASE: &str = "89e29cc2-0000-4000-8000-000000000004";
+
+#[test]
+fn the_musicbrainz_ids_are_written_and_cleared_and_put_back_on_both_kinds_of_file() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    for name in ["x.mp3", "x.flac"] {
+        let path = song(
+            dir.path(),
+            name,
+            "My Chemical Romance",
+            "Welcome to the Black Parade",
+            "The Black Parade",
+        );
+        {
+            let mut file = TagFile::open(&path).expect("opens");
+            extras::set_release_track_id(&mut file, Some(TRACK));
+            extras::set_text(&mut file, TagFields::ALBUM_ID, Some(RELEASE));
+            extras::set_text(&mut file, TagFields::RELEASE_GROUP_ID, Some(RELEASE));
+            file.save().expect("saved");
+        }
+
+        let written = write(
+            &path,
+            &changes(&[
+                ("recordingId", Some(RECORDING)),
+                ("releaseTrackId", Some("")),
+                ("releaseId", None),
+                ("releaseGroupId", None),
+            ]),
+        );
+        assert!(written.changed, "{name}");
+        // The ids an edit names are read before it, so its undo puts them back.
+        assert_eq!(value(&written.before, "recordingId"), None, "{name}");
+        assert_eq!(
+            value(&written.before, "releaseTrackId").as_deref(),
+            Some(TRACK),
+            "{name}"
+        );
+        assert_eq!(
+            value(&written.after, "recordingId").as_deref(),
+            Some(RECORDING),
+            "{name}"
+        );
+        let mut file = TagFile::open(&path).expect("opens");
+        assert_eq!(
+            extras::read_recording_id(&mut file).as_deref(),
+            Some(RECORDING),
+            "{name}"
+        );
+        for field in ["releaseTrackId", "releaseId", "releaseGroupId"] {
+            assert_eq!(read_identity(&mut file, field), None, "{name} {field}");
+        }
+        // The tags the apps list are the same nine.
+        assert!(!read(&path).expect("reads").contains_key("recordingId"));
+
+        let back: IndexMap<String, Option<String>> = written.before.clone();
+        assert!(write(&path, &back).changed, "{name}");
+        let mut file = TagFile::open(&path).expect("opens");
+        assert_eq!(extras::read_recording_id(&mut file), None, "{name}");
+        assert_eq!(
+            read_identity(&mut file, "releaseTrackId").as_deref(),
+            Some(TRACK),
+            "{name}"
+        );
+        assert_eq!(
+            read_identity(&mut file, "releaseId").as_deref(),
+            Some(RELEASE),
+            "{name}"
+        );
+        assert_eq!(
+            read_identity(&mut file, "releaseGroupId").as_deref(),
+            Some(RELEASE),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn an_id_that_is_not_a_musicbrainz_id_is_refused_and_a_blank_one_clears() {
+    assert_eq!(
+        invalid(&changes(&[("recordingId", Some("rec-studio"))])).as_deref(),
+        Some("\"rec-studio\" is not a MusicBrainz id.")
+    );
+    assert_eq!(invalid(&changes(&[("RELEASEID", Some(RELEASE))])), None);
+    assert_eq!(invalid(&changes(&[("releaseTrackId", Some(""))])), None);
+    assert_eq!(song_tag_fields::canonical("RecordingID"), Some("recordingId"));
+    assert_eq!(words("releaseGroupId"), "release group id");
+}
+
 #[test]
 fn a_file_that_cannot_be_read_fails_in_plain_words() {
     let dir = tempfile::tempdir().expect("a temp dir");

@@ -107,6 +107,7 @@ getImports
 getLibraryActions
 getLibraryTrash
 getLyricsCandidates
+getPlace
 getTopChart
 getUpgrades
 importAction

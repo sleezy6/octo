@@ -9,7 +9,9 @@ use std::time::Duration;
 use axum::http::{Method, StatusCode};
 use chrono::Utc;
 use futures::FutureExt;
-use octo_core::models::download::{AcquisitionCandidate, AcquisitionEvent, DownloadHistoryEntry};
+use octo_core::models::download::{
+    AcquisitionCandidate, AcquisitionEvent, AcquisitionHeard, DownloadHistoryEntry,
+};
 use octo_core::settings::{
     AppSettings, LibraryAction, LibraryActionDefinition, LibraryActionSettings, SoulseekSettings,
     SubsonicSettings,
@@ -136,6 +138,7 @@ fn line(at: chrono::DateTime<Utc>, kind: &str, text: &str, copies: usize) -> Acq
                 })
                 .collect()
         }),
+        heard: None,
     }
 }
 
@@ -512,4 +515,163 @@ async fn a_find_started_while_two_run_answers_why() {
         "{third}"
     );
     release.send(true).expect("released");
+}
+
+/// The dashboard's own script, which reads the fields below.
+fn admin_js() -> String {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../octo/wwwroot/admin/admin.js"
+    ))
+    .expect("the dashboard script")
+}
+
+#[tokio::test]
+async fn a_check_line_carries_what_acoust_id_heard_and_the_page_reads_it() {
+    let dash = Dashboard::new();
+    let now = Utc::now();
+    let history = &dash.state.download_history;
+    history.record(entry(
+        "Teardrop",
+        Some("soulseek:heard"),
+        now - chrono::TimeDelta::minutes(1),
+    ));
+    let check = AcquisitionEvent {
+        detail: Some(
+            "the right length; AcoustID: no match above 85% (best 61%), so the name and length decide".into(),
+        ),
+        heard: Some(vec![
+            AcquisitionHeard {
+                title: "Teardrop".into(),
+                artist: "Massive Attack".into(),
+                score: 61,
+            },
+            AcquisitionHeard {
+                title: "Angel".into(),
+                artist: "Massive Attack".into(),
+                score: 40,
+            },
+        ]),
+        ..line(now, acquisition_event_kinds::CHECK, "Passed the checks", 0)
+    };
+    assert!(history.attach_log(
+        "soulseek:heard",
+        now - chrono::TimeDelta::minutes(2),
+        &[
+            line(now, acquisition_event_kinds::FOUND, "Found 1 copy", 1),
+            check
+        ],
+    ));
+    let token = dash.token(Some("admin"));
+    let saved_at = history.get_recent(1)[0].downloaded_at.clone();
+    let saved = dash
+        .get(
+            token.as_deref(),
+            &format!(
+                "/api/admin/downloads/log?key=soulseek:heard&at={}",
+                octo_core::common::dotnet::escape_data_string(&saved_at)
+            ),
+        )
+        .await
+        .json();
+    let lines = saved["event"].as_array().expect("lines");
+    assert!(
+        lines[0].get("heard").is_none(),
+        "a line without any leaves it out"
+    );
+    assert_eq!(
+        lines[1]["detail"],
+        "the right length; AcoustID: no match above 85% (best 61%), so the name and length decide"
+    );
+    assert_eq!(
+        lines[1]["heard"],
+        json!([
+            { "title": "Teardrop", "artist": "Massive Attack", "score": 61 },
+            { "title": "Angel", "artist": "Massive Attack", "score": 40 },
+        ])
+    );
+
+    let js = admin_js();
+    for read in ["line.heard", "h.artist", "h.title", "h.score", "Also heard: "] {
+        assert!(js.contains(read), "admin.js reads {read}");
+    }
+}
+
+#[tokio::test]
+async fn a_review_question_shows_acoust_id_numbers_and_the_page_reads_them() {
+    use octo_core::fingerprint::VerificationResult;
+    use octo_core::fingerprint::{AcoustIdLookup, AcoustIdRecording, AcoustIdResult, InconclusiveReason};
+    use octo_core::models::domain::Song;
+
+    let dash = Dashboard::new();
+    let song = Song {
+        artist: "Massive Attack".into(),
+        title: "Teardrop".into(),
+        ..Default::default()
+    };
+    let below = VerificationResult {
+        reason: InconclusiveReason::BelowThreshold,
+        lookup: Some(AcoustIdLookup::new(
+            true,
+            None,
+            vec![AcoustIdResult::new(
+                0.64,
+                vec![AcoustIdRecording::new(
+                    "rec",
+                    "Angel",
+                    ["Massive Attack"],
+                    None,
+                    None,
+                )],
+            )],
+        )),
+        threshold: 0.85,
+        ..Default::default()
+    };
+    assert!(
+        dash.state
+            .notice_queue
+            .add_review("alice", "/music/a.flac", &song, &below)
+    );
+    let no_entry = VerificationResult {
+        reason: InconclusiveReason::NoEntry,
+        ..Default::default()
+    };
+    assert!(
+        dash.state
+            .notice_queue
+            .add_review("alice", "/music/b.flac", &song, &no_entry)
+    );
+
+    let token = dash.token(Some("admin"));
+    let body = dash.get(token.as_deref(), "/api/admin/notices").await.json();
+    let entries = body["entries"].as_array().expect("entries");
+    let scored = entries
+        .iter()
+        .find(|e| e["reason"] == "AcoustID was not sure what this is")
+        .expect("the scored question");
+    assert_eq!(scored["acoustIdScore"], 64);
+    assert_eq!(scored["threshold"], 85);
+    // Below the threshold nothing matched: the best recording heard is only the closest.
+    assert!(scored.get("matched").is_none(), "{scored}");
+    assert_eq!(scored["closest"], "Massive Attack - Angel");
+    let unscored = entries
+        .iter()
+        .find(|e| e["reason"] == "AcoustID has never heard this recording")
+        .expect("the question without a score");
+    for key in ["acoustIdScore", "threshold", "matched", "closest"] {
+        assert!(unscored.get(key).is_none(), "{key} left out");
+    }
+
+    let js = admin_js();
+    for read in [
+        "entry.acoustIdScore",
+        "entry.threshold",
+        "entry.matched",
+        "entry.closest",
+        "closest: ",
+        "% sure, needs ",
+    ] {
+        assert!(js.contains(read), "admin.js reads {read}");
+    }
 }

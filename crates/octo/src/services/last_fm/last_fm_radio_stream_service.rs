@@ -9,7 +9,7 @@ use chrono::{TimeDelta, Utc};
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use indexmap::IndexMap;
-use octo_core::common::dotnet;
+use octo_core::common::{dotnet, skipped_takes};
 use octo_core::last_fm::LastFmTrack;
 use octo_core::last_fm::RadioAudioProfile;
 use octo_core::library::generated_playlist_service::dotnet_ticks;
@@ -29,8 +29,9 @@ pub use octo_core::last_fm::last_fm_radio_stream_service::{
 use super::OperationCanceled;
 use super::icy_metadata_stream::{DEFAULT_INTERVAL, IcyMetadataStream};
 use super::last_fm_radio_audio_transcoder::ILastFmRadioAudioTranscoder;
+use super::last_fm_radio_recommendation_service::LastFmRadioRecommendationService;
 use super::last_fm_radio_refresh_queue::LastFmRadioRefreshQueue;
-use super::last_fm_radio_state_store::LastFmRadioStateStore;
+use super::last_fm_radio_state_store::{LastFmRadioStateStore, route_track};
 use super::last_fm_radio_stream_session_store::{
     LastFmRadioStreamSession, LastFmRadioStreamSessionStore, PreparedRadioTrack,
 };
@@ -49,6 +50,18 @@ use crate::services::subsonic::SubsonicProxyService;
 /// The radio streams playing at once, process-wide: 8, or more with Family on (see
 /// [`LastFmRadioStreamService::stream_cap`]).
 static STREAM_SLOTS: LazyLock<StreamSlots> = LazyLock::new(StreamSlots::default);
+
+/// How many new songs a stream asks its station for at once.
+const CONTINUE_WITH: usize = 25;
+
+/// How few songs a stream may have left before it asks its station for more.
+const CONTINUE_BEFORE: usize = 20;
+
+/// The most new songs one stream adds before it plays its station from the top again.
+const CONTINUE_AT_MOST: usize = 1000;
+
+/// How many of the songs it played a stream leaves out when it asks for more.
+const PLAYED_KEPT: usize = 200;
 
 /// A count of playing radio streams with a limit read each time a stream asks to start.
 #[derive(Default)]
@@ -119,6 +132,9 @@ pub struct LastFmRadioStreamServiceParts {
     pub last_fm: Option<Arc<LastFmService>>,
     pub listen_brainz: Option<Arc<ListenBrainzService>>,
     pub last_fm_scrobbles: Option<Arc<LastFmScrobbleService>>,
+    /// The stations' picker, which a stream asks for more songs once its snapshot runs out;
+    /// None plays the snapshot round and round.
+    pub recommendations: Option<Arc<LastFmRadioRecommendationService>>,
 }
 
 struct Shared_ {
@@ -137,8 +153,57 @@ struct Shared_ {
     last_fm: Option<Arc<LastFmService>>,
     listen_brainz: Option<Arc<ListenBrainzService>>,
     last_fm_scrobbles: Option<Arc<LastFmScrobbleService>>,
+    recommendations: Option<Arc<LastFmRadioRecommendationService>>,
     /// The audio gate's rules, once the app hands them over.
     family: OnceLock<Arc<AudioGate>>,
+}
+
+/// The songs a stream plays after its station's snapshot, asked of the station's picker a few
+/// songs before the snapshot runs out, and the songs the stream has played.
+#[derive(Default)]
+struct Continuation {
+    /// The new songs, each with a resolved id, in the order they play after the snapshot.
+    tracks: Vec<LastFmRadioTrack>,
+    /// What the stream played, the newest last, at most [`PLAYED_KEPT`].
+    played: VecDeque<LastFmRadioTrack>,
+    /// The ask under way.
+    asking: Option<tokio::task::JoinHandle<Vec<LastFmRadioTrack>>>,
+    /// The last ask brought nothing new: no other until the stream starts from the top again.
+    dry: bool,
+}
+
+impl Continuation {
+    /// Counts a song the stream played.
+    fn count_played(&mut self, track: &LastFmRadioTrack) {
+        self.played.push_back(track.clone());
+        if self.played.len() > PLAYED_KEPT {
+            self.played.pop_front();
+        }
+    }
+
+    /// Adds the songs an ask found that are not here yet, each given an id to play by.
+    fn add(&mut self, found: Vec<LastFmRadioTrack>, registry: &ExternalIdRegistry) {
+        let before = self.tracks.len();
+        let mut known: HashSet<String> = self.tracks.iter().map(folded_key).collect();
+        for mut track in found {
+            if !known.insert(folded_key(&track)) {
+                continue;
+            }
+            if !has_resolved_id(&track) {
+                route_track(registry, &mut track);
+            }
+            self.tracks.push(track);
+        }
+        self.dry = self.tracks.len() == before;
+    }
+}
+
+impl Drop for Continuation {
+    fn drop(&mut self) {
+        if let Some(asking) = self.asking.take() {
+            asking.abort();
+        }
+    }
 }
 
 /// A snapshot track with a resolved id, its place among those, and its cache key.
@@ -220,6 +285,7 @@ impl LastFmRadioStreamService {
                 last_fm: parts.last_fm,
                 listen_brainz: parts.listen_brainz,
                 last_fm_scrobbles: parts.last_fm_scrobbles,
+                recommendations: parts.recommendations,
                 family: OnceLock::new(),
             }),
             proxy: parts.proxy,
@@ -270,8 +336,12 @@ impl LastFmRadioStreamService {
         self.shared.family.get().map_or(8, |gate| gate.radio_cap())
     }
 
-    /// Whether the listener's clean-only profile keeps this track out.
+    /// Whether this track is kept out of the stream: an outside cover, karaoke or instrumental take while
+    /// Skip covers and instrumentals is on, or a song the listener's clean-only profile keeps out.
     async fn keeps_out(&self, session: &LastFmRadioStreamSession, track: &LastFmRadioTrack) -> bool {
+        if self.skips_take(track) {
+            return true;
+        }
         let (Some(gate), Some(id)) = (self.shared.family.get(), track.resolved_id.as_deref()) else {
             return false;
         };
@@ -284,6 +354,25 @@ impl LastFmRadioStreamService {
             self.shared.library.as_ref(),
         )
         .await
+    }
+
+    /// An outside cover, karaoke or instrumental take, by its title or album, while Skip covers and instrumentals is
+    /// on. A library song always plays.
+    fn skips_take(&self, track: &LastFmRadioTrack) -> bool {
+        if !self
+            .shared
+            .settings
+            .current()
+            .soulseek
+            .skip_covers_and_instrumentals
+        {
+            return false;
+        }
+        let outside = track
+            .resolved_id
+            .as_deref()
+            .is_some_and(|id| self.shared.library.parse_song_id(id).0);
+        outside && skipped_takes::song_names_skipped(&track.title, track.album.as_deref().unwrap_or(""))
     }
 
     /// The session's station while radio streams are on and its kind is switched on, if it still
@@ -378,15 +467,26 @@ impl LastFmRadioStreamService {
             .sessions
             .attach_ready_pool(&session.token, &ready, None);
 
-        let mut next_index = (ready[ready.len() - 1].index + 1) % tracks.len();
+        let mut next_index = ready[ready.len() - 1].index + 1;
         let mut queue: VecDeque<PreparedRadioTrack> = ready.into();
         let mut failures = 0usize;
         let mut kept_out = 0usize;
+        let mut continuation = Continuation::default();
 
         while !cancellation_token.is_cancelled() {
+            next_index = self
+                .continue_from(session, &mut continuation, &queue, next_index)
+                .await;
             if queue.is_empty() {
                 let emergency = self
-                    .prepare_next(session, next_index, &HashSet::new(), cancellation_token, None)
+                    .prepare_next(
+                        session,
+                        next_index,
+                        &HashSet::new(),
+                        &continuation.tracks,
+                        cancellation_token,
+                        None,
+                    )
                     .await?
                     .ok_or_else(|| {
                         anyhow::anyhow!("No tracks in this Radio snapshot have a playable source")
@@ -399,7 +499,8 @@ impl LastFmRadioStreamService {
             self.shared
                 .sessions
                 .consume_ready_track(&session.token, &prepared.cache_key);
-            // A clean-only profile skips explicit songs; a station of nothing else ends.
+            // A clean-only profile skips explicit songs and Skip covers and instrumentals outside covers and instrumentals;
+            // a station of nothing else ends.
             if self.keeps_out(session, &prepared.track).await {
                 kept_out += 1;
                 if kept_out >= tracks.len() {
@@ -408,11 +509,13 @@ impl LastFmRadioStreamService {
                 continue;
             }
             kept_out = 0;
+            continuation.count_played(&prepared.track);
             let reserved: HashSet<String> = queue.iter().map(|item| item.cache_key.clone()).collect();
             let replenishment = self.start_replenishment(
                 session,
                 next_index,
                 reserved,
+                continuation.tracks.clone(),
                 self.shared.cache.get_profile(&prepared.path),
             );
             self.persist_replenishment(session.token.clone(), replenishment.clone());
@@ -443,6 +546,14 @@ impl LastFmRadioStreamService {
             let result = match played {
                 Ok(()) => {
                     failures = 0;
+                    // Only a song that went out whole counts as served by the station.
+                    if let Some(recommendations) = &self.shared.recommendations {
+                        recommendations.record_station_served(
+                            &session.username,
+                            &session.station_id,
+                            [prepared.track.clone()],
+                        );
+                    }
                     async {
                         let song = self
                             .resolver
@@ -470,13 +581,11 @@ impl LastFmRadioStreamService {
                             queue.push_back(replacement);
                         }
 
-                        let upcoming_tracks: Vec<LastFmRadioTrack> = self
-                            .resolve(session)
-                            .map(|current| current.tracks.into_iter().filter(has_resolved_id).collect())
-                            .unwrap_or_default();
+                        let upcoming_tracks = self.candidates(session, &continuation.tracks);
                         let upcoming: Vec<String> = (0..8.min(upcoming_tracks.len()))
                             .filter_map(|offset| {
                                 upcoming_tracks[(next_index + offset) % upcoming_tracks.len()]
+                                    .track
                                     .resolved_id
                                     .clone()
                             })
@@ -506,6 +615,93 @@ impl LastFmRadioStreamService {
         Ok(())
     }
 
+    /// Where the stream goes on from `next_index`: on into the songs the station adds after its
+    /// snapshot, with more asked for once [`CONTINUE_BEFORE`] or fewer songs the station has not
+    /// served lately are left, or back to the top of the station when nothing new comes. Without
+    /// the stations' picker the snapshot plays round and round.
+    async fn continue_from(
+        &self,
+        session: &LastFmRadioStreamSession,
+        continuation: &mut Continuation,
+        queue: &VecDeque<PreparedRadioTrack>,
+        next_index: usize,
+    ) -> usize {
+        let candidates = self.candidates(session, &continuation.tracks);
+        let Some(recommendations) = self.shared.recommendations.clone() else {
+            return if candidates.is_empty() {
+                next_index
+            } else {
+                next_index % candidates.len()
+            };
+        };
+        let left_out = recommendations.station_left_out(&session.username, &session.station_id);
+        let fresh_after = |candidates: &[RadioCandidate]| {
+            candidates
+                .iter()
+                .skip(next_index)
+                .filter(|candidate| !left_out.contains(&candidate.track))
+                .count()
+        };
+        let mut total = candidates.len();
+        let mut fresh = fresh_after(&candidates);
+        let finished = continuation
+            .asking
+            .as_ref()
+            .is_some_and(|asking| asking.is_finished());
+        if finished || (fresh == 0 && continuation.asking.is_some()) {
+            if let Some(asking) = continuation.asking.take() {
+                continuation.add(asking.await.unwrap_or_default(), &self.shared.registry);
+            }
+            let candidates = self.candidates(session, &continuation.tracks);
+            total = candidates.len();
+            fresh = fresh_after(&candidates);
+        }
+        if continuation.asking.is_none()
+            && !continuation.dry
+            && continuation.tracks.len() < CONTINUE_AT_MOST
+            && fresh <= CONTINUE_BEFORE
+        {
+            // Everything played, queued or still to come is left out of the ask.
+            let exclude: Vec<LastFmRadioTrack> = continuation
+                .played
+                .iter()
+                .cloned()
+                .chain(queue.iter().map(|item| item.track.clone()))
+                .chain(
+                    self.candidates(session, &continuation.tracks)
+                        .into_iter()
+                        .skip(next_index)
+                        .map(|candidate| candidate.track),
+                )
+                .collect();
+            let (username, station_id) = (session.username.clone(), session.station_id.clone());
+            continuation.asking = Some(tokio::spawn(async move {
+                recommendations
+                    .next_for_station(
+                        &username,
+                        &station_id,
+                        &exclude,
+                        CONTINUE_WITH,
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }));
+            if fresh == 0
+                && let Some(asking) = continuation.asking.take()
+            {
+                continuation.add(asking.await.unwrap_or_default(), &self.shared.registry);
+                total = self.candidates(session, &continuation.tracks).len();
+            }
+        }
+        if next_index < total {
+            return next_index;
+        }
+        // Nothing new: the station plays from the top, and may go on afresh once it ends again.
+        continuation.tracks.clear();
+        continuation.dry = false;
+        0
+    }
+
     /// Returns up to three current-snapshot tracks that already satisfy the existing radio-cache
     /// retention and size policy. This method never performs I/O beyond checking the cache, so
     /// station listings remain responsive. The scan starts where the tune-in selector says, so
@@ -516,7 +712,7 @@ impl LastFmRadioStreamService {
         // three cached out of twenty, a start drawn over twenty lands on the first cached track
         // seventeen times in twenty.
         let cached: Vec<PreparedRadioTrack> = self
-            .candidates(session)
+            .candidates(session, &[])
             .into_iter()
             .filter_map(|candidate| {
                 self.shared
@@ -658,7 +854,7 @@ impl LastFmRadioStreamService {
     ) -> anyhow::Result<Vec<PreparedRadioTrack>> {
         let mut prepared = Vec::new();
         let mut rejected_any = false;
-        for candidate in self.candidates(session) {
+        for candidate in self.candidates(session, &[]) {
             match self
                 .prepare_candidate(session, &candidate, cancellation_token, external_only)
                 .await
@@ -705,6 +901,7 @@ impl LastFmRadioStreamService {
         session: &LastFmRadioStreamSession,
         start_index: usize,
         reserved: HashSet<String>,
+        continuation: Vec<LastFmRadioTrack>,
         current: Option<RadioAudioProfile>,
     ) -> Replenishment {
         let service = self.clone();
@@ -715,6 +912,7 @@ impl LastFmRadioStreamService {
                     &session,
                     start_index,
                     &reserved,
+                    &continuation,
                     &CancellationToken::new(),
                     current,
                 )
@@ -726,19 +924,40 @@ impl LastFmRadioStreamService {
             .shared()
     }
 
+    /// The next playable track from `start_index` of the snapshot and, after it, `continuation`.
     async fn prepare_next(
         &self,
         session: &LastFmRadioStreamSession,
         start_index: usize,
         reserved: &HashSet<String>,
+        continuation: &[LastFmRadioTrack],
         cancellation_token: &CancellationToken,
         current: Option<RadioAudioProfile>,
     ) -> anyhow::Result<Option<PreparedRadioTrack>> {
-        let candidates = self.candidates(session);
+        let candidates = self.candidates(session, continuation);
         if candidates.is_empty() {
             return Ok(None);
         }
         let mut start_index = start_index;
+        // A song the station served lately, through getStationSongs or a stream, is passed over
+        // before anything is prepared, unless every song left to prepare is one of those.
+        let left_out =
+            self.shared.recommendations.as_ref().map(|recommendations| {
+                recommendations.station_left_out(&session.username, &session.station_id)
+            });
+        let any_fresh = candidates.iter().any(|candidate| {
+            !reserved.contains(&candidate.key)
+                && left_out
+                    .as_ref()
+                    .is_none_or(|left_out| !left_out.contains(&candidate.track))
+        });
+        let passed_over = |candidate: &RadioCandidate| {
+            reserved.contains(&candidate.key)
+                || (any_fresh
+                    && left_out
+                        .as_ref()
+                        .is_some_and(|left_out| left_out.contains(&candidate.track)))
+        };
 
         // Flow: look at the next few unreserved tracks and, where their profiles are known, lead
         // with the one that follows the current track most smoothly. The rest of the window is
@@ -746,7 +965,7 @@ impl LastFmRadioStreamService {
         // unchosen track is still next in line.
         let window: Vec<&RadioCandidate> = (0..candidates.len())
             .map(|offset| &candidates[(start_index + offset) % candidates.len()])
-            .filter(|candidate| !reserved.contains(&candidate.key))
+            .filter(|candidate| !passed_over(candidate))
             .take(FLOW_WINDOW)
             .collect();
         let profiles: Vec<Option<RadioAudioProfile>> = window
@@ -767,11 +986,18 @@ impl LastFmRadioStreamService {
             start_index = window[lead].index;
         }
 
-        for offset in 0..candidates.len() {
-            let candidate = &candidates[(start_index + offset) % candidates.len()];
-            if reserved.contains(&candidate.key) {
-                continue;
-            }
+        // The songs served lately are tried last, when none of the others could be prepared.
+        let order = (0..candidates.len())
+            .map(|offset| &candidates[(start_index + offset) % candidates.len()])
+            .filter(|candidate| !passed_over(candidate))
+            .chain(
+                (0..candidates.len())
+                    .map(|offset| &candidates[(start_index + offset) % candidates.len()])
+                    .filter(|candidate| {
+                        any_fresh && !reserved.contains(&candidate.key) && passed_over(candidate)
+                    }),
+            );
+        for candidate in order {
             match self
                 .prepare_candidate(session, candidate, cancellation_token, false)
                 .await
@@ -884,7 +1110,13 @@ impl LastFmRadioStreamService {
         }))
     }
 
-    fn candidates(&self, session: &LastFmRadioStreamSession) -> Vec<RadioCandidate> {
+    /// The station's snapshot tracks that can play, then the `continuation` after them, each
+    /// with its place in that order.
+    fn candidates(
+        &self,
+        session: &LastFmRadioStreamSession,
+        continuation: &[LastFmRadioTrack],
+    ) -> Vec<RadioCandidate> {
         let Some(station) = self.resolve(session) else {
             return Vec::new();
         };
@@ -899,6 +1131,7 @@ impl LastFmRadioStreamService {
         station
             .tracks
             .into_iter()
+            .chain(continuation.iter().cloned())
             .filter(has_resolved_id)
             .enumerate()
             .map(|(index, track)| RadioCandidate {
@@ -1057,6 +1290,16 @@ impl LastFmRadioStreamService {
         );
         self.proxy.relay_safe("rest/scrobble", &parameters).await;
     }
+}
+
+/// A track's key, as the stations match songs.
+fn track_key(track: &LastFmRadioTrack) -> String {
+    octo_core::last_fm::last_fm_radio_seed_normalizer::track_key(&track.artist, &track.title)
+}
+
+/// A track's key folded for comparing ignoring case.
+fn folded_key(track: &LastFmRadioTrack) -> String {
+    dotnet::ordinal_ignore_case_key(&track_key(track))
 }
 
 fn has_resolved_id(track: &LastFmRadioTrack) -> bool {

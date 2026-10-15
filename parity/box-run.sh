@@ -443,9 +443,13 @@ if [ "$build" = 2 ]; then
   [ -x .parity-bin/octo ] || { echo "no .parity-bin/octo in the checkout; lxc131.sh sends it" >&2; exit 1; }
   old_id="$(docker image inspect -f '{{.Id}}' "$RS_IMAGE" 2> /dev/null || true)"
   say "building $RS_IMAGE around the binary built for $(git rev-parse --short HEAD)"
+  # The place data stage swapped for an empty folder: the corpus is recorded without place data.
+  mkdir -p .parity-bin/no-places
   {
     echo "FROM scratch AS build"
     echo "COPY .parity-bin/octo /out/octo"
+    echo "FROM scratch AS places"
+    echo "COPY .parity-bin/no-places/ /out/"
     sed -n '/^# ---- Runtime ----/,$p' Dockerfile
   } > .parity-bin/Dockerfile
   start=$(date +%s)
@@ -471,9 +475,10 @@ elif [ "$build" = 1 ]; then
   start=$(date +%s)
   # The harness compares with C# 2026.10.05, so the binary claims that release (build.rs reads
   # OCTO_VERSION first). A VERSION ahead of it, as on a release branch, would otherwise differ in
-  # every answer that names the release. PARITY_OCTO_VERSION picks another.
+  # every answer that names the release. PARITY_OCTO_VERSION picks another. No place data, as
+  # with --prebuilt: the corpus is recorded without it.
   docker buildx build --builder "$BUILDER" --progress plain -f Dockerfile \
-    --build-arg "OCTO_VERSION=${PARITY_OCTO_VERSION:-2026.10.05}" \
+    --build-arg "OCTO_VERSION=${PARITY_OCTO_VERSION:-2026.10.05}" --build-arg PLACES_DOWNLOAD=0 \
     "${build_args[@]}" -t "$RS_IMAGE" --load . > "$RUN/build.log" 2>&1 || {
     tail -n 40 "$RUN/build.log"
     echo "the Rust image did not build; the whole log is $RUN/build.log on the box" >&2

@@ -237,7 +237,9 @@ impl SubsonicModelMapper {
         );
         merged_songs.extend(trailing_local_songs);
 
-        // Albums, deduplicated by artist+name so an album you own is not listed twice.
+        // Albums, deduplicated by artist+name so an album you own is not listed twice. An
+        // outside album with an owned count was already weighed against the library and kept
+        // (a one-song namesake does not hide its album), so the name does not drop it here.
         // Playlists follow, appearing as albums with genre "Playlist".
         let mut local_album_keys = HashSet::new();
         for album in &local_albums {
@@ -255,7 +257,9 @@ impl SubsonicModelMapper {
                 .albums
                 .iter()
                 .filter(|a| {
-                    album_key(Some(&a.artist), Some(&a.title)).is_none_or(|k| !local_album_keys.contains(&k))
+                    a.owned_count.is_some()
+                        || album_key(Some(&a.artist), Some(&a.title))
+                            .is_none_or(|k| !local_album_keys.contains(&k))
                 })
                 .map(|a| Row::Json(Value::Object(self.response_builder.convert_album_to_json(a)))),
         );
@@ -324,7 +328,7 @@ impl SubsonicModelMapper {
             }
         }
 
-        // Albums, deduplicated by artist+name so an album you own is not listed twice.
+        // Albums, deduplicated by artist+name as the JSON merge does, counted albums aside.
         let mut local_album_keys = HashSet::new();
         let mut merged_albums = Vec::new();
         for album in local_albums.into_iter().filter_map(Row::into_xml) {
@@ -334,8 +338,9 @@ impl SubsonicModelMapper {
             merged_albums.push(Row::Xml(rename(album, "album")));
         }
         for album in &external_result.albums {
-            if album_key(Some(&album.artist), Some(&album.title))
-                .is_some_and(|key| local_album_keys.contains(&key))
+            if album.owned_count.is_none()
+                && album_key(Some(&album.artist), Some(&album.title))
+                    .is_some_and(|key| local_album_keys.contains(&key))
             {
                 continue;
             }

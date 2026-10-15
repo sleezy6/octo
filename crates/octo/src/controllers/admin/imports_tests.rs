@@ -1,13 +1,12 @@
 //! The import page's endpoints. The dashboard's need its sign-in, the apps' check the caller with
-//! Navidrome, both answer in the shapes the page and the apps read, and Spotify's return to
-//! Octo's own address finishes a sign-in without one.
+//! Navidrome, and both answer in the shapes the page and the apps read.
 
 use axum::body::Body;
 use axum::http::{Method, Request};
 use http_body_util::BodyExt;
-use octo_core::settings::{AppSettings, ImportSettings, SubsonicSettings};
+use octo_core::settings::{AppSettings, FamilySettings, SubsonicSettings};
 use tower::ServiceExt;
-use wiremock::matchers::{method, path, path_regex, query_param};
+use wiremock::matchers::{body_string_contains, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::super::test_app::{Reply, app, get, send};
@@ -46,6 +45,13 @@ async fn navidrome() -> MockServer {
         ))
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/api/user"))
+        .respond_with(json(
+            r#"[{"id":"u-admin","userName":"admin","name":"Admin","isAdmin":true},{"id":"u-alice","userName":"alice","name":"Alice","isAdmin":false},{"id":"u-bob","userName":"Bob","name":"Bob","isAdmin":false},{"id":"u-alex","userName":"alex","name":"Alex","isAdmin":false}]"#,
+        ))
+        .mount(&server)
+        .await;
     Mock::given(path("/api/song"))
         .respond_with(json(
             r#"[{"id":"nd-1","path":"/m/a.flac","suffix":"flac","bitRate":900,"title":"Teardrop","artist":"Massive Attack","duration":330.2}]"#,
@@ -61,7 +67,12 @@ struct Rig {
     app: App,
 }
 
-async fn rig(client_id: &str) -> Rig {
+async fn rig() -> Rig {
+    rig_with(false).await
+}
+
+/// [`rig`] with Family on or off.
+async fn rig_with(family: bool) -> Rig {
     let server = navidrome().await;
     let state = AppState::for_tests_with(
         AppSettings {
@@ -71,8 +82,8 @@ async fn rig(client_id: &str) -> Rig {
                 admin_password: Some("synthetic".into()),
                 ..Default::default()
             },
-            imports: ImportSettings {
-                spotify_client_id: client_id.into(),
+            family: FamilySettings {
+                enabled: family,
                 ..Default::default()
             },
             ..Default::default()
@@ -119,12 +130,10 @@ impl Rig {
 
 #[tokio::test]
 async fn every_dashboard_endpoint_needs_the_sign_in() {
-    let rig = rig("").await;
+    let rig = rig().await;
     let cases = [
         (Method::GET, "/api/admin/imports"),
         (Method::GET, "/api/admin/imports/lists/spotify-liked"),
-        (Method::POST, "/api/admin/imports/spotify/connect"),
-        (Method::POST, "/api/admin/imports/spotify/disconnect"),
         (Method::POST, "/api/admin/imports/link"),
         (Method::POST, "/api/admin/imports/lists/x/fetch"),
         (Method::POST, "/api/admin/imports/trickle/pause"),
@@ -144,7 +153,7 @@ async fn every_dashboard_endpoint_needs_the_sign_in() {
 
 #[tokio::test]
 async fn the_dashboard_shows_the_signed_in_persons_lists_and_adds_a_file() {
-    let rig = rig("client-1").await;
+    let rig = rig().await;
     let token = rig.sign_in("alice");
     let upload = rig
         .upload(
@@ -164,9 +173,8 @@ async fn the_dashboard_shows_the_signed_in_persons_lists_and_adds_a_file() {
         .json();
     assert_eq!(page["user"], "alice");
     let overview = &page["overview"];
-    assert_eq!(overview["spotify"]["configured"], true);
-    assert_eq!(overview["spotify"]["connected"], false);
-    assert_eq!(overview["spotify"]["redirectUri"], "http://127.0.0.1/callback");
+    assert!(overview.get("spotify").is_none(), "{overview}");
+    assert!(overview.get("reading").is_none(), "{overview}");
     let lists = overview["lists"].as_array().expect("lists");
     assert_eq!(lists.len(), 1);
     assert_eq!(lists[0]["have"], 1);
@@ -198,25 +206,11 @@ async fn the_dashboard_shows_the_signed_in_persons_lists_and_adds_a_file() {
         .map(|t| t["state"].as_str().unwrap_or_default())
         .collect();
     assert_eq!(states, ["have", "queued"]);
-
-    let connect = send(
-        &rig.app,
-        Method::POST,
-        "/api/admin/imports/spotify/connect",
-        &auth,
-        None,
-    )
-    .await;
-    let url = connect.json()["url"].as_str().unwrap_or_default().to_string();
-    assert!(
-        url.starts_with(crate::services::imports::SpotifyAuth::AUTHORIZE_URL),
-        "{url}"
-    );
 }
 
 #[tokio::test]
 async fn a_write_without_the_admin_header_is_refused() {
-    let rig = rig("").await;
+    let rig = rig().await;
     let token = rig.sign_in("alice");
     let reply = send(
         &rig.app,
@@ -230,25 +224,33 @@ async fn a_write_without_the_admin_header_is_refused() {
 }
 
 #[tokio::test]
-async fn spotifys_return_to_octo_with_an_unknown_state_says_so() {
-    let rig = rig("").await;
-    let html = get(&rig.app, "/imports/spotify/callback?code=abc&state=nope").await;
-    assert_eq!(html.header("content-type"), Some("text/html"));
-    assert!(html.text().contains("Spotify sign-in did not finish"));
-    assert!(html.text().contains("too old or was already used"));
-    let denied = get(
-        &rig.app,
-        "/imports/spotify/callback?error=access_denied&state=nope",
-    )
-    .await;
-    assert!(denied.text().contains("access was not allowed"));
+async fn there_is_no_spotify_sign_in() {
+    let rig = rig().await;
+    let token = rig.sign_in("alice");
+    let auth = [("X-Octo-Browse-Token", token.as_str()), ("X-Octo-Admin", "1")];
+    for uri in [
+        "/api/admin/imports/spotify/connect",
+        "/api/admin/imports/spotify/finish",
+        "/api/admin/imports/spotify/read",
+        "/api/admin/imports/spotify/disconnect",
+    ] {
+        let reply = send(&rig.app, Method::POST, uri, &auth, Some("{}")).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{uri}: {}", reply.text());
+    }
+    let callback = get(&rig.app, "/imports/spotify/callback?code=abc&state=nope").await;
+    assert_ne!(callback.status, StatusCode::OK, "{}", callback.text());
+    assert!(
+        !callback.text().contains("Spotify sign-in"),
+        "{}",
+        callback.text()
+    );
 }
 
 const AUTH: &str = "u=alice&t=good&s=salt&v=1.16.1&c=Octo&f=json";
 
 #[tokio::test]
 async fn the_apps_see_the_same_lists_as_whoever_they_signed_in_as() {
-    let rig = rig("").await;
+    let rig = rig().await;
     let token = rig.sign_in("alice");
     let upload = rig
         .upload(
@@ -292,7 +294,7 @@ async fn the_apps_see_the_same_lists_as_whoever_they_signed_in_as() {
 
 #[tokio::test]
 async fn an_app_action_answers_in_words_and_a_wrong_password_is_refused() {
-    let rig = rig("").await;
+    let rig = rig().await;
     let pause = get(&rig.app, &format!("/rest/importAction?{AUTH}&action=pause"))
         .await
         .json();
@@ -305,18 +307,17 @@ async fn an_app_action_answers_in_words_and_a_wrong_password_is_refused() {
             .starts_with("Paused")
     );
 
-    let connect = get(
-        &rig.app,
-        &format!("/rest/importAction?{AUTH}&action=connect&redirect=http://127.0.0.1:5555/callback"),
-    )
-    .await
-    .json();
-    assert!(
-        connect["subsonic-response"]["importAction"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Client ID")
-    );
+    for action in ["connect", "finish", "read", "disconnect"] {
+        let gone = get(
+            &rig.app,
+            &format!("/rest/importAction?{AUTH}&action={action}&redirect=http://127.0.0.1:5555/callback"),
+        )
+        .await
+        .json();
+        let answer = &gone["subsonic-response"]["importAction"];
+        assert_eq!(answer["ok"], false, "{action}");
+        assert_eq!(answer["message"], format!("Unknown action \"{action}\"."));
+    }
 
     let wrong = get(
         &rig.app,
@@ -329,7 +330,7 @@ async fn an_app_action_answers_in_words_and_a_wrong_password_is_refused() {
 
 #[tokio::test]
 async fn the_apps_are_told_imports_are_here() {
-    let rig = rig("").await;
+    let rig = rig().await;
     let doc = get(
         &rig.app,
         "/rest/getOpenSubsonicExtensions.view?f=json&v=1.16.1&c=Octo",
@@ -349,7 +350,7 @@ async fn the_apps_are_told_imports_are_here() {
 
 #[tokio::test]
 async fn a_member_of_the_wrong_type_is_refused_with_the_reference_message() {
-    let rig = rig("").await;
+    let rig = rig().await;
     let token = rig.sign_in("alice");
     let auth = [("X-Octo-Browse-Token", token.as_str()), ("X-Octo-Admin", "1")];
     let reply = send(
@@ -378,7 +379,7 @@ async fn a_member_of_the_wrong_type_is_refused_with_the_reference_message() {
 
 #[tokio::test]
 async fn a_file_sent_as_json_finds_no_action_and_an_empty_one_is_asked_for() {
-    let rig = rig("").await;
+    let rig = rig().await;
     let token = rig.sign_in("alice");
     let auth = [("X-Octo-Browse-Token", token.as_str()), ("X-Octo-Admin", "1")];
     let json = send(
@@ -393,11 +394,6 @@ async fn a_file_sent_as_json_finds_no_action_and_an_empty_one_is_asked_for() {
     let empty = rig.upload(&token, "Empty.csv", "").await;
     assert_eq!(empty.status, StatusCode::BAD_REQUEST);
     assert_eq!(empty.json()["message"], "Choose a file first.");
-}
-
-#[test]
-fn html_is_encoded_as_web_utility_did() {
-    assert_eq!(html_encode("a<b>&\"c' é"), "a&lt;b&gt;&amp;&quot;c&#39; &#233;");
 }
 
 // ---- octoImports version 2 ------------------------------------------------------------------
@@ -444,8 +440,8 @@ impl Rig {
 }
 
 #[tokio::test]
-async fn the_apps_get_the_export_services_and_whether_spotify_can_connect() {
-    let rig = rig("").await;
+async fn the_apps_get_the_export_services() {
+    let rig = rig().await;
     let answer = get(&rig.app, &format!("/rest/getImportServices.view?{AUTH}"))
         .await
         .json();
@@ -462,15 +458,9 @@ async fn the_apps_get_the_export_services_and_whether_spotify_can_connect() {
         "https://www.tunemymusic.com/transfer/tidal-to-file"
     );
     assert_eq!(services[4]["tile"], "TIDAL");
-    assert_eq!(envelope["importServices"]["spotifyConnect"], false);
-
-    let connected = self::rig("client-1").await;
-    let answer = get(&connected.app, &format!("/rest/getImportServices?{AUTH}"))
-        .await
-        .json();
-    assert_eq!(
-        answer["subsonic-response"]["importServices"]["spotifyConnect"],
-        true
+    assert!(
+        envelope["importServices"].get("spotifyConnect").is_none(),
+        "{envelope}"
     );
 
     let wrong = get(
@@ -484,7 +474,7 @@ async fn the_apps_get_the_export_services_and_whether_spotify_can_connect() {
 
 #[tokio::test]
 async fn an_app_pastes_a_list_and_reads_it_back() {
-    let rig = rig("").await;
+    let rig = rig().await;
     let pasted = get(
         &rig.app,
         &format!(
@@ -533,7 +523,7 @@ async fn an_app_pastes_a_list_and_reads_it_back() {
 
 #[tokio::test]
 async fn an_app_uploads_a_file_as_a_multipart_form() {
-    let rig = rig("").await;
+    let rig = rig().await;
     let uri = format!("/rest/importFile.view?{AUTH}");
     let csv = rig
         .post_form(
@@ -604,7 +594,7 @@ async fn an_app_uploads_a_file_as_a_multipart_form() {
 
 #[tokio::test]
 async fn the_dashboard_pastes_a_list_and_lists_the_export_services() {
-    let rig = rig("").await;
+    let rig = rig().await;
     let token = rig.sign_in("alice");
     let auth = [("X-Octo-Browse-Token", token.as_str()), ("X-Octo-Admin", "1")];
     let pasted = send(
@@ -633,7 +623,7 @@ async fn the_dashboard_pastes_a_list_and_lists_the_export_services() {
     assert_eq!(services.status, StatusCode::OK);
     let services = services.json();
     assert_eq!(services["services"].as_array().expect("services").len(), 10);
-    assert_eq!(services["spotifyConnect"], false);
+    assert!(services.get("spotifyConnect").is_none(), "{services}");
 
     for (verb, uri) in [
         (Method::GET, "/api/admin/imports/services"),
@@ -647,7 +637,7 @@ async fn the_dashboard_pastes_a_list_and_lists_the_export_services() {
 
 #[tokio::test]
 async fn the_apps_are_told_imports_are_at_versions_one_and_two() {
-    let rig = rig("").await;
+    let rig = rig().await;
     let doc = get(
         &rig.app,
         "/rest/getOpenSubsonicExtensions.view?f=json&v=1.16.1&c=Octo",
@@ -662,4 +652,408 @@ async fn the_apps_are_told_imports_are_at_versions_one_and_two() {
         .cloned()
         .expect("octoImports");
     assert_eq!(imports["versions"], serde_json::json!([1, 2]));
+}
+
+// ---- Importing for someone else (for=<Navidrome username>) ------------------------------------
+
+/// Two songs one a line: the first in the library, the second not.
+const TWO_SONGS: &str = r#"{"name":"Gym","text":"Massive Attack - Teardrop\nNobody - Nothing"}"#;
+
+impl Rig {
+    fn auth(token: &str) -> [(&'static str, &str); 2] {
+        [("X-Octo-Browse-Token", token), ("X-Octo-Admin", "1")]
+    }
+
+    /// The names of the lists `user` has.
+    fn list_names(&self, user: &str) -> Vec<String> {
+        self.state
+            .imports
+            .overview(user)
+            .lists
+            .iter()
+            .map(|list| list.name.clone())
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn without_for_the_import_is_the_signed_in_persons_own() {
+    let rig = rig().await;
+    let token = rig.sign_in("alice");
+    let auth = Rig::auth(&token);
+    let pasted = send(
+        &rig.app,
+        Method::POST,
+        "/api/admin/imports/text",
+        &auth,
+        Some(TWO_SONGS),
+    )
+    .await;
+    assert_eq!(pasted.status, StatusCode::OK, "{}", pasted.text());
+    assert_eq!(rig.list_names("alice"), ["Gym"]);
+    assert!(rig.list_names("Bob").is_empty());
+    let page = send(&rig.app, Method::GET, "/api/admin/imports", &auth, None)
+        .await
+        .json();
+    assert_eq!(page["user"], "alice");
+    assert_eq!(page["overview"]["lists"][0]["name"], "Gym");
+    // Naming yourself, in any case, is the same as naming nobody.
+    let own = send(&rig.app, Method::GET, "/api/admin/imports?for=ALICE", &auth, None)
+        .await
+        .json();
+    assert_eq!(own["user"], "alice");
+    assert_eq!(own["overview"]["lists"][0]["name"], "Gym");
+}
+
+#[tokio::test]
+async fn for_another_user_makes_the_list_its_playlist_and_its_downloads_theirs() {
+    let rig = rig().await;
+    let answer = |body: serde_json::Value| ResponseTemplate::new(200).set_body_json(body);
+    Mock::given(method("POST"))
+        .and(path("/api/playlist"))
+        .respond_with(answer(serde_json::json!({ "id": "pl-1" })))
+        .expect(1)
+        .mount(&rig._navidrome)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/playlist/pl-1"))
+        .respond_with(answer(
+            serde_json::json!({ "id": "pl-1", "name": "Gym", "ownerId": "u-admin" }),
+        ))
+        .mount(&rig._navidrome)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/playlist/pl-1"))
+        .and(body_string_contains(r#""ownerId":"u-bob""#))
+        .respond_with(answer(serde_json::json!({ "id": "pl-1" })))
+        .expect(1)
+        .mount(&rig._navidrome)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/playlist/pl-1/tracks"))
+        .respond_with(answer(serde_json::json!([])))
+        .mount(&rig._navidrome)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/playlist/pl-1/tracks"))
+        .and(body_string_contains("nd-1"))
+        .respond_with(answer(serde_json::json!({ "added": 1 })))
+        .expect(1)
+        .mount(&rig._navidrome)
+        .await;
+
+    let token = rig.sign_in("alice");
+    let auth = Rig::auth(&token);
+    // The name is matched ignoring case and kept the way Navidrome spells it.
+    let pasted = send(
+        &rig.app,
+        Method::POST,
+        "/api/admin/imports/text?for=bob",
+        &auth,
+        Some(TWO_SONGS),
+    )
+    .await;
+    assert_eq!(pasted.status, StatusCode::OK, "{}", pasted.text());
+    let list_id = pasted.json()["listId"].as_str().expect("an id").to_string();
+    assert_eq!(rig.list_names("Bob"), ["Gym"]);
+    assert!(rig.list_names("alice").is_empty());
+
+    let playlist = send(
+        &rig.app,
+        Method::POST,
+        &format!("/api/admin/imports/lists/{list_id}/playlist?for=bob"),
+        &auth,
+        Some(r#"{"on":true}"#),
+    )
+    .await;
+    assert_eq!(playlist.status, StatusCode::OK, "{}", playlist.text());
+    let kept = rig.state.imports.overview("Bob");
+    assert_eq!(kept.lists[0].playlist_id.as_deref(), Some("pl-1"));
+    assert_eq!(kept.lists[0].playlist_note, None, "the playlist is Bob's");
+
+    let fetch = send(
+        &rig.app,
+        Method::POST,
+        &format!("/api/admin/imports/lists/{list_id}/fetch?for=bob"),
+        &auth,
+        Some(r#"{"on":true}"#),
+    )
+    .await;
+    assert_eq!(fetch.status, StatusCode::OK, "{}", fetch.text());
+    assert_eq!(rig.state.imports.overview("Bob").trickle.queued, 1);
+    assert_eq!(rig.state.imports.overview("alice").trickle.queued, 0);
+    // Bob is no Family member, so his songs go to the shared library, as his own import's do.
+    assert_eq!(
+        rig.state.heart_acquisition_coordinator.import_target("Bob"),
+        Ok(crate::services::common::track_acquisition_queue::AcquisitionTarget::Shared)
+    );
+
+    let status = send(&rig.app, Method::GET, "/api/admin/imports?for=bob", &auth, None)
+        .await
+        .json();
+    assert_eq!(status["user"], "Bob");
+    assert_eq!(status["overview"]["trickle"]["queued"], 1);
+}
+
+#[tokio::test]
+async fn a_name_navidrome_does_not_know_is_refused() {
+    let rig = rig().await;
+    let token = rig.sign_in("alice");
+    let auth = Rig::auth(&token);
+    let cases = [
+        (Method::GET, "/api/admin/imports?for=nobody", None),
+        (Method::GET, "/api/admin/imports/services?for=nobody", None),
+        (Method::GET, "/api/admin/imports/lists/x?for=nobody", None),
+        (
+            Method::POST,
+            "/api/admin/imports/text?for=nobody",
+            Some(TWO_SONGS),
+        ),
+        (
+            Method::POST,
+            "/api/admin/imports/trickle/pause?for=nobody",
+            Some(r#"{"paused":true}"#),
+        ),
+        (Method::DELETE, "/api/admin/imports/lists/x?for=nobody", None),
+    ];
+    for (verb, uri, body) in cases {
+        let reply = send(&rig.app, verb.clone(), uri, &auth, body).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{verb} {uri}: {}",
+            reply.text()
+        );
+        assert_eq!(
+            reply.json()["error"],
+            "There is no user named nobody on this server.",
+            "{verb} {uri}"
+        );
+    }
+    assert!(rig.list_names("alice").is_empty());
+    assert!(rig.list_names("nobody").is_empty());
+    assert_eq!(rig.state.imports.overview("alice").trickle.state, "idle");
+}
+
+#[tokio::test]
+async fn a_file_uploaded_for_someone_else_is_theirs() {
+    let rig = rig().await;
+    let token = rig.sign_in("alice");
+    let boundary = "octo-test-boundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"Gym.csv\"\r\nContent-Type: text/csv\r\n\r\nTrack Name,Artist Name(s)\nTeardrop,Massive Attack\n\r\n--{boundary}--\r\n"
+    );
+    let send_for = |name: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/admin/imports/file?for={name}"))
+            .header("X-Octo-Admin", "1")
+            .header("X-Octo-Browse-Token", token.as_str())
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body.clone()))
+            .expect("request")
+    };
+    let unknown = rig
+        .app
+        .clone()
+        .oneshot(send_for("nobody"))
+        .await
+        .expect("infallible");
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    assert!(rig.list_names("alice").is_empty());
+    let known = rig
+        .app
+        .clone()
+        .oneshot(send_for("Bob"))
+        .await
+        .expect("infallible");
+    assert_eq!(known.status(), StatusCode::OK);
+    assert_eq!(rig.list_names("Bob"), ["Gym"]);
+    assert!(rig.list_names("alice").is_empty());
+}
+
+#[tokio::test]
+async fn the_lists_and_their_songs_follow_for() {
+    let rig = rig().await;
+    let token = rig.sign_in("alice");
+    let auth = Rig::auth(&token);
+    let mine = send(
+        &rig.app,
+        Method::POST,
+        "/api/admin/imports/text",
+        &auth,
+        Some(r#"{"name":"Mine","text":"Massive Attack - Teardrop"}"#),
+    )
+    .await
+    .json();
+    let theirs = send(
+        &rig.app,
+        Method::POST,
+        "/api/admin/imports/text?for=Bob",
+        &auth,
+        Some(r#"{"name":"Theirs","text":"Massive Attack - Teardrop"}"#),
+    )
+    .await
+    .json();
+    let names = |page: &serde_json::Value| -> Vec<String> {
+        page["overview"]["lists"]
+            .as_array()
+            .expect("lists")
+            .iter()
+            .map(|list| list["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let own = send(&rig.app, Method::GET, "/api/admin/imports", &auth, None)
+        .await
+        .json();
+    assert_eq!(names(&own), ["Mine"]);
+    let bob = send(&rig.app, Method::GET, "/api/admin/imports?for=bob", &auth, None)
+        .await
+        .json();
+    assert_eq!(names(&bob), ["Theirs"]);
+
+    let theirs_id = theirs["listId"].as_str().expect("an id");
+    let mine_id = mine["listId"].as_str().expect("an id");
+    let as_alice = send(
+        &rig.app,
+        Method::GET,
+        &format!("/api/admin/imports/lists/{theirs_id}"),
+        &auth,
+        None,
+    )
+    .await;
+    assert_eq!(as_alice.status, StatusCode::NOT_FOUND);
+    let as_bob = send(
+        &rig.app,
+        Method::GET,
+        &format!("/api/admin/imports/lists/{theirs_id}?for=bob"),
+        &auth,
+        None,
+    )
+    .await;
+    assert_eq!(as_bob.status, StatusCode::OK);
+    assert_eq!(as_bob.json()["list"]["name"], "Theirs");
+    let mine_as_bob = send(
+        &rig.app,
+        Method::GET,
+        &format!("/api/admin/imports/lists/{mine_id}?for=bob"),
+        &auth,
+        None,
+    )
+    .await;
+    assert_eq!(mine_as_bob.status, StatusCode::NOT_FOUND);
+
+    // Removing for Bob removes Bob's list and leaves Alice's.
+    let removed = send(
+        &rig.app,
+        Method::DELETE,
+        &format!("/api/admin/imports/lists/{theirs_id}?for=bob"),
+        &auth,
+        None,
+    )
+    .await;
+    assert_eq!(removed.status, StatusCode::OK, "{}", removed.text());
+    assert!(rig.list_names("Bob").is_empty());
+    assert_eq!(rig.list_names("alice"), ["Mine"]);
+}
+
+/// A Family member who adds songs at once.
+fn family_member(name: &str) -> crate::services::family::Member {
+    crate::services::family::Member {
+        username: name.into(),
+        display_name: name.into(),
+        preset: octo_core::family::abilities::Preset::Member,
+        edits: serde_json::Map::new(),
+        navidrome_user_id: format!("u-{name}"),
+        navidrome_password: String::new(),
+        personal_library_id: Some(7),
+        shared_libraries: crate::services::family::SharedLibraries::All,
+        account_password: String::new(),
+        created: chrono::Utc::now(),
+        suspended: false,
+        ntfy_topic: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn a_family_members_import_goes_to_their_own_library() {
+    let rig = rig_with(true).await;
+    rig.state.family_store.upsert_member(family_member("alex"));
+    let token = rig.sign_in("admin");
+    let auth = Rig::auth(&token);
+    let pasted = send(
+        &rig.app,
+        Method::POST,
+        "/api/admin/imports/text?for=Alex",
+        &auth,
+        Some(TWO_SONGS),
+    )
+    .await;
+    assert_eq!(pasted.status, StatusCode::OK, "{}", pasted.text());
+    let list_id = pasted.json()["listId"].as_str().expect("an id").to_string();
+    assert_eq!(rig.list_names("alex"), ["Gym"]);
+    let fetch = send(
+        &rig.app,
+        Method::POST,
+        &format!("/api/admin/imports/lists/{list_id}/fetch?for=Alex"),
+        &auth,
+        Some(r#"{"on":true}"#),
+    )
+    .await;
+    assert_eq!(fetch.status, StatusCode::OK, "{}", fetch.text());
+    assert_eq!(rig.state.imports.overview("alex").trickle.queued, 1);
+    assert_eq!(rig.state.imports.overview("admin").trickle.queued, 0);
+    // The trickle fetches each job into its owner's import target: Alex's own library.
+    assert_eq!(
+        rig.state.heart_acquisition_coordinator.import_target("alex"),
+        Ok(crate::services::common::track_acquisition_queue::AcquisitionTarget::Member("alex".into()))
+    );
+}
+
+#[tokio::test]
+async fn the_page_lists_who_it_can_import_for() {
+    let rig = rig_with(true).await;
+    rig.state.family_store.upsert_member(family_member("alex"));
+    let token = rig.sign_in("alice");
+    let auth = Rig::auth(&token);
+    let people = send(&rig.app, Method::GET, "/api/admin/imports/people", &auth, None).await;
+    assert_eq!(people.status, StatusCode::OK, "{}", people.text());
+    let people = people.json();
+    assert_eq!(people["signedIn"], "alice");
+    assert_eq!(people["problem"], serde_json::Value::Null);
+    let rows: Vec<(String, bool, bool)> = people["users"]
+        .as_array()
+        .expect("users")
+        .iter()
+        .map(|user| {
+            (
+                user["username"].as_str().unwrap_or_default().to_string(),
+                user["member"].as_bool().unwrap_or_default(),
+                user["you"].as_bool().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("alice".to_string(), false, true),
+            ("admin".to_string(), false, false),
+            ("alex".to_string(), true, false),
+            ("Bob".to_string(), false, false),
+        ]
+    );
+    assert_eq!(people["users"][0]["name"], "Alice");
+
+    let signed_out = send(
+        &rig.app,
+        Method::GET,
+        "/api/admin/imports/people",
+        &[("X-Octo-Admin", "1")],
+        None,
+    )
+    .await;
+    assert_eq!(signed_out.status, StatusCode::UNAUTHORIZED);
 }

@@ -1265,7 +1265,7 @@ fn a_radio_station_is_a_read_only_playlist() {
     };
     assert_eq!(
         octo_core::json::to_string(&builder().radio_playlist_fields(&station)),
-        r#"{"id":"or1","name":"Radio","owner":"alice","public":false,"songCount":2,"duration":100,"created":"2026-01-02T03:04:05.000Z","changed":"2026-01-02T03:04:05.000Z","coverArt":"or1","readonly":true,"validUntil":"2026-01-02T03:04:05.000Z"}"#
+        r#"{"id":"or1","name":"Radio","owner":"alice","public":false,"songCount":2,"duration":100,"created":"2026-01-02T03:04:05.000Z","changed":"2026-01-02T03:04:05.000Z","coverArt":"or1","readonly":true,"validUntil":"2026-01-02T03:04:05.000Z","octoGroup":"station"}"#
     );
     let songs = [song("s1", "One", None)];
     let json = json_of(&builder().create_radio_playlist_response("Json", &station, &songs));
@@ -1275,6 +1275,8 @@ fn a_radio_station_is_a_read_only_playlist() {
     let root = xml_of(&builder().create_radio_playlist_response("xml", &station, &songs));
     let playlist = child(&root, "playlist");
     assert_eq!(playlist.attribute("readonly"), Some("true"));
+    assert_eq!(playlist.attribute("octoGroup"), Some("station"));
+    assert_eq!(json["subsonic-response"]["playlist"]["octoGroup"], "station");
     assert_eq!(playlist.elements_named(NS, "song").count(), 1);
 }
 
@@ -1461,7 +1463,7 @@ fn extensions_json_adds_octos_own_and_missing_versions() {
     assert_eq!(reply.content_type, "application/json");
     assert_eq!(
         reply.text(),
-        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","openSubsonic":true,"openSubsonicExtensions":[{"name":"songLyrics","versions":[1,2]},{"name":"octoLyrics","versions":[1]},{"name":"octoAcquisitions","versions":[1,2,3]},{"name":"octoLibraryActions","versions":[1,2,3]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1]}]}}"#
+        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","openSubsonic":true,"openSubsonicExtensions":[{"name":"songLyrics","versions":[1,2]},{"name":"octoLyrics","versions":[1]},{"name":"octoAcquisitions","versions":[1,2,3]},{"name":"octoLibraryActions","versions":[1,2,3]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1,2]}]}}"#
     );
     // Lyrics choices off and library actions off leave those two out.
     let reply = builder().merge_open_subsonic_extensions(
@@ -1473,7 +1475,7 @@ fn extensions_json_adds_octos_own_and_missing_versions() {
     );
     assert_eq!(
         reply.text(),
-        r#"{"subsonic-response":{"status":"ok","openSubsonicExtensions":[{"name":"octoAcquisitions","versions":[1,2,3]},{"name":"songLyrics","versions":[1,2]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1]}]}}"#
+        r#"{"subsonic-response":{"status":"ok","openSubsonicExtensions":[{"name":"octoAcquisitions","versions":[1,2,3]},{"name":"songLyrics","versions":[1,2]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1,2]}]}}"#
     );
     // A failed answer is written back as it was read.
     let failed = r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"isn't"}}}"#;
@@ -1515,9 +1517,51 @@ fn extensions_xml_adds_octos_own_and_reindents() {
             "  </openSubsonicExtensions>\n",
             "  <openSubsonicExtensions name=\"octoLists\">\n",
             "    <versions>1</versions>\n",
+            "    <versions>2</versions>\n",
             "  </openSubsonicExtensions>\n",
             "</subsonic-response>"
         )
+    );
+}
+
+#[test]
+fn the_places_extension_is_listed_last_only_with_place_data() {
+    let listed = |places: bool| {
+        builder()
+            .merge_open_subsonic_extensions_with(
+                "json",
+                Some(NAVIDROME_JSON.as_bytes()),
+                Some("application/json"),
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                places,
+            )
+            .text()
+            .to_string()
+    };
+    assert_eq!(
+        listed(true),
+        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","openSubsonic":true,"openSubsonicExtensions":[{"name":"songLyrics","versions":[1,2]},{"name":"octoLyrics","versions":[1]},{"name":"octoAcquisitions","versions":[1,2,3]},{"name":"octoLibraryActions","versions":[1,2,3]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1,2]},{"name":"octoPlaces","versions":[1]}]}}"#
+    );
+    assert!(!listed(false).contains("octoPlaces"));
+    let own = builder()
+        .merge_open_subsonic_extensions_with(
+            "xml", None, None, false, false, false, false, false, false, true,
+        )
+        .text()
+        .to_string();
+    assert!(
+        own.ends_with(concat!(
+            "  <openSubsonicExtensions name=\"octoPlaces\">\n",
+            "    <versions>1</versions>\n",
+            "  </openSubsonicExtensions>\n",
+            "</subsonic-response>"
+        )),
+        "{own}"
     );
 }
 
@@ -1559,7 +1603,7 @@ fn extensions_without_an_answer_list_octos_own() {
         builder()
             .merge_open_subsonic_extensions("json", None, None, true, true)
             .text(),
-        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"octo","openSubsonicExtensions":[{"name":"octoAcquisitions","versions":[1,2,3]},{"name":"octoLyrics","versions":[1]},{"name":"octoLibraryActions","versions":[1,2,3]},{"name":"songLyrics","versions":[1,2]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1]}]}}"#
+        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"octo","openSubsonicExtensions":[{"name":"octoAcquisitions","versions":[1,2,3]},{"name":"octoLyrics","versions":[1]},{"name":"octoLibraryActions","versions":[1,2,3]},{"name":"songLyrics","versions":[1,2]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1,2]}]}}"#
     );
     assert_eq!(
         builder()
@@ -1582,6 +1626,7 @@ fn extensions_without_an_answer_list_octos_own() {
             "  </openSubsonicExtensions>\n",
             "  <openSubsonicExtensions name=\"octoLists\">\n",
             "    <versions>1</versions>\n",
+            "    <versions>2</versions>\n",
             "  </openSubsonicExtensions>\n",
             "</subsonic-response>"
         )
@@ -1634,4 +1679,92 @@ fn responses_say_explicit_or_clean_for_outside_songs_and_albums_in_json_and_xml(
         builder.convert_song_to_xml(&song, NS).attribute("explicitStatus"),
         Some("explicit")
     );
+}
+
+// ---- getStationSongs ------------------------------------------------------------------------
+
+#[test]
+fn the_stations_extension_is_listed_last_and_only_when_asked() {
+    let names = |stations: bool| -> Vec<String> {
+        let reply = builder().merge_open_subsonic_extensions_with(
+            "json", None, None, true, true, true, true, true, stations, false,
+        );
+        let answer: Value = serde_json::from_str(&reply.text()).unwrap();
+        answer["subsonic-response"]["openSubsonicExtensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|extension| extension["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let listed = names(true);
+    assert_eq!(listed.last().map(String::as_str), Some(STATIONS_EXTENSION));
+    assert_eq!(STATIONS_EXTENSION, "octoStations");
+    assert!(!names(false).iter().any(|name| name == STATIONS_EXTENSION));
+    // The short form never lists it.
+    let short = builder()
+        .merge_open_subsonic_extensions("json", None, None, true, true)
+        .text()
+        .into_owned();
+    assert!(!short.contains("octoStations"), "{short}");
+}
+
+#[test]
+fn station_songs_carry_the_station_and_its_entries_in_both_formats() {
+    let station = LastFmRadioStation {
+        id: "or12345678901234567890".into(),
+        name: "Your Radio".into(),
+        tracks: vec![LastFmRadioTrack::default()],
+        ..Default::default()
+    };
+    let songs = [Song {
+        id: "local-1".into(),
+        title: "Title".into(),
+        artist: "Artist".into(),
+        album: "Album".into(),
+        duration: Some(200),
+        is_local: true,
+        ..Default::default()
+    }];
+    let json: Value = serde_json::from_str(
+        &builder()
+            .create_station_songs_response("json", &station, &songs)
+            .text(),
+    )
+    .unwrap();
+    let answer = &json["subsonic-response"];
+    assert_eq!(answer["status"], "ok");
+    assert_eq!(answer["stationSongs"]["id"], "or12345678901234567890");
+    assert_eq!(answer["stationSongs"]["name"], "Your Radio");
+    // Shaped as any song row; `created` is the clock's now, so it is left out of the comparison.
+    let mut entry = answer["stationSongs"]["entry"][0].clone();
+    let mut row = Value::Object(builder().convert_song_to_json(&songs[0]));
+    for value in [&mut entry, &mut row] {
+        value.as_object_mut().unwrap().remove("created");
+    }
+    assert_eq!(entry, row);
+    let empty: Value = serde_json::from_str(
+        &builder()
+            .create_station_songs_response("json", &station, &[])
+            .text(),
+    )
+    .unwrap();
+    assert_eq!(empty["subsonic-response"]["stationSongs"]["entry"], json!([]));
+
+    let xml = builder()
+        .create_station_songs_response("xml", &station, &songs)
+        .text()
+        .into_owned();
+    let root = XElement::parse(&xml).unwrap();
+    let element = root
+        .elements()
+        .find(|e| e.name == "stationSongs")
+        .expect("stationSongs");
+    assert_eq!(element.attribute("id"), Some("or12345678901234567890"));
+    assert_eq!(element.attribute("name"), Some("Your Radio"));
+    let entries: Vec<&XElement> = element.elements().collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "entry");
+    assert_eq!(entries[0].attribute("id"), Some("local-1"));
+    assert_eq!(entries[0].attribute("title"), Some("Title"));
 }

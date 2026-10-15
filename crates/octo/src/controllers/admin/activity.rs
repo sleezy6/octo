@@ -1,7 +1,7 @@
 //! Everything Octo is working on, in one shape, for the dashboard's progress toasts: a library
-//! re-tag, a covers or lyrics run, better copies, hearted downloads, a Spotify read, a duplicate
-//! scan, an slskd rescan and Navidrome's own scan. The dashboard asks often while something runs
-//! and seldom while nothing does, so one cheap read replaces a poller per page.
+//! re-tag, a covers or lyrics run, better copies, hearted downloads, an import's downloads, a
+//! duplicate scan, an slskd rescan and Navidrome's own scan. The dashboard asks often while
+//! something runs and seldom while nothing does, so one cheap read replaces a poller per page.
 //!
 //! A job that needs the Navidrome sign-in on its own page is listed only for a signed-in
 //! browser. A job just finished stays listed for [`RECENT_WINDOW`], so a toast can say how it
@@ -152,7 +152,7 @@ async fn get_activity(State(state): State<AppState>, request: Request) -> Respon
         items.extend(upgrades(&state.upgrade_queue.snapshot(), now));
         if let Some(user) = sessions.user_of(browse) {
             let overview = state.imports.overview(&user);
-            items.extend(imports(&ImportsActivity::from(&overview), now));
+            items.extend(imports(&ImportsActivity::from(&overview)));
         }
         if let Some(admin) = sessions.navidrome_user_of(browse) {
             let looks: Vec<FindLook> = state
@@ -729,14 +729,9 @@ pub fn find(looks: &[FindLook], now: DateTime<Utc>) -> Option<ActivityItem> {
     })
 }
 
-/// What the activity view reads of a person's imports (`ImportOverview`): the Spotify
-/// read and the trickle.
+/// What the activity view reads of a person's imports (`ImportOverview`): the trickle.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ImportsActivity {
-    pub reading_busy: bool,
-    pub reading_step: Option<String>,
-    pub reading_error: Option<String>,
-    pub reading_finished_utc: Option<DateTime<Utc>>,
     pub trickle_downloading: i32,
     pub trickle_done: i32,
     pub trickle_queued: i32,
@@ -745,10 +740,6 @@ pub struct ImportsActivity {
 impl From<&ImportOverview> for ImportsActivity {
     fn from(overview: &ImportOverview) -> Self {
         ImportsActivity {
-            reading_busy: overview.reading.busy,
-            reading_step: overview.reading.step.clone(),
-            reading_error: overview.reading.error.clone(),
-            reading_finished_utc: overview.reading.finished_utc,
             trickle_downloading: overview.trickle.downloading,
             trickle_done: overview.trickle.done,
             trickle_queued: overview.trickle.queued,
@@ -756,51 +747,9 @@ impl From<&ImportOverview> for ImportsActivity {
     }
 }
 
-/// A Spotify read while it runs and a moment after, and the trickle while it fetches.
-pub fn imports(overview: &ImportsActivity, now: DateTime<Utc>) -> Vec<ActivityItem> {
+/// The trickle while it fetches.
+pub fn imports(overview: &ImportsActivity) -> Vec<ActivityItem> {
     let mut items = Vec::new();
-    let finished = overview.reading_finished_utc;
-    if overview.reading_busy {
-        items.push(
-            ActivityItem::new(
-                "imports:read",
-                "imports",
-                "imports",
-                "Reading your Spotify lists",
-                "running",
-            )
-            .detail(overview.reading_step.clone()),
-        );
-    } else if let (Some(error), Some(at)) = (&overview.reading_error, finished)
-        && recent(finished, now)
-    {
-        items.push(
-            ActivityItem::new(
-                format!("imports:read:{}", dotnet_ticks(at)),
-                "imports",
-                "imports",
-                "Reading your Spotify lists",
-                "failed",
-            )
-            .detail(Some(error.clone()))
-            .finished(finished)
-            .error(Some(error.clone())),
-        );
-    } else if let Some(at) = finished
-        && recent(finished, now)
-    {
-        items.push(
-            ActivityItem::new(
-                format!("imports:read:{}", dotnet_ticks(at)),
-                "imports",
-                "imports",
-                "Read your Spotify lists",
-                "done",
-            )
-            .finished(finished),
-        );
-    }
-
     if overview.trickle_downloading > 0 {
         items.push(
             ActivityItem::new(

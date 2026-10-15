@@ -120,6 +120,15 @@ function icon(name, extraClass = '') {
 const navItems = document.querySelectorAll('.sidebar-nav-item');
 const panes    = document.querySelectorAll('section[data-pane]');
 
+// On a phone the sidebar is a strip stuck to the top, and its height changes as its rows wrap
+// (the signed-in line, Restart). --strip-h keeps jumps to a spot on the page below it.
+const sidebarStrip = document.querySelector('.sidebar');
+if (sidebarStrip && 'ResizeObserver' in window) {
+  new ResizeObserver(() => {
+    document.documentElement.style.setProperty('--strip-h', `${sidebarStrip.offsetHeight}px`);
+  }).observe(sidebarStrip);
+}
+
 // focus: true when the user chose the pane, so keyboard and screen-reader focus follows them
 // to its heading instead of being left on a sidebar button that no longer describes the page.
 function activateTab(name, { focus = false } = {}) {
@@ -128,9 +137,14 @@ function activateTab(name, { focus = false } = {}) {
     b.classList.toggle('active', on);
     if (on) b.setAttribute('aria-current', 'page');
     else b.removeAttribute('aria-current');
-    // On a phone the nav is a sideways strip; keep the current pill in view.
+    // On a phone the nav is a sideways strip; keep the current pill in view. Only the strip
+    // scrolls: the page's scroll padding covers the strip itself, so scrollIntoView would move
+    // the page as well.
     if (on && window.matchMedia('(max-width: 760px)').matches) {
-      b.scrollIntoView({ block: 'nearest', inline: 'center' });
+      const nav = b.closest('.sidebar-nav');
+      const pill = b.getBoundingClientRect();
+      const box = nav?.getBoundingClientRect();
+      if (box) nav.scrollBy({ left: pill.left + pill.width / 2 - (box.left + box.width / 2) });
     }
   });
   panes.forEach(p => p.classList.toggle('active', p.dataset.pane === name));
@@ -201,8 +215,8 @@ window.addEventListener('hashchange', followHash);
 // ────────────────────────────────────────────────────────────────
 // Activity: live progress of Octo's background work
 // ────────────────────────────────────────────────────────────────
-// One card per job (a re-tag, a covers or lyrics run, better copies, hearted downloads, a
-// Spotify read, a duplicate scan, an slskd rescan, Navidrome's scan), updated in place from
+// One card per job (a re-tag, a covers or lyrics run, better copies, hearted downloads, an
+// import's downloads, a duplicate scan, an slskd rescan, Navidrome's scan), updated in place from
 // GET /api/admin/activity, on whatever page is open. A card never repeats: a job is one card
 // for as long as it runs, then says how it ended and goes. The page that shows a job in full
 // hides its card, and is refreshed when that job starts or ends, so it is never left stale.
@@ -237,7 +251,7 @@ const ACTIVITY_PAGE_REFRESH = {
 };
 
 // One card per job kind, so a run that becomes the next run, or a running batch that becomes
-// "Added 3 songs", stays the same card. A Spotify read and its trickle are two jobs.
+// "Added 3 songs", stays the same card. An import's downloads are one job.
 function activityKey(item) {
   return item.kind === 'imports' ? item.id.split(':').slice(0, 2).join(':') : item.kind;
 }
@@ -969,6 +983,10 @@ document.querySelectorAll('form[data-section]').forEach(form => {
       renderSetupChecklist();
       // The scrobbling card reads the running settings, which catch up with the file a moment later.
       if (form.dataset.section?.startsWith('lastfm')) setTimeout(loadLastFmScrobbling, 700);
+      // The re-check offer on the Verify card follows the saved match score.
+      if (form.dataset.section === 'soulseek-verify' || form.dataset.section?.startsWith('library-actions')) {
+        setTimeout(loadReviewSweep, 700);
+      }
       form.querySelector('.form-actions')?.classList.remove('dirty');
       // A saved admin password is only ever shown as the placeholder; the typed value should
       // not stay in the page after it has been saved.
@@ -2459,6 +2477,7 @@ const libraryActionLabels = {
   Keep: 'Keep: the track is right, so stop asking. Removes nothing',
   WrongLyrics: 'Wrong lyrics: look for other lyrics, and never show these again',
   WrongCover: 'Wrong cover: look for another cover, and never use this one again',
+  FixDuplicates: 'Fix duplicates: fix every copy of the song, as Library health does. Needs Delete on',
 };
 
 function normalizeLibraryAction(action = {}) {
@@ -2629,11 +2648,26 @@ const noticeStates = {
 
 const noticeKinds = { Review: 'Review', Duplicates: 'Duplicate' };
 
+// AcoustID's numbers on a question, when it gave any: "64% sure, needs 85%; closest: Artist - Title",
+// or "it matched Artist - Title" when AcoustID named the recording.
+function noticeScore(entry) {
+  const parts = [];
+  if (typeof entry.acoustIdScore === 'number' && !String(entry.reason || '').includes(`${entry.acoustIdScore}% sure`)) {
+    parts.push(typeof entry.threshold === 'number'
+      ? `${entry.acoustIdScore}% sure, needs ${entry.threshold}%`
+      : `${entry.acoustIdScore}% sure`);
+  }
+  const reason = String(entry.reason || '');
+  if (entry.matched && !reason.includes(entry.matched)) parts.push(`it matched ${entry.matched}`);
+  else if (!entry.matched && entry.closest && !reason.includes(entry.closest)) parts.push(`closest: ${entry.closest}`);
+  return parts.length ? ` (${parts.join('; ')})` : '';
+}
+
 document.getElementById('notices-refresh')?.addEventListener('click', () =>
   showSessionTable(document.getElementById('notices-list'), '/api/admin/notices',
     ['Track', 'Why', 'Who', 'Answer'], entry => `
             <span class="key">${esc(entry.artist)} - ${esc(entry.title)}</span>
-            <span class="value">${esc(noticeKinds[entry.kind] || entry.kind)}: ${esc(entry.reason)}${entry.origin === 'LibrarySweep' ? ' (from the library)' : ''}</span>
+            <span class="value">${esc(noticeKinds[entry.kind] || entry.kind)}: ${esc(entry.reason)}${esc(noticeScore(entry))}${entry.origin === 'LibrarySweep' ? ' (from the library)' : ''}</span>
             <span class="value">${esc(entry.username)}</span>
             <span class="value">${esc(noticeStates[entry.state] || entry.state)}${entry.submitted ? ', sent to AcoustID' : ''}</span>`,
     body => {
@@ -2643,6 +2677,15 @@ document.getElementById('notices-refresh')?.addEventListener('click', () =>
       return `Last duplicate scan ${esc(when)}: ${scan.tracks} tracks with a recording id, ${scan.groups} group${scan.groups === 1 ? '' : 's'}`
         + (scan.complete ? '.' : ', but the walk did not finish, so nothing was settled.');
     }));
+
+// A star rating that asked for an action and got none says why, with the setting to change.
+document.getElementById('ignored-ratings-refresh')?.addEventListener('click', () =>
+  showSessionTable(document.getElementById('ignored-ratings-list'), '/api/admin/library-actions/ignored-ratings',
+    ['When', 'Track', 'Who', 'Why'], entry => `
+            <span class="value">${esc(new Date(entry.atUtc).toLocaleString())}</span>
+            <span class="key">${entry.title ? `${entry.artist ? `${esc(entry.artist)} - ` : ''}${esc(entry.title)}` : esc(entry.songId)}</span>
+            <span class="value">${esc(entry.username || 'Unknown')}</span>
+            <span class="value">${esc(String(entry.rating))} star${entry.rating === 1 ? '' : 's'} for ${esc(entry.action)}: ${esc(entry.reason)}</span>`));
 
 document.getElementById('duplicates-scan')?.addEventListener('click', async (event) => {
   const button = event.currentTarget;
@@ -2671,11 +2714,20 @@ async function loadReviewSweep() {
     const s = await response.json();
     const parts = [`${reviewSweepStates[s.state] || s.state}.`];
     if (s.total > 0) parts.push(`Checked ${s.position} of ${s.total} songs (pass ${s.pass}).`);
-    parts.push(`Found ${s.found}, ${s.open} waiting for an answer.`);
+    parts.push(s.replaced > 0
+      ? `Found ${s.found}, ${s.replaced} of them replaced, ${s.open} waiting for an answer.`
+      : `Found ${s.found}, ${s.open} waiting for an answer.`);
     if (s.undecodable > 0) parts.push(`${s.undecodable} could not be decoded.`);
     if (s.keeper) parts.push(`Asking ${s.keeper}.`);
+    if (s.autoReplace) {
+      const day = s.autoReplace;
+      parts.push(day.failedToday >= 3
+        ? `Replaced ${day.replacedToday} today; three replacements failed, so the rest of today is asked about.`
+        : `Replaced ${day.replacedToday} of at most ${day.perDay} today.`);
+    }
     if (s.reason) parts.push(s.reason);
     status.textContent = parts.join(' ');
+    showRecheck(s);
     const toggle = document.getElementById('review-sweep-toggle');
     toggle.dataset.paused = s.paused ? 'true' : 'false';
     toggle.querySelector('span').textContent = s.paused ? 'Start' : 'Pause';
@@ -2683,6 +2735,21 @@ async function loadReviewSweep() {
   } catch (error) {
     status.textContent = `Could not read the library check: ${error.message}`;
   }
+}
+
+// The re-check of Octo's downloads: how far it got, or that it is done, and the Verify card's
+// offer once the match score changed since the last one.
+function showRecheck(s) {
+  const status = document.getElementById('review-sweep-recheck-status');
+  const r = s.recheck;
+  if (status && r) {
+    const found = `${r.found} asked about${r.replaced > 0 ? `, ${r.replaced} replaced` : ''}`;
+    status.textContent = r.running
+      ? `Re-checking Octo's downloads: ${r.position} of ${r.total}, ${found}.`
+      : `Done: re-checked ${r.checked} of Octo's downloads at ${r.threshold}%, ${found}.`;
+  }
+  const offer = document.getElementById('recheck-offer');
+  if (offer) offer.hidden = !s.thresholdChanged || !!r?.running;
 }
 
 async function reviewSweepPost(button, path, message) {
@@ -2705,6 +2772,11 @@ document.getElementById('review-sweep-toggle')?.addEventListener('click', (event
   const start = button.dataset.paused === 'true';
   reviewSweepPost(button, `/api/admin/review-sweep/${start ? 'start' : 'pause'}`, start ? 'Carrying on.' : 'Paused.');
 });
+document.querySelectorAll('[data-recheck-octo]').forEach(button => button.addEventListener('click', async (event) => {
+  const clicked = event.currentTarget;
+  if (!(await askConfirm("Re-check Octo's downloads?", 'Every song Octo downloaded is checked once more, at least 60 an hour. Songs already answered in Review are not asked about again.', 'Re-check'))) return;
+  reviewSweepPost(clicked, '/api/admin/review-sweep/recheck-octo', "Re-checking Octo's downloads.");
+}));
 document.getElementById('review-sweep-reset')?.addEventListener('click', async (event) => {
   // Taken before the question: once it is awaited the event no longer says which button it was.
   const button = event.currentTarget;
@@ -2714,6 +2786,72 @@ document.getElementById('review-sweep-reset')?.addEventListener('click', async (
 ready.then(loadReviewSweep);
 // Not while the sign-in screen is up: every refused poll would wait behind it and fire at once after.
 setInterval(() => { if (document.visibilityState === 'visible' && !gatePromise) loadReviewSweep(); }, 30000);
+
+// ---- Tags against the audio: the library tag check ----
+// Its line, found and fixed counts, and a Pause that becomes Start while it is paused.
+// On Library health itself, `here` leaves out where the findings are.
+function tagCheckWords(t, here = false) {
+  const parts = [t.line];
+  if (t.found && !here) parts.push(`${healthPlural(t.found, 'song')} to look at in Library health${t.sure ? `, ${t.sure.toLocaleString()} sure` : ''}.`);
+  if (t.spacesFixed) parts.push(`Stray spaces taken off ${healthPlural(t.spacesFixed, 'song')}.`);
+  if (t.reason && t.state !== 'Done' && !t.paused) parts.push(t.reason);
+  return parts.join(' ');
+}
+
+function showTagCheckButtons(t, toggle) {
+  if (!toggle) return;
+  toggle.dataset.paused = t.paused ? 'true' : 'false';
+  toggle.querySelector('span').textContent = t.paused ? 'Start' : 'Pause';
+  toggle.disabled = t.perHour === 0;
+}
+
+async function loadTagCheck() {
+  const status = document.getElementById('tag-check-status');
+  if (!status) return;
+  try {
+    const response = await api('/api/admin/health/tags', { cache: 'no-store' });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    status.textContent = tagCheckWords(body.tagCheck);
+    showTagCheckButtons(body.tagCheck, document.getElementById('tag-check-toggle'));
+  } catch (error) {
+    status.textContent = `Could not read the tag check: ${error.message}`;
+  }
+}
+
+async function tagCheckPost(button, path, message) {
+  button.disabled = true;
+  try {
+    const response = await api(path, { method: 'POST' });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    note(button, message);
+  } catch (error) {
+    note(button, error.message, 'error');
+  } finally {
+    button.disabled = false;
+    await loadTagCheck();
+    if (healthPaneOpen()) loadHealth();
+  }
+}
+
+async function tagCheckToggle(button) {
+  const start = button.dataset.paused === 'true';
+  await tagCheckPost(button, `/api/admin/health/tags/${start ? 'start' : 'pause'}`, start ? 'Carrying on.' : 'Paused.');
+}
+
+async function tagCheckReset(button) {
+  if (!(await askConfirm('Check every song again?', 'From the start. What it found is listed again as it finds it.', 'Start over'))) return;
+  await tagCheckPost(button, '/api/admin/health/tags/reset', 'Starting over.');
+}
+
+document.getElementById('tag-check-toggle')?.addEventListener('click', event => tagCheckToggle(event.currentTarget));
+document.getElementById('tag-check-reset')?.addEventListener('click', event => {
+  // Taken before the question: once it is awaited the event no longer says which button it was.
+  tagCheckReset(event.currentTarget);
+});
+ready.then(loadTagCheck);
+setInterval(() => { if (document.visibilityState === 'visible' && !gatePromise) loadTagCheck(); }, 30000);
 
 // octo-sonic's analysis of every song (how it sounds, and its transition profile), on the radio page.
 const sonicStates = { Off: 'Off', Paused: 'Paused', Waiting: 'Waiting', Running: 'Analyzing', Done: 'Up to date' };
@@ -3222,7 +3360,7 @@ async function loadRadioStatus() {
     const stateMessage = !data.enabled ? 'Radio is disabled. Existing history and snapshots are preserved.'
       : !data.hasApiKey ? 'Last.fm key missing. Starter/local fallback remains available; recommendation refresh is degraded.'
       : !learning ? 'Waiting for the first authenticated completed scrobble.'
-      : learning.needed > 0 ? `${learning.plays} completed plays learned · ${learning.needed} more before Your Mix.`
+      : learning.needed > 0 ? `${learning.plays} completed plays learned · ${learning.needed} more before Your Radio.`
       : learning.refreshing ? 'Refreshing now. The last good snapshots remain playable.'
       : learning.lastRefreshError ? `Last refresh failed: ${learning.lastRefreshError}` : `${learning.plays} completed plays learned.`;
     output.innerHTML = `<p class="radio-state-copy">${escapeHtml(stateMessage)}</p>` + ((data.stations || []).length
@@ -4335,6 +4473,7 @@ function renderDlog(events) {
   return `<ol class="dlog">${events.map(line => {
     const kind = DLOG_GLYPH[line.kind] ? line.kind : 'note';
     const copies = Array.isArray(line.candidate) ? line.candidate : [];
+    const heard = Array.isArray(line.heard) ? line.heard : [];
     const many = copies.length > 3;
     const list = copies.length
       ? (many
@@ -4346,6 +4485,7 @@ function renderDlog(events) {
       <div class="dlog-body">
         <div class="dlog-head"><span class="dlog-text">${escapeHtml(line.text)}</span><time class="dlog-time" datetime="${escapeHtml(line.at)}">${escapeHtml(dlogClock(line.at))}</time></div>
         ${line.detail ? `<div class="dlog-detail">${escapeHtml(line.detail)}</div>` : ''}
+        ${heard.length ? `<div class="dlog-detail">Also heard: ${escapeHtml(heard.map(h => `${h.artist} - ${h.title}, ${h.score}% sure`).join('; '))}</div>` : ''}
         ${list}
       </div>
     </li>`;
@@ -5132,31 +5272,6 @@ function decoratePageHeaders() {
     if (label) item.title = label;
   });
 
-  // A long page gets a row of links to its sections under the header, as the desktop app's
-  // settings list its sections beside the page.
-  document.querySelectorAll('section[data-pane]').forEach(pane => {
-    const titles = Array.from(pane.querySelectorAll(':scope > .set-section > .set-head > .set-title'));
-    const header = pane.querySelector(':scope > .page-header');
-    if (titles.length < 4 || !header || pane.querySelector('.page-toc')) return;
-    const toc = document.createElement('nav');
-    toc.className = 'page-toc';
-    toc.setAttribute('aria-label', 'On this page');
-    titles.forEach((title, index) => {
-      if (!title.id) title.id = `${pane.dataset.pane}-section-${index + 1}`;
-      title.setAttribute('tabindex', '-1');
-      const link = document.createElement('a');
-      link.href = `#${pane.dataset.pane}`;
-      link.textContent = title.textContent.trim();
-      link.addEventListener('click', event => {
-        event.preventDefault();
-        const calm = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-        title.closest('.set-section').scrollIntoView({ behavior: calm ? 'auto' : 'smooth', block: 'start' });
-        title.focus({ preventScroll: true });
-      });
-      toc.appendChild(link);
-    });
-    header.after(toc);
-  });
 }
 
 // A description says one thing. Anything more sits in a .set-info-more beside it, folded away
@@ -6381,6 +6496,30 @@ function updateRunActive(info = updateInfo) {
   return !!info && (info.pending || (!!info.run && UPDATE_RUNNING.includes(info.run.state)));
 }
 
+// Update now needs a helper on the host, and not one from 2026.10.05 or earlier.
+function updateHelperReady(info = updateInfo) {
+  return !!info?.helper?.installed && !info.helper.outdated;
+}
+
+// Opens About with the update card in view and the keyboard on it, from any page,
+// About included. The card's edge lights up for a moment so the eye finds it.
+function showUpdateCard() {
+  const card = document.getElementById('update-card');
+  if (!card) return;
+  if (!card.closest('section[data-pane]')?.classList.contains('active')) openTab('about');
+  card.focus({ preventScroll: true });
+  card.classList.remove('is-pointed');
+  void card.offsetWidth;
+  card.classList.add('is-pointed');
+  requestAnimationFrame(() => {
+    const calm = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    card.scrollIntoView({ block: 'start', behavior: calm ? 'auto' : 'smooth' });
+  });
+}
+document.getElementById('update-card')?.addEventListener('animationend', event => {
+  if (event.target === event.currentTarget) event.currentTarget.classList.remove('is-pointed');
+});
+
 function renderUpdate() {
   const info = updateInfo;
   if (!info) return;
@@ -6410,7 +6549,7 @@ function renderUpdate() {
   // A helper from 2026.10.05 or earlier would restart the same Octo and call it an update, so it
   // gets reinstalled first. An update reinstalls it as its last step; this shows when that failed.
   const helperOld = !!helper && !!info.helper?.outdated;
-  byId('update-now').hidden = !(info.updateAvailable && helper && !helperOld && !active);
+  byId('update-now').hidden = !(info.updateAvailable && updateHelperReady(info) && !active);
   const old = byId('update-helper-old');
   old.hidden = !helperOld || active;
   if (!old.hidden) {
@@ -6470,7 +6609,11 @@ function renderUpdate() {
   // The banner on every page, and the dot on About.
   const banner = byId('update-banner');
   banner.hidden = !(info.updateAvailable && !active && updateLater() !== latest?.tag);
-  if (!banner.hidden) byId('update-banner-text').textContent = `Octo ${latest.tag} is out. You run ${info.running}.`;
+  if (!banner.hidden) {
+    byId('update-banner-text').textContent = `Octo ${latest.tag} is out. You run ${info.running}.`;
+    // Without a helper that takes the update, the About page shows a command to run instead.
+    byId('update-banner-go').textContent = updateHelperReady(info) ? 'Update' : 'How to update';
+  }
   const about = document.querySelector('.sidebar-nav-item[data-tab="about"]');
   let flag = about?.querySelector('.nav-flag');
   if (about && info.updateAvailable && !flag) {
@@ -6494,48 +6637,83 @@ async function loadUpdate({ check = false } = {}) {
     if (!updateInfo) document.getElementById('update-line').textContent = "Couldn't ask Octo about new releases.";
     return;
   }
+  updatePageRunning ??= updateInfo.running;
+  welcomeFinishedUpdate();
   renderUpdate();
 }
 
+// The version this page's own code came with. Once Octo runs another, the page is reloaded so
+// the dashboard is the new release's too.
+let updatePageRunning = null;
+let updatePollBusy = false;
+const UPDATE_FINISHED_KEY = 'octo.update.finished';
+
+// After the reload that follows an update: the card shows the finished run, and a toast says so.
+function welcomeFinishedUpdate() {
+  let finished = null;
+  try {
+    finished = JSON.parse(sessionStorage.getItem(UPDATE_FINISHED_KEY) || 'null');
+    sessionStorage.removeItem(UPDATE_FINISHED_KEY);
+  } catch { /* nothing to welcome */ }
+  if (!finished || finished.tag !== updateInfo?.running) return;
+  updateRequestId = finished.id ?? null;
+  toast(`Octo now runs ${updateInfo.running}.`, 'ok');
+  // The helper reinstalls itself just after Octo is back, so its version is read again.
+  setTimeout(() => loadUpdate(), 15_000);
+}
+
 // Every 2 seconds while a run is under way. Octo is down while it restarts, so failed polls
-// read as "Restarting" for up to 15 minutes before the page gives up.
-function pollUpdate() {
+// read as "Restarting" for up to 15 minutes before the page gives up. Each ask gives up after
+// 5 seconds: a kept-alive connection to the container that was replaced can hang without ever
+// failing, and the next ask then goes out on a new one.
+function pollUpdate(delay = 2000) {
   clearTimeout(updatePollTimer);
-  updatePollTimer = setTimeout(async () => {
-    const before = updateInfo?.running;
-    try {
-      const response = await api('/api/admin/update', { cache: 'no-store' });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      updateInfo = await response.json();
+  updatePollTimer = setTimeout(pollUpdateNow, delay);
+}
+
+async function pollUpdateNow() {
+  updatePollBusy = true;
+  try {
+    const response = await api('/api/admin/update', { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    updateInfo = await response.json();
+    updateOutageSince = null;
+  } catch {
+    updatePollBusy = false;
+    updateOutageSince ??= Date.now();
+    if (Date.now() - updateOutageSince > 15 * 60_000) {
+      updatePollTimer = null;
       updateOutageSince = null;
-    } catch {
-      updateOutageSince ??= Date.now();
-      if (Date.now() - updateOutageSince > 15 * 60_000) {
-        updatePollTimer = null;
-        updateOutageSince = null;
-        document.getElementById('update-line').textContent = 'Octo has not come back after the update. "docker compose logs octo" on the host says why.';
-        return;
-      }
-      renderUpdate();
-      pollUpdate();
+      document.getElementById('update-line').textContent = 'Octo has not come back after the update. "docker compose logs octo" on the host says why.';
       return;
     }
-    updatePollTimer = null;
     renderUpdate();
-    if (updateRunActive()) { pollUpdate(); return; }
-    const run = updateInfo.run;
-    if (run?.state === 'done' && before && updateInfo.running !== before) {
-      toast(`Octo now runs ${updateInfo.running}.`, 'ok');
-      await loadSettings();
-      // The helper reinstalls itself just after Octo is back, so its version is read again.
-      setTimeout(() => loadUpdate(), 15_000);
-    } else if (run?.state === 'failed' && run.id === updateRequestId) {
-      toast('The update failed. Octo still runs the old version.', 'error');
-    } else if (updateRequestId && updateInfo.unanswered === updateRequestId) {
-      toast('The update helper did not answer. The command to run is on the About page.', 'error');
-    }
-  }, 2000);
+    pollUpdate();
+    return;
+  }
+  updatePollBusy = false;
+  updatePollTimer = null;
+  const run = updateInfo.run;
+  if (run?.state === 'done' && updatePageRunning && updateInfo.running !== updatePageRunning) {
+    try {
+      sessionStorage.setItem(UPDATE_FINISHED_KEY, JSON.stringify({ id: run.id, tag: updateInfo.running }));
+    } catch { /* the reload still shows the new version */ }
+    location.reload();
+    return;
+  }
+  renderUpdate();
+  if (updateRunActive()) { pollUpdate(); return; }
+  if (run?.state === 'failed' && run.id === updateRequestId) {
+    toast('The update failed. Octo still runs the old version.', 'error');
+  } else if (updateRequestId && updateInfo.unanswered === updateRequestId) {
+    toast('The update helper did not answer. The command to run is on the About page.', 'error');
+  }
 }
+
+// A tab in the background has its timers slowed down; coming back asks at once.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && updatePollTimer && !updatePollBusy) pollUpdate(0);
+});
 
 document.getElementById('update-check')?.addEventListener('click', async event => {
   const btn = event.currentTarget;
@@ -6544,7 +6722,7 @@ document.getElementById('update-check')?.addEventListener('click', async event =
   btn.disabled = updateRunActive();
 });
 
-document.getElementById('update-now')?.addEventListener('click', async () => {
+async function startUpdate() {
   const tag = updateInfo?.latest?.tag;
   if (!tag) return;
   const unsavedCards = document.querySelectorAll('form.unsaved').length;
@@ -6564,6 +6742,13 @@ document.getElementById('update-now')?.addEventListener('click', async () => {
   updateRequestId = body.id;
   updateInfo = { ...updateInfo, pending: true, pendingId: body.id };
   renderUpdate();
+}
+
+document.getElementById('update-now')?.addEventListener('click', startUpdate);
+// The banner's button goes to the update card, and starts Update now when the helper can take it.
+document.getElementById('update-banner-go')?.addEventListener('click', () => {
+  showUpdateCard();
+  if (updateHelperReady() && updateInfo?.updateAvailable && !updateRunActive()) startUpdate();
 });
 
 document.getElementById('update-notes')?.addEventListener('click', showReleaseNotes);
@@ -6767,27 +6952,104 @@ document.getElementById('share-rescan')?.addEventListener('click', async event =
 });
 
 // ────────────────────────────────────────────────────────────────
-// Import: lists from a Spotify account, a link, a file or a pasted list, the services TuneMyMusic
-// exports from, what the library has of each list, playlists kept in Navidrome, and the trickle
+// Import: where a person's music is now (a service, a file or a pasted list), the way to bring it
+// from there, what the library has of each list, playlists kept in Navidrome, and the trickle
 // that fetches the rest
 // ────────────────────────────────────────────────────────────────
-const imp = { view: null, user: null, open: null, detail: null, picked: new Set(), timer: null, waitingForPaste: false, services: null, service: null };
+const imp = { view: null, user: null, open: null, detail: null, picked: new Set(), timer: null, services: null, choice: null, busy: false, people: null, forUser: null };
 const impEl = id => document.getElementById(id);
 const impStateWords = {
   have: 'In your library', missing: 'Missing', queued: 'Queued', downloading: 'Fetching',
   done: 'Fetched', notFound: 'Not found', skipped: 'Skipped',
 };
 const impStateTone = { have: 'good', done: 'good', missing: 'state', queued: 'state', downloading: 'state', notFound: 'warn', skipped: 'warn' };
-const impSourceWords = { spotifyLiked: 'Spotify', spotifyPlaylist: 'Spotify', link: 'Link', file: 'File' };
+const impSourceWords = { spotifyLiked: 'Spotify', spotifyPlaylist: 'Spotify', link: 'Spotify link', file: 'File' };
+// Services with a badge in the sprite; any other one the server lists gets a plain note glyph.
+const IMP_BADGES = new Set(['spotify', 'apple-music', 'youtube-music', 'amazon-music', 'tidal', 'deezer', 'qobuz', 'soundcloud', 'pandora', 'youtube']);
+// Two ways in that are not a service, after the services.
+const IMP_OTHER = [
+  { id: 'file', name: 'Another file', glyph: 'i-file-arrow-up' },
+  { id: 'paste', name: 'Paste a list', glyph: 'i-clipboard-text' },
+];
+const IMP_CHOICE_KEY = 'octo.import.choice';
+// Whom the page imports for, kept for this tab only.
+const IMP_FOR_KEY = 'octo.import.for';
+// The server takes a file up to this size (ImportFileReader::MAX_BYTES).
+const IMP_MAX_BYTES = 64 * 1024 * 1024;
 
-// The page acts for the Navidrome account signed in on it, like Better quality.
-async function impFetch(path, options = {}) {
-  let response = await api(path, { credentials: 'same-origin', ...options });
+// The address with the person picked under Import for, when it is someone else.
+function impFor(path, forUser = imp.forUser) {
+  if (!forUser) return path;
+  return `${path}${path.includes('?') ? '&' : '?'}for=${encodeURIComponent(forUser)}`;
+}
+
+// The page acts for the Navidrome account signed in on it, like Better quality, or for the person
+// picked under Import for.
+async function impFetch(path, options = {}, forUser = imp.forUser) {
+  const address = impFor(path, forUser);
+  let response = await api(address, { credentials: 'same-origin', ...options });
   if (response.status === 401 && await browseAuthenticate(impEl('imp-lists'))) {
-    response = await api(path, { credentials: 'same-origin', ...options });
+    response = await api(address, { credentials: 'same-origin', ...options });
   }
   return response;
 }
+
+// The name the page uses for the person picked under Import for.
+function impForName() {
+  const person = imp.people?.find(p => p.username === imp.forUser);
+  return person?.name || imp.forUser || '';
+}
+
+// Who the page can import for: yourself first, then every Navidrome user, Family members marked.
+async function loadImportPeople() {
+  const response = await impFetch('/api/admin/imports/people', {}, null).catch(() => null);
+  const body = await response?.json().catch(() => null);
+  const people = response?.ok && Array.isArray(body?.users) ? body.users : [];
+  // Asked again on the next load when this one found nobody (a sign-in that was not made).
+  imp.people = people.length ? people : null;
+  let kept = null;
+  try { kept = sessionStorage.getItem(IMP_FOR_KEY); } catch { /* a blocked store remembers nothing */ }
+  const keptPerson = kept ? people.find(p => !p.you && p.username.toLowerCase() === kept.toLowerCase()) : null;
+  imp.forUser = keptPerson?.username ?? null;
+  const select = impEl('imp-for');
+  select.innerHTML = people.map(person => {
+    const label = person.you ? 'Yourself'
+      : person.name && person.name !== person.username ? `${person.name} (${person.username})` : person.username;
+    return `<option value="${person.you ? '' : esc(person.username)}">${esc(label)}${person.member ? ' · Family member' : ''}</option>`;
+  }).join('');
+  select.value = imp.forUser ?? '';
+  // One account on the server leaves nobody else to import for.
+  impEl('imp-for-section').hidden = people.length < 2;
+  renderImportFor();
+}
+
+function renderImportFor() {
+  const person = imp.people?.find(p => p.username === imp.forUser);
+  const name = impForName();
+  impEl('imp-for-line').textContent = !person
+    ? 'Lists, playlists and fetched songs go to the person you pick.'
+    : person.member
+      ? `Lists and playlists below are ${name}'s, as if ${name} imported them. ${name} is a Family member, so fetched songs go to their own library.`
+      : `Lists and playlists below are ${name}'s, as if ${name} imported them.`;
+  impEl('imp-lists-title').textContent = person ? `${name}'s lists` : 'Your lists';
+}
+
+impEl('imp-for')?.addEventListener('change', event => {
+  imp.forUser = event.target.value || null;
+  try {
+    if (imp.forUser) sessionStorage.setItem(IMP_FOR_KEY, imp.forUser); else sessionStorage.removeItem(IMP_FOR_KEY);
+  } catch { /* not remembered */ }
+  // Another person's page starts empty: none of the last person's lists, songs or result.
+  imp.view = null;
+  imp.open = null;
+  imp.detail = null;
+  imp.picked.clear();
+  impEl('imp-detail').hidden = true;
+  if (!imp.busy) impEl('imp-result').hidden = true;
+  renderImportFor();
+  renderImportServices();
+  loadImports();
+});
 
 async function impPost(path, body, anchor) {
   const response = await impFetch(path, {
@@ -6811,6 +7073,20 @@ function impExportUrl(url) {
   }
 }
 
+function impLogo(id, extraClass = '') {
+  if (IMP_BADGES.has(id)) return icon(`b-svc-${id}`, `imp-logo ${extraClass}`.trim());
+  const glyph = IMP_OTHER.find(other => other.id === id)?.glyph ?? 'i-music-notes';
+  return `<span class="imp-logo imp-logo-plain ${extraClass}" aria-hidden="true">${icon(glyph)}</span>`;
+}
+
+function impSize(bytes) {
+  if (bytes < 1024) return `${bytes} bytes`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024).toLocaleString()} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const impCount = (n, one, many = `${one}s`) => `${Number(n).toLocaleString()} ${n === 1 ? one : many}`;
+
 async function loadImportServices() {
   if (imp.services) return;
   const response = await impFetch('/api/admin/imports/services').catch(() => null);
@@ -6820,46 +7096,279 @@ async function loadImportServices() {
     return;
   }
   imp.services = body.services.filter(service => impExportUrl(service.exportUrl));
+  if (!imp.choice) {
+    let kept = null;
+    try { kept = localStorage.getItem(IMP_CHOICE_KEY); } catch { /* a blocked store remembers nothing */ }
+    if (kept && (imp.services.some(s => s.id === kept) || IMP_OTHER.some(o => o.id === kept))) imp.choice = kept;
+  }
   renderImportServices();
 }
 
 function renderImportServices() {
   const grid = impEl('imp-services');
   if (!grid || !imp.services) return;
-  grid.innerHTML = imp.services.map(service => {
-    const on = imp.service === service.id;
-    return `<button type="button" class="imp-svc${on ? ' selected' : ''}" data-imp-service="${esc(service.id)}" aria-pressed="${on}">
-      <span class="imp-svc-check" aria-hidden="true">${icon('i-check')}</span><span class="imp-svc-name">${esc(service.name)}</span></button>`;
+  const tiles = [...imp.services.map(s => ({ id: s.id, name: s.name })), ...IMP_OTHER];
+  grid.innerHTML = tiles.map(tile => {
+    const on = imp.choice === tile.id;
+    return `<button type="button" class="imp-svc${on ? ' selected' : ''}" data-imp-choice="${esc(tile.id)}" aria-pressed="${on}">
+      ${impLogo(tile.id)}<span class="imp-svc-name">${esc(tile.name)}</span>
+      <span class="imp-svc-check" aria-hidden="true">${icon('i-check')}</span></button>`;
   }).join('');
-  const service = imp.services.find(s => s.id === imp.service);
-  const guide = impEl('imp-guide-steps');
-  guide.hidden = !service;
-  if (!service) return;
-  impEl('imp-guide-list').innerHTML = [
-    'Open TuneMyMusic with the button below.',
-    `Tap the <strong>${esc(service.tile)}</strong> tile and sign in to ${esc(service.name)}.`,
-    'Pick your playlists or Liked songs.',
-    'Export to file, as CSV.',
-    'Come back here and upload the file below.',
-  ].map(step => `<li>${step}</li>`).join('');
-  impEl('imp-guide-open').href = impExportUrl(service.exportUrl);
-  impEl('imp-guide-open').querySelector('span').textContent = `Open TuneMyMusic for ${service.name}`;
+  renderImportPanel();
+}
+
+function renderImportPanel() {
+  const panel = impEl('imp-panel');
+  const choice = imp.choice;
+  panel.hidden = !choice;
+  if (!choice) return;
+  const service = imp.services?.find(s => s.id === choice);
+  const isSpotify = choice === 'spotify';
+  const isPaste = choice === 'paste';
+  const guided = !!service;
+
+  impEl('imp-panel-logo').innerHTML = impLogo(choice, 'imp-logo-l');
+  impEl('imp-panel-title').textContent = service ? `From ${service.name}` : isPaste ? 'Paste a list' : 'From a file';
+  impEl('imp-panel-sub').textContent = isSpotify
+    ? 'TuneMyMusic exports your Spotify playlists and liked songs to a file for free, private playlists too. Three steps, then the file comes here. One public playlist or album can also come in by its link.'
+    : guided ? `TuneMyMusic exports your ${service.name} playlists and liked songs to a file for free. Three steps, then the file comes here.`
+      : isPaste ? 'One song a line, written Artist - Title. Octo reads Title - Artist too when that names more of your library.'
+        : 'A CSV from Exportify, Soundiiz or any other tool with a title and an artist column, or a plain list with one Artist - Title a line.';
+
+  impEl('imp-spotify').hidden = !isSpotify;
+  impEl('imp-paste-box').hidden = !isPaste;
+  impEl('imp-drop').hidden = isPaste;
+
+  const steps = impEl('imp-guide-list');
+  const open = impEl('imp-guide-open');
+  steps.hidden = !guided;
+  open.hidden = !guided;
+  if (guided) {
+    steps.innerHTML = [
+      `Open TuneMyMusic, pick the <strong>${esc(service.tile)}</strong> tile and sign in to ${esc(service.name)}.`,
+      'Choose your playlists or liked songs, then <strong>Export to file</strong>, as CSV.',
+      'Drop the file below.',
+    ].map(step => `<li><span>${step}</span></li>`).join('');
+    open.href = impExportUrl(service.exportUrl);
+    open.querySelector('span').textContent = `Open TuneMyMusic for ${service.name}`;
+  }
+  impEl('imp-drop-hint').textContent = isSpotify ? 'The CSV TuneMyMusic made, Spotify\'s Download your data zip, or a CSV from Exportify'
+    : guided ? 'The CSV or TXT file TuneMyMusic made'
+      : 'CSV, TXT, JSON, or Spotify\'s zip';
 }
 
 impEl('imp-services')?.addEventListener('click', event => {
-  const tile = event.target.closest('[data-imp-service]');
-  if (!tile) return;
-  imp.service = imp.service === tile.dataset.impService ? null : tile.dataset.impService;
+  const tile = event.target.closest('[data-imp-choice]');
+  if (!tile || tile.disabled) return;
+  if (imp.choice !== tile.dataset.impChoice && !imp.busy) impEl('imp-result').hidden = true;
+  imp.choice = tile.dataset.impChoice;
+  try { localStorage.setItem(IMP_CHOICE_KEY, imp.choice); } catch { /* not remembered */ }
   renderImportServices();
+  if (imp.view) renderImports();
+  // On a phone the way in opens under the tiles, off screen.
+  impEl('imp-panel').scrollIntoView({ block: 'nearest', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+});
+
+// ── a file: sent with its progress, then read and matched on the server ──────────────────────
+// Steps a file goes through, as the drop area lists them.
+const IMP_PHASES = [
+  ['send', 'Sending the file'],
+  ['read', 'Reading the songs and checking your library'],
+];
+
+function impShowRun(file) {
+  impEl('imp-drop-idle').hidden = true;
+  impEl('imp-drop-run').hidden = false;
+  impEl('imp-drop').classList.add('running');
+  impEl('imp-drop-name').textContent = file.name;
+  impEl('imp-drop-size').textContent = impSize(file.size);
+  impEl('imp-result').hidden = true;
+}
+
+function impPhase(key, detail = '', fraction = null) {
+  const at = IMP_PHASES.findIndex(([k]) => k === key);
+  impEl('imp-phases').innerHTML = IMP_PHASES.map(([k, label], i) => {
+    const state = i < at ? 'done' : i === at ? 'now' : 'todo';
+    const glyph = state === 'done' ? icon('i-check-circle-fill') : state === 'now' ? icon('i-circle-notch', 'spin') : icon('i-circle-dashed');
+    return `<li class="${state}">${glyph}<span>${esc(label)}</span>${i === at && detail ? `<span class="imp-phase-detail">${esc(detail)}</span>` : ''}</li>`;
+  }).join('');
+  const bar = impEl('imp-drop-bar');
+  bar.classList.toggle('indeterminate', fraction === null);
+  bar.firstElementChild.style.width = fraction === null ? '' : `${Math.round(fraction * 100)}%`;
+}
+
+function impEndRun() {
+  impEl('imp-drop-idle').hidden = false;
+  impEl('imp-drop-run').hidden = true;
+  impEl('imp-drop').classList.remove('running');
+  impEl('imp-file').value = '';
+}
+
+// One POST of the file with upload progress, which fetch cannot report. Answers the status and the
+// parsed body.
+function impSendFile(file, onProgress, onSent) {
+  return new Promise(resolve => {
+    const form = new FormData();
+    form.append('file', file, file.name);
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', impFor('/api/admin/imports/file'));
+    xhr.withCredentials = true;
+    xhr.setRequestHeader('X-Octo-Admin', '1');
+    xhr.upload.addEventListener('progress', e => { if (e.lengthComputable) onProgress(e.loaded, e.total); });
+    xhr.upload.addEventListener('load', onSent);
+    xhr.addEventListener('load', () => {
+      let body = {};
+      try { body = JSON.parse(xhr.responseText || '{}'); } catch { /* not JSON */ }
+      resolve({ status: xhr.status, body });
+    });
+    xhr.addEventListener('error', () => resolve({ status: 0, body: { message: 'The file did not reach Octo. Check the connection and try again.' } }));
+    xhr.addEventListener('abort', () => resolve({ status: 0, body: { message: 'Sending the file stopped.' } }));
+    xhr.send(form);
+  });
+}
+
+async function impUpload(file) {
+  if (!file || imp.busy) return;
+  if (file.size > IMP_MAX_BYTES) {
+    impShowResult({ error: `${file.name} is ${impSize(file.size)}, more than any export Octo reads (64 MB). Split it into smaller files.` });
+    return;
+  }
+  imp.busy = true;
+  // The file goes to the person picked when it was dropped, so the pick holds until it is in.
+  impEl('imp-for').disabled = true;
+  impShowRun(file);
+  try {
+    let answer = null;
+    // A lapsed sign-in answers 401: sign in through the page's own prompt, then send once more.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      impPhase('send', `0 of ${impSize(file.size)}`, 0);
+      answer = await impSendFile(file,
+        (loaded, total) => impPhase('send', `${impSize(loaded)} of ${impSize(total)}`, loaded / total),
+        () => impPhase('read'));
+      if (answer.status !== 401) break;
+      const check = await impFetch('/api/admin/imports');
+      if (!check.ok) break;
+    }
+    impEndRun();
+    if (answer.status >= 200 && answer.status < 300 && answer.body.ok !== false) {
+      await impFinished(answer.body, file.name);
+    } else {
+      impShowResult({ error: answer.body.message || answer.body.error || `Octo answered HTTP ${answer.status}.` });
+    }
+  } finally {
+    imp.busy = false;
+    impEl('imp-for').disabled = false;
+  }
+}
+
+impEl('imp-file')?.addEventListener('change', event => impUpload(event.target.files?.[0]));
+
+// The whole page takes a dropped file, not only the box, so a near miss never opens the file in
+// the browser instead.
+(() => {
+  const pane = document.querySelector('section[data-pane="imports"]');
+  const drop = impEl('imp-drop');
+  if (!pane || !drop) return;
+  let depth = 0;
+  const hasFile = e => [...(e.dataTransfer?.types ?? [])].includes('Files');
+  pane.addEventListener('dragenter', e => { if (!hasFile(e)) return; e.preventDefault(); depth++; drop.classList.add('dragging'); });
+  pane.addEventListener('dragover', e => { if (!hasFile(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+  pane.addEventListener('dragleave', e => { if (!hasFile(e)) return; depth = Math.max(0, depth - 1); if (!depth) drop.classList.remove('dragging'); });
+  pane.addEventListener('drop', e => {
+    if (!hasFile(e)) return;
+    e.preventDefault();
+    depth = 0;
+    drop.classList.remove('dragging');
+    const file = e.dataTransfer.files?.[0];
+    if (!file) return;
+    // A file dropped before picking a service, or on the paste page, is read as a file.
+    if (!imp.choice || imp.choice === 'paste') {
+      imp.choice = 'file';
+      renderImportServices();
+    }
+    impUpload(file);
+  });
+})();
+
+// ── what came of an import ───────────────────────────────────────────────────────────────────
+function impShowResult({ error = null, list = null, message = '', from = '' }) {
+  const box = impEl('imp-result');
+  box.hidden = false;
+  box.classList.toggle('failed', !!error);
+  if (error) {
+    box.innerHTML = `
+      <div class="imp-result-head">${icon('i-x-circle-fill')}<div><strong>That did not import</strong><p>${esc(error)}</p></div></div>`;
+    return;
+  }
+  if (!list) {
+    box.innerHTML = `<div class="imp-result-head">${icon('i-check-circle-fill')}<div><strong>${esc(message)}</strong>
+      <p>Every list is under Your lists below.</p></div></div>
+      <div class="imp-result-actions"><button type="button" class="btn" data-imp-jump="lists">See your lists</button></div>`;
+    return;
+  }
+  const total = list.total || list.have + list.missing + list.queued + list.downloading + list.done + list.notFound + list.skipped;
+  const missing = total - list.have;
+  const pct = total ? Math.round(list.have / total * 100) : 0;
+  const fetching = list.getMissing && missing > 0;
+  box.innerHTML = `
+    <div class="imp-result-head">${icon('i-check-circle-fill')}<div><strong>Added ${esc(list.name)}</strong>
+      <p>${esc(impCount(total, 'song'))}${from ? ` from ${esc(from)}` : ''}</p></div></div>
+    <div class="imp-result-stats">
+      <div class="imp-stat"><span class="imp-stat-n">${list.have.toLocaleString()}</span><span class="imp-stat-l">${imp.forUser ? 'already in their library' : 'already in your library'}</span></div>
+      <div class="imp-stat"><span class="imp-stat-n">${missing.toLocaleString()}</span><span class="imp-stat-l">${missing ? 'missing' : 'missing, so nothing to fetch'}</span></div>
+    </div>
+    <span class="lossy-meter imp-result-meter" aria-hidden="true"><span style="width:${pct}%"></span></span>
+    <div class="imp-result-actions">
+      ${missing && !fetching ? `<button type="button" class="btn btn-primary" data-imp-result-fetch="${esc(list.id)}">${icon('i-tray-arrow-down')}<span>Get the ${missing.toLocaleString()} missing</span></button>` : ''}
+      ${fetching ? `<span class="imp-result-note">${icon('i-check')}Getting the missing songs</span>` : ''}
+      ${list.keepPlaylist ? `<span class="imp-result-note">${icon('i-check')}Kept as a playlist</span>`
+        : `<button type="button" class="btn" data-imp-result-playlist="${esc(list.id)}">${icon('i-playlist')}<span>Keep as playlist</span></button>`}
+      <button type="button" class="btn btn-ghost" data-imp-result-open="${esc(list.id)}">See the songs</button>
+    </div>`;
+}
+
+// After a file, a link or a pasted list: the lists read again, then what the new one holds.
+async function impFinished(answer, from = '') {
+  imp.resultFrom = from;
+  await loadImports();
+  const list = answer.listId ? imp.view?.lists?.find(l => l.id === answer.listId) : null;
+  const several = /^Added \d+ lists/.test(answer.message || '');
+  impShowResult({ list: several ? null : list, message: answer.message || 'Added.', from });
+  if (!list && !several && answer.listId) await loadImportDetail(answer.listId);
+}
+
+impEl('imp-result')?.addEventListener('click', async event => {
+  const fetchBtn = event.target.closest('[data-imp-result-fetch]');
+  const playlistBtn = event.target.closest('[data-imp-result-playlist]');
+  const openBtn = event.target.closest('[data-imp-result-open]');
+  if (event.target.closest('[data-imp-jump]')) {
+    impEl('imp-lists').closest('.set-section').scrollIntoView({ block: 'start', behavior: 'smooth' });
+    return;
+  }
+  if (openBtn) { await loadImportDetail(openBtn.dataset.impResultOpen); return; }
+  const button = fetchBtn ?? playlistBtn;
+  if (!button) return;
+  const id = fetchBtn ? fetchBtn.dataset.impResultFetch : playlistBtn.dataset.impResultPlaylist;
+  button.disabled = true;
+  const { ok, answer } = await impPost(`/api/admin/imports/lists/${encodeURIComponent(id)}/${fetchBtn ? 'fetch' : 'playlist'}`, { on: true }, null);
+  toast(answer.message || 'Done.', ok ? 'ok' : 'error');
+  await loadImports();
+  const list = imp.view?.lists?.find(l => l.id === id);
+  if (list) impShowResult({ list, from: imp.resultFrom });
+  else button.disabled = false;
 });
 
 async function loadImports() {
   clearTimeout(imp.timer);
+  if (!imp.people) await loadImportPeople();
   loadImportServices();
-  if (!imp.view) impEl('imp-lists').innerHTML = stateBlock('loading', 'Reading your lists…');
+  if (!imp.view) impEl('imp-lists').innerHTML = stateBlock('loading', imp.forUser ? `Reading ${impForName()}'s lists…` : 'Reading your lists…');
+  const forUser = imp.forUser;
   try {
     const response = await impFetch('/api/admin/imports');
     const body = await response.json().catch(() => ({}));
+    // A pick changed while this was read: the newer read shows its own person.
+    if (imp.forUser !== forUser) return;
     if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
     imp.view = body.overview;
     imp.user = body.user;
@@ -6869,7 +7378,7 @@ async function loadImports() {
     impEl('imp-lists').innerHTML = stateBlock('error', error.message);
   }
   // Live while something is moving and the page is open.
-  const moving = imp.view && (imp.view.reading?.busy || imp.view.trickle?.queued > 0 || imp.view.trickle?.downloading > 0);
+  const moving = imp.view && (imp.view.trickle?.queued > 0 || imp.view.trickle?.downloading > 0);
   if (moving && document.querySelector('section[data-pane="imports"].active')) imp.timer = setTimeout(loadImports, 3000);
 }
 
@@ -6884,37 +7393,9 @@ function impWhen(utc) {
 function renderImports() {
   const view = imp.view;
   if (!view) return;
-  const spotify = view.spotify;
-
   const problem = impEl('imp-library-problem');
   problem.hidden = !view.libraryProblem;
   if (view.libraryProblem) problem.textContent = view.libraryProblem;
-
-  // The account.
-  impEl('imp-redirect-shown').textContent = spotify.redirectUri;
-  impEl('imp-account-title').textContent = spotify.connected ? `Connected as ${spotify.account}`
-    : spotify.problem ? 'Sign in again' : 'Not connected';
-  let line;
-  if (!spotify.configured) line = 'Add your Spotify app\'s Client ID below first. The steps are under "Set up your Spotify app".';
-  else if (spotify.redirectProblem) line = `The redirect URI will not work: ${spotify.redirectProblem}`;
-  else if (spotify.problem) line = spotify.problem;
-  else if (spotify.connected) line = `Spotify ends this sign-in on ${new Date(spotify.endsUtc).toLocaleDateString()}, six months after it was made; connect again then.`;
-  else line = 'Connect opens Spotify in a new tab to allow Octo to read your library.';
-  impEl('imp-account-line').textContent = line;
-  impEl('imp-connect').textContent = spotify.connected ? 'Connect again' : 'Connect Spotify';
-  impEl('imp-connect').disabled = !spotify.configured || !!spotify.redirectProblem;
-  impEl('imp-connect').classList.toggle('btn-primary', !spotify.connected);
-  impEl('imp-read').hidden = !spotify.connected;
-  impEl('imp-read').disabled = !!view.reading?.busy;
-  impEl('imp-disconnect').hidden = !spotify.connected && !spotify.problem;
-  impEl('imp-paste-row').hidden = !imp.waitingForPaste || spotify.octoFinishes;
-  impEl('imp-guide').open = !spotify.configured;
-
-  const reading = impEl('imp-reading');
-  const read = view.reading;
-  reading.hidden = !read?.busy && !read?.error;
-  reading.classList.toggle('imp-error', !!read?.error);
-  reading.textContent = read?.busy ? `${read.step}…` : read?.error ?? '';
 
   renderImportLists();
   renderTrickle();
@@ -6924,9 +7405,9 @@ function renderImportLists() {
   const lists = imp.view.lists || [];
   const holder = impEl('imp-lists');
   if (!lists.length) {
-    holder.innerHTML = stateBlock('empty', imp.view.spotify.connected
-      ? 'No lists yet. Read again to look at your Spotify once more.'
-      : 'No lists yet. Connect Spotify, or add a link or a file.');
+    holder.innerHTML = stateBlock('empty', imp.forUser
+      ? `No lists for ${impForName()} yet. Pick where their music is now, above, to bring the first one.`
+      : 'No lists yet. Pick where your music is now, above, to bring your first one.');
     return;
   }
   holder.innerHTML = `
@@ -6948,10 +7429,11 @@ function renderImportLists() {
           coming ? `${coming} coming` : null, list.notFound ? `${list.notFound} not found` : null].filter(Boolean).join(' · ');
         return `
           <div class="config-row imp-row${imp.open === list.id ? ' picked' : ''}">
-            <span class="key"><button type="button" class="link-btn imp-name" data-imp-open="${esc(list.id)}">${esc(list.name)}</button>
+            <span class="key imp-list-name">${impLogo(list.source === 'file' ? 'file' : 'spotify', 'imp-logo-s')}<span class="imp-list-words">
+              <button type="button" class="link-btn imp-name" data-imp-open="${esc(list.id)}">${esc(list.name)}</button>
               <span class="lossy-sub">${esc(sub)}</span>
               ${list.partial ? `<span class="lossy-detail">${esc(list.partial)}</span>` : ''}
-              ${list.playlistNote ? `<span class="lossy-detail">${esc(list.playlistNote)}</span>` : ''}</span>
+              ${list.playlistNote ? `<span class="lossy-detail">${esc(list.playlistNote)}</span>` : ''}</span></span>
             <span><span class="lossy-sub">${esc(counts)}</span><span class="lossy-meter"><span style="width:${pct}%"></span></span></span>
             <span class="imp-switch-cell"><span class="imp-cell-label">Keep as playlist</span><label class="switch" title="Keep as playlist"><input type="checkbox" data-imp-playlist="${esc(list.id)}" ${list.keepPlaylist ? 'checked' : ''}
               aria-label="Keep ${esc(list.name)} as a Navidrome playlist" /><span class="sw-track"></span><span class="sw-thumb"></span></label></span>
@@ -7076,98 +7558,48 @@ function renderTrickle() {
   impEl('imp-trickle-rows').innerHTML = sections.join('');
 }
 
-impEl('imp-connect')?.addEventListener('click', async event => {
-  const button = event.currentTarget;
-  // Opened before the answer, inside the click, so the browser does not block the new tab.
-  const tab = window.open('', '_blank');
-  const { ok, answer } = await impPost('/api/admin/imports/spotify/connect', {}, null);
-  if (!ok || !answer.url) {
-    tab?.close();
-    note(button, answer.message || 'Spotify could not be opened.', 'error');
-    return;
-  }
-  if (tab) tab.location.href = answer.url; else location.href = answer.url;
-  imp.waitingForPaste = !imp.view?.spotify?.octoFinishes;
-  renderImports();
-  if (imp.waitingForPaste) impEl('imp-paste').focus();
-  else imp.timer = setTimeout(loadImports, 4000);
-});
-
-impEl('imp-finish')?.addEventListener('click', async event => {
-  const address = impEl('imp-paste').value.trim();
-  if (!address) { note(event.currentTarget, 'Paste the address first.', 'error'); return; }
-  event.currentTarget.disabled = true;
-  const { ok } = await impPost('/api/admin/imports/spotify/finish', { address }, event.currentTarget);
-  event.currentTarget.disabled = false;
-  if (ok) {
-    imp.waitingForPaste = false;
-    impEl('imp-paste').value = '';
-    await loadImports();
-  }
-});
-
-impEl('imp-paste')?.addEventListener('keydown', event => {
-  if (event.key === 'Enter') { event.preventDefault(); impEl('imp-finish').click(); }
-});
-
-impEl('imp-read')?.addEventListener('click', async event => {
-  await impPost('/api/admin/imports/spotify/read', {}, event.currentTarget);
-  await loadImports();
-});
-
-impEl('imp-disconnect')?.addEventListener('click', async event => {
-  const button = event.currentTarget;
-  if (!(await askConfirm('Disconnect Spotify?', 'Your lists, playlists and fetched songs stay. Octo stops reading your Spotify.', 'Disconnect'))) return;
-  await impPost('/api/admin/imports/spotify/disconnect', {}, button);
-  await loadImports();
-});
-
 impEl('imp-link-add')?.addEventListener('click', async event => {
+  const button = event.currentTarget;
   const url = impEl('imp-link').value.trim();
-  if (!url) { note(event.currentTarget, 'Paste a link first.', 'error'); return; }
-  event.currentTarget.disabled = true;
-  note(event.currentTarget, 'Reading the link…', 'busy');
-  const { ok, answer } = await impPost('/api/admin/imports/link', { url }, event.currentTarget);
-  event.currentTarget.disabled = false;
+  if (!url) { note(button, 'Paste a link first.', 'error'); return; }
+  button.disabled = true;
+  note(button, 'Reading the link…', 'busy');
+  const { ok, answer } = await impPost('/api/admin/imports/link', { url }, null);
+  button.disabled = false;
+  note(button, ok ? '' : answer.message || answer.error || 'Octo could not read that link.', 'error');
   if (ok) {
     impEl('imp-link').value = '';
-    await loadImports();
-    if (answer.listId) await loadImportDetail(answer.listId);
+    await impFinished(answer);
   }
 });
 
-impEl('imp-file-add')?.addEventListener('click', async event => {
-  const file = impEl('imp-file').files?.[0];
-  if (!file) { note(event.currentTarget, 'Choose a file first.', 'error'); return; }
-  const form = new FormData();
-  form.append('file', file, file.name);
-  event.currentTarget.disabled = true;
-  note(event.currentTarget, 'Reading the file…', 'busy');
-  const { ok, answer } = await impPost('/api/admin/imports/file', form, event.currentTarget);
-  event.currentTarget.disabled = false;
-  if (ok) {
-    impEl('imp-file').value = '';
-    await loadImports();
-    if (answer.listId) await loadImportDetail(answer.listId);
-  }
+impEl('imp-link')?.addEventListener('keydown', event => {
+  if (event.key === 'Enter') { event.preventDefault(); impEl('imp-link-add').click(); }
 });
+
+function impPasteCount() {
+  const lines = impEl('imp-paste-text').value.split(/\r?\n/).filter(line => line.trim()).length;
+  impEl('imp-paste-count').textContent = lines ? impCount(lines, 'song') : '';
+}
+impEl('imp-paste-text')?.addEventListener('input', impPasteCount);
 
 impEl('imp-paste-add')?.addEventListener('click', async event => {
+  const button = event.currentTarget;
   const text = impEl('imp-paste-text').value;
-  if (!text.trim()) { note(event.currentTarget, 'Paste a list first.', 'error'); return; }
+  if (!text.trim()) { note(button, 'Paste a list first.', 'error'); return; }
   const name = impEl('imp-paste-name').value.trim();
-  event.currentTarget.disabled = true;
-  note(event.currentTarget, 'Reading the list…', 'busy');
-  const { ok, answer } = await impPost('/api/admin/imports/text', { name, text }, event.currentTarget);
-  event.currentTarget.disabled = false;
+  button.disabled = true;
+  note(button, 'Reading the list and checking your library…', 'busy');
+  const { ok, answer } = await impPost('/api/admin/imports/text', { name, text }, null);
+  button.disabled = false;
+  note(button, ok ? '' : answer.message || answer.error || 'Octo could not read that list.', 'error');
   if (ok) {
     impEl('imp-paste-text').value = '';
     impEl('imp-paste-name').value = '';
-    await loadImports();
-    if (answer.listId) await loadImportDetail(answer.listId);
+    impPasteCount();
+    await impFinished(answer);
   }
 });
-
 impEl('imp-lists')?.addEventListener('click', async event => {
   const open = event.target.closest('[data-imp-open]');
   if (open) { await loadImportDetail(open.dataset.impOpen); return; }
@@ -7251,7 +7683,7 @@ impEl('imp-trickle-rows')?.addEventListener('click', async event => {
   await loadImports();
 });
 
-// A saved Client ID or redirect URI changes what Connect can do, so the page reads itself again.
+// Saved import settings change what the page shows, so it reads itself again.
 impEl('imports-form')?.addEventListener('submit', () => setTimeout(loadImports, 800));
 
 // ────────────────────────────────────────────────────────────────
@@ -7383,6 +7815,7 @@ function healthFixes(check) {
   if (check.check === 'noCover' && can.addCover) all = check.fixAllLabel;
   if (check.check === 'noLength' && can.upgrade) all = check.fixAllLabel;
   if (['noYear', 'noGenre', 'noAlbumArtist'].includes(check.check) && can.edit && check.fixAllLabel) all = check.fixAllLabel;
+  if (check.check === 'tags' && can.edit && check.fixAllLabel) all = check.fixAllLabel;
   return { all, lookUp, busy };
 }
 
@@ -7395,12 +7828,13 @@ function healthWhyNot(check, fixes) {
   if (check.check === 'noCover' && !can.addCover) return 'This server cannot look covers up.';
   if (['noYear', 'noGenre', 'noAlbumArtist'].includes(check.check) && can.edit && !check.fixAllLabel)
     return 'No song here has an album that agrees on it, so they can only be looked up.';
+  if (check.check === 'tags' && can.edit && check.noneSure) return check.noneSure;
   return '';
 }
 
 function healthSection(check) {
   const fixes = healthFixes(check);
-  const fixable = fixes.all || fixes.lookUp;
+  const fixable = fixes.all || fixes.lookUp || (check.check === 'tags' && healthReport.can?.edit);
   const whyNot = healthWhyNot(check, fixes);
   const buttons = [
     fixes.lookUp ? `<button class="btn btn-ghost" type="button" data-health-lookup-all="${check.check}"${fixes.busy ? ' disabled' : ''}>${icon('i-magnifying-glass')}<span>${esc(fixes.lookUp)}</span></button>` : '',
@@ -7423,11 +7857,28 @@ function healthSection(check) {
           </div>
           ${buttons ? `<div class="set-ctrl health-ctrl">${buttons}</div>` : ''}
         </div>
+        ${check.check === 'tags' ? healthTagCheckRow() : ''}
+        ${healthKeepRatedRow(check)}
         <div class="set-row stack health-preview" id="health-preview-${check.check}" hidden></div>
       </div>
       ${healthItems(check)}
     </div>`;
 }
+
+// The switch beside Fix on the duplicates page, saved as a setting the moment it changes.
+function healthKeepRatedRow(check) {
+  if (check.check !== 'duplicates' || !check.keepRatedLabel || !(healthReport.can || {}).remove) return '';
+  return `<div class="set-row">
+          <div class="set-info">
+            <div class="set-info-t" id="health-keep-rated-label">${esc(check.keepRatedLabel)}</div>
+            <div class="set-info-d" id="health-keep-rated-meaning">${esc(check.keepRatedMeaning)}</div>
+            <div class="set-info-more">${esc(check.keepRatedMore)}</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="health-keep-rated" aria-labelledby="health-keep-rated-label" aria-describedby="health-keep-rated-meaning"${check.keepRated ? ' checked' : ''} /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+        </div>`;
+}
+
+const healthKeepRated = () => !!healthReport?.checks.find(check => check.check === 'duplicates')?.keepRated;
 
 function healthMore(check, total) {
   const shown = healthShown[check] ?? healthPage(check);
@@ -7484,6 +7935,7 @@ function healthItems(check) {
     }).join('');
     return `<div class="health-groups">${cards}</div>${healthMore(check.check, check.albums.length)}`;
   }
+  if (check.check === 'tags') return healthTagItems(check);
   const fills = new Map((check.fills || []).map(fill => [fill.id, fill]));
   const rows = check.songs.slice(0, shown).map(id => {
     const song = healthSong(id);
@@ -7498,6 +7950,37 @@ function healthItems(check) {
     return healthRow(song, extra, buttons ? `<div class="health-actions">${buttons}</div>` : '');
   }).join('');
   return `<div class="dl-list health-songs">${rows}</div>${healthMore(check.check, check.songs.length)}`;
+}
+
+// The tag check's line, with Pause and Start over, as the Library actions card shows it.
+function healthTagCheckRow() {
+  const t = healthReport.tagCheck;
+  if (!t) return '';
+  return `<div class="set-row">
+    <div class="set-info"><div class="set-info-t">Tag check</div><div class="set-info-d">${esc(tagCheckWords(t, true))}</div></div>
+    <button class="btn btn-ghost" type="button" data-tag-check="toggle" data-paused="${t.paused ? 'true' : 'false'}"${t.perHour === 0 ? ' disabled' : ''}><span>${t.paused ? 'Start' : 'Pause'}</span></button>
+    <button class="btn btn-ghost" type="button" data-tag-check="reset">${icon('i-arrow-counter-clockwise')}<span>Start over</span></button>
+  </div>`;
+}
+
+// Each song the tag check found: what its audio is, what disagrees, what the fix writes.
+function healthTagItems(check) {
+  const shown = healthShown[check.check] ?? healthPage(check.check);
+  const can = healthReport.can || {};
+  const off = healthReport.run?.state === 'running' ? ' disabled' : '';
+  const rows = check.items.slice(0, shown).map(item => {
+    const song = healthSong(item.id);
+    const heard = item.heard ? `<div class="dl-sub">The audio is ${esc(item.heard)}.</div>` : '';
+    const rules = item.rules.map(rule => `<div class="dl-sub"><strong>${esc(rule.label)}.</strong> ${esc(rule.words)}</div>`).join('');
+    const writes = item.changes.length
+      ? `<div class="dl-sub">Writes ${esc(item.changes.map(change => change.words).join('; '))}.</div>`
+      : '<div class="dl-sub">The audio does not say what to write, so this one waits for you.</div>';
+    const badge = item.sure ? '<span class="dl-badge good">Sure</span>' : '';
+    const use = can.edit && item.changes.length
+      ? `<button class="btn btn-ghost btn-sm" type="button" data-health-tags-use="${esc(item.id)}"${off}>${esc(check.useLabel)}</button>` : '';
+    return healthRow(song, heard + rules + writes, `${badge}${use ? `<div class="health-actions">${use}</div>` : ''}`);
+  }).join('');
+  return `<div class="dl-list health-songs">${rows}</div>${healthMore(check.check, check.items.length)}`;
 }
 
 // A song row, as Fetched songs draws one: its title, who and where, then what can be done.
@@ -7533,6 +8016,7 @@ function closeHealthPreview(check) {
 async function openHealthPreview(check, request) {
   const holder = healthPreviewHolder(check);
   if (!holder) return;
+  if (check === 'duplicates' && request.keepRated === undefined) request = { ...request, keepRated: healthKeepRated() };
   holder.hidden = false;
   holder.innerHTML = stateBlock('loading', 'Working out what this would change…');
   holder.scrollIntoView({ block: 'nearest', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
@@ -7565,10 +8049,12 @@ function renderHealthPreview(check) {
   let detail = '';
   if (data.sets) {
     const one = data.sets.length === 1;
-    detail = healthLines(data.sets.map(set => `<div class="health-plan">
+    const skipped = data.skippedLine ? `<div class="set-info-d"><strong>${esc(data.skippedLine)}</strong></div>` : '';
+    detail = skipped + healthLines(data.sets.map(set => `<div class="health-plan">
       <div class="set-info-t">${esc(set.heading)}</div>
       <div class="set-info-d">${esc(one ? set.why : set.line)}${set.note ? ` ${esc(set.note)}` : ''}</div>
-      ${one ? healthDuplicateDetail(set, preview.request) : ''}
+      ${healthStaysAndGoes(set)}
+      ${one && !set.skipped ? healthDuplicateDetail(set, preview.request) : ''}
     </div>`));
   } else if (data.albums) {
     detail = healthLines(data.albums.map(album => `<div class="health-plan">
@@ -7592,6 +8078,15 @@ function renderHealthPreview(check) {
     ${why}
     <div class="health-plans">${detail}</div>
     ${healthPreviewButtons(check, data.canFix === false ? null : data.go, steps > 0 || !!data.upgrade)}`;
+}
+
+// Every copy of one set by name, in what stays and what goes to the trash, with who starred or
+// rated it.
+function healthStaysAndGoes(set) {
+  if (!set.kept) return '';
+  const line = copy => `<li><span>${esc(copy.name)}</span>${copy.album ? ` <span class="dl-dash">·</span> ${esc(copy.album)}` : ''}${copy.marks ? ` <span class="dl-badge good">${esc(copy.marks)}</span>` : ''}${copy.soundMovesIn ? ' <span class="dl-badge state">its sound moves into the copy that stays</span>' : ''}</li>`;
+  const list = (title, copies) => `<div class="health-fate"><div class="set-info-d"><strong>${title}</strong></div><ul>${copies.map(line).join('')}</ul></div>`;
+  return list('Stays', set.kept) + (set.removed.length ? list('Goes to the trash', set.removed) : '');
 }
 
 // One set of copies: every tag of every copy side by side, what the kept copy ends with, the
@@ -7797,9 +8292,10 @@ function healthWriteLookups(check, holder) {
 document.getElementById('health-refresh')?.addEventListener('click', () => loadHealth({ fresh: true }));
 document.getElementById('health-result-close')?.addEventListener('click', () => { document.getElementById('health-result').hidden = true; });
 document.getElementById('health-undo')?.addEventListener('click', async event => {
-  event.currentTarget.disabled = true;
+  const button = event.currentTarget;
+  button.disabled = true;
   const { ok, data } = await healthCall('/api/admin/health/undo', {});
-  event.currentTarget.disabled = false;
+  button.disabled = false;
   if (!ok) { showHealthResult(data.error || 'Undo did not start.', false); return; }
   document.getElementById('health-result').hidden = true;
   if (healthReport) healthReport.run = data.run;
@@ -7843,6 +8339,9 @@ document.querySelector('section[data-pane="health"]')?.addEventListener('click',
     startHealthRun('/api/admin/health/lookup', { ids: [], check: d.healthLookupAll }, d.healthLookupAll);
     return;
   }
+  if (d.healthTagsUse) { openHealthPreview('tags', { keys: [d.healthTagsUse] }); return; }
+  if (d.tagCheck === 'toggle') { tagCheckToggle(target); return; }
+  if (d.tagCheck === 'reset') { tagCheckReset(target); return; }
   if (d.healthFixSet) { openHealthPreview('duplicates', { keys: [d.healthFixSet] }); return; }
   if (d.healthKeep) { openHealthPreview('duplicates', { keys: [d.healthKeep], keep: d.id }); return; }
   if (d.healthJoin) { openHealthPreview('splitAlbums', { keys: [d.healthJoin] }); return; }
@@ -7861,6 +8360,27 @@ document.querySelector('section[data-pane="health"]')?.addEventListener('click',
     }
     openHealthPreview('duplicates', request);
   }
+});
+
+// "Keep every rated copy" is saved as a setting as soon as it changes; an open preview of the
+// duplicates is worked out again with it.
+document.getElementById('health-body')?.addEventListener('change', async event => {
+  const box = event.target.closest?.('#health-keep-rated');
+  if (!box || !healthReport) return;
+  const on = box.checked;
+  box.disabled = true;
+  const { ok, data } = await healthCall('/api/admin/settings', { LibraryActions: { KeepRatedCopies: on } });
+  box.disabled = false;
+  if (!ok) {
+    box.checked = !on;
+    note(box.closest('.set-row') || box, `Not saved: ${data.error || 'the server said no'}`, 'error');
+    return;
+  }
+  const duplicates = healthReport.checks.find(check => check.check === 'duplicates');
+  if (duplicates) duplicates.keepRated = on;
+  if (currentSettings?.LibraryActions) currentSettings.LibraryActions.KeepRatedCopies = on;
+  const open = healthPreviews.duplicates;
+  if (open?.request) openHealthPreview('duplicates', { ...open.request, keepRated: on });
 });
 
 // The findings menu is one tab stop; the arrow keys, Home and End move along it.

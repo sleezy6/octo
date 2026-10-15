@@ -1,8 +1,13 @@
 //! The generated playlists and their state file, `generated-playlists.json`.
 //!
-//! Genre and decade mixes built from the listener's own library and served like radio stations
-//! (#54): per listener, read-only, under ids that start "og" so they can never be mistaken for a
-//! Navidrome playlist. Nothing is written to Navidrome.
+//! Genre, decade, year, country and artist mixes built from the listener's own library and
+//! served like radio stations: per listener, read-only, under ids that start "og" so they
+//! can never be mistaken for a Navidrome playlist. Nothing is written to Navidrome.
+//!
+//! Year mixes are counted from the same walk of the library as Made for you. Artist mixes are
+//! the listener's most played artists, each drawn once a period from the artist's own songs
+//! and the library's songs by the artists Last.fm calls similar, and kept on disk as Made for
+//! you is.
 //!
 //! Which mixes exist is decided from counts refreshed every RefreshHours, with hysteresis so a
 //! genre sitting at the threshold does not appear and vanish on alternate days. What is in a mix
@@ -24,11 +29,14 @@ use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use indexmap::IndexMap;
 use octo_core::common::{SingleFlight, dotnet};
 use octo_core::json::dom::Node;
+use octo_core::last_fm::last_fm_radio_recommendation_service::ARTIST_RADIO_NEIGHBOURS;
 use octo_core::library::for_you_lists;
 use octo_core::library::generated_playlist_service::{
-    BLEND_CANDIDATES, COUNTRY_PREFIX, FIRST_DECADE, MAX_GENRE_PAGES, POOL_PAGE, StateDocument, UserMixes,
-    active_mixes, apply_hysteresis, blend, country_mixes_on, describe, dotnet_ticks, for_you_on, is_stale,
-    kinds_of, mixes_on, parse_genres, period_index, playlist_id, seed, select, str_of, user_key,
+    ARTIST_MIX_SLACK, ARTIST_PREFIX, ArtistMix, BLEND_CANDIDATES, COUNTRY_PREFIX, FIRST_DECADE,
+    MAX_GENRE_PAGES, POOL_PAGE, StateDocument, UserMixes, YEAR_PREFIX, active_mixes, apply_hysteresis,
+    artist_mix_key, artist_mixes_on, blend, count_years, country_mixes_on, describe, dotnet_ticks,
+    for_you_on, is_stale, kept_artist_mixes, kinds_of, mixes_on, parse_genres, period_index, playlist_id,
+    seed, select, str_of, user_key, year_mixes_on,
 };
 use octo_core::models::domain::Song;
 use octo_core::models::radio::{LastFmRadioStation, LastFmRadioStationKind};
@@ -45,7 +53,7 @@ use super::artist_country::CountryLibrary;
 use super::for_you_lists::{CatalogSeed, Entry, NewReleasesBuilder, mint};
 use crate::services::family::{FamilyStore, kid_filter};
 use crate::services::framework::{DotnetDictionary, MemoryCache};
-use crate::services::last_fm::OperationCanceled;
+use crate::services::last_fm::{LastFmService, OperationCanceled};
 use crate::services::state_file;
 use crate::services::subsonic::SubsonicProxyService;
 
@@ -109,6 +117,9 @@ pub struct GeneratedPlaylistService {
     listener_songs: Mutex<HashMap<String, Arc<HashSet<String>>>>,
     /// The family, whose kid profiles get clean lists.
     family: Option<Arc<FamilyStore>>,
+    /// Last.fm, for the artists like each artist mix's own. None: artist mixes are the artist's
+    /// own songs.
+    last_fm: Option<Arc<LastFmService>>,
 }
 
 /// The services New Releases is made with: the catalog walk, and the outside song's JSON.
@@ -139,9 +150,16 @@ impl GeneratedPlaylistService {
             countries: None,
             listener_songs: Mutex::new(HashMap::new()),
             family: None,
+            last_fm: None,
         };
         service.load();
         service
+    }
+
+    /// The service with Last.fm, which names the artists like each artist mix's own.
+    pub fn with_last_fm(mut self, last_fm: Arc<LastFmService>) -> Self {
+        self.last_fm = Some(last_fm);
+        self
     }
 
     /// The service with what New Releases needs.
@@ -202,11 +220,14 @@ impl GeneratedPlaylistService {
         let listeners = self.listener_songs.lock().clone();
         let codes = settings.country_codes();
         let mut state = self.state.lock();
-        for (user, mixes) in state
-            .users
-            .iter_mut()
-            .filter(|(user, mixes)| mixes.kinds == kinds_of(&settings, self.explicit_filter_now(user)))
-        {
+        for (user, mixes) in state.users.iter_mut().filter(|(user, mixes)| {
+            mixes.kinds
+                == kinds_of(
+                    &settings,
+                    self.explicit_filter_now(user),
+                    self.skips_covers_and_instrumentals(),
+                )
+        }) {
             let Some(ids) = listeners.get(user) else {
                 continue;
             };
@@ -288,6 +309,12 @@ impl GeneratedPlaylistService {
         kid_filter::explicit_filter_for(&self.settings.current(), self.family.as_deref(), Some(username))
     }
 
+    /// Skip covers and instrumentals, which New Releases' outside songs obey as search and radio's do. Also
+    /// part of what decides the lists.
+    fn skips_covers_and_instrumentals(&self) -> bool {
+        self.settings.current().soulseek.skip_covers_and_instrumentals
+    }
+
     /// The listener's mixes, refreshing the counts behind them when they are stale. The first
     /// list ever waits a moment for them, so mixes show on a listener's first look rather than
     /// their second; later refreshes run behind the answer.
@@ -305,15 +332,23 @@ impl GeneratedPlaylistService {
         let user = user_key(username);
         let now = Utc::now();
         let explicit_filter = self.explicit_filter_now(username);
+        let skip_covers_and_instrumentals = self.skips_covers_and_instrumentals();
         let (known, due) = {
             let mut state = self.state.lock();
             let current = state.users.get(&user);
             let known = current.is_some();
-            let due = current.is_none_or(|current| is_stale(current, &settings, explicit_filter, now))
-                && state
-                    .last_attempt
-                    .get(&user)
-                    .is_none_or(|attempted| now - *attempted >= RETRY_AFTER_FAILURE);
+            let due = current.is_none_or(|current| {
+                is_stale(
+                    current,
+                    &settings,
+                    explicit_filter,
+                    skip_covers_and_instrumentals,
+                    now,
+                )
+            }) && state
+                .last_attempt
+                .get(&user)
+                .is_none_or(|attempted| now - *attempted >= RETRY_AFTER_FAILURE);
             if due {
                 state.last_attempt.insert(user.clone(), now);
             }
@@ -395,6 +430,23 @@ impl GeneratedPlaylistService {
             });
         let mixes_shown = mixes_on(settings);
         let list: Vec<GeneratedPlaylist> = for_you.collect();
+        // Artist mixes last, in rank order, each named after its artist by the name format.
+        let artists = mixes
+            .artist_mixes
+            .iter()
+            .filter(|_| mixes_shown && settings.artists)
+            .filter(|(_, mix)| !mix.songs.is_empty())
+            .map(|(key, mix)| GeneratedPlaylist {
+                id: playlist_id(username, key),
+                key: key.clone(),
+                kind: "artist".to_string(),
+                label: mix.name.clone(),
+                name: settings.name(&mix.name),
+                owner: username.trim().to_string(),
+                pool_size: i32::try_from(mix.songs.len()).unwrap_or(i32::MAX),
+                period_start_utc: start,
+                period_end_utc: end,
+            });
         list.into_iter()
             .chain(
                 mixes
@@ -405,6 +457,7 @@ impl GeneratedPlaylistService {
                         (settings.genres && key.starts_with("genre:"))
                             || (settings.decades && key.starts_with("decade:"))
                             || (settings.country_mixes && key.starts_with(COUNTRY_PREFIX))
+                            || (settings.years && key.starts_with(YEAR_PREFIX))
                     })
                     .map(|key| {
                         let (kind, label) = describe(key);
@@ -421,6 +474,7 @@ impl GeneratedPlaylistService {
                         }
                     }),
             )
+            .chain(artists)
             .collect()
     }
 
@@ -474,13 +528,23 @@ impl GeneratedPlaylistService {
                 decade += 10;
             }
         }
-        // One walk of the listener's own library, for Made for you and their country mixes.
+        // One walk of the listener's own library, for Made for you and their country, year and
+        // artist mixes.
         let countries_on = country_mixes_on(&settings) && self.countries.is_some();
-        let library = if settings.any_for_you() || countries_on {
+        let years_on = year_mixes_on(&settings);
+        let artists_on = artist_mixes_on(&settings);
+        let library = if settings.any_for_you() || countries_on || years_on || artists_on {
             self.walk_library(auth, cancellation_token).await?
         } else {
             None
         };
+        // Years from the same walk. A walk that failed keeps the year counts they had.
+        if years_on {
+            match library.as_deref() {
+                Some(songs) => counts.extend(count_years(songs)),
+                None => counts.extend(self.counts_before(username, YEAR_PREFIX)),
+            }
+        }
         // Countries from the walk every listener shares, as far as their artists are known by
         // now, counted over the listener's own songs: a pass that learns more counts them again.
         // A walk that failed keeps the country counts they had.
@@ -499,29 +563,46 @@ impl GeneratedPlaylistService {
                             &ids,
                         ));
                     }
-                    None => {
-                        if let Some(before) = self.state.lock().users.get(&user_key(username)) {
-                            counts.extend(
-                                before
-                                    .counts
-                                    .iter()
-                                    .filter(|(key, _)| key.starts_with(COUNTRY_PREFIX))
-                                    .map(|(key, count)| (key.clone(), *count)),
-                            );
-                        }
-                    }
+                    None => counts.extend(self.counts_before(username, COUNTRY_PREFIX)),
                 }
             }
         }
 
         let explicit_filter = self.explicit_filter_now(username);
+        let skip_covers_and_instrumentals = self.skips_covers_and_instrumentals();
         let before = self.state.lock().users.get(&user_key(username)).cloned();
+        // The artist mixes read the walk once into an index, off the async threads, and draw every
+        // artist's mix from it.
+        let (library, artist_index) = match library {
+            Some(songs) if artists_on => {
+                let (songs, index) = tokio::task::spawn_blocking(move || {
+                    let index = for_you_lists::ArtistIndex::new(&songs);
+                    (songs, index)
+                })
+                .await?;
+                (Some(songs), Some(index))
+            }
+            library => (library, None),
+        };
+        let artist_mixes = if artists_on {
+            self.build_artist_mixes(
+                username,
+                library.as_deref().zip(artist_index.as_ref()),
+                &settings,
+                before.as_ref(),
+                cancellation_token,
+            )
+            .await?
+        } else {
+            IndexMap::new()
+        };
         let (for_you, covers) = if settings.any_for_you() {
             self.build_for_you(
                 username,
                 library,
                 &settings,
                 explicit_filter,
+                skip_covers_and_instrumentals,
                 before.as_ref(),
                 cancellation_token,
             )
@@ -545,9 +626,10 @@ impl GeneratedPlaylistService {
                     active,
                     counts: counts.clone(),
                     counts_utc: Utc::now(),
-                    kinds: kinds_of(&settings, explicit_filter),
+                    kinds: kinds_of(&settings, explicit_filter, skip_covers_and_instrumentals),
                     for_you,
                     for_you_covers: covers,
+                    artist_mixes,
                 },
             );
             self.save_locked(&state);
@@ -560,6 +642,121 @@ impl GeneratedPlaylistService {
         Ok(true)
     }
 
+    /// The counts the listener's last refresh made for one kind of mix, by its key's prefix.
+    fn counts_before(&self, username: &str, prefix: &str) -> Vec<(String, i32)> {
+        self.state
+            .lock()
+            .users
+            .get(&user_key(username))
+            .map(|before| {
+                before
+                    .counts
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(prefix))
+                    .map(|(key, count)| (key.clone(), *count))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The listener's artist mixes for this period, from their walk and its
+    /// [`for_you_lists::ArtistIndex`] (None when the walk failed, which keeps the artist mixes
+    /// they had): their most played artists by [`kept_artist_mixes`], each drawn again from
+    /// their own songs and the songs of the artists Last.fm calls like them.
+    async fn build_artist_mixes(
+        &self,
+        username: &str,
+        walk: Option<(&[Node], &for_you_lists::ArtistIndex)>,
+        settings: &GeneratedPlaylistSettings,
+        before: Option<&UserMixes>,
+        cancellation_token: &CancellationToken,
+    ) -> anyhow::Result<IndexMap<String, ArtistMix>> {
+        let previous = before
+            .map(|before| before.artist_mixes.clone())
+            .unwrap_or_default();
+        let Some((library, index)) = walk else {
+            return Ok(previous);
+        };
+        let count = usize::try_from(settings.effective_artist_count()).unwrap_or(1);
+        let ranked = for_you_lists::top_artists(library, count + ARTIST_MIX_SLACK);
+        let keys: Vec<String> = ranked.iter().map(|artist| artist_mix_key(&artist.key)).collect();
+        let began: IndexMap<String, DateTime<Utc>> = previous
+            .iter()
+            .map(|(key, mix)| (key.clone(), mix.since))
+            .collect();
+        let now = Utc::now();
+        let period = period_index(now, settings.effective_refresh_hours());
+        let mut mixes: IndexMap<String, ArtistMix> = IndexMap::new();
+        for key in kept_artist_mixes(&keys, &began, count, now) {
+            if cancellation_token.is_cancelled() {
+                return Err(OperationCanceled.into());
+            }
+            let artist = key.strip_prefix(ARTIST_PREFIX).unwrap_or_default();
+            let name = ranked
+                .iter()
+                .find(|ranked| ranked.key == artist)
+                .map(|ranked| ranked.name.clone())
+                .or_else(|| previous.get(&key).map(|mix| mix.name.clone()))
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let similar = self.similar_artists(&name).await;
+            let songs = for_you_lists::artist_mix_in(
+                library,
+                index,
+                artist,
+                &similar,
+                usize::try_from(settings.effective_track_count()).unwrap_or(0),
+                settings.effective_max_per_artist(),
+                seed(username, &key, period),
+            );
+            // An artist whose songs have all left the library has no mix.
+            if songs.is_empty() {
+                continue;
+            }
+            mixes.insert(
+                key.clone(),
+                ArtistMix {
+                    name,
+                    since: began.get(&key).copied().unwrap_or(now),
+                    songs: songs.iter().map(|song| song.to_json_string(false)).collect(),
+                },
+            );
+        }
+        Ok(mixes)
+    }
+
+    /// The artists Last.fm calls like `artist`, by name; none without a Last.fm key or when
+    /// Last.fm does not answer. Asked for as many as the artist stations ask for, so the two
+    /// share Last.fm's answer.
+    async fn similar_artists(&self, artist: &str) -> Vec<String> {
+        let Some(last_fm) = self.last_fm.as_ref().filter(|last_fm| last_fm.has_api_key()) else {
+            return Vec::new();
+        };
+        last_fm
+            .get_similar_artists(artist, ARTIST_RADIO_NEIGHBOURS)
+            .await
+            .map(|similar| similar.into_iter().map(|similar| similar.name).collect())
+            .unwrap_or_default()
+    }
+
+    /// An artist mix's songs as stored for this period.
+    fn stored_artist_mix(&self, username: &str, key: &str) -> Vec<Node> {
+        self.state
+            .lock()
+            .users
+            .get(&user_key(username))
+            .and_then(|state| state.artist_mixes.get(key))
+            .map(|mix| {
+                mix.songs
+                    .iter()
+                    .filter_map(|song| Node::parse(song).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Made for you, from one walk of the listener's library as they see it (None when it
     /// failed). A list that could not be made this time (Navidrome or the catalog not answering)
     /// keeps what it had, so a bad day never empties it.
@@ -569,6 +766,7 @@ impl GeneratedPlaylistService {
         library: Option<Vec<Node>>,
         settings: &GeneratedPlaylistSettings,
         explicit_filter: ExplicitFilter,
+        skip_covers_and_instrumentals: bool,
         before: Option<&UserMixes>,
         cancellation_token: &CancellationToken,
     ) -> anyhow::Result<(IndexMap<String, Vec<String>>, Vec<String>)> {
@@ -654,6 +852,7 @@ impl GeneratedPlaylistService {
                             settings.effective_new_release_weeks(),
                             cancellation_token,
                             explicit_filter,
+                            skip_covers_and_instrumentals,
                         )
                         .await?;
                     if built.entries.is_empty() && !built.whole {
@@ -795,6 +994,9 @@ impl GeneratedPlaylistService {
         if for_you_lists::is_for_you(&playlist.kind) {
             return Ok(self.stored_for_you(username, &playlist.kind));
         }
+        if playlist.key.starts_with(ARTIST_PREFIX) {
+            return Ok(self.stored_artist_mix(username, &playlist.key));
+        }
         let cache_key = draw_key(username, playlist);
         if let Some(cached) = self.drawn.get(&cache_key) {
             return Ok(cached.as_ref().clone());
@@ -819,6 +1021,20 @@ impl GeneratedPlaylistService {
                 ("size", POOL_PAGE.to_string()),
                 ("fromYear", decade.to_string()),
                 ("toYear", (decade + 9).to_string()),
+            ];
+            pool.extend(
+                self.fetch_songs(auth, "rest/getRandomSongs", "randomSongs", &extra)
+                    .await
+                    .unwrap_or_default(),
+            );
+        } else if let Some(year) = playlist.key.strip_prefix(YEAR_PREFIX) {
+            let year: i32 = year.parse().map_err(|_| {
+                anyhow::anyhow!("The input string '{}' was not in a correct format.", playlist.key)
+            })?;
+            let extra = [
+                ("size", POOL_PAGE.to_string()),
+                ("fromYear", year.to_string()),
+                ("toYear", year.to_string()),
             ];
             pool.extend(
                 self.fetch_songs(auth, "rest/getRandomSongs", "randomSongs", &extra)
@@ -876,12 +1092,15 @@ impl GeneratedPlaylistService {
         if for_you_lists::is_for_you(&playlist.kind) {
             return Some(self.stored_for_you(username, &playlist.kind));
         }
+        if playlist.key.starts_with(ARTIST_PREFIX) {
+            return Some(self.stored_artist_mix(username, &playlist.key));
+        }
         self.drawn
             .get(&draw_key(username, playlist))
             .map(|cached| cached.as_ref().clone())
     }
 
-    /// Keep MIX_NEW_SHARE percent of Discovery Mix for library songs new to the listener.
+    /// Keep MIX_NEW_SHARE percent of Discovery Radio for library songs new to the listener.
     /// Discovery is otherwise all outside the library, so what someone added and never played was
     /// the one thing it could not surface. The station's songs come back as they were when there
     /// is nothing to put in.

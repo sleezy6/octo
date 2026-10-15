@@ -675,6 +675,56 @@ async fn the_app_signs_its_admin_calls_with_its_subsonic_sign_in() {
     );
 }
 
+/// The app's server update panel: a Navidrome admin reads the update card and starts Update now
+/// with the app's own sign-in; a listener reaches neither.
+#[tokio::test]
+async fn an_admin_app_reads_the_update_card_and_asks_for_an_update() {
+    let factory = SignInFactory::new().await;
+    let card = get(&factory.app, "/api/admin/update?u=admin&p=pw&v=1.16.1&c=test").await;
+    assert_eq!(card.status, StatusCode::OK);
+    assert!(card.json().get("running").is_some(), "{}", card.text());
+    assert!(card.json().get("updateAvailable").is_some(), "{}", card.text());
+    assert_eq!(
+        get(&factory.app, "/api/admin/update?u=listener&p=pw&v=1.16.1&c=test")
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // Past the gate, the update endpoint itself answers: nothing newer is known here.
+    let ask = admin_write(
+        &factory.app,
+        Method::POST,
+        "/api/admin/update?u=admin&p=pw&v=1.16.1&c=test",
+        Some(r#"{"tag":"2099.01.01"}"#),
+    )
+    .await;
+    assert_eq!(ask.status, StatusCode::CONFLICT, "{}", ask.text());
+    assert_eq!(
+        admin_write(
+            &factory.app,
+            Method::POST,
+            "/api/admin/update?u=listener&p=pw&v=1.16.1&c=test",
+            Some(r#"{"tag":"2099.01.01"}"#),
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    // Asking GitHub again stays the dashboard's.
+    assert_eq!(
+        admin_write(
+            &factory.app,
+            Method::POST,
+            "/api/admin/update/check?u=admin&p=pw&v=1.16.1&c=test",
+            None,
+        )
+        .await
+        .status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
 #[tokio::test]
 async fn a_listener_sees_and_rebuilds_only_their_own_stations() {
     let factory = SignInFactory::new().await;

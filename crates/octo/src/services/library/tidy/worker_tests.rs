@@ -331,6 +331,27 @@ async fn preview_writes_nothing() {
     assert_eq!(rig.navidrome.starts(), 0);
 }
 
+#[tokio::test]
+async fn a_semicolon_credit_naming_the_title_guest_is_left_as_it_is() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    let source = rig.song(
+        "SAYGRACE/You Don't Own Me/You Don't Own Me.flac",
+        "SAYGRACE; G\u{2010}Eazy",
+        &[],
+        "You Don't Own Me (feat. G-Eazy)",
+    );
+    let bytes = std::fs::read(&source).expect("read");
+
+    rig.preview(WHOLE).await;
+    let plan = rig.worker.store().plan().expect("the plan is kept");
+    assert!(!plan.plan.rows.iter().any(|row| row.kind == TidyKind::Guest));
+    assert!(plan.plan.retags.is_empty());
+    rig.apply(WHOLE, &[]).await;
+
+    assert_eq!(std::fs::read(&source).expect("read"), bytes);
+    assert!(tags(&source).artists.is_empty());
+}
+
 // ---- apply ----------------------------------------------------------------------------------
 
 #[tokio::test]

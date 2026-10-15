@@ -1,11 +1,7 @@
-//! octoImports v1, the Spotify import page for the Octo apps, the same lists and trickle the
-//! dashboard shows, for whoever the app signed in as. Every call checks the caller's sign-in with
-//! Navidrome first, as getUpgrades does, and answers JSON. Version 2 adds getImportServices (where to export a library to a file),
-//! importFile and importText.
-//!
-//! The Spotify sign-in from an app: importAction connect with the app's own loopback redirect
-//! (`http://127.0.0.1:port/path`) gives the address to open; the app's loopback page catches
-//! Spotify's answer and sends its code and state back with importAction finish.
+//! octoImports v1, the import page for the Octo apps, the same lists and trickle the dashboard
+//! shows, for whoever the app signed in as. Every call checks the caller's sign-in with Navidrome
+//! first, as getUpgrades does, and answers JSON. Version 2 adds getImportServices (where to
+//! export a library to a file), importFile and importText.
 
 use axum::extract::{DefaultBodyLimit, FromRequest, Request, State};
 use axum::http::header;
@@ -248,9 +244,9 @@ fn answer_action(state: &AppState, call: &str, result: &ImportActionResult) -> A
     Ok(octo_answer(state, "importAction", to_value(result)?).into_response())
 }
 
-/// One thing to do: connect (redirect), finish (code and state), disconnect, read, addLink (url),
-/// playlist (id, on), fetch (id, on), songs (id, key...), refresh (id), remove (id), pause,
-/// resume, retry (key... or none for every song not found), skip (key...), clear.
+/// One thing to do: addLink (url), playlist (id, on), fetch (id, on), songs (id, key...), refresh
+/// (id), remove (id), pause, resume, retry (key... or none for every song not found), skip
+/// (key...), clear.
 pub async fn import_action(State(state): State<AppState>, req: Request) -> AppResult {
     let call = match SubsonicCall::read(&state, req).await {
         Ok(call) => call,
@@ -266,34 +262,11 @@ pub async fn import_action(State(state): State<AppState>, req: Request) -> AppRe
     let keys = call.incoming.parameter_values("key");
     let imports = state.imports.clone();
     // Slow work is not tied to the request: an app that gives up must not leave a list half done.
-    let (redirect, address, code, sign_in_state, url) = (
-        call.param_opt("redirect").map(str::to_string),
-        call.param_opt("address").map(str::to_string),
-        call.param_opt("code").map(str::to_string),
-        call.param_opt("state").map(str::to_string),
-        call.param("url").to_string(),
-    );
+    let url = call.param("url").to_string();
     let (who, what) = (user.clone(), action.clone());
     let result: ImportActionResult = tokio::spawn(async move {
         let user = who;
         anyhow::Ok(match to_lower_invariant(&what).as_str() {
-            "connect" => imports.begin_spotify(&user, redirect.as_deref()),
-            "finish" => {
-                imports
-                    .finish_spotify(
-                        address.as_deref(),
-                        code.as_deref(),
-                        sign_in_state.as_deref(),
-                        Some(&user),
-                    )
-                    .await?
-            }
-            "disconnect" => imports.disconnect_spotify(&user),
-            "read" => ImportActionResult::ok(if imports.start_reading(&user) {
-                "Reading your Spotify lists again."
-            } else {
-                "Octo is already reading your Spotify lists."
-            }),
             "addlink" => imports.add_link(&user, &url).await?,
             "playlist" => imports.set_playlist(&user, &id, on).await,
             "fetch" => imports.set_get_missing(&user, &id, on),

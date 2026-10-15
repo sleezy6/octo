@@ -805,6 +805,14 @@ fn spec_names_the_list_and_says_what_it_is() {
         ("Late Night Jazz", list_kinds::RADIO, "Late Night Jazz", "Station"),
         ("Rock Mix", list_kinds::MIX, "Rock", "Mix"),
         ("1990s Mix", list_kinds::MIX, "1990s", "Mix"),
+        ("1994 Mix", list_kinds::MIX, "1994", "Mix"),
+        ("Radiohead Mix", list_kinds::MIX, "Radiohead", "Mix"),
+        (
+            "Tyler, The Creator Mix",
+            list_kinds::MIX,
+            "Tyler, The Creator",
+            "Mix",
+        ),
         ("Late Night Jazz", list_kinds::MIX, "Late Night Jazz", "Mix"),
     ];
     for (name, kind, title, line) in cases {
@@ -858,6 +866,8 @@ fn a_mix_named_mix_reads_as_two_lines_whatever_its_kind() {
         ("Bad Bunny Radio", list_kinds::RADIO, "Bad Bunny", Some("Station")),
         ("Bad Bunny Radio", list_kinds::MIX, "Bad Bunny", Some("Station")),
         ("Your Mix", list_kinds::RADIO, "Your Mix", None),
+        ("Discovery Radio", list_kinds::RADIO, "Discovery", Some("Station")),
+        ("Your Radio", list_kinds::RADIO, "Your Radio", None),
         ("Top 50 Chart", list_kinds::MIX, "Top 50", Some("Chart")),
         // New and Trending stay bound to their kind: a mix named "Something New" keeps its name.
         ("Something New", list_kinds::MIX, "Something New", Some("Mix")),

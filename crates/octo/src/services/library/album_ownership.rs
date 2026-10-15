@@ -531,7 +531,7 @@ impl AlbumOwnership {
         let (mut asked, mut warming) = (0, 0);
         for (at, album) in &outside {
             let (title, artist) = (Some(album.title.as_str()), Some(album.artist.as_str()));
-            if !index.same_album(title, artist).is_empty() {
+            if !Self::whole_namesakes(&index, album).is_empty() {
                 continue;
             }
             let likely = index.likely(title, artist);
@@ -591,7 +591,7 @@ impl AlbumOwnership {
         let standings: Vec<Standing> = outside
             .iter()
             .map(|(at, album)| {
-                let same_name = index.same_album(Some(&album.title), Some(&album.artist));
+                let same_name = Self::whole_namesakes(&index, album);
                 if !same_name.is_empty() {
                     return Standing {
                         index: *at,
@@ -627,6 +627,25 @@ impl AlbumOwnership {
             clock.elapsed().as_millis()
         );
         standings
+    }
+
+    /// Library albums with the catalog album's very name and artist, when together they hold at
+    /// least half the songs it lists; otherwise none. One song hearted from "Real Deal" files a
+    /// one-song "Real Deal", and that is not the album: the catalog's must still be listed (and
+    /// hearted) beside it. Half, not all, because Navidrome splits one album by album artist
+    /// ("$ome $exy $ongs 4 U" as 15 and 5 of 21), and those parts are still the album. With no
+    /// song count to go on, any namesake is the album, as before.
+    fn whole_namesakes(index: &LibraryAlbumIndex, album: &Album) -> Vec<Arc<LibraryAlbum>> {
+        let named = index.same_album(Some(&album.title), Some(&album.artist));
+        let Some(count) = album.song_count.filter(|count| *count > 0) else {
+            return named;
+        };
+        let held: usize = named.iter().map(|namesake| namesake.songs.len()).sum();
+        if held * 2 >= count as usize {
+            named
+        } else {
+            Vec::new()
+        }
     }
 
     /// What the library holds of a catalog album, song by song (`Judge`).

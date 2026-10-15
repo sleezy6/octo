@@ -12,6 +12,9 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::Response;
 use axum::routing::{get, post};
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use futures::stream::{self, StreamExt};
 use indexmap::IndexMap;
 use octo_core::common::dotnet::{eq_ignore_case, is_blank, to_lower_invariant, utf16_len};
 use serde::Deserialize;
@@ -28,12 +31,15 @@ use crate::services::health::health_fixes::{
     self as fixes, AlbumJoin, DuplicateFix, FixStep, TagChange, fix_actions,
 };
 use crate::services::health::health_words as words;
-use crate::services::health::keep_marks::{self, TargetPick};
+use crate::services::health::keep_marks::{self, PlaylistUses, SetMarks};
 use crate::services::health::library_health::{
     self as health, DuplicateSet, HealthCheck, HealthTag, SplitAlbum,
 };
 use crate::services::health::library_health_service::Row;
-use crate::services::health::{HealthRun, IHealthFields, LibraryHealthService, ServerSongFields};
+use crate::services::health::{
+    HealthAbilities, HealthRun, IHealthFields, LibraryHealthService, ServerSongFields,
+};
+use crate::services::library::library_identity_sweep::{IdentitySweepStatus, TagFinding};
 use crate::services::library::library_tag_edits::song_tag_fields;
 use crate::services::library::library_write_gate::LibraryWriteGate;
 use crate::services::library::quality_upgrade_worker::compare_ordinal;
@@ -47,6 +53,10 @@ pub fn routes() -> RouteSet {
         .route("/api/admin/health/lookup", post(lookup))
         .route("/api/admin/health/stop", post(stop))
         .route("/api/admin/health/undo", post(undo))
+        .route("/api/admin/health/tags", get(get_tags))
+        .route("/api/admin/health/tags/start", post(start_tags))
+        .route("/api/admin/health/tags/pause", post(pause_tags))
+        .route("/api/admin/health/tags/reset", post(reset_tags))
 }
 
 /// The Navidrome admin asking: signed in on the dashboard, or the app with an admin's sign-in.
@@ -114,9 +124,19 @@ async fn get_report(State(state): State<AppState>, request: Request) -> Response
         match check {
             HealthCheck::Duplicates => {
                 item.insert("fixAllLabel".into(), json!(words::fix_all_label(check, count)));
+                // The switch beside Fix: every copy someone starred or rated stays.
+                let keep_rated = state.settings.current().library_actions.keep_rated_copies;
+                item.insert("keepRated".into(), json!(keep_rated));
+                item.insert("keepRatedLabel".into(), json!(words::KEEP_RATED_LABEL));
+                item.insert("keepRatedMeaning".into(), json!(words::KEEP_RATED_MEANING));
+                item.insert("keepRatedMore".into(), json!(words::KEEP_RATED_MORE));
                 // The list shows the best-sound plan; the preview reads people's marks.
-                let marks_note = (can.edit && can.remove && health.keep_marks().is_some())
-                    .then_some(words::MARKS_PICKED_IN_PREVIEW);
+                let marks_note =
+                    (can.edit && can.remove && health.keep_marks().is_some()).then_some(if keep_rated {
+                        words::RATED_KEPT_IN_PREVIEW
+                    } else {
+                        words::MARKS_PICKED_IN_PREVIEW
+                    });
                 let sets: Vec<Value> = report
                     .duplicates
                     .iter()
@@ -212,14 +232,27 @@ async fn get_report(State(state): State<AppState>, request: Request) -> Response
         checks.push(Value::Object(item));
     }
 
+    // The server's own check: tags held against each song's audio by the library tag check.
+    let (tag_findings, tag_status) = state.library_identity_sweep.findings_and_status();
+    if !tag_findings.is_empty() {
+        checks.push(tags_check(&tag_findings));
+        used.extend(tag_findings.iter().map(|finding| finding.id.clone()));
+    }
+
     let mut by_id = Map::new();
     for song in found.songs.iter().filter(|song| used.contains(&song.id)) {
         by_id.insert(song.id.clone(), song_view(song, fields));
     }
+    for finding in &tag_findings {
+        if !by_id.contains_key(&finding.id) {
+            by_id.insert(finding.id.clone(), finding_song_view(finding));
+        }
+    }
     ok(&json!({
         "checked": report.checked,
-        "overview": words::overview(report),
-        "clean": report.clean(),
+        "overview": words::overview_and(report, usize::from(!tag_findings.is_empty())),
+        "clean": report.clean() && tag_findings.is_empty(),
+        "tagCheck": tag_check_view(&tag_status),
         "allClear": words::ALL_CLEAR,
         "readUtc": utc(&found.read_utc),
         "user": user,
@@ -248,7 +281,8 @@ async fn get_run(State(state): State<AppState>, request: Request) -> Response {
 // ---- previews ---------------------------------------------------------------------------
 
 /// `PreviewRequest(string? Check, List<string>? Keys, string? Keep, List<string>? Fills,
-/// Dictionary<string, string>? Choose)`.
+/// Dictionary<string, string>? Choose)`, and `keepRated`: whether every copy someone starred or
+/// rated stays (the saved setting when absent).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct PreviewRequest {
@@ -257,6 +291,7 @@ struct PreviewRequest {
     keep: Option<String>,
     fills: Option<Vec<String>>,
     choose: Option<IndexMap<String, String>>,
+    keep_rated: Option<bool>,
 }
 
 impl FromBody for PreviewRequest {
@@ -284,6 +319,10 @@ impl FromBody for PreviewRequest {
                 name: "choose",
                 kind: Kind::TextMap,
             },
+            Member {
+                name: "keepRated",
+                kind: Kind::Bool,
+            },
         ],
     };
 }
@@ -292,7 +331,9 @@ impl FromBody for PreviewRequest {
 /// the best copy (or `keep`) with the reason, fill blanks from the copies (only the tags in
 /// `fills` when given) and take the values picked in `choose`; split albums join onto their lead
 /// part; missing year, genre and album artist fill from the album; covers are looked for. `keys`
-/// narrows it to some sets, albums or songs. Writes nothing.
+/// narrows it to some sets, albums or songs. With `keepRated`, every copy someone starred or
+/// rated stays, only the others go, and a set where every copy is starred or rated is left out of
+/// the steps. Each set says what stays and what goes. Writes nothing.
 async fn preview(State(state): State<AppState>, request: Request) -> Response {
     let (parts, body) = split(request).await;
     let request: PreviewRequest = match bind_body(&parts, &body) {
@@ -302,6 +343,13 @@ async fn preview(State(state): State<AppState>, request: Request) -> Response {
     let Some(user) = navidrome_user(&state, &parts) else {
         return not_admin();
     };
+    if request
+        .check
+        .as_deref()
+        .is_some_and(|check| eq_ignore_case(check, TAGS))
+    {
+        return tags_preview(&state, &user, request.keys.as_deref());
+    }
     let Some(check) = parse_check(request.check.as_deref()) else {
         return error(StatusCode::BAD_REQUEST, "Say which finding to fix.");
     };
@@ -320,163 +368,134 @@ async fn preview(State(state): State<AppState>, request: Request) -> Response {
         .filter(|keys| !keys.is_empty())
         .map(|keys| keys.iter().map(String::as_str).collect());
     let picked = |key: &str| keys.as_ref().is_none_or(|keys| keys.contains(key));
-    // Which copy of each set keeps people's marks, read from Navidrome now, unless a person
-    // picked the copy to keep.
+    // Whether a copy someone starred or rated stays: the request says, else the saved setting.
+    let keep_rated = request
+        .keep_rated
+        .unwrap_or(state.settings.current().library_actions.keep_rated_copies);
     let keeping = can.edit && can.remove && check == HealthCheck::Duplicates;
-    let mut marked: HashMap<String, TargetPick> = HashMap::new();
-    if let Some(keep) = health.keep_marks().filter(|_| keeping) {
-        let sets: Vec<&DuplicateSet<Row>> = report
+    let keeper = health.keep_marks().filter(|_| keeping).cloned();
+    let sets: Vec<&DuplicateSet<Row>> = if check == HealthCheck::Duplicates {
+        report
             .duplicates
             .iter()
             .filter(|set| picked(&set_key(set)))
-            .collect();
-        if !(sets.len() == 1 && request.keep.is_some()) {
-            let uses = keep.playlist_uses().await.unwrap_or_default();
-            for set in sets {
-                if let Some(pick) = keep.pick_for(set, &uses).await {
-                    marked.insert(set_key(set), pick);
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let one = sets.len() == 1;
+    let person_pick = |set: &DuplicateSet<Row>| match (&request.keep, one) {
+        (Some(keep_id), true) => set.copies.iter().find(|copy| &copy.id == keep_id).cloned(),
+        _ => None,
+    };
+    // Every reader's marks on each copy, read from Navidrome now: always while every
+    // rated copy is kept, else unless a person picked the copy to keep.
+    let wants_marks =
+        |set: &DuplicateSet<Row>| keeper.is_some() && (keep_rated || person_pick(set).is_none());
+    let uses = match &keeper {
+        Some(keep) if sets.iter().any(|set| wants_marks(set)) => {
+            keep.playlist_uses().await.unwrap_or_default()
+        }
+        _ => PlaylistUses::default(),
+    };
+    let reads: Vec<BoxFuture<'_, Option<SetMarks>>> = sets
+        .iter()
+        .map(|set| {
+            let keep = keeper.clone().filter(|_| wants_marks(set));
+            let set: &DuplicateSet<Row> = set;
+            async move {
+                match keep {
+                    Some(keep) => Some(keep.read_set(set).await),
+                    None => None,
                 }
             }
-        }
-    }
+            .boxed()
+        })
+        .collect();
+    let marks: Vec<Option<SetMarks>> = stream::iter(reads).buffered(MARK_READS).collect().await;
     let fields = fields_of(&found.fields);
 
     match check {
         HealthCheck::Duplicates => {
-            let sets: Vec<&DuplicateSet<Row>> = report
-                .duplicates
-                .iter()
-                .filter(|set| picked(&set_key(set)))
-                .collect();
             if sets.is_empty() {
                 return gone();
             }
-            let one = sets.len() == 1;
-            let plans: Vec<(&DuplicateSet<Row>, DuplicateFix<Row>, Vec<TagChange>)> = sets
+            let plans: Vec<DuplicatePlan<'_>> = sets
                 .iter()
-                .map(|set| {
-                    let keep = match (&request.keep, one) {
-                        (Some(keep_id), true) => set.copies.iter().find(|copy| &copy.id == keep_id),
-                        _ => None,
-                    };
-                    let fix = match (keep, marked.get(&set_key(set))) {
-                        (None, Some(pick)) => keep_marks::plan(set, fields, Some(pick)),
-                        _ => fixes::duplicate_fix(set, fields, keep),
-                    };
-                    let fills: Vec<TagChange> = if !can.edit {
-                        Vec::new()
-                    } else if let (true, Some(tags)) = (one, &request.fills) {
-                        fix.fills
-                            .iter()
-                            .filter(|change| tags.contains(&change.tag))
-                            .cloned()
-                            .collect()
-                    } else {
-                        fix.fills.clone()
-                    };
-                    let chosen: Vec<TagChange> = if !can.edit || !one {
-                        Vec::new()
-                    } else {
-                        fix.differs
-                            .iter()
-                            .filter_map(|choice| {
-                                let now = choice
-                                    .values
-                                    .iter()
-                                    .find(|(id, _)| *id == fix.keep.id)
-                                    .map(|(_, value)| value.as_str());
-                                let value = request.choose.as_ref()?.get(&choice.tag)?;
-                                (Some(value.as_str()) != now
-                                    && choice.values.iter().any(|(_, other)| other == value))
-                                .then(|| TagChange::new(&choice.tag, now, value))
-                            })
-                            .collect()
-                    };
-                    let changes: Vec<TagChange> = fills.into_iter().chain(chosen).collect();
-                    (*set, fix, changes)
+                .zip(marks)
+                .map(|(set, marks)| {
+                    let picked = person_pick(set);
+                    let fix = keep_marks::plan_with_marks(
+                        set,
+                        fields,
+                        marks.as_ref(),
+                        &uses,
+                        keep_rated,
+                        picked.as_ref(),
+                    );
+                    let changes = fix
+                        .as_ref()
+                        .map(|fix| picked_changes(fix, &request, one, can.edit))
+                        .unwrap_or_default();
+                    DuplicatePlan {
+                        set,
+                        fix,
+                        changes,
+                        marks,
+                    }
                 })
                 .collect();
             let steps: Vec<Value> = plans
                 .iter()
-                .flat_map(|(_, fix, changes)| fixes::duplicate_steps(fix, fields, Some(changes)))
+                .filter_map(|plan| plan.fix.as_ref().map(|fix| (fix, &plan.changes)))
+                .flat_map(|(fix, changes)| {
+                    let mut steps = fixes::duplicate_steps(fix, fields, Some(changes));
+                    if keep_rated {
+                        fixes::only_unrated(&mut steps);
+                    }
+                    steps
+                })
                 .map(|step| step_view(&step))
                 .collect();
             let removing: usize = plans
                 .iter()
-                .map(|(_, fix, _)| fix.remove.len() + usize::from(fix.audio.is_some()))
+                .filter_map(|plan| plan.fix.as_ref())
+                .map(|fix| fix.remove.len() + usize::from(fix.audio.is_some()))
                 .sum();
+            let skipped = plans.iter().filter(|plan| plan.fix.is_none()).count();
+            let fixing = plans.len() - skipped;
             let set_views: Vec<Value> = plans
                 .iter()
-                .map(|(set, fix, changes)| {
-                    let fills: Vec<Value> = if can.edit {
-                        fix.fills.iter().map(change_view).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let differs: Vec<Value> = if can.edit {
-                        fix.differs
-                            .iter()
-                            .map(|choice| {
-                                let picked = request
-                                    .choose
-                                    .as_ref()
-                                    .and_then(|choose| choose.get(&choice.tag))
-                                    .cloned()
-                                    .or_else(|| {
-                                        choice
-                                            .values
-                                            .iter()
-                                            .find(|(id, _)| *id == fix.keep.id)
-                                            .map(|(_, value)| value.clone())
-                                    });
-                                let values: Vec<Value> = choice
-                                    .values
-                                    .iter()
-                                    .map(|(id, value)| json!({ "id": id, "value": value }))
-                                    .collect();
-                                json!({
-                                    "tag": choice.tag,
-                                    "label": fixes::tag_name(&choice.tag),
-                                    "values": values,
-                                    "picked": picked,
-                                })
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let copies: Vec<Value> = set.copies.iter().map(|copy| song_view(copy, fields)).collect();
-                    json!({
-                        "key": set_key(set),
-                        "heading": words::set_heading(set, fields),
-                        "why": fix.why,
-                        "line": fix_line(fix, changes, fields, can.edit),
-                        "note": fix.note,
-                        "keep": fix.keep.id,
-                        "copies": copies,
-                        "fills": fills,
-                        "differs": differs,
-                        "diff": if one { duplicate_diff(fix, changes, fields) } else { Value::Null },
-                    })
-                })
+                .map(|plan| duplicate_plan_view(plan, &request, one, can.edit, fields))
                 .collect();
+            // Without a way to read who starred or rated each copy, none can be promised to stay.
+            let can_fix = can.remove && (!keep_rated || keeper.is_some());
+            let why =
+                if can_fix {
+                    None
+                } else if !can.remove {
+                    Some(can.why.clone().unwrap_or_else(|| {
+                        "Removing songs is off: turn on the Delete action under Library actions.".to_string()
+                    }))
+                } else {
+                    Some(can.why.clone().unwrap_or_else(|| {
+                        "This server cannot read who starred or rated each copy.".to_string()
+                    }))
+                };
             ok(&json!({
                 "title": if one {
                     "Fix these copies".to_string()
                 } else {
-                    format!("Fix {} you have twice", words::count_text(sets.len(), "song", "songs"))
+                    format!("Fix {} you have twice", words::count_text(fixing, "song", "songs"))
                 },
                 "meaning": words::fix_meaning(check),
                 "go": format!("Move {} to the trash", words::count_text(removing, "copy", "copies")),
                 "label": "Fixing copies",
-                "canFix": can.remove,
-                "why": if can.remove {
-                    None
-                } else {
-                    Some(can.why.clone().unwrap_or_else(|| {
-                        "Removing songs is off: turn on the Delete action under Library actions.".to_string()
-                    }))
-                },
+                "canFix": can_fix,
+                "why": why,
+                "keepRated": keep_rated,
+                "skipped": skipped,
+                "skippedLine": (skipped > 0).then(|| words::skipped_rated(skipped)),
                 "sets": set_views,
                 "steps": steps,
             }))
@@ -633,6 +652,415 @@ async fn preview(State(state): State<AppState>, request: Request) -> Response {
             "Songs with no track number are looked up, not filled in: use lookup.",
         ),
     }
+}
+
+// ---- tags against the audio ------------------------------------------------------------------
+
+/// The name the page and its fixes give the tag check's finding.
+pub const TAGS: &str = "tags";
+
+/// A finding whose identity is sure and that has something to write: what Fix all sure ones
+/// takes.
+fn sure_fix(finding: &TagFinding) -> bool {
+    finding.sure && !finding.changes.is_empty()
+}
+
+/// The tag check's finding, shaped like the app's checks: its words, count, songs, and per song
+/// what the audio is, what disagrees and what Use the audio's tags writes.
+fn tags_check(findings: &[TagFinding]) -> Value {
+    let sure = findings.iter().filter(|finding| sure_fix(finding)).count();
+    let items: Vec<Value> = findings.iter().map(tag_item).collect();
+    json!({
+        "check": TAGS,
+        "title": words::TAGS_TITLE,
+        "count": findings.len(),
+        "countLabel": words::count_text(findings.len(), "song", "songs"),
+        "meaning": words::TAGS_MEANING,
+        "advice": words::TAGS_ADVICE,
+        "fixMeaning": words::TAGS_FIX_MEANING,
+        "fixAllLabel": (sure > 0).then(|| words::tags_fix_all_label(sure)),
+        "noneSure": (sure == 0).then_some(words::TAGS_NONE_SURE),
+        "useLabel": words::USE_THE_AUDIOS_TAGS,
+        "sure": sure,
+        "songs": findings.iter().map(|finding| finding.id.clone()).collect::<Vec<_>>(),
+        "items": items,
+    })
+}
+
+fn tag_item(finding: &TagFinding) -> Value {
+    let rules: Vec<Value> = finding
+        .findings
+        .iter()
+        .map(|(rule, words)| json!({ "rule": rule.name(), "label": rule.label(), "words": words }))
+        .collect();
+    json!({
+        "id": finding.id,
+        "sure": finding.sure,
+        "heard": finding.heard,
+        "rules": rules,
+        "changes": tag_changes(finding),
+    })
+}
+
+/// What Use the audio's tags writes for one song, each change in words.
+fn tag_changes(finding: &TagFinding) -> Vec<Value> {
+    finding
+        .changes
+        .iter()
+        .map(|(tag, value)| {
+            let now = match tag.as_str() {
+                song_tag_fields::TITLE => Some(finding.title.as_str()),
+                song_tag_fields::ALBUM => Some(finding.album.as_str()),
+                _ => None,
+            };
+            let words = match value {
+                Some(value) => TagChange::new(tag, now, value).words(),
+                None => format!("{}: taken off", fixes::tag_name(tag)),
+            };
+            json!({ "tag": tag, "label": fixes::tag_name(tag), "value": value, "words": words })
+        })
+        .collect()
+}
+
+/// A song the tag check found that the library read does not hold (yet): what its tags said.
+fn finding_song_view(finding: &TagFinding) -> Value {
+    json!({
+        "id": finding.id,
+        "title": finding.title,
+        "artist": finding.artist,
+        "album": finding.album,
+        "albumArtist": Value::Null,
+        "year": Value::Null,
+        "quality": Value::Null,
+        "lossless": false,
+        "path": finding.path,
+    })
+}
+
+fn tag_check_view(status: &IdentitySweepStatus) -> Value {
+    json!({
+        "state": status.state,
+        "reason": status.reason,
+        "paused": status.paused,
+        "checked": status.checked,
+        "total": status.total,
+        "pass": status.pass,
+        "found": status.found,
+        "sure": status.sure,
+        "spacesFixed": status.spaces_fixed,
+        "perHour": status.per_hour,
+        "line": words::tag_check_line(&status.state, status.checked, status.total, status.per_hour),
+        "lastCheckedUtc": utc_opt(&status.last_checked_utc),
+        "passFinishedUtc": utc_opt(&status.pass_finished_utc),
+    })
+}
+
+/// What Use the audio's tags would write: for the songs in `keys`, or with none named, every
+/// finding whose identity is sure. Writes nothing.
+fn tags_preview(state: &AppState, user: &str, keys: Option<&[String]>) -> Response {
+    let can: HealthAbilities = state.library_health.abilities(user);
+    let findings = state.library_identity_sweep.findings();
+    let picked: Vec<&TagFinding> = match keys.filter(|keys| !keys.is_empty()) {
+        Some(keys) => {
+            let named: Vec<&TagFinding> = findings
+                .iter()
+                .filter(|finding| keys.contains(&finding.id))
+                .collect();
+            if named.is_empty() {
+                return gone();
+            }
+            named
+                .into_iter()
+                .filter(|finding| !finding.changes.is_empty())
+                .collect()
+        }
+        None => findings.iter().filter(|finding| sure_fix(finding)).collect(),
+    };
+    if picked.is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "The audio does not say what to write here, so this one waits for you.",
+        );
+    }
+    let one = picked.len() == 1;
+    let lines: Vec<Value> = picked
+        .iter()
+        .map(|finding| {
+            let changes: Vec<String> = tag_changes(finding)
+                .iter()
+                .filter_map(|change| change["words"].as_str().map(str::to_string))
+                .collect();
+            json!({ "id": finding.id, "title": finding.title, "words": changes.join("; ") })
+        })
+        .collect();
+    let steps: Vec<Value> = picked
+        .iter()
+        .map(|finding| {
+            let mut with: IndexMap<String, String> = finding
+                .changes
+                .iter()
+                .map(|(tag, value)| (tag.clone(), value.clone().unwrap_or_default()))
+                .collect();
+            // The file the tags were worked out from: once it is replaced, they are not written.
+            with.insert(fix_actions::FILE_STAMP.to_string(), finding.stamp.clone());
+            step_view(&FixStep::with(
+                fix_actions::RETAG,
+                &finding.id,
+                &finding.title,
+                with,
+            ))
+        })
+        .collect();
+    ok(&json!({
+        "title": if one { words::USE_THE_AUDIOS_TAGS.to_string() } else { words::tags_fix_all_label(picked.len()) },
+        "meaning": words::TAGS_FIX_MEANING,
+        "go": if one {
+            "Write these tags".to_string()
+        } else {
+            format!("Write tags for {}", words::count_text(picked.len(), "song", "songs"))
+        },
+        "label": "Writing the audio's tags",
+        "canFix": can.edit,
+        "why": if can.edit { None } else { can.why.clone() },
+        "lines": lines,
+        "steps": steps,
+    }))
+}
+
+/// How far the library tag check has got, and how many songs it found.
+async fn get_tags(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, _) = request.into_parts();
+    if navidrome_user(&state, &parts).is_none() {
+        return not_admin();
+    }
+    ok(&json!({ "tagCheck": tag_check_view(&state.library_identity_sweep.status()) }))
+}
+
+async fn start_tags(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, _) = request.into_parts();
+    if navidrome_user(&state, &parts).is_none() {
+        return not_admin();
+    }
+    let per_hour = state
+        .settings
+        .current()
+        .library_actions
+        .effective_tag_check_per_hour();
+    if per_hour == 0 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Set how many songs an hour to check under Library actions first.",
+        );
+    }
+    state.library_identity_sweep.set_paused(false);
+    accepted(&json!({ "ok": true, "tagCheck": tag_check_view(&state.library_identity_sweep.status()) }))
+}
+
+async fn pause_tags(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, _) = request.into_parts();
+    if navidrome_user(&state, &parts).is_none() {
+        return not_admin();
+    }
+    state.library_identity_sweep.set_paused(true);
+    accepted(&json!({ "ok": true, "tagCheck": tag_check_view(&state.library_identity_sweep.status()) }))
+}
+
+/// Check every song again from the start; what was found is forgotten until found again.
+async fn reset_tags(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, _) = request.into_parts();
+    if navidrome_user(&state, &parts).is_none() {
+        return not_admin();
+    }
+    state.library_identity_sweep.reset();
+    accepted(&json!({ "ok": true, "tagCheck": tag_check_view(&state.library_identity_sweep.status()) }))
+}
+
+/// How many sets' marks a preview reads at once.
+const MARK_READS: usize = 8;
+
+/// One set of copies as a preview plans it: None for a set left alone because every copy is
+/// starred or rated, the tag changes picked for the kept copy, and every reader's marks on each
+/// copy when they were read.
+struct DuplicatePlan<'a> {
+    set: &'a DuplicateSet<Row>,
+    fix: Option<DuplicateFix<Row>>,
+    changes: Vec<TagChange>,
+    marks: Option<SetMarks>,
+}
+
+/// The tag changes a fix of one set writes onto the kept copy: the blanks it fills (only the
+/// tags in `fills` when one set is previewed and they are named) and, for one set, the values
+/// picked in `choose` where the copies disagree.
+fn picked_changes(
+    fix: &DuplicateFix<Row>,
+    request: &PreviewRequest,
+    one: bool,
+    can_edit: bool,
+) -> Vec<TagChange> {
+    let fills: Vec<TagChange> = if !can_edit {
+        Vec::new()
+    } else if let (true, Some(tags)) = (one, &request.fills) {
+        fix.fills
+            .iter()
+            .filter(|change| tags.contains(&change.tag))
+            .cloned()
+            .collect()
+    } else {
+        fix.fills.clone()
+    };
+    let chosen: Vec<TagChange> = if !can_edit || !one {
+        Vec::new()
+    } else {
+        fix.differs
+            .iter()
+            .filter_map(|choice| {
+                let now = choice
+                    .values
+                    .iter()
+                    .find(|(id, _)| *id == fix.keep.id)
+                    .map(|(_, value)| value.as_str());
+                let value = request.choose.as_ref()?.get(&choice.tag)?;
+                (Some(value.as_str()) != now && choice.values.iter().any(|(_, other)| other == value))
+                    .then(|| TagChange::new(&choice.tag, now, value))
+            })
+            .collect()
+    };
+    fills.into_iter().chain(chosen).collect()
+}
+
+/// The stars and ratings on one copy in words, or None when nobody starred or rated it.
+fn marks_of(marks: Option<&SetMarks>, id: &str) -> Option<String> {
+    let marks = marks?;
+    let read: Vec<_> = marks
+        .of(id)
+        .iter()
+        .filter_map(|reader| reader.marks.as_ref())
+        .collect();
+    let starred = read.iter().filter(|marks| marks.starred).count();
+    let rated = read.iter().filter(|marks| marks.rating > 0).count();
+    let best = read.iter().map(|marks| marks.rating).max().unwrap_or(0);
+    let people = read
+        .iter()
+        .filter(|marks| keep_marks::starred_or_rated(marks))
+        .count();
+    words::marks_words(starred, best, rated, people, marks.unread(id))
+}
+
+/// One copy in a preview's lists of what stays and what goes.
+fn copy_line(copy: &Row, fields: &dyn IHealthFields<Row>, marks: Option<&SetMarks>) -> Value {
+    json!({
+        "id": copy.id,
+        "name": fixes::copy_name(copy, fields),
+        "album": copy.album,
+        "path": copy.path,
+        "marks": marks_of(marks, &copy.id),
+    })
+}
+
+/// One set in a duplicates preview: what the fix keeps and removes, why, the tags it changes,
+/// and with one set, every tag of every copy side by side.
+fn duplicate_plan_view(
+    plan: &DuplicatePlan<'_>,
+    request: &PreviewRequest,
+    one: bool,
+    can_edit: bool,
+    fields: &dyn IHealthFields<Row>,
+) -> Value {
+    let set = plan.set;
+    let marks = plan.marks.as_ref();
+    let copies: Vec<Value> = set
+        .copies
+        .iter()
+        .map(|copy| {
+            let mut view = song_view(copy, fields);
+            view["marks"] = json!(marks_of(marks, &copy.id));
+            view
+        })
+        .collect();
+    let Some(fix) = &plan.fix else {
+        return json!({
+            "key": set_key(set),
+            "heading": words::set_heading(set, fields),
+            "why": words::ALL_RATED,
+            "line": words::ALL_RATED,
+            "note": null,
+            "keep": null,
+            "skipped": true,
+            "kept": set.copies.iter().map(|copy| copy_line(copy, fields, marks)).collect::<Vec<_>>(),
+            "removed": [],
+            "copies": copies,
+            "fills": [],
+            "differs": [],
+            "diff": null,
+        });
+    };
+    let changes = &plan.changes;
+    let fills: Vec<Value> = if can_edit {
+        fix.fills.iter().map(change_view).collect()
+    } else {
+        Vec::new()
+    };
+    let differs: Vec<Value> = if can_edit {
+        fix.differs
+            .iter()
+            .map(|choice| {
+                let picked = request
+                    .choose
+                    .as_ref()
+                    .and_then(|choose| choose.get(&choice.tag))
+                    .cloned()
+                    .or_else(|| {
+                        choice
+                            .values
+                            .iter()
+                            .find(|(id, _)| *id == fix.keep.id)
+                            .map(|(_, value)| value.clone())
+                    });
+                let values: Vec<Value> = choice
+                    .values
+                    .iter()
+                    .map(|(id, value)| json!({ "id": id, "value": value }))
+                    .collect();
+                json!({
+                    "tag": choice.tag,
+                    "label": fixes::tag_name(&choice.tag),
+                    "values": values,
+                    "picked": picked,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let kept: Vec<Value> = std::iter::once(&fix.keep)
+        .chain(fix.also_kept.iter())
+        .map(|copy| copy_line(copy, fields, marks))
+        .collect();
+    let removed: Vec<Value> = fix
+        .audio
+        .iter()
+        .map(|audio| {
+            let mut line = copy_line(audio, fields, marks);
+            line["soundMovesIn"] = json!(true);
+            line
+        })
+        .chain(fix.remove.iter().map(|copy| copy_line(copy, fields, marks)))
+        .collect();
+    json!({
+        "key": set_key(set),
+        "heading": words::set_heading(set, fields),
+        "why": fix.why,
+        "line": fix_line(fix, changes, fields, can_edit),
+        "note": fix.note,
+        "keep": fix.keep.id,
+        "skipped": false,
+        "kept": kept,
+        "removed": removed,
+        "copies": copies,
+        "fills": fills,
+        "differs": differs,
+        "diff": if one { duplicate_diff(fix, changes, fields) } else { Value::Null },
+    })
 }
 
 fn gone() -> Response {
@@ -987,14 +1415,19 @@ fn fix_line(
             .collect();
         format!(" Fills in {}.", names.join(", "))
     };
+    let also = if fix.also_kept.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", words::also_keeps_rated(fix.also_kept.len()))
+    };
     match &fix.audio {
         Some(audio) => format!(
-            "Moves the sound of {} into {}, which keeps its marks, and moves {gone} to the trash.{filled}",
+            "Moves the sound of {} into {}, which keeps its marks, and moves {gone} to the trash.{also}{filled}",
             fixes::copy_name(audio, fields),
             fixes::copy_name(&fix.keep, fields)
         ),
         None => format!(
-            "Keeps {} and moves {gone} to the trash.{filled}",
+            "Keeps {} and moves {gone} to the trash.{also}{filled}",
             fixes::copy_name(&fix.keep, fields)
         ),
     }

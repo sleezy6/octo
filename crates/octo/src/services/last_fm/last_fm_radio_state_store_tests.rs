@@ -460,7 +460,7 @@ fn playlist_serializer_has_json_xml_symmetry_and_read_only_metadata() {
     let station = LastFmRadioStation {
         id: station_id("alice", "mix"),
         key: "mix".into(),
-        name: "Your Mix".into(),
+        name: "Your Radio".into(),
         owner: "alice".into(),
         personalized: true,
         created_utc: Utc::now(),

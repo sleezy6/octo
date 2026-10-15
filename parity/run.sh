@@ -516,9 +516,13 @@ for s in plan["shards"] if isinstance(plan, dict) else plan:
     local old_id new_id start
     old_id="$(docker image inspect -f '{{.Id}}' "$RS_IMAGE" 2> /dev/null || true)"
     say "building $RS_IMAGE around the binary built for $(git rev-parse --short HEAD)"
+    # The place data stage swapped for an empty folder: the corpus is recorded without place data.
+    mkdir -p .parity-bin/no-places
     {
       echo "FROM scratch AS build"
       echo "COPY .parity-bin/octo /out/octo"
+      echo "FROM scratch AS places"
+      echo "COPY .parity-bin/no-places/ /out/"
       sed -n '/^# ---- Runtime ----/,$p' Dockerfile
     } > .parity-bin/Dockerfile
     start=$(date +%s)

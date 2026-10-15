@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use octo_core::family::abilities::Preset;
-use octo_core::models::domain::Song;
+use octo_core::models::domain::{Album, Song};
 use octo_core::settings::{HeartDownloadSource, HeartDownloadStep};
 use serde_json::json;
 
@@ -14,7 +14,9 @@ use super::*;
 use crate::services::common::test_fakes::{FakeDownloads, FakeLidarr, FakeMetadata};
 use crate::services::common::{AcquisitionPlace, AcquisitionRequest};
 use crate::services::family::library_index::ScopeResolver;
-use crate::services::family::test_support::{World, member, write_file};
+use crate::services::family::test_support::{
+    World, eventually, member, navidrome_with_songs, song_row, write_file,
+};
 use crate::services::family::{LibraryWriteGate, PersonalLibrary};
 use crate::services::library::LibraryOwnership;
 use crate::services::library::library_ownership::{Candidate, search_from};
@@ -39,6 +41,7 @@ fn configure(world: &World, sources: &[HeartDownloadSource], download_on_play: b
 
 struct Chain {
     world: World,
+    metadata: Arc<FakeMetadata>,
     queue: Arc<TrackAcquisitionQueue>,
     lidarr: Arc<FakeLidarr>,
     coordinator: Arc<HeartAcquisitionCoordinator>,
@@ -118,10 +121,11 @@ fn chain_holding(world: World, copy: String) -> Chain {
             personal,
         )),
         pool: world.pool.clone(),
-        metadata,
+        metadata: metadata.clone(),
     });
     Chain {
         world,
+        metadata,
         queue,
         lidarr,
         coordinator,
@@ -397,4 +401,88 @@ async fn a_member_who_sees_the_shared_library_has_its_song_already() {
         .expect("ran");
     assert_eq!(outcome, TrackOutcome::AlreadyThere);
     assert!(next_queued(&chain.queue).await.is_none());
+}
+
+/// A member who hearts one song of an album gets the whole album into their own library, but
+/// only the song they hearted is starred for them. A heart on the album stars every song.
+#[tokio::test]
+async fn a_members_song_heart_brings_its_album_without_starring_its_songs() {
+    let world = World::new(None);
+    configure(&world, &[HeartDownloadSource::YouTube], false);
+    let members = world.members();
+    let alex = format!("{members}/alex");
+    let navidrome = navidrome_with_songs(json!([
+        song_row("alex-2", 3, &alex, "Artist/Album/2.flac", 10),
+        song_row("alex-3", 3, &alex, "Artist/Album/3.flac", 10),
+    ]))
+    .await;
+    world.point_at(&navidrome.uri());
+    world.index.refresh().await.expect("read");
+    let chain = chain(world);
+    let song = |id: &str| Song {
+        title: format!("Song {id}"),
+        artist: "Artist".into(),
+        album: "Album".into(),
+        external_provider: Some("test".into()),
+        external_id: Some(id.into()),
+        ..Default::default()
+    };
+    chain.metadata.albums.lock().insert(
+        ("test".into(), "album-1".into()),
+        Album {
+            id: "album-1".into(),
+            title: "Album".into(),
+            artist: "Artist".into(),
+            songs: vec![song("2"), song("3")],
+            ..Default::default()
+        },
+    );
+    let land = |expected: &'static str| {
+        let queue = chain.queue.clone();
+        let path = format!("{alex}/Artist/Album/{expected}.flac");
+        async move {
+            let request = next_queued(&queue).await.expect("queued");
+            assert_eq!(request.external_id, expected);
+            assert_eq!(request.pool_destination(), Some(vec!["alex".to_string()]));
+            queue.release(&request);
+            request.completion.try_set_result(path);
+        }
+    };
+
+    chain.coordinator.queue_tracks_then_album_for(
+        &[("test".to_string(), "9".to_string())],
+        "test",
+        "album-1",
+        Some("alex"),
+        Some("alex"),
+        AcquisitionTarget::Member("alex".into()),
+    );
+    // The hearted song first, then the album's songs one by one.
+    land("9").await;
+    land("2").await;
+    land("3").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        chain.world.stars.asked.lock().is_empty(),
+        "the album's songs are not starred for a song heart"
+    );
+
+    chain.coordinator.queue_album_for(
+        "test",
+        "album-1",
+        Some("alex"),
+        AcquisitionTarget::Member("alex".into()),
+    );
+    land("2").await;
+    land("3").await;
+    let stars = chain.world.stars.clone();
+    assert!(
+        eventually(|| {
+            let asked = stars.asked.lock();
+            asked.contains(&("alex".into(), "alex-2".into()))
+                && asked.contains(&("alex".into(), "alex-3".into()))
+        })
+        .await,
+        "an album heart stars every song"
+    );
 }

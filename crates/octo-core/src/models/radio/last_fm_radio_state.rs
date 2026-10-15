@@ -217,7 +217,7 @@ pub struct LastFmRadioStation {
     #[serde(deserialize_with = "null_as_default")]
     pub tracks: Vec<LastFmRadioTrack>,
     /// Further suggestions, in the walk's order, that stand in for a track the station may not
-    /// use once it is resolved (a library song past Discovery Mix's share). Never listed.
+    /// use once it is resolved (a library song past Discovery Radio's share). Never listed.
     #[serde(deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub reserve: Vec<LastFmRadioTrack>,
 }

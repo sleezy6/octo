@@ -1763,3 +1763,43 @@ fn an_import_file_may_carry_a_whole_export_and_everything_else_keeps_the_usual_l
     assert_eq!(body_limit("/rest/importText"), MAX_BODY);
     assert_eq!(body_limit("/rest/stream"), MAX_BODY);
 }
+
+/// A family member looks up a place like any listener: the gate signs them in with their hidden
+/// password, and getPlace answers.
+#[tokio::test]
+async fn a_member_looks_up_a_place() {
+    let f = family(true).await;
+    f.navidrome_takes(|hidden| hidden == HIDDEN).await;
+    f.navidrome_refuses_the_rest().await;
+    crate::controllers::subsonic::places_tests::write_fixture(f._dir.path());
+    let app = build_with(f.state.clone(), crate::controllers::subsonic::places::routes());
+    let t = subsonic_token(APP_SECRET, "c19b2d");
+    let r = send(
+        &app,
+        Method::GET,
+        &format!("/rest/getPlace?u=alex&t={t}&s=c19b2d&v=1.16.1&c=Octo&f=json&code=90210&country=US"),
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(
+        r.json()["subsonic-response"]["place"]["name"],
+        "Beverly Hills",
+        "{}",
+        r.body
+    );
+    let wrong = send(
+        &app,
+        Method::GET,
+        "/rest/getPlace?u=alex&p=not-it&v=1.16.1&c=Octo&f=json&code=90210&country=US",
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(
+        wrong.json()["subsonic-response"]["error"]["code"],
+        40,
+        "{}",
+        wrong.body
+    );
+}

@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use octo_core::common::Clock;
+use octo_core::places::PlaceIndex;
 use octo_core::settings::{AppSettings, RestartTracker, SettingsFileWriter, SettingsStore};
 use octo_core::tagging::{CatalogLookup, FingerprintVerifier, ReleaseIdentifier, ReleaseLookup, TagPreview};
 use octo_media::audio::{AudioFingerprinter, ILoudnessMeter, LoudnessMeter, SpectrumAnalyzer};
@@ -52,6 +53,7 @@ use crate::services::cover_art::{
 use octo_media::cover::CoverArtService;
 
 use crate::services::charts::{AppleMusicPages, ChartsWarmWorker};
+use crate::services::common::IAcquisitionActivity;
 use crate::services::common::TopSongsService;
 use crate::services::cover_art::{AnimatedArtwork, ArtworkHints, HintedArtwork};
 use crate::services::deezer::{DeezerAudioCache, DeezerResolver};
@@ -70,6 +72,8 @@ use crate::services::fingerprint::{
     MusicBrainzClient,
 };
 use crate::services::health::keep_marks::{KeepMarks, KeepMarksParts};
+use crate::services::health::library_health_service::HealthDuplicateFixer;
+use crate::services::health::member_marks::NavidromeMemberMarks;
 use crate::services::health::{HealthServices, LibraryHealthService};
 use crate::services::http_client_factory;
 use crate::services::i_download_service::IDownloadService;
@@ -99,9 +103,11 @@ use crate::services::library::tidy::worker::ListSongs;
 use crate::services::library::tidy::{TidyJournal, TidyServices, TidyStore, TidyWorker};
 use crate::services::library::{AlbumOwnership, GeneratedPlaylistService, LibrarySnapshot};
 use crate::services::library::{
-    DuplicateScanWorker, FingerprintSweepVerifier, LibraryReviewSweepParts, LibraryReviewSweepWorker,
-    NoticePlaylistWorker, QualityUpgradeStore, QualityUpgradeWorker, ReviewSweepStore, UpgradeWorker,
-    UpgradeWorkerParts,
+    DuplicateScanWorker, EditServiceSweepEdits, ExecutorSweepReplacer, FingerprintSweepVerifier,
+    IdentitySweepStore, LibraryIdentitySweep, LibraryIdentitySweepParts, LibraryReviewSweepParts,
+    LibraryReviewSweepWorker, MusicBrainzRecordingFacts, MusicBrainzReleaseTracks, NavidromeOtherListeners,
+    NoticePlaylistWorker, QualityUpgradeStore, QualityUpgradeWorker, ReviewSweepStore, SnapshotSweepLibrary,
+    UpgradeWorker, UpgradeWorkerParts,
 };
 use crate::services::library::{
     HeartOwnership, LibraryActionExecutor, LibraryActionExecutorParts, LibraryActionJournal,
@@ -433,6 +439,9 @@ pub struct AppInner {
     pub sonic_worker: Arc<SonicAnalysisWorker>,
     /// `GeneratedPlaylistService`: the genre and decade mixes, `generated-playlists.json`.
     pub generated_playlists: Arc<GeneratedPlaylistService>,
+    /// `PlaceIndex`: postal codes and cities as coordinates (getPlace), read from the place data
+    /// a block at a time.
+    pub places: Arc<PlaceIndex>,
     /// `TopSongsService`: an artist's top songs and every chart (Apple Music's pages, Deezer and
     /// Last.fm behind Popular right now).
     pub top_songs: TopSongsService,
@@ -488,6 +497,12 @@ pub struct AppInner {
     pub review_sweep_store: Arc<ReviewSweepStore>,
     /// `LibraryReviewSweepWorker`: the "LibraryReviewSweepWorker" worker.
     pub library_review_sweep_worker: Arc<LibraryReviewSweepWorker>,
+    /// `IdentitySweepStore`: the library tag check's place and answers, `identity-sweep.json`.
+    /// Its 5-second flush is the "IdentitySweepStore" worker.
+    pub identity_sweep_store: Arc<IdentitySweepStore>,
+    /// `LibraryIdentitySweep`: every library song's tags held against its audio, for Library
+    /// health: the "LibraryIdentitySweep" worker.
+    pub library_identity_sweep: Arc<LibraryIdentitySweep>,
     /// `FingerprintSweepVerifier`: the sweep's check, over the download verification service.
     pub fingerprint_sweep_verifier: Arc<FingerprintSweepVerifier>,
     /// `LibraryRescan`: one normal Navidrome scan a few seconds after a run of library changes.
@@ -498,9 +513,8 @@ pub struct AppInner {
     /// `LibraryHealthService`: Library health for the dashboard, the app's checks and fixes run
     /// on the server.
     pub library_health: Arc<LibraryHealthService>,
-    /// `ImportService`, over the import stores (`imports.json`, `imports-trickle.json`,
-    /// `spotify-accounts.json`), the Spotify sign-in and the trickle (`TrickleWorker`): the
-    /// "ImportService" and "TrickleWorker" workers.
+    /// `ImportService`, over the import stores (`imports.json`, `imports-trickle.json`) and the
+    /// trickle (`TrickleWorker`): the "ImportService" and "TrickleWorker" workers.
     pub imports: Arc<crate::services::imports::ImportService>,
     /// `family.key`: seals members' device secrets and hidden Navidrome passwords, and signs
     /// their browser tokens.
@@ -566,7 +580,17 @@ fn library_health(
     quarantine: &Arc<LibraryActionQuarantine>,
     scope: &ScopeResolver,
 ) -> Arc<LibraryHealthService> {
-    // Only the admin's marks are read for now; members' marks plug in here.
+    // The admin's marks are read with Octo's admin sign-in, each member's with their own.
+    let members = NavidromeMemberMarks::new(
+        Arc::clone(settings),
+        navidrome.http.clone(),
+        Arc::clone(&stores.family_store),
+        Arc::new(MemberCredentials::new(
+            Arc::clone(&stores.family_store),
+            Arc::clone(&stores.family_vault),
+            Arc::clone(settings),
+        )),
+    );
     let keep_marks = Arc::new(KeepMarks::new(KeepMarksParts {
         api: navidrome.navidrome_playlist_api.clone(),
         resolver: navidrome.navidrome_song_path_resolver.clone(),
@@ -575,10 +599,10 @@ fn library_health(
         library: navidrome.local_library.clone(),
         executor: Arc::clone(executor),
         settings: Arc::clone(settings),
-        members: None,
+        members: Some(Arc::new(members)),
         write_gate: Some(stores.library_write_gate.clone()),
     }));
-    Arc::new(LibraryHealthService::new(
+    let health = Arc::new(LibraryHealthService::new(
         Arc::clone(snapshot),
         Arc::clone(rescan),
         Arc::clone(settings),
@@ -588,6 +612,43 @@ fn library_health(
             upgrade_sources: Some(Arc::clone(upgrade_sources)),
             keep_marks: Some(keep_marks),
             scope: Some(scope.clone()),
+        },
+        Clock::system(),
+    ));
+    // Fix duplicates, from a star or its action playlist, runs Library health's duplicate fix.
+    executor.use_duplicate_fixer(Arc::new(HealthDuplicateFixer::new(&health)));
+    health
+}
+
+/// The library tag check: Navidrome's song list from the snapshot, the sweep's fingerprint
+/// check, the edit path stray spaces go through, and MusicBrainz for a release's tracks and what a
+/// recording is.
+#[allow(clippy::too_many_arguments)]
+fn library_identity_sweep(
+    settings: &Arc<SettingsStore>,
+    stores: &Stores,
+    navidrome: &NavidromeServices,
+    music_brainz: &Arc<MusicBrainzClient>,
+    activity: Arc<dyn IAcquisitionActivity>,
+    verifier: Arc<FingerprintSweepVerifier>,
+    snapshot: &Arc<LibrarySnapshot>,
+    edits: &Arc<LibraryEditService>,
+    scope: &ScopeResolver,
+) -> Arc<LibraryIdentitySweep> {
+    Arc::new(LibraryIdentitySweep::new(
+        LibraryIdentitySweepParts {
+            store: stores.identity_sweep_store.clone(),
+            verifier,
+            activity,
+            library: Arc::new(SnapshotSweepLibrary {
+                snapshot: Arc::clone(snapshot),
+                resolver: navidrome.navidrome_song_path_resolver.clone(),
+                scope: Some(scope.clone()),
+            }),
+            edits: Some(Arc::new(EditServiceSweepEdits(Arc::clone(edits)))),
+            releases: Some(Arc::new(MusicBrainzReleaseTracks(Arc::clone(music_brainz)))),
+            recordings: Some(Arc::new(MusicBrainzRecordingFacts(Arc::clone(music_brainz)))),
+            settings: Arc::clone(settings),
         },
         Clock::system(),
     ))
@@ -1189,6 +1250,7 @@ struct Stores {
     quality_upgrade_store: Arc<QualityUpgradeStore>,
     notice_queue: Arc<NoticeQueue>,
     review_sweep_store: Arc<ReviewSweepStore>,
+    identity_sweep_store: Arc<IdentitySweepStore>,
     lidarr_pending: Arc<LidarrPendingAlbums>,
     family_vault: Arc<FamilyVault>,
     family_store: Arc<FamilyStore>,
@@ -1294,6 +1356,9 @@ impl Stores {
             ))),
             notice_queue: Arc::new(NoticeQueue::with_path(Some(config_dir.join("notice-queue.json")))),
             review_sweep_store: Arc::new(ReviewSweepStore::new(Some(config_dir.join("review-sweep.json")))),
+            identity_sweep_store: Arc::new(IdentitySweepStore::new(Some(
+                config_dir.join("identity-sweep.json"),
+            ))),
             lidarr_pending: Arc::new(LidarrPendingAlbums::new(Some(
                 config_dir.join("lidarr-pending.json"),
             ))),
@@ -1331,6 +1396,10 @@ impl Stores {
         workers.register("NoticeQueue", move |token| notices.clone().run_flusher(token));
         let sweep = self.review_sweep_store.clone();
         workers.register("ReviewSweepStore", move |token| sweep.clone().run_flusher(token));
+        let identities = self.identity_sweep_store.clone();
+        workers.register("IdentitySweepStore", move |token| {
+            identities.clone().run_flusher(token)
+        });
     }
 }
 
@@ -1729,14 +1798,14 @@ impl GenreAndCoverJobs {
     }
 }
 
-/// The Spotify import: the import service and the trickle that downloads into the library.
+/// Imports: the import service and the trickle that downloads into the library.
 struct Imports {
     service: Arc<crate::services::imports::ImportService>,
     trickle: Arc<crate::services::imports::TrickleWorker>,
 }
 
 impl Imports {
-    /// `config_dir`: where the three files live; None keeps them in memory (endpoint tests).
+    /// `config_dir`: where the two files live; None keeps them in memory (endpoint tests).
     fn build(
         settings: &Arc<SettingsStore>,
         config_dir: Option<&Path>,
@@ -1747,8 +1816,7 @@ impl Imports {
     ) -> Imports {
         use crate::services::imports::{
             ImportMatcher, ImportParts, ImportPlaylists, ImportService, ImportStore, NavidromePlaylists,
-            SpotifyAccountStore, SpotifyAuth, SpotifyLinkReader, SpotifyWebApi, TrickleQueue,
-            TrickleServices, TrickleWorker,
+            SpotifyLinkReader, TrickleQueue, TrickleServices, TrickleWorker,
         };
         let file = |name: &str| config_dir.map(|dir| dir.join(name));
         let queue = Arc::new(TrickleQueue::new(file("imports-trickle.json")));
@@ -1776,9 +1844,6 @@ impl Imports {
                 api: navidrome.navidrome_playlist_api.clone(),
                 identity: navidrome.navidrome_identity.clone(),
             })),
-            auth: Arc::new(SpotifyAuth::default()),
-            accounts: Arc::new(SpotifyAccountStore::new(file("spotify-accounts.json"))),
-            spotify: Arc::new(SpotifyWebApi::new(SpotifyWebApi::client())),
             links: Arc::new(SpotifyLinkReader::new(SpotifyLinkReader::client())),
             settings: settings.clone(),
             tracker: Some(acquisition.acquisition_tracker.clone()),
@@ -2001,6 +2066,7 @@ impl Radio {
             last_fm: Some(integrations.last_fm.clone()),
             listen_brainz: Some(integrations.listen_brainz.clone()),
             last_fm_scrobbles: Some(integrations.last_fm_scrobbles.clone()),
+            recommendations: Some(recommendations.clone()),
         });
         let warmup = Arc::new(LastFmRadioWarmupService::new(streams.clone(), state.clone()));
         let refresh_worker = Arc::new(LastFmRadioRefreshWorker::new(
@@ -2050,7 +2116,8 @@ impl Radio {
                 responses: stores.subsonic_response_builder.clone(),
             })
             .with_countries(country_library)
-            .with_family(stores.family_store.clone()),
+            .with_family(stores.family_store.clone())
+            .with_last_fm(integrations.last_fm.clone()),
         );
         Radio {
             state,
@@ -2354,7 +2421,29 @@ impl LibraryJobs {
                 },
                 Clock::system(),
             )
-            .with_library_scope(navidrome.library_scope.clone()),
+            .with_library_scope(navidrome.library_scope.clone())
+            // The admin's marks are read with Octo's admin sign-in and each Family member's with
+            // their own. Anyone else on the server, or a member whose marks cannot be read, keeps
+            // the song a question.
+            .with_replacer(Arc::new(ExecutorSweepReplacer::new(
+                navidrome.navidrome_song_path_resolver.clone(),
+                executor.clone(),
+                navidrome.navidrome_playlist_api.clone(),
+                Some(Arc::new(NavidromeMemberMarks::new(
+                    Arc::clone(settings),
+                    navidrome.http.clone(),
+                    Arc::clone(&stores.family_store),
+                    Arc::new(MemberCredentials::new(
+                        Arc::clone(&stores.family_store),
+                        Arc::clone(&stores.family_vault),
+                        Arc::clone(settings),
+                    )),
+                ))),
+                Arc::new(NavidromeOtherListeners::new(
+                    navidrome.navidrome_admin.clone(),
+                    stores.family_store.clone(),
+                )),
+            ))),
         );
         LibraryJobs {
             upgrade_worker,
@@ -2861,6 +2950,21 @@ impl AppState {
                 }
             });
         }
+        let library_identity_sweep = library_identity_sweep(
+            &settings,
+            &stores,
+            &navidrome,
+            &clients.music_brainz,
+            acquisition.acquisition_activity.clone(),
+            library_jobs.fingerprint_sweep_verifier.clone(),
+            &library_snapshot,
+            &library_edits,
+            &family_navidrome.2,
+        );
+        let identity_sweep = library_identity_sweep.clone();
+        workers.register("LibraryIdentitySweep", move |stopping| {
+            identity_sweep.clone().run(stopping)
+        });
         let imports = Imports::build(
             &settings,
             Some(&config_dir),
@@ -2906,6 +3010,9 @@ impl AppState {
             cover_upgrade_worker: genre_cover_jobs.cover_upgrade_worker,
             explicit_backfill: genre_cover_jobs.explicit_backfill,
             update_host: Arc::new(UpdateHost::new(config_dir.join("update"), Clock::system())),
+            places: Arc::new(PlaceIndex::new(
+                crate::controllers::subsonic::places::places_file(&config_dir),
+            )),
             lifetime: CancellationToken::new(),
             download_history: stores.download_history,
             download_concurrency: stores.download_concurrency,
@@ -3018,6 +3125,8 @@ impl AppState {
             quality_upgrade_worker: library_jobs.quality_upgrade_worker,
             duplicate_scan_worker: library_jobs.duplicate_scan_worker,
             review_sweep_store: stores.review_sweep_store,
+            identity_sweep_store: stores.identity_sweep_store,
+            library_identity_sweep,
             library_review_sweep_worker: library_jobs.library_review_sweep_worker,
             fingerprint_sweep_verifier: library_jobs.fingerprint_sweep_verifier,
             library_rescan,
@@ -3253,6 +3362,17 @@ impl AppState {
             &library_actions.quarantine,
             &family_navidrome.2,
         );
+        let library_identity_sweep = library_identity_sweep(
+            &settings,
+            &stores,
+            &navidrome,
+            &clients.music_brainz,
+            acquisition.acquisition_activity.clone(),
+            library_jobs.fingerprint_sweep_verifier.clone(),
+            &library_snapshot,
+            &library_edits,
+            &family_navidrome.2,
+        );
         // The import's files stay in memory; no worker is run.
         let imports = Imports::build(
             &settings,
@@ -3298,6 +3418,7 @@ impl AppState {
             cover_upgrade_worker: genre_cover_jobs.cover_upgrade_worker,
             explicit_backfill: genre_cover_jobs.explicit_backfill,
             update_host: Arc::new(UpdateHost::new(config_dir.join("update"), Clock::system())),
+            places: Arc::new(PlaceIndex::new(config_dir.join("places.bin"))),
             lifetime: CancellationToken::new(),
             download_history: stores.download_history,
             download_concurrency: stores.download_concurrency,
@@ -3410,6 +3531,8 @@ impl AppState {
             quality_upgrade_worker: library_jobs.quality_upgrade_worker,
             duplicate_scan_worker: library_jobs.duplicate_scan_worker,
             review_sweep_store: stores.review_sweep_store,
+            identity_sweep_store: stores.identity_sweep_store,
+            library_identity_sweep,
             library_review_sweep_worker: library_jobs.library_review_sweep_worker,
             fingerprint_sweep_verifier: library_jobs.fingerprint_sweep_verifier,
             library_rescan,
@@ -3740,6 +3863,8 @@ mod tests {
             "UpgradeWorker",
             "QualityUpgradeWorker",
             "LibraryReviewSweepWorker",
+            "IdentitySweepStore",
+            "LibraryIdentitySweep",
         ] {
             assert!(names.iter().any(|n| n == name), "{name} in {names:?}");
         }
@@ -3762,6 +3887,12 @@ mod tests {
                 .review_sweep_store
                 .path()
                 .is_some_and(|p| p.ends_with("review-sweep.json"))
+        );
+        assert!(
+            state
+                .identity_sweep_store
+                .path()
+                .is_some_and(|p| p.ends_with("identity-sweep.json"))
         );
         assert!(state.upgrade_queue.snapshot().is_empty());
         assert_eq!(

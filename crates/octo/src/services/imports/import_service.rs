@@ -8,12 +8,12 @@ use chrono::{DateTime, TimeDelta, Utc};
 use indexmap::IndexMap;
 use octo_core::common::Clock;
 use octo_core::common::acquisition_tracker::user_safe;
-use octo_core::common::dotnet::{eq_ignore_case, is_blank, ordinal_ignore_case_key, to_lower_invariant};
+use octo_core::common::dotnet::{eq_ignore_case, ordinal_ignore_case_key, to_lower_invariant};
 use octo_core::settings::SettingsStore;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use super::import_file_reader::{FileList, FileRead, FileReadError, ImportFileReader};
 use super::import_matcher::ImportMatcher;
@@ -21,34 +21,28 @@ use super::import_models::{import_sources, import_track_states};
 use super::import_playlists::ImportPlaylists;
 use super::import_store::ImportStore;
 use super::import_views::{
-    ApprovalView, ImportActionResult, ImportOverview, ListDetail, ListSummary, ReadView, SpotifyView,
-    TrackView, TrickleView,
+    ApprovalView, ImportActionResult, ImportOverview, ListDetail, ListSummary, TrackView, TrickleView,
 };
-use super::spotify_account_store::SpotifyAccountStore;
-use super::spotify_auth::{SpotifyAuth, absolute};
-use super::spotify_link_reader::SpotifyLinkReader;
-use super::spotify_web_api::{SpotifyException, SpotifyPlaylistInfo, SpotifyWebApi};
+use super::spotify_link_reader::{SpotifyException, SpotifyLinkReader};
 use super::text_list::{self, TextLine, TextList};
 use super::trickle_queue::TrickleQueue;
 use super::trickle_worker::TrickleWorker;
 use super::tunemymusic::ImportServices;
-use super::{ImportList, ImportTrack, SpotifyAccount, TrickleJob};
+use super::{ImportList, ImportTrack, TrickleJob};
 use crate::services::common::acquisition_tracker::{
     AcquisitionSnapshot, AcquisitionState, AcquisitionTracker, key_of,
 };
 use crate::services::family::request_service::{RequestFacts, RequestService};
 use crate::services::family::{LibraryWriteGate, WriteDecision};
 
-/// Where Octo answers Spotify's redirect itself.
-pub const CALLBACK_PATH: &str = "/imports/spotify/callback";
+/// What a list saved from a Spotify account says: it is kept and matched, never read again.
+pub const ACCOUNT_LIST_NOTE: &str = "Octo does not read Spotify accounts, so this list stays as it was. Export it with TuneMyMusic and import the file to bring it up to date, or remove it.";
 
-const LIKED_ID: &str = "spotify-liked";
-
-/// Importing from Spotify, a public link or a file, for the dashboard and the Octo apps alike:
-/// the Spotify sign-in, reading every list, matching each song against the library, keeping a
-/// list as a Navidrome playlist, and handing missing songs to the trickle.
+/// Importing from a public link, an exported file or a pasted list, for the dashboard and the
+/// Octo apps alike: reading each list, matching each song against the library, keeping a list
+/// as a Navidrome playlist, and handing missing songs to the trickle.
 ///
-/// Also the loop that keeps it all current: lists kept as playlists or fetched in full are read
+/// Also the loop that keeps it all current: links kept as playlists or fetched in full are read
 /// again every few hours, a song the trickle fetched is matched and put in its playlists, and a
 /// playlist that changed is written. Everything slow runs here, never inside a request.
 pub struct ImportService {
@@ -57,15 +51,10 @@ pub struct ImportService {
     trickle: Arc<TrickleWorker>,
     matcher: Arc<ImportMatcher>,
     playlists: ImportPlaylists,
-    auth: Arc<SpotifyAuth>,
-    accounts: Arc<SpotifyAccountStore>,
-    spotify: Arc<SpotifyWebApi>,
     links: Arc<SpotifyLinkReader>,
     settings: Arc<SettingsStore>,
     tracker: Option<Arc<AcquisitionTracker>>,
 
-    /// Each person's read, by name ignoring case.
-    reading: Mutex<HashMap<String, ReadView>>,
     gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// People whose lists need matching again: the trickle brought them something.
     rematch: Mutex<Vec<String>>,
@@ -74,7 +63,6 @@ pub struct ImportService {
     /// The back-off for a playlist that would not write: failures so far and when to try
     /// again, by "owner\nid".
     playlist_retries: Mutex<HashMap<String, (u32, DateTime<Utc>)>>,
-    stopping: Mutex<CancellationToken>,
     clock: Mutex<Clock>,
     /// Family's write gate and requests: a member who must ask first asks for a list's missing
     /// songs instead of fetching them. Unset, or with Family off, everyone fetches as always.
@@ -105,9 +93,6 @@ pub struct ImportParts {
     pub trickle: Arc<TrickleWorker>,
     pub matcher: Arc<ImportMatcher>,
     pub playlists: ImportPlaylists,
-    pub auth: Arc<SpotifyAuth>,
-    pub accounts: Arc<SpotifyAccountStore>,
-    pub spotify: Arc<SpotifyWebApi>,
     pub links: Arc<SpotifyLinkReader>,
     pub settings: Arc<SettingsStore>,
     pub tracker: Option<Arc<AcquisitionTracker>>,
@@ -115,9 +100,6 @@ pub struct ImportParts {
 
 impl ImportService {
     pub const LOOP_EVERY: Duration = Duration::from_secs(30);
-    /// Spotify ends every sign-in this long after it was made, however often it is renewed.
-    pub const SIGN_IN_LASTS: TimeDelta = TimeDelta::days(182);
-    const BETWEEN_PLAYLISTS: Duration = Duration::from_millis(250);
 
     /// Lists one person may keep, from files and links.
     pub const MAX_LISTS: usize = 500;
@@ -137,18 +119,13 @@ impl ImportService {
             trickle: parts.trickle,
             matcher: parts.matcher,
             playlists: parts.playlists,
-            auth: parts.auth,
-            accounts: parts.accounts,
-            spotify: parts.spotify,
             links: parts.links,
             settings: parts.settings,
             tracker: parts.tracker,
-            reading: Mutex::new(HashMap::new()),
             gates: Mutex::new(HashMap::new()),
             rematch: Mutex::new(Vec::new()),
             dirty_playlists: Mutex::new(Vec::new()),
             playlist_retries: Mutex::new(HashMap::new()),
-            stopping: Mutex::new(CancellationToken::new()),
             clock: Mutex::new(Clock::system()),
             family: std::sync::OnceLock::new(),
         });
@@ -181,8 +158,6 @@ impl ImportService {
         let lists = self.store.lists_of(user);
         let jobs = self.jobs(user);
         ImportOverview {
-            spotify: self.spotify_for(user),
-            reading: self.reading_for(user),
             lists: lists.iter().map(|list| summary(list, &jobs)).collect(),
             trickle: self.trickle_view(user, &jobs),
             library_problem: self.matcher.problem(),
@@ -201,7 +176,7 @@ impl ImportService {
 
     /// Where people can bring their music from, for the apps and pages.
     pub fn services(&self) -> ImportServices {
-        ImportServices::new(&self.settings.current().imports.spotify_client_id)
+        ImportServices::new()
     }
 
     pub fn detail(&self, user: &str, id: &str) -> Option<ListDetail> {
@@ -234,43 +209,6 @@ impl ImportService {
                 .or_insert(row);
         }
         rows
-    }
-
-    fn spotify_for(&self, user: &str) -> SpotifyView {
-        let settings = self.settings.current().imports.clone();
-        let redirect = settings.effective_redirect_uri();
-        let account = self.accounts.get(user);
-        SpotifyView {
-            configured: !is_blank(&settings.spotify_client_id),
-            connected: account.as_ref().is_some_and(|a| a.problem.is_none()),
-            account: account
-                .as_ref()
-                .and_then(|a| a.display_name.clone().or_else(|| a.spotify_id.clone())),
-            problem: account.as_ref().and_then(|a| a.problem.clone()),
-            redirect_problem: SpotifyAuth::redirect_problem(Some(&redirect)).map(str::to_string),
-            octo_finishes: Self::octo_finishes(&redirect),
-            ends_utc: account.as_ref().map(|a| a.connected_utc + Self::SIGN_IN_LASTS),
-            redirect_uri: redirect,
-        }
-    }
-
-    /// Whether the redirect URI is Octo's own callback, so the browser comes back by itself.
-    pub fn octo_finishes(redirect_uri: &str) -> bool {
-        absolute(Some(redirect_uri)).is_some_and(|uri| {
-            to_lower_invariant(uri.path().trim_end_matches('/')).ends_with(&to_lower_invariant(CALLBACK_PATH))
-        })
-    }
-
-    fn reading_for(&self, user: &str) -> ReadView {
-        self.reading
-            .lock()
-            .get(&ordinal_ignore_case_key(user))
-            .cloned()
-            .unwrap_or_else(ReadView::idle)
-    }
-
-    fn set_reading(&self, user: &str, view: ReadView) {
-        self.reading.lock().insert(ordinal_ignore_case_key(user), view);
     }
 
     fn trickle_view(&self, user: &str, jobs: &IndexMap<String, TrickleJob>) -> TrickleView {
@@ -320,412 +258,8 @@ impl ImportService {
     }
 
     // =========================================================================================
-    // The Spotify sign-in
+    // Adding lists
     // =========================================================================================
-
-    /// Starts a sign-in: the address to open. An app may ask for its own loopback redirect,
-    /// which must be the registered one, or the same loopback address on another port.
-    pub fn begin_spotify(&self, user: &str, app_redirect: Option<&str>) -> ImportActionResult {
-        let settings = self.settings.current().imports.clone();
-        if is_blank(&settings.spotify_client_id) {
-            return ImportActionResult::failed(
-                "Add your Spotify app's Client ID first, on the dashboard's Spotify import page.",
-            );
-        }
-        let registered = settings.effective_redirect_uri();
-        if let Some(problem) = SpotifyAuth::redirect_problem(Some(&registered)) {
-            return ImportActionResult::failed(problem);
-        }
-        let Some(redirect) = SpotifyAuth::allowed_redirect(&registered, app_redirect) else {
-            return ImportActionResult::failed(format!(
-                "This app needs the redirect URI registered as {registered}, a loopback address with no port. Change it on the dashboard and on the Spotify app."
-            ));
-        };
-        let (url, _) = self
-            .auth
-            .begin(user, settings.spotify_client_id.trim(), &redirect);
-        ImportActionResult::ok("Opened Spotify. Allow Octo there.").with_url(url)
-    }
-
-    /// Finishes a sign-in from what Spotify sent back: the whole address, or code and state. The
-    /// state says whose it is; `user`, when given, must be the same person. `Err` when Spotify
-    /// cannot be reached at all.
-    pub async fn finish_spotify(
-        self: &Arc<Self>,
-        pasted: Option<&str>,
-        code: Option<&str>,
-        state: Option<&str>,
-        user: Option<&str>,
-    ) -> anyhow::Result<ImportActionResult> {
-        let (mut code, mut state) = (code.map(str::to_string), state.map(str::to_string));
-        if let Some(pasted) = pasted {
-            let (parsed_code, parsed_state, refused) = SpotifyAuth::parse_return(Some(pasted));
-            if let Some(refused) = refused {
-                return Ok(ImportActionResult::failed(if refused == "access_denied" {
-                    "Spotify says access was not allowed.".to_string()
-                } else {
-                    format!("Spotify sent back an error: {refused}")
-                }));
-            }
-            code = parsed_code;
-            state = parsed_state.or(state);
-        }
-        let Some(code) = code.filter(|c| !is_blank(c)) else {
-            return Ok(ImportActionResult::failed(
-                "That address holds no code from Spotify. Copy the whole address the browser ended on.",
-            ));
-        };
-        let Some(pending) = self.auth.take(state.as_deref()) else {
-            return Ok(ImportActionResult::failed(
-                "That sign-in is too old or was already used. Start again with Connect.",
-            ));
-        };
-        if user.is_some_and(|u| !eq_ignore_case(u, &pending.user)) {
-            return Ok(ImportActionResult::failed(
-                "That sign-in was started by someone else.",
-            ));
-        }
-        let client_id = self
-            .settings
-            .current()
-            .imports
-            .spotify_client_id
-            .trim()
-            .to_string();
-        let connected = async {
-            let tokens = self
-                .spotify
-                .exchange(&client_id, &code, &pending.verifier, &pending.redirect_uri)
-                .await?;
-            let profile = self.spotify.profile(&tokens.access_token).await?;
-            anyhow::Ok((tokens, profile))
-        }
-        .await;
-        match connected {
-            Ok((tokens, profile)) => {
-                self.accounts.set(
-                    &pending.user,
-                    SpotifyAccount {
-                        access_token: tokens.access_token,
-                        refresh_token: tokens.refresh_token.unwrap_or_default(),
-                        expires_utc: tokens.expires_utc,
-                        connected_utc: self.now(),
-                        spotify_id: Some(profile.id.clone()),
-                        display_name: profile.display_name.clone(),
-                        problem: None,
-                    },
-                );
-                let shown = profile.display_name.clone().unwrap_or_else(|| profile.id.clone());
-                info!("{} connected Spotify account {shown}", pending.user);
-                self.start_reading(&pending.user);
-                Ok(ImportActionResult::ok(format!(
-                    "Connected to Spotify as {shown}. Octo is reading your lists."
-                )))
-            }
-            Err(e) => match e.downcast_ref::<SpotifyException>() {
-                Some(refused) => {
-                    warn!("Spotify sign-in for {} failed: {}", pending.user, refused.message);
-                    Ok(ImportActionResult::failed(refused.message.clone()))
-                }
-                None => Err(e),
-            },
-        }
-    }
-
-    pub fn disconnect_spotify(&self, user: &str) -> ImportActionResult {
-        ImportActionResult::ok(if self.accounts.remove(user) {
-            "Disconnected. Your lists stay, and are no longer read again. Remove Octo under Apps on your Spotify account page to end it there too."
-        } else {
-            "No Spotify account was connected."
-        })
-    }
-
-    /// A working access token for this person, renewed when it is about to end.
-    async fn token(&self, user: &str) -> anyhow::Result<String> {
-        let account = self
-            .accounts
-            .get(user)
-            .ok_or_else(|| SpotifyException::new("Connect a Spotify account first."))?;
-        if let Some(problem) = account.problem {
-            return Err(SpotifyException::ended(problem, None).into());
-        }
-        if account.expires_utc - self.now() > TimeDelta::minutes(2) {
-            return Ok(account.access_token);
-        }
-        let client_id = self
-            .settings
-            .current()
-            .imports
-            .spotify_client_id
-            .trim()
-            .to_string();
-        match self.spotify.refresh(&client_id, &account.refresh_token).await {
-            Ok(tokens) => {
-                self.accounts.update(user, |a| {
-                    a.access_token = tokens.access_token.clone();
-                    a.expires_utc = tokens.expires_utc;
-                    if let Some(refresh) = tokens.refresh_token.as_ref().filter(|r| !r.is_empty()) {
-                        a.refresh_token = refresh.clone();
-                    }
-                });
-                Ok(tokens.access_token)
-            }
-            Err(e) => {
-                if let Some(ended) = e.downcast_ref::<SpotifyException>().filter(|s| s.sign_in_ended) {
-                    let problem = ended.message.clone();
-                    self.accounts.update(user, |a| a.problem = Some(problem));
-                }
-                Err(e)
-            }
-        }
-    }
-
-    // =========================================================================================
-    // Reading lists
-    // =========================================================================================
-
-    /// Reads everything again from Spotify in the background. False when it is already reading.
-    pub fn start_reading(self: &Arc<Self>, user: &str) -> bool {
-        {
-            let mut reading = self.reading.lock();
-            let key = ordinal_ignore_case_key(user);
-            if reading.get(&key).is_some_and(|now| now.busy) {
-                return false;
-            }
-            reading.insert(
-                key,
-                ReadView {
-                    busy: true,
-                    step: Some("Starting".to_string()),
-                    error: None,
-                    finished_utc: None,
-                },
-            );
-        }
-        let service = self.clone();
-        let user = user.to_string();
-        tokio::spawn(async move { service.read_spotify(&user).await });
-        true
-    }
-
-    pub async fn read_spotify(self: &Arc<Self>, user: &str) {
-        let stopping = self.stopping.lock().clone();
-        let gate = self.gate(user);
-        let _held = gate.lock().await;
-        let read = tokio::select! {
-            read = self.read_spotify_held(user) => Some(read),
-            () = stopping.cancelled() => None,
-        };
-        let now = self.now();
-        match read {
-            None => self.set_reading(
-                user,
-                ReadView {
-                    busy: false,
-                    step: None,
-                    error: Some("Stopped: Octo is shutting down.".to_string()),
-                    finished_utc: Some(now),
-                },
-            ),
-            Some(Ok(())) => {}
-            Some(Err(e)) => {
-                warn!("Reading Spotify for {user} failed: {e}");
-                let error = match e.downcast_ref::<SpotifyException>() {
-                    Some(refused) => refused.message.clone(),
-                    None => format!(
-                        "Reading Spotify failed: {}.",
-                        user_safe(Some(&e.to_string())).unwrap_or_else(|| "something went wrong".to_string())
-                    ),
-                };
-                self.set_reading(
-                    user,
-                    ReadView {
-                        busy: false,
-                        step: None,
-                        error: Some(error),
-                        finished_utc: Some(now),
-                    },
-                );
-            }
-        }
-    }
-
-    fn step(&self, user: &str, words: String) {
-        self.set_reading(
-            user,
-            ReadView {
-                busy: true,
-                step: Some(words),
-                error: None,
-                finished_utc: None,
-            },
-        );
-    }
-
-    async fn read_spotify_held(self: &Arc<Self>, user: &str) -> anyhow::Result<()> {
-        let mut token = self.token(user).await?;
-        let mut seen: Vec<String> = Vec::new();
-
-        self.step(user, "Reading your liked songs".to_string());
-        let progress = {
-            let service = self.clone();
-            let user = user.to_string();
-            move |done: i32, total: i32| {
-                service.step(&user, format!("Reading your liked songs ({done} of {total})"))
-            }
-        };
-        let liked = self.spotify.liked_songs(&token, Some(&progress)).await?;
-        seen.push(LIKED_ID.to_string());
-        let liked_count = liked.len();
-        self.store.save(ImportList {
-            id: LIKED_ID.to_string(),
-            owner: user.to_string(),
-            name: "Liked Songs".to_string(),
-            source: import_sources::SPOTIFY_LIKED.to_string(),
-            total: liked_count as i32,
-            tracks: liked,
-            read_utc: self.now(),
-            ..Default::default()
-        });
-
-        self.step(user, "Reading your playlists".to_string());
-        token = self.token(user).await?;
-        let account = self.accounts.get(user);
-        let playlists = self.spotify.playlists(&token).await?;
-        for (index, playlist) in playlists.iter().enumerate() {
-            let id = format!("spotify-{}", playlist.id);
-            if seen.contains(&id) {
-                continue;
-            }
-            seen.push(id.clone());
-            self.step(
-                user,
-                format!(
-                    "Reading playlist {} of {}: {}",
-                    index + 1,
-                    playlists.len(),
-                    playlist.name
-                ),
-            );
-            let existing = self.store.get(user, &id);
-            // Unchanged since the last read: Spotify's snapshot says so, and nothing is fetched.
-            if let Some(existing) = &existing
-                && !existing.gone
-                && existing.partial.is_none()
-                && playlist.snapshot_id.is_some()
-                && existing.snapshot_id == playlist.snapshot_id
-            {
-                self.store.update(user, &id, |list| {
-                    list.name = playlist.name.clone();
-                    list.image_url = playlist.image_url.clone();
-                });
-                continue;
-            }
-            token = self.token(user).await?;
-            let mine = playlist.collaborative
-                || playlist.owner_id == account.as_ref().and_then(|a| a.spotify_id.clone());
-            let (tracks, partial) = self.read_playlist(&token, playlist, mine).await?;
-            self.store.save(ImportList {
-                id: id.clone(),
-                owner: user.to_string(),
-                name: playlist.name.clone(),
-                source: import_sources::SPOTIFY_PLAYLIST.to_string(),
-                source_ref: Some(playlist.id.clone()),
-                by: if mine { None } else { playlist.owner_name.clone() },
-                image_url: playlist.image_url.clone(),
-                snapshot_id: if partial.is_none() {
-                    playlist.snapshot_id.clone()
-                } else {
-                    None
-                },
-                total: playlist.total,
-                tracks,
-                partial,
-                read_utc: self.now(),
-                ..Default::default()
-            });
-            tokio::time::sleep(Self::BETWEEN_PLAYLISTS).await;
-        }
-
-        // A playlist no longer on the account: gone, unless it is kept or fetching, which keeps it.
-        for list in self
-            .store
-            .lists_of(user)
-            .into_iter()
-            .filter(|list| list.source == import_sources::SPOTIFY_PLAYLIST && !seen.contains(&list.id))
-        {
-            if list.keep_playlist || list.get_missing {
-                self.store.update(user, &list.id, |l| l.gone = true);
-            } else {
-                self.store.remove(user, &list.id);
-            }
-        }
-        self.store.update_all(user, |list| {
-            if seen.contains(&list.id) {
-                list.gone = false;
-            }
-        });
-
-        self.step(user, "Matching against your library".to_string());
-        self.match_and_follow(user).await;
-        self.set_reading(
-            user,
-            ReadView {
-                busy: false,
-                step: None,
-                error: None,
-                finished_utc: Some(self.now()),
-            },
-        );
-        info!(
-            "Read {liked_count} liked songs and {} playlists from Spotify for {user}",
-            playlists.len()
-        );
-        Ok(())
-    }
-
-    async fn read_playlist(
-        &self,
-        token: &str,
-        playlist: &SpotifyPlaylistInfo,
-        mine: bool,
-    ) -> anyhow::Result<(Vec<ImportTrack>, Option<String>)> {
-        let items = self.spotify.playlist_items(token, &playlist.id, None).await?;
-        if !items.hidden {
-            return Ok((items.tracks, None));
-        }
-        // Someone else's playlist: Spotify shows an app in development mode only the songs of
-        // playlists the account made or works on. Its public page still lists the first 100.
-        match self
-            .links
-            .read(&format!("https://open.spotify.com/playlist/{}", playlist.id))
-            .await
-        {
-            Ok(page) => {
-                let whole = !page.capped && page.tracks.len() as i64 >= i64::from(playlist.total);
-                Ok((
-                    page.tracks,
-                    (!whole).then(|| {
-                        format!(
-                            "Spotify shows Octo only the songs of playlists you made, so Octo read this one from its public page, which lists the first {}. Import it from a file to get the rest.",
-                            SpotifyLinkReader::EMBED_CAP
-                        )
-                    }),
-                ))
-            }
-            Err(e) => {
-                debug!("Public page of playlist {} could not be read: {e}", playlist.id);
-                Ok((
-                    Vec::new(),
-                    Some(if mine {
-                        "Spotify would not show this playlist's songs.".to_string()
-                    } else {
-                        "Spotify shows Octo only the songs of playlists you made, and this one has no public page. Import it from a file instead.".to_string()
-                    }),
-                ))
-            }
-        }
-    }
 
     /// A public playlist or album, by its link. No sign-in needed. `Err` when the link could not
     /// be read for a reason other than Spotify's own refusal.
@@ -763,7 +297,7 @@ impl ImportService {
             read_utc: self.now(),
             partial: read.capped.then(|| {
                 format!(
-                    "A link shows only the first {} songs. Connect Spotify or import a file for the whole list.",
+                    "A link shows only the first {} songs. Export the list with TuneMyMusic and import the file for the whole list.",
                     SpotifyLinkReader::EMBED_CAP
                 )
             }),
@@ -924,20 +458,13 @@ impl ImportService {
         None
     }
 
-    /// Reads one list again from where it came from: the account for a Spotify list, the page for
-    /// a link.
+    /// Reads one list again from where it came from: the page for a link. Any other list is
+    /// matched against the library again.
     pub async fn refresh(self: &Arc<Self>, user: &str, id: &str) -> anyhow::Result<ImportActionResult> {
         let Some(list) = self.store.get(user, id) else {
             return Ok(ImportActionResult::failed("There is no such list."));
         };
         match list.source.as_str() {
-            import_sources::SPOTIFY_LIKED | import_sources::SPOTIFY_PLAYLIST => {
-                Ok(ImportActionResult::ok(if self.start_reading(user) {
-                    "Reading your Spotify lists again."
-                } else {
-                    "Octo is already reading your Spotify lists."
-                }))
-            }
             import_sources::LINK if list.source_ref.is_some() => {
                 self.add_link(user, list.source_ref.as_deref().unwrap_or_default())
                     .await
@@ -1340,7 +867,7 @@ impl ImportService {
     }
 
     /// One pass of the loop: matches people the trickle brought songs, writes playlists, and
-    /// reads stale lists again.
+    /// reads stale links again.
     pub async fn loop_once(self: &Arc<Self>) -> anyhow::Result<()> {
         let users: Vec<String> = std::mem::take(&mut *self.rematch.lock());
         for user in users {
@@ -1362,25 +889,15 @@ impl ImportService {
             .store
             .all()
             .into_iter()
-            .filter(|list| (list.keep_playlist || list.get_missing) && !list.gone && list.read_utc < stale)
+            .filter(|list| {
+                (list.keep_playlist || list.get_missing)
+                    && !list.gone
+                    && list.read_utc < stale
+                    && list.source == import_sources::LINK
+                    && list.source_ref.is_some()
+            })
             .collect();
-        let mut owners: Vec<String> = Vec::new();
-        for list in followed.iter().filter(|list| {
-            list.source == import_sources::SPOTIFY_LIKED || list.source == import_sources::SPOTIFY_PLAYLIST
-        }) {
-            if !owners.iter().any(|o| eq_ignore_case(o, &list.owner)) {
-                owners.push(list.owner.clone());
-            }
-        }
-        for user in owners {
-            if self.accounts.get(&user).is_some_and(|a| a.problem.is_none()) {
-                self.start_reading(&user);
-            }
-        }
-        for list in followed
-            .iter()
-            .filter(|list| list.source == import_sources::LINK && list.source_ref.is_some())
-        {
+        for list in &followed {
             let link = list.source_ref.clone().unwrap_or_default();
             let read = self.add_link(&list.owner, &link).await?;
             // A link that no longer reads is tried again next time round, not every pass.
@@ -1395,7 +912,6 @@ impl ImportService {
 
     /// The hosted loop: a pass every 30 seconds until Octo stops.
     pub async fn run_loop(self: Arc<Self>, stopping: CancellationToken) -> anyhow::Result<()> {
-        *self.stopping.lock() = stopping.clone();
         while !stopping.is_cancelled() {
             // Per-pass catch: one failed pass must not stop the loop.
             let service = self.clone();
@@ -1449,7 +965,11 @@ fn summary(list: &ImportList, jobs: &IndexMap<String, TrickleJob>) -> ListSummar
         playlist_id: list.playlist_id.clone(),
         playlist_note: list.playlist_note.clone(),
         get_missing: list.get_missing,
-        partial: list.partial.clone(),
+        partial: if import_sources::from_account(&list.source) {
+            Some(ACCOUNT_LIST_NOTE.to_string())
+        } else {
+            list.partial.clone()
+        },
         gone: list.gone,
         can_refresh: import_sources::can_refresh(&list.source),
         read_utc: list.read_utc,

@@ -1,14 +1,17 @@
-//! The dashboard's import page. Connect a Spotify account, add a public link, an exported file
-//! or a pasted list, see what the library has and what it is missing, keep a list as a playlist,
-//! and the trickle that fetches the rest. Lists belong to the Navidrome user signed in on the
-//! page, the same person an Octo app signed in as sees them, so it needs the dashboard's sign-in.
+//! The dashboard's import page. Add a public link, an exported file or a pasted list, see what
+//! the library has and what it is missing, keep a list as a playlist, and the trickle that
+//! fetches the rest. Lists belong to the Navidrome user signed in on the page, the same person an
+//! Octo app signed in as sees them, so it needs the dashboard's sign-in.
 //!
-//! Also the page Spotify sends the browser back to when the redirect URI is Octo's own address.
+//! Every endpoint also takes `for=<Navidrome username>` in the query: the import, its lists,
+//! playlists, downloads and status are then that person's, exactly as if they had imported it
+//! themselves.
 
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::response::Response;
 use axum::routing::{get, post};
+use octo_core::common::dotnet::{eq_ignore_case, to_lower_invariant};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
@@ -22,16 +25,12 @@ use crate::http::error::{AppError, AppResult, problem};
 use crate::http::routes::RouteSet;
 use crate::services::imports::ImportActionResult;
 use crate::services::imports::import_file_reader::ImportFileReader;
-use crate::services::imports::import_service::CALLBACK_PATH;
 
 pub fn routes() -> RouteSet {
     RouteSet::new()
         .route("/api/admin/imports", get(overview))
+        .route("/api/admin/imports/people", get(people))
         .route("/api/admin/imports/lists/{id}", get(list).delete(remove))
-        .route("/api/admin/imports/spotify/connect", post(connect))
-        .route("/api/admin/imports/spotify/finish", post(finish))
-        .route("/api/admin/imports/spotify/disconnect", post(disconnect))
-        .route("/api/admin/imports/spotify/read", post(read))
         .route("/api/admin/imports/link", post(link))
         .route(
             "/api/admin/imports/file",
@@ -48,7 +47,6 @@ pub fn routes() -> RouteSet {
         .route("/api/admin/imports/trickle/retry", post(retry))
         .route("/api/admin/imports/trickle/skip", post(skip))
         .route("/api/admin/imports/trickle/clear", post(clear))
-        .route(CALLBACK_PATH, get(callback))
 }
 
 /// `SignedIn(header)`: `NavidromeUserOf(cookie ?? header)`. Never the recovery code, and the
@@ -65,6 +63,54 @@ fn sign_in() -> Response {
         StatusCode::UNAUTHORIZED,
         "Sign in with your Navidrome account first.",
     )
+}
+
+/// The person a request acts for: the Navidrome user its `for` names, spelled the way Navidrome
+/// spells them, or the signed-in person when `for` is absent or names them. A name Navidrome
+/// has no user for is answered 400.
+#[allow(clippy::result_large_err)] // the error is the answer itself, sent at once
+async fn acting_for(state: &AppState, uri: &Uri, signed_in: String) -> Result<String, Response> {
+    let Some(wanted) = query(uri, "for")
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+    else {
+        return Ok(signed_in);
+    };
+    if eq_ignore_case(&wanted, &signed_in) {
+        return Ok(signed_in);
+    }
+    let users = state.navidrome_admin.list_users().await.map_err(|e| {
+        error_json(
+            StatusCode::BAD_GATEWAY,
+            &format!("Octo could not read the users on this server: {e}"),
+        )
+    })?;
+    users
+        .iter()
+        .map(|user| user.user_name())
+        .find(|name| eq_ignore_case(name, &wanted))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            error_json(
+                StatusCode::BAD_REQUEST,
+                &format!("There is no user named {wanted} on this server."),
+            )
+        })
+}
+
+/// The signed-in person and the person the request acts for, or the answer that refuses it.
+#[allow(clippy::result_large_err)] // the error is the answer itself, sent at once
+async fn whose(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Result<(String, String), Response> {
+    let admin = signed_in(state, headers).ok_or_else(sign_in)?;
+    let user = acting_for(state, uri, admin.clone()).await?;
+    Ok((admin, user))
+}
+
+/// Logs a new import the signed-in person started for someone else.
+fn note_import_for(admin: &str, user: &str) {
+    if !eq_ignore_case(admin, user) {
+        info!("Import for {user} started by {admin}");
+    }
 }
 
 /// `result.Ok ? Ok(result) : BadRequest(result)`.
@@ -167,23 +213,6 @@ impl FromBody for LinkRequest {
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
-struct FinishRequest {
-    address: Option<String>,
-}
-
-impl FromBody for FinishRequest {
-    const SHAPE: &'static Shape = &Shape {
-        name: "Octo.Controllers.ImportsController+FinishRequest",
-        by_constructor: true,
-        members: &[Member {
-            name: "address",
-            kind: Kind::Text,
-        }],
-    };
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
 struct TextRequest {
     name: Option<String>,
     text: Option<String>,
@@ -212,69 +241,73 @@ async fn split(request: Request) -> (axum::http::request::Parts, axum::body::Byt
 
 // ---- The endpoints ----------------------------------------------------------------------------
 
-async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(user) = signed_in(&state, &headers) else {
-        return sign_in();
+async fn overview(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    let (_, user) = match whose(&state, &headers, &uri).await {
+        Ok(people) => people,
+        Err(refused) => return refused,
     };
     let overview = state.imports.overview(&user);
     ok(&json!({ "user": user, "overview": overview }))
 }
 
-async fn list(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> Response {
-    let Some(user) = signed_in(&state, &headers) else {
+/// Who the page can import for: the signed-in person first, then every other Navidrome user by
+/// name, each marked when they are a Family member (their songs go to their own library).
+async fn people(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(admin) = signed_in(&state, &headers) else {
         return sign_in();
+    };
+    let family_on = state.settings.current().family.enabled;
+    let member = |name: &str| family_on && state.family_store.member(name).is_some();
+    let (mut users, problem) = match state.navidrome_admin.list_users().await {
+        Ok(users) => (users, None),
+        Err(e) => (
+            Vec::new(),
+            Some(format!("Octo could not read the users on this server: {e}")),
+        ),
+    };
+    users.retain(|user| !user.user_name().trim().is_empty());
+    users.sort_by_key(|user| to_lower_invariant(user.user_name()));
+    let own_name = users
+        .iter()
+        .find(|user| eq_ignore_case(user.user_name(), &admin))
+        .map(|user| user.name().to_string())
+        .unwrap_or_default();
+    let mut rows = vec![json!({
+        "username": admin,
+        "name": own_name,
+        "member": member(&admin),
+        "you": true,
+    })];
+    rows.extend(
+        users
+            .iter()
+            .filter(|user| !eq_ignore_case(user.user_name(), &admin))
+            .map(|user| {
+                json!({
+                    "username": user.user_name(),
+                    "name": user.name(),
+                    "member": member(user.user_name()),
+                    "you": false,
+                })
+            }),
+    );
+    ok(&json!({ "signedIn": admin, "users": rows, "problem": problem }))
+}
+
+async fn list(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let (_, user) = match whose(&state, &headers, &uri).await {
+        Ok(people) => people,
+        Err(refused) => return refused,
     };
     match state.imports.detail(&user, &id) {
         Some(detail) => ok(&detail),
         None => error_json(StatusCode::NOT_FOUND, "There is no such list."),
     }
-}
-
-async fn connect(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(user) = signed_in(&state, &headers) else {
-        return sign_in();
-    };
-    answer(&state.imports.begin_spotify(&user, None))
-}
-
-async fn finish(State(state): State<AppState>, request: Request) -> AppResult {
-    let (parts, body) = split(request).await;
-    let request: FinishRequest = match bind_body::<FinishRequest>(&parts.headers, &body, "request") {
-        Ok(request) => request,
-        Err(refused) => return Ok(refused),
-    };
-    let Some(user) = signed_in(&state, &parts.headers) else {
-        return Ok(sign_in());
-    };
-    let result = state
-        .imports
-        .finish_spotify(
-            Some(request.address.as_deref().unwrap_or("")),
-            None,
-            None,
-            Some(&user),
-        )
-        .await
-        .map_err(app_error)?;
-    Ok(answer(&result))
-}
-
-async fn disconnect(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(user) = signed_in(&state, &headers) else {
-        return sign_in();
-    };
-    answer(&state.imports.disconnect_spotify(&user))
-}
-
-async fn read(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(user) = signed_in(&state, &headers) else {
-        return sign_in();
-    };
-    ok(&ImportActionResult::ok(if state.imports.start_reading(&user) {
-        "Reading your Spotify lists again."
-    } else {
-        "Octo is already reading your Spotify lists."
-    }))
 }
 
 async fn link(State(state): State<AppState>, request: Request) -> AppResult {
@@ -283,9 +316,11 @@ async fn link(State(state): State<AppState>, request: Request) -> AppResult {
         Ok(request) => request,
         Err(refused) => return Ok(refused),
     };
-    let Some(user) = signed_in(&state, &parts.headers) else {
-        return Ok(sign_in());
+    let (admin, user) = match whose(&state, &parts.headers, &parts.uri).await {
+        Ok(people) => people,
+        Err(refused) => return Ok(refused),
     };
+    note_import_for(&admin, &user);
     // Not tied to the request: a closed tab must not leave a list half read.
     let imports = state.imports.clone();
     let url = request.url.unwrap_or_default();
@@ -309,8 +344,9 @@ async fn file(State(state): State<AppState>, request: Request) -> AppResult {
     {
         return Ok(problem(StatusCode::NOT_FOUND));
     }
-    let Some(user) = signed_in(&state, request.headers()) else {
-        return Ok(sign_in());
+    let (admin, user) = match whose(&state, request.headers(), request.uri()).await {
+        Ok(people) => people,
+        Err(refused) => return Ok(refused),
     };
     let choose = || answer(&ImportActionResult::failed("Choose a file first."));
     if content_type.is_none() {
@@ -343,6 +379,7 @@ async fn file(State(state): State<AppState>, request: Request) -> AppResult {
     let Some((name, bytes)) = found.filter(|(_, bytes)| !bytes.is_empty()) else {
         return Ok(choose());
     };
+    note_import_for(&admin, &user);
     let imports = state.imports.clone();
     let result = tokio::spawn(async move { imports.add_file(&user, &name, &bytes).await })
         .await
@@ -357,13 +394,15 @@ async fn text(State(state): State<AppState>, request: Request) -> AppResult {
         Ok(request) => request,
         Err(refused) => return Ok(refused),
     };
-    let Some(user) = signed_in(&state, &parts.headers) else {
-        return Ok(sign_in());
+    let (admin, user) = match whose(&state, &parts.headers, &parts.uri).await {
+        Ok(people) => people,
+        Err(refused) => return Ok(refused),
     };
     let text = request.text.unwrap_or_default();
     if text.trim().is_empty() {
         return Ok(answer(&ImportActionResult::failed("Paste a list first.")));
     }
+    note_import_for(&admin, &user);
     let imports = state.imports.clone();
     let name = request.name;
     let result = tokio::spawn(async move { imports.add_text(&user, name.as_deref(), &text).await })
@@ -373,9 +412,9 @@ async fn text(State(state): State<AppState>, request: Request) -> AppResult {
 }
 
 /// Where people can bring their music from, for the dashboard's guide.
-async fn services(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if signed_in(&state, &headers).is_none() {
-        return sign_in();
+async fn services(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Err(refused) = whose(&state, &headers, &uri).await {
+        return refused;
     }
     ok(&state.imports.services())
 }
@@ -386,8 +425,9 @@ async fn playlist(State(state): State<AppState>, Path(id): Path<String>, request
         Ok(request) => request,
         Err(refused) => return Ok(refused),
     };
-    let Some(user) = signed_in(&state, &parts.headers) else {
-        return Ok(sign_in());
+    let (_, user) = match whose(&state, &parts.headers, &parts.uri).await {
+        Ok(people) => people,
+        Err(refused) => return Ok(refused),
     };
     let imports = state.imports.clone();
     let result = tokio::spawn(async move { imports.set_playlist(&user, &id, request.on).await })
@@ -402,8 +442,9 @@ async fn fetch(State(state): State<AppState>, Path(id): Path<String>, request: R
         Ok(request) => request,
         Err(refused) => return refused,
     };
-    let Some(user) = signed_in(&state, &parts.headers) else {
-        return sign_in();
+    let (_, user) = match whose(&state, &parts.headers, &parts.uri).await {
+        Ok(people) => people,
+        Err(refused) => return refused,
     };
     answer(&state.imports.set_get_missing(&user, &id, request.on))
 }
@@ -414,8 +455,9 @@ async fn songs(State(state): State<AppState>, Path(id): Path<String>, request: R
         Ok(request) => request,
         Err(refused) => return refused,
     };
-    let Some(user) = signed_in(&state, &parts.headers) else {
-        return sign_in();
+    let (_, user) = match whose(&state, &parts.headers, &parts.uri).await {
+        Ok(people) => people,
+        Err(refused) => return refused,
     };
     answer(
         &state
@@ -424,9 +466,15 @@ async fn songs(State(state): State<AppState>, Path(id): Path<String>, request: R
     )
 }
 
-async fn refresh(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> AppResult {
-    let Some(user) = signed_in(&state, &headers) else {
-        return Ok(sign_in());
+async fn refresh(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> AppResult {
+    let (_, user) = match whose(&state, &headers, &uri).await {
+        Ok(people) => people,
+        Err(refused) => return Ok(refused),
     };
     let imports = state.imports.clone();
     let result = tokio::spawn(async move { imports.refresh(&user, &id).await })
@@ -436,9 +484,15 @@ async fn refresh(State(state): State<AppState>, Path(id): Path<String>, headers:
     Ok(answer(&result))
 }
 
-async fn remove(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> Response {
-    let Some(user) = signed_in(&state, &headers) else {
-        return sign_in();
+async fn remove(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let (_, user) = match whose(&state, &headers, &uri).await {
+        Ok(people) => people,
+        Err(refused) => return refused,
     };
     answer(&state.imports.remove(&user, &id))
 }
@@ -449,8 +503,9 @@ async fn pause(State(state): State<AppState>, request: Request) -> Response {
         Ok(request) => request,
         Err(refused) => return refused,
     };
-    let Some(user) = signed_in(&state, &parts.headers) else {
-        return sign_in();
+    let (_, user) = match whose(&state, &parts.headers, &parts.uri).await {
+        Ok(people) => people,
+        Err(refused) => return refused,
     };
     answer(&state.imports.pause(&user, request.paused))
 }
@@ -461,8 +516,9 @@ async fn retry(State(state): State<AppState>, request: Request) -> Response {
         Ok(request) => request,
         Err(refused) => return refused,
     };
-    let Some(user) = signed_in(&state, &parts.headers) else {
-        return sign_in();
+    let (_, user) = match whose(&state, &parts.headers, &parts.uri).await {
+        Ok(people) => people,
+        Err(refused) => return refused,
     };
     answer(&state.imports.retry(&user, request.keys().as_deref()))
 }
@@ -473,84 +529,19 @@ async fn skip(State(state): State<AppState>, request: Request) -> Response {
         Ok(request) => request,
         Err(refused) => return refused,
     };
-    let Some(user) = signed_in(&state, &parts.headers) else {
-        return sign_in();
+    let (_, user) = match whose(&state, &parts.headers, &parts.uri).await {
+        Ok(people) => people,
+        Err(refused) => return refused,
     };
     answer(&state.imports.skip(&user, &request.keys().unwrap_or_default()))
 }
 
-async fn clear(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(user) = signed_in(&state, &headers) else {
-        return sign_in();
+async fn clear(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    let (_, user) = match whose(&state, &headers, &uri).await {
+        Ok(people) => people,
+        Err(refused) => return refused,
     };
     answer(&state.imports.clear_finished(&user))
-}
-
-/// Where Spotify sends the browser when the redirect URI is Octo's own address. The state says
-/// whose sign-in it is, so no dashboard sign-in is needed here, and the PKCE verifier Octo kept
-/// is what makes the code worth anything.
-async fn callback(State(state): State<AppState>, request: Request) -> AppResult {
-    let uri = request.uri().clone();
-    let (code, sign_in_state, error) = (query(&uri, "code"), query(&uri, "state"), query(&uri, "error"));
-    let result = match error {
-        Some(error) => ImportActionResult::failed(if error == "access_denied" {
-            "Spotify says access was not allowed.".to_string()
-        } else {
-            format!("Spotify sent back an error: {error}")
-        }),
-        None => {
-            let imports = state.imports.clone();
-            tokio::spawn(async move {
-                imports
-                    .finish_spotify(None, code.as_deref(), sign_in_state.as_deref(), None)
-                    .await
-            })
-            .await
-            .map_err(|e| AppError::Internal(e.into()))?
-            .map_err(app_error)?
-        }
-    };
-    if !result.ok {
-        info!("Spotify sign-in callback refused: {}", result.message);
-    }
-    let title = if result.ok {
-        "Connected to Spotify"
-    } else {
-        "Spotify sign-in did not finish"
-    };
-    let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n\
-<title>{title}</title><style>body{{font:16px system-ui,sans-serif;background:#0d0f14;color:#e8e8ef;display:grid;place-items:center;min-height:100vh;margin:0}}\n\
-main{{max-width:28rem;padding:2rem}}a{{color:#9db4ff}}</style></head>\n\
-<body><main><h1>{title}</h1><p>{}</p>\n\
-<p>You can close this tab and go back to Octo.</p><p><a href=\"/admin/#imports\">Open the Spotify import page</a></p></main></body></html>",
-        html_encode(&result.message)
-    );
-    let mut response = html.into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("text/html"),
-    );
-    Ok(response)
-}
-
-/// `WebUtility.HtmlEncode`: the five markup characters, and Latin-1's upper half and anything
-/// past the BMP as numeric references.
-pub(crate) fn html_encode(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            '&' => out.push_str("&amp;"),
-            '\u{a0}'..='\u{ff}' => out.push_str(&format!("&#{};", c as u32)),
-            c if (c as u32) > 0xFFFF => out.push_str(&format!("&#{};", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

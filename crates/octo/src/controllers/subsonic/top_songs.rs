@@ -6,6 +6,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use octo_core::charts::chart_settings::{self, ChartKind, OVERALL};
 use octo_core::charts::top_songs::MAX_ROWS;
+use octo_core::common::skipped_takes;
 use octo_core::models::domain::Song;
 use octo_core::soulseek::soulseek_metadata_service::RoutingKind;
 use octo_subsonic::subsonic_request_parser::Parameters;
@@ -196,12 +197,15 @@ pub async fn get_top_songs(State(state): State<AppState>, req: Request) -> AppRe
         .top_songs
         .for_artist(&name, Some(artist_id.as_str()).filter(|id| !id.is_empty()))
         .await;
-    let outside = state.settings.current().subsonic.enable_search_discovery;
+    let settings = state.settings.current();
+    let outside = settings.subsonic.enable_search_discovery;
+    let skip_covers_and_instrumentals = settings.soulseek.skip_covers_and_instrumentals;
 
-    // With outside songs shown, only the rows asked for are looked up in the library. Without
-    // them every row is, because the library's rows are all that is left to list.
+    // With outside songs shown, only the rows asked for are looked up in the library, and the
+    // rows Skip covers and instrumentals would leave out beside them. Without outside songs every row is,
+    // because the library's rows are all that is left to list.
     let candidates: Vec<_> = if outside {
-        list.songs.iter().take(count).cloned().collect()
+        TopSongsService::rows_to_match(&list.songs, count, skip_covers_and_instrumentals)
     } else {
         list.songs.clone()
     };
@@ -222,7 +226,9 @@ pub async fn get_top_songs(State(state): State<AppState>, req: Request) -> AppRe
         }
         match library.get(i).cloned().flatten() {
             Some(owned) => rows.push(TopSongRow::Library(owned)),
-            None if outside => rows.push(TopSongRow::Outside(synced_song(&state, &username, &top.song))),
+            None if outside && !skipped_takes::hides_song(&top.song, skip_covers_and_instrumentals) => {
+                rows.push(TopSongRow::Outside(synced_song(&state, &username, &top.song)));
+            }
             None => {}
         }
     }
@@ -305,13 +311,18 @@ fn synced_song(state: &AppState, username: &str, song: &Song) -> Song {
         .unwrap_or_else(|| song.clone())
 }
 
-/// The first `count` rows, each matched against the caller's own library.
+/// The first `count` rows, each matched against the caller's own library. While Skip covers,
+/// karaoke and instrumentals is on, an outside cover, karaoke or instrumental take is left out and
+/// the next row takes its place.
 async fn answer(state: &AppState, call: &SubsonicCall, list: &TopList, count: usize) -> Response {
-    let shown: Vec<_> = list.songs.iter().take(count).cloned().collect();
-    let library = TopSongsService::match_library(&shown, |query| {
+    let skip_covers_and_instrumentals = state.settings.current().soulseek.skip_covers_and_instrumentals;
+    let candidates = TopSongsService::rows_to_match(&list.songs, count, skip_covers_and_instrumentals);
+    let library = TopSongsService::match_library(&candidates, |query| {
         library_songs_matching(&call.proxy, &call.parameters, query)
     })
     .await;
+    let (shown, library) =
+        TopSongsService::shown_rows(candidates, library, count, skip_covers_and_instrumentals);
     let rows: Vec<RankedRow<'_>> = shown
         .iter()
         .enumerate()

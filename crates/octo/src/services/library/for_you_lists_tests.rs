@@ -372,6 +372,7 @@ async fn new_releases_are_the_artists_latest_newest_first_with_the_listeners_own
             8,
             &CancellationToken::new(),
             ExplicitFilter::All,
+            false,
         )
         .await
         .expect("built");
@@ -440,6 +441,7 @@ async fn a_clean_only_server_leaves_out_explicit_outside_songs_but_never_the_lis
             8,
             &CancellationToken::new(),
             ExplicitFilter::CleanOnly,
+            false,
         )
         .await
         .expect("built");
@@ -461,6 +463,7 @@ async fn a_long_career_is_read_past_its_first_page_so_the_newest_single_is_found
             8,
             &CancellationToken::new(),
             ExplicitFilter::All,
+            false,
         )
         .await
         .expect("built");
@@ -486,6 +489,7 @@ async fn listeners_building_together_take_the_catalog_in_turn() {
                     8,
                     &CancellationToken::new(),
                     ExplicitFilter::All,
+                    false,
                 )
                 .await
         })
@@ -502,6 +506,7 @@ async fn listeners_building_together_take_the_catalog_in_turn() {
                     8,
                     &CancellationToken::new(),
                     ExplicitFilter::All,
+                    false,
                 )
                 .await
         })

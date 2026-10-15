@@ -221,7 +221,7 @@ fn install_stations(state: &AppState) {
         &[LastFmRadioStation {
             id: station_id("alice", "your-mix"),
             key: "your-mix".into(),
-            name: "Your Mix".into(),
+            name: "Your Radio".into(),
             owner: "alice".into(),
             kind: LastFmRadioStationKind::YourMix,
             personalized: true,

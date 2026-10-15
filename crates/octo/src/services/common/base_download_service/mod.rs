@@ -49,7 +49,7 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use octo_core::common::{PathHelper, dotnet};
 use octo_core::fingerprint::VerificationResult;
 use octo_core::models::domain::{Album, Song};
-use octo_core::models::download::{DownloadHistoryEntry, DownloadInfo, DownloadStatus};
+use octo_core::models::download::{AcquisitionHeard, DownloadHistoryEntry, DownloadInfo, DownloadStatus};
 use octo_core::notifications::{NotificationEvent, NotificationEventType};
 use octo_core::settings::{
     DownloadMode, DownloadSource, LibraryAction, SettingsStore, SoulseekSettings, StorageMode,
@@ -482,17 +482,42 @@ impl BaseDownloadService {
     /// One line in the downloads log of this source's row for a song. Watching only, like
     /// [`Self::track`].
     pub fn log_step(&self, external_id: &str, kind: &str, text: &str, detail: Option<&str>) {
+        self.log_step_heard(external_id, kind, text, detail, Vec::new());
+    }
+
+    /// The same with the other recordings AcoustID heard in the file.
+    pub fn log_step_heard(
+        &self,
+        external_id: &str,
+        kind: &str,
+        text: &str,
+        detail: Option<&str>,
+        heard: Vec<AcquisitionHeard>,
+    ) {
         let provider = self.provider_name().to_string();
-        self.track(|t| t.log(&provider, external_id, kind, text, detail));
+        self.track(|t| t.log_heard(&provider, external_id, kind, text, detail, heard));
     }
 
     /// The same for a song that carries its own outside id.
     pub(crate) fn log_song_step(&self, song: &Song, kind: &str, text: &str, detail: Option<&str>) {
+        self.log_song_step_heard(song, kind, text, detail, Vec::new());
+    }
+
+    /// The same for a song that carries its own outside id, with the other recordings AcoustID
+    /// heard in the file.
+    pub(crate) fn log_song_step_heard(
+        &self,
+        song: &Song,
+        kind: &str,
+        text: &str,
+        detail: Option<&str>,
+        heard: Vec<AcquisitionHeard>,
+    ) {
         if let (Some(provider), Some(id)) = (
             song.external_provider.as_deref().filter(|p| !p.is_empty()),
             song.external_id.as_deref().filter(|i| !i.is_empty()),
         ) {
-            self.track(|t| t.log(provider, id, kind, text, detail));
+            self.track(|t| t.log_heard(provider, id, kind, text, detail, heard));
         }
     }
 

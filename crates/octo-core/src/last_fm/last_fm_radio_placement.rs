@@ -522,9 +522,9 @@ mod tests {
     /// The longest run of the commoner kind anywhere, at 85 songs of one kind to 15.
     const LONGEST_COMMON_RUN: usize = 20;
 
-    /// The Check Mode finding M1 (2026-10-08): a short Your Mix or Starter Radio walk, 5
-    /// familiar tracks and 18 discoveries, paced at Your Mix's 36% ended on 16 discoveries in a
-    /// row. Paced to the list, it ends on 6 at most over 200 seeds.
+    /// A short Your Radio or Starter Radio walk, 5 familiar tracks and 18 discoveries, is paced
+    /// to the list rather than at Your Radio's 36%, so it ends on 6 discoveries in a row at most
+    /// over 200 seeds.
     #[test]
     fn a_short_walk_ends_on_no_long_run_of_discoveries() {
         let pool = songs(5, 18);

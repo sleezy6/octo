@@ -496,3 +496,60 @@ pub fn parse_recording_credits(root: &Value) -> std::collections::HashMap<String
 #[cfg(test)]
 #[path = "music_brainz_client_tests.rs"]
 mod tests;
+
+/// The lookup of one recording with every release it is on and their groups: what the music
+/// database says the recording is, beyond what AcoustID sends.
+pub fn recording_facts_url(recording_id: &str) -> Option<String> {
+    is_mbid(recording_id).then(|| {
+        format!(
+            "recording/{}?inc=releases+release-groups&fmt=json",
+            dotnet::escape_data_string(recording_id)
+        )
+    })
+}
+
+/// A recording lookup's title, disambiguation, length and releases (each with its status and
+/// its group's title and secondary types).
+pub fn parse_recording_facts(
+    root: &Value,
+) -> ElementResult<crate::fingerprint::recording_identity::RecordingFacts> {
+    use crate::fingerprint::recording_identity::{FactRelease, RecordingFacts};
+    use crate::json::element::{str_prop, string_prop};
+
+    let mut releases = Vec::new();
+    if let Some(list @ Value::Array(_)) = try_get_property(root, "releases")? {
+        for release in enumerate_array(list)? {
+            let group = try_get_property(release, "release-group")?;
+            let mut secondary = Vec::new();
+            if let Some(group) = group
+                && let Some(types @ Value::Array(_)) = try_get_property(group, "secondary-types")?
+            {
+                for kind in enumerate_array(types)? {
+                    if let Some(kind) = get_string(kind)? {
+                        secondary.push(kind.to_string());
+                    }
+                }
+            }
+            releases.push(FactRelease {
+                title: str_prop(release, "title")?.unwrap_or("").to_string(),
+                status: string_prop(release, "status")?,
+                group_title: match group {
+                    Some(group) => string_prop(group, "title")?,
+                    None => None,
+                },
+                group_secondary_types: secondary,
+            });
+        }
+    }
+    let length_ms = match try_get_property(root, "length")? {
+        Some(length @ Value::Number(_)) => Some(get_double(length)? as i64).filter(|ms| *ms > 0),
+        _ => None,
+    };
+    Ok(RecordingFacts {
+        recording_id: str_prop(root, "id")?.unwrap_or("").to_string(),
+        title: str_prop(root, "title")?.unwrap_or("").to_string(),
+        disambiguation: string_prop(root, "disambiguation")?.filter(|text| !dotnet::is_blank(text)),
+        length_ms,
+        releases,
+    })
+}

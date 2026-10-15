@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use octo_core::common::SongIdentity;
 use octo_core::common::dotnet;
 use octo_core::common::song_versions::strip_versions;
+use octo_core::fingerprint::recording_identity::{self, RecordingFacts, RecordingKind, Takes};
 use octo_core::fingerprint::{
     AcoustIdLookup, AcoustIdRecording, AcoustIdResult, InconclusiveReason, TrackMatchComparer,
     VerificationResult, VerificationVerdict,
@@ -21,10 +22,14 @@ use octo_media::tags::{TagFile, tag_writer_extras};
 use tracing::{debug, info, warn};
 
 use super::acoust_id_client::AcoustIdClient;
+use super::acoust_id_rate_limiter::AcoustIdRateLimiter;
 use super::music_brainz_client::{MusicBrainzClient, MusicBrainzError};
 
 /// The ISRCs MusicBrainz listed per recording id, with ids compared ignoring case.
 pub type RecordingIsrcs = HashMap<String, Vec<String>>;
+
+/// What MusicBrainz says each recording is, by lowercased recording id.
+pub type FactsById = HashMap<String, RecordingFacts>;
 
 /// Asks what a finished download actually contains, rather than what its name and advertised
 /// length claim.
@@ -46,6 +51,10 @@ impl DownloadVerificationService {
     /// MusicBrainz call a second apart, spent only when the request carried an ISRC and the
     /// recordings' names disagreed with it.
     pub const MAX_ISRC_LOOKUPS: usize = 3;
+
+    /// How many recordings MusicBrainz is asked about when AcoustID's answer cannot tell their
+    /// kinds apart. Each is a call a second apart.
+    pub const MAX_FACT_LOOKUPS: usize = 3;
 
     pub fn new(
         fingerprinter: Arc<AudioFingerprinter>,
@@ -99,6 +108,29 @@ impl DownloadVerificationService {
         report
     }
 
+    /// The takes a download asking for this title and album may be: the ones they name, never
+    /// a cover, a karaoke backing or an instrumental while Skip covers and instrumentals is on.
+    pub fn takes_for(&self, title: Option<&str>, album: Option<&str>) -> Takes {
+        let never = if self.settings.current().soulseek.skip_covers_and_instrumentals {
+            std::collections::BTreeSet::from(octo_core::common::skipped_takes::SKIPPED)
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        Takes::for_request(title, album, &never)
+    }
+
+    /// [`Self::takes_for`] a download request: one replacing a library file keeps the take its
+    /// title names, since that file is the person's own (Skip covers, karaoke and instrumentals
+    /// is for songs Octo brings in).
+    pub fn takes_for_routing(&self, routing: &octo_core::soulseek::SoulseekRouting) -> Takes {
+        let (title, album) = (routing.title.as_deref(), routing.album.as_deref());
+        if routing.replaces_library_file {
+            Takes::for_request(title, album, &std::collections::BTreeSet::new())
+        } else {
+            self.takes_for(title, album)
+        }
+    }
+
     /// AcoustID can answer at all.
     pub fn has_api_key(&self) -> bool {
         !dotnet::is_blank(&self.settings.current().soulseek.acoust_id_api_key)
@@ -121,16 +153,49 @@ impl DownloadVerificationService {
     /// No cancellation token, deliberately. There must be no way for a caller who has already
     /// given up to skip verification on a file that is about to enter the library.
     ///
-    /// `refuse_live`: a download that did not ask for a live take: a recording MusicBrainz only
-    /// ever lists on live albums is the wrong file. Off for songs already in the library, which
-    /// may be live on purpose.
+    /// `takes`: which takes of the song the file may be. A download that did not ask for a live
+    /// take, an instrumental or a karaoke backing refuses a file that is one; [`Takes::Any`] for
+    /// songs already in the library, which may be such a take on purpose.
     pub async fn verify(
         &self,
         path: &str,
         requested_artist: Option<&str>,
         requested_title: Option<&str>,
         requested_isrc: Option<&str>,
-        refuse_live: bool,
+        takes: &Takes,
+    ) -> VerificationResult {
+        self.verify_on(
+            path,
+            requested_artist,
+            requested_title,
+            requested_isrc,
+            takes,
+            false,
+        )
+        .await
+    }
+
+    /// [`Self::verify`] for work nobody waits on (the library sweep, a song's own file heard
+    /// before its search): its MusicBrainz questions go in the background lane, behind every
+    /// download's.
+    pub async fn verify_in_background(
+        &self,
+        path: &str,
+        requested_artist: Option<&str>,
+        requested_title: Option<&str>,
+    ) -> VerificationResult {
+        self.verify_on(path, requested_artist, requested_title, None, &Takes::Any, true)
+            .await
+    }
+
+    async fn verify_on(
+        &self,
+        path: &str,
+        requested_artist: Option<&str>,
+        requested_title: Option<&str>,
+        requested_isrc: Option<&str>,
+        takes: &Takes,
+        background: bool,
     ) -> VerificationResult {
         if !self.remembers_rejections() {
             return VerificationResult::inconclusive();
@@ -153,7 +218,8 @@ impl DownloadVerificationService {
                 requested_title,
                 isrc.as_deref(),
                 tagged_match,
-                refuse_live,
+                takes,
+                background,
             )
             .await
         } else {
@@ -218,7 +284,8 @@ impl DownloadVerificationService {
         requested_title: Option<&str>,
         isrc: Option<&str>,
         tagged_match: bool,
-        refuse_live: bool,
+        takes: &Takes,
+        background: bool,
     ) -> VerificationResult {
         let settings = self.settings.current().soulseek.clone();
         let fingerprint = self
@@ -249,7 +316,7 @@ impl DownloadVerificationService {
         // TagLib's duration, not fpcalc's. -length pins how much audio is fingerprinted, and
         // staking a rejection on whether that also truncates the reported duration would reject
         // every track over two minutes if it does.
-        let mut seconds = read_duration_seconds(path);
+        let (mut seconds, file_ms) = read_duration(path);
         if seconds <= 0 {
             seconds = fingerprint.decoded_seconds;
         }
@@ -289,6 +356,7 @@ impl DownloadVerificationService {
                 fingerprint: Some(print),
                 duration_seconds: seconds,
                 lookup: Some(lookup),
+                threshold: settings.effective_min_score_fraction(),
                 ..Default::default()
             };
         }
@@ -297,17 +365,28 @@ impl DownloadVerificationService {
         // source is exactly the split it exists to remove (#48).
         let threshold = settings.effective_min_score_fraction();
         let authoritative = settings.tag_from_music_brainz || settings.name_from_match;
+        let facts = self
+            .recording_facts(
+                &lookup,
+                (requested_artist, requested_title),
+                threshold,
+                (seconds, file_ms),
+                takes,
+                (settings.effective_acoust_id_timeout_seconds(), background),
+            )
+            .await;
         let mut verdict = VerificationResult {
             fingerprint: Some(print),
             duration_seconds: seconds,
-            ..Self::decide(
+            ..Self::decide_with(
                 &lookup,
                 requested_artist,
                 requested_title,
                 threshold,
                 authoritative,
-                seconds,
-                refuse_live,
+                (seconds, file_ms),
+                takes,
+                &facts,
             )
         };
 
@@ -333,6 +412,7 @@ impl DownloadVerificationService {
                 tagged_match,
             );
         }
+        verdict.threshold = threshold;
 
         // A confirmation is logged too, not just a refusal. The dominant risk in this feature is
         // that a broken key, a missing binary or a mangled request makes it accept everything
@@ -371,6 +451,91 @@ impl DownloadVerificationService {
         }
 
         verdict
+    }
+
+    /// What MusicBrainz says the recordings that could be this file are, when AcoustID's answer
+    /// may not tell their kinds apart: every agreeing recording (up to
+    /// [`Self::MAX_FACT_LOOKUPS`]) when there are several and the exact length does not decide,
+    /// and otherwise, for a download that refuses some takes, the one recording it would keep,
+    /// so a take only the database's note calls an instrumental or a live one is seen. Bounded by
+    /// one timeout for all of them; a recording that could not be asked is judged by what
+    /// AcoustID said. Work in AcoustID's background lane asks in MusicBrainz's background lane
+    /// too, so a library sweep never holds up a download's lookup.
+    async fn recording_facts(
+        &self,
+        lookup: &AcoustIdLookup,
+        (requested_artist, requested_title): (Option<&str>, Option<&str>),
+        threshold: f64,
+        (seconds, file_ms): (i32, Option<i64>),
+        takes: &Takes,
+        (timeout_seconds, background): (i32, bool),
+    ) -> FactsById {
+        let mut found = FactsById::new();
+        let Some(music_brainz) = &self.music_brainz else {
+            return found;
+        };
+        let Some(best) = best_qualifying(lookup, threshold) else {
+            return found;
+        };
+        let agreeing = agreeing_in(
+            best,
+            requested_artist.unwrap_or(""),
+            requested_title.unwrap_or(""),
+            seconds,
+        );
+        let mut ids: Vec<String> = Vec::new();
+        for recording in &agreeing {
+            if !ids
+                .iter()
+                .any(|id| dotnet::eq_ignore_case(id, &recording.recording_id))
+            {
+                ids.push(recording.recording_id.clone());
+            }
+        }
+        let decided = recording_identity::decided_by_length(&agreeing, file_ms).is_some();
+        let wanted: Vec<String> = if ids.len() > 1 && !decided {
+            ids.into_iter().take(Self::MAX_FACT_LOOKUPS).collect()
+        } else if matches!(takes, Takes::Only(_)) {
+            let kind = |r: &AcoustIdRecording| recording_identity::kind_of(r, None);
+            let asked = RecordingKind::requested_by(requested_title.unwrap_or(""));
+            recording_identity::choose(&agreeing, file_ms, &asked, |k| takes.refuses(k), kind)
+                .map(|chosen| vec![chosen.recording.recording_id.clone()])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if wanted.is_empty() {
+            return found;
+        }
+
+        // The background lane waits behind every download's questions, so it is given longer.
+        let per_lookup = if background { 30 } else { 2 };
+        let budget = Duration::from_secs((timeout_seconds.max(0) as u64) + per_lookup * wanted.len() as u64);
+        let deadline = tokio::time::Instant::now() + budget;
+        for id in &wanted {
+            let asked = tokio::time::timeout_at(
+                deadline,
+                music_brainz.recording_facts(id, background || AcoustIdRateLimiter::in_background_now()),
+            )
+            .await;
+            match asked {
+                Ok(Ok(Some(facts))) => {
+                    found.insert(dotnet::to_lower_invariant(id), facts);
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(MusicBrainzError::TimedOut)) | Err(_) => {
+                    info!(
+                        "musicbrainz took too long to say what the recordings are; deciding on what AcoustID said"
+                    );
+                    break;
+                }
+                Ok(Err(error)) => {
+                    warn!("musicbrainz answered the recording lookup with something unreadable: {error}");
+                    break;
+                }
+            }
+        }
+        found
     }
 
     /// The ISRCs MusicBrainz lists for the first few recordings of the best qualifying result, by
@@ -462,6 +627,7 @@ impl DownloadVerificationService {
                 fingerprint: verdict.fingerprint,
                 duration_seconds: verdict.duration_seconds,
                 lookup: Some(lookup.clone()),
+                threshold: verdict.threshold,
                 evidence: Some(format!(
                     "MusicBrainz lists the requested ISRC {isrc} on '{} - {}'",
                     agreed.artist_credit(),
@@ -496,18 +662,43 @@ impl DownloadVerificationService {
         threshold: f64,
         tags_authoritative: bool,
         duration_seconds: i32,
-        refuse_live: bool,
+        takes: &Takes,
+    ) -> VerificationResult {
+        Self::decide_with(
+            lookup,
+            requested_artist,
+            requested_title,
+            threshold,
+            tags_authoritative,
+            (duration_seconds, None),
+            takes,
+            &FactsById::new(),
+        )
+    }
+
+    /// [`Self::decide`] with the file's length to the millisecond and what MusicBrainz said
+    /// about the recordings, which decide between takes that share the fingerprint.
+    pub fn decide_with(
+        lookup: &AcoustIdLookup,
+        requested_artist: Option<&str>,
+        requested_title: Option<&str>,
+        threshold: f64,
+        tags_authoritative: bool,
+        (duration_seconds, file_ms): (i32, Option<i64>),
+        takes: &Takes,
+        facts: &FactsById,
     ) -> VerificationResult {
         VerificationResult {
             lookup: Some(lookup.clone()),
+            threshold,
             ..decide_core(
                 lookup,
-                requested_artist.unwrap_or(""),
-                requested_title.unwrap_or(""),
+                (requested_artist.unwrap_or(""), requested_title.unwrap_or("")),
                 threshold,
                 tags_authoritative,
-                duration_seconds,
-                refuse_live,
+                (duration_seconds, file_ms),
+                takes,
+                facts,
             )
         }
     }
@@ -589,7 +780,7 @@ impl FingerprintVerifier for DownloadVerificationService {
     }
 
     async fn verify(&self, path: &str, artist: &str, title: &str) -> VerificationResult {
-        DownloadVerificationService::verify(self, path, Some(artist), Some(title), None, false).await
+        DownloadVerificationService::verify(self, path, Some(artist), Some(title), None, &Takes::Any).await
     }
 }
 
@@ -657,14 +848,41 @@ fn length_off(agreed: &AcoustIdRecording, file_seconds: i32) -> bool {
     (length - file_seconds).abs() > slack
 }
 
-fn decide_core(
-    lookup: &AcoustIdLookup,
+/// The recordings of a result that agree with the request on title and artist and can be
+/// believed (see [`trustworthy`]).
+fn agreeing_in<'a>(
+    result: &'a AcoustIdResult,
     requested_artist: &str,
     requested_title: &str,
+    duration_seconds: i32,
+) -> Vec<&'a AcoustIdRecording> {
+    result
+        .recordings
+        .iter()
+        .filter(|r| {
+            TrackMatchComparer::title_matches(requested_title, &r.title)
+                && TrackMatchComparer::artist_matches(requested_artist, &r.artist_credit(), &r.artists)
+                && trustworthy(r, result, duration_seconds)
+        })
+        .collect()
+}
+
+/// The kind of take a recording is, with what MusicBrainz said about it when it was asked.
+fn kind_with(recording: &AcoustIdRecording, facts: &FactsById) -> RecordingKind {
+    recording_identity::kind_of(
+        recording,
+        facts.get(&dotnet::to_lower_invariant(&recording.recording_id)),
+    )
+}
+
+fn decide_core(
+    lookup: &AcoustIdLookup,
+    (requested_artist, requested_title): (&str, &str),
     threshold: f64,
     tags_authoritative: bool,
-    duration_seconds: i32,
-    refuse_live: bool,
+    (duration_seconds, file_ms): (i32, Option<i64>),
+    takes: &Takes,
+    facts: &FactsById,
 ) -> VerificationResult {
     let qualifying = qualifying(lookup, threshold);
 
@@ -692,46 +910,61 @@ fn decide_core(
 
     // Any, not first: one AcoustID id maps to several MusicBrainz recordings when the same audio
     // ships on an album and a compilation, and demanding the first would reject correct files.
-    let agreeing: Vec<&AcoustIdRecording> = best
-        .recordings
-        .iter()
-        .filter(|r| {
-            TrackMatchComparer::title_matches(requested_title, &r.title)
-                && TrackMatchComparer::artist_matches(requested_artist, &r.artist_credit(), &r.artists)
-                && trustworthy(r, best, duration_seconds)
-        })
-        .collect();
-    // The studio recording first, when the same audio is listed under both.
-    let agreed = agreeing
-        .iter()
-        .find(|r| !DownloadVerificationService::only_on_live_albums(r))
-        .or(agreeing.first())
-        .copied();
+    let agreeing = agreeing_in(best, requested_artist, requested_title, duration_seconds);
+    // One fingerprint is often tied to the studio take, a live take and an instrumental alike.
+    // The file's exact length decides between them when it can; otherwise a take the title asks
+    // for goes first, then the studio take.
+    let asked = RecordingKind::requested_by(requested_title);
+    let chosen = recording_identity::choose(
+        &agreeing,
+        file_ms,
+        &asked,
+        |k| takes.refuses(k),
+        |r| kind_with(r, facts),
+    );
+    let sole = agreeing.first().is_some_and(|first| {
+        agreeing
+            .iter()
+            .all(|r| dotnet::eq_ignore_case(&first.recording_id, &r.recording_id))
+    });
 
-    // The right song and artist, but a live take the request never asked for: the same title and
-    // nearly the same length, so only the albums it is on tell it apart.
-    if let Some(agreed) = agreed
-        && refuse_live
-        && DownloadVerificationService::only_on_live_albums(agreed)
+    if let Some(recording_identity::Chosen {
+        recording: agreed,
+        kind,
+        by_length,
+        kind_certain,
+    }) = chosen
     {
+        // The right song and artist, but a take the request never asked for: the same title and
+        // nearly the same length, so only its exact length and what it is on tell it apart.
+        if takes.refuses(kind) {
+            let album = recording_album(agreed, kind);
+            return VerificationResult {
+                verdict: VerificationVerdict::Mismatch,
+                score: best.score,
+                matched_title: Some(agreed.title.clone()),
+                matched_artist: Some(agreed.artist_credit()),
+                matched_album: album.clone(),
+                matched_year: agreed.year,
+                recording_id: Some(agreed.recording_id.clone()),
+                deny_reason: match album.filter(|a| !a.is_empty()) {
+                    None => format!("is {}", kind.described()),
+                    Some(album) => format!("is {}, from '{album}'", kind.described()),
+                },
+                kind: Some(kind),
+                by_length,
+                kind_certain,
+                sole,
+                ..Default::default()
+            };
+        }
         return VerificationResult {
-            verdict: VerificationVerdict::Mismatch,
-            score: best.score,
-            matched_title: Some(agreed.title.clone()),
-            matched_artist: Some(agreed.artist_credit()),
-            matched_album: agreed.album_title.clone(),
-            matched_year: agreed.year,
-            recording_id: Some(agreed.recording_id.clone()),
-            deny_reason: match agreed.album_title.as_deref().filter(|a| !a.is_empty()) {
-                None => "is a live recording".to_string(),
-                Some(album) => format!("is a live recording, from '{album}'"),
-            },
-            ..Default::default()
+            kind: Some(kind),
+            by_length,
+            kind_certain,
+            sole,
+            ..confirm(best, agreed, tags_authoritative)
         };
-    }
-
-    if let Some(agreed) = agreed {
-        return confirm(best, agreed, tags_authoritative);
     }
 
     // The right song and artist, believed but for its length: a person can tell whether it is a
@@ -795,12 +1028,33 @@ fn confirm(
     }
 }
 
-fn read_duration_seconds(path: &str) -> i32 {
+/// The release a take is best named by: one whose title says what the take is (the promo of
+/// instrumentals, not the album the studio take is on), else the album AcoustID picked.
+fn recording_album(recording: &AcoustIdRecording, kind: RecordingKind) -> Option<String> {
+    if kind != RecordingKind::Studio {
+        let telling = recording.releases.iter().find_map(|release| {
+            let title = release.title.as_deref().or(release.group_title.as_deref())?;
+            RecordingKind::named_in(title)
+                .contains(&kind)
+                .then(|| title.to_string())
+        });
+        if telling.is_some() {
+            return telling;
+        }
+    }
+    recording.album_title.clone()
+}
+
+/// The file's length in whole seconds and in milliseconds; 0 and None when it cannot be read.
+fn read_duration(path: &str) -> (i32, Option<i64>) {
     match TagFile::open(path) {
-        Ok(file) => file.duration_seconds(),
+        Ok(file) => {
+            let ms = file.duration().as_millis() as i64;
+            (file.duration_seconds(), (ms > 0).then_some(ms))
+        }
         Err(error) => {
             debug!("could not read a duration from {path}: {error}");
-            0
+            (0, None)
         }
     }
 }
@@ -848,6 +1102,49 @@ impl crate::services::library::library_review_sweep_worker::SweepVerification
     }
 
     async fn verify(&self, path: &str, artist: Option<&str>, title: Option<&str>) -> VerificationResult {
-        DownloadVerificationService::verify(self, path, artist, title, None, false).await
+        DownloadVerificationService::verify_in_background(self, path, artist, title).await
+    }
+
+    /// The codes AcoustID's own answer carried for the recordings of its best result, else the
+    /// ones MusicBrainz lists for them, the lookup a download with an ISRC is settled by.
+    async fn isrc_agrees(&self, question: &VerificationResult, isrc: &str) -> Option<bool> {
+        let isrc = SongIdentity::normalize_isrc(isrc)?;
+        let lookup = question.lookup.as_ref()?;
+        let settings = self.settings.current().soulseek.clone();
+        let threshold = if question.threshold > 0.0 {
+            question.threshold
+        } else {
+            settings.effective_min_score_fraction()
+        };
+        let best = best_qualifying(lookup, threshold)?;
+        let mut listed = RecordingIsrcs::new();
+        for recording in best.recordings.iter().filter(|r| !r.recording_id.is_empty()) {
+            if !recording.isrcs.is_empty() {
+                insert_ignore_case(&mut listed, &recording.recording_id, recording.isrcs.clone());
+            }
+        }
+        if listed.is_empty() {
+            let music_brainz = self.music_brainz.as_ref()?;
+            listed = Self::recording_isrcs(
+                music_brainz,
+                lookup,
+                threshold,
+                settings.effective_acoust_id_timeout_seconds(),
+            )
+            .await;
+        }
+        let settled = Self::settle_by_isrc(question.clone(), lookup, threshold, false, &isrc, &listed, true);
+        if settled.verdict == VerificationVerdict::Confirmed {
+            return Some(true);
+        }
+        if listed.values().all(Vec::is_empty) {
+            return None;
+        }
+        Some(
+            listed
+                .values()
+                .flatten()
+                .any(|code| SongIdentity::normalize_isrc(code).as_deref() == Some(isrc.as_str())),
+        )
     }
 }

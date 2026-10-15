@@ -1,17 +1,20 @@
 //! The library action playlist worker, and the playlist rows and parsers `NavidromePlaylistApi`
 //! returns.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use octo_core::common::dotnet;
 use octo_core::settings::{
     LibraryAction, LibraryActionDefinition, LibraryActionSettings, NoticeKind, SettingsStore,
 };
+use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use super::duplicate_fixer::fix_playlist_comment;
 use super::library_action_executor::{LibraryActionExecutor, LibraryActionRequest};
 use super::library_action_journal::action_name;
 use super::{
@@ -49,6 +52,8 @@ pub struct LibraryActionPlaylistWorker {
     settings: Arc<SettingsStore>,
     /// Removes the Navidrome rows of trashed songs once the trash deletes them for good.
     missing_rows: Option<Arc<MissingRows>>,
+    /// The description each action playlist was last given, by playlist id.
+    comments: Mutex<HashMap<String, String>>,
 }
 
 impl LibraryActionPlaylistWorker {
@@ -70,6 +75,25 @@ impl LibraryActionPlaylistWorker {
             api,
             settings,
             missing_rows: None,
+            comments: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Gives the playlist `comment` as its description, once per text: apps show it under the
+    /// playlist's name.
+    async fn describe(&self, playlist_id: &str, comment: &str) {
+        if self
+            .comments
+            .lock()
+            .get(playlist_id)
+            .is_some_and(|said| said == comment)
+        {
+            return;
+        }
+        if self.api.set_comment(playlist_id, comment).await {
+            self.comments
+                .lock()
+                .insert(playlist_id.to_string(), comment.to_string());
         }
     }
 
@@ -151,6 +175,11 @@ impl LibraryActionPlaylistWorker {
                 continue;
             }
 
+            // Fix duplicates says on the playlist itself what adding a song to it does.
+            if action.action == LibraryAction::FixDuplicates {
+                self.describe(&playlist.id, &fix_playlist_comment(&settings))
+                    .await;
+            }
             let applied = self
                 .apply_playlist(&playlist, action.action, budget, stopping)
                 .await;

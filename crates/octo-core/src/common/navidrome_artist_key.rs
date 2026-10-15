@@ -7,7 +7,10 @@
 //! one artist to Navidrome and two spellings with different ids are two. Accents are not folded:
 //! "Beyonce" and "Beyoncé" are different artists.
 
+use std::sync::LazyLock;
+
 use md5::{Digest, Md5};
+use regex::Regex;
 
 /// Navidrome's base62 digits: 0-9, then a-z, then A-Z.
 const DIGITS: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -26,6 +29,31 @@ pub fn navidrome_artist_text(name: &str) -> String {
 /// Whether two names are one artist to Navidrome.
 pub fn same_navidrome_artist(a: &str, b: &str) -> bool {
     navidrome_artist_text(a) == navidrome_artist_text(b)
+}
+
+/// The separators Navidrome splits a lone ARTIST or ALBUMARTIST value on, in any case
+/// (its default `artists.split` mapping).
+static ARTIST_SPLIT: LazyLock<Regex> = LazyLock::new(|| {
+    let separators = [" / ", " feat. ", " feat ", " ft. ", " ft ", "; "];
+    let escaped: Vec<String> = separators.iter().map(|s| regex::escape(s)).collect();
+    Regex::new(&format!("(?i)({})", escaped.join("|"))).expect("valid separators")
+});
+
+/// The artists Navidrome lists for a file's ARTIST (or ALBUMARTIST) values when the file has no
+/// ARTISTS (or ALBUMARTISTS) tag. Only a single value is split, on " / ", " feat. ", " feat ",
+/// " ft. ", " ft " and "; " in any case; each part is trimmed and empty or repeated parts are
+/// dropped. Several values are already several artists and come back as they are.
+pub fn navidrome_artist_parts(values: &[String]) -> Vec<String> {
+    let [value] = values else {
+        return values.to_vec();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for part in ARTIST_SPLIT.split(value).map(str::trim) {
+        if !part.is_empty() && !parts.iter().any(|seen| seen == part) {
+            parts.push(part.to_string());
+        }
+    }
+    parts
 }
 
 /// Lowercase one character at a time with the simple case mapping. A final sigma stays σ, and
@@ -122,6 +150,40 @@ mod tests {
         assert!(same_navidrome_artist("beyonc\u{e9}", "BEYONC\u{c9}"));
         assert!(same_navidrome_artist("Jay\u{2014}Z", "jay-z"));
         assert!(!same_navidrome_artist("P!nk", "Pink"));
+    }
+
+    fn parts(value: &str) -> Vec<String> {
+        navidrome_artist_parts(&[value.to_string()])
+    }
+
+    #[test]
+    fn a_lone_value_splits_where_navidrome_splits_it() {
+        assert_eq!(parts("SAYGRACE; G\u{2010}Eazy"), ["SAYGRACE", "G\u{2010}Eazy"]);
+        assert_eq!(parts("A / B; C"), ["A", "B", "C"]);
+        assert_eq!(parts("Drake FEAT. Rihanna"), ["Drake", "Rihanna"]);
+        assert_eq!(parts("A ft B"), ["A", "B"]);
+        assert_eq!(parts("A; A"), ["A"]);
+    }
+
+    #[test]
+    fn a_value_navidrome_keeps_whole_stays_whole() {
+        for name in [
+            "AC/DC",
+            "A;B",
+            "Earth, Wind & Fire",
+            "Simon & Garfunkel",
+            "Featurette",
+            "Lefty",
+        ] {
+            assert_eq!(parts(name), [name], "{name:?}");
+        }
+    }
+
+    #[test]
+    fn several_values_are_left_as_they_are() {
+        let values = vec!["A; B".to_string(), "C".to_string()];
+        assert_eq!(navidrome_artist_parts(&values), values);
+        assert!(navidrome_artist_parts(&[]).is_empty());
     }
 
     #[test]

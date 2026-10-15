@@ -1,5 +1,5 @@
 //! The library actions, questions and checks: the action history and its Allow downloading again,
-//! the notices, the duplicate scan, the library Review sweep, the weekly upgrade's status and the
+//! the ratings not acted on, the notices, the duplicate scan, the library Review sweep, the weekly upgrade's status and the
 //! song path resolver.
 //!
 //! Session-gated, because these list filenames and usernames. Every /api/admin endpoint sits
@@ -32,12 +32,20 @@ pub fn routes() -> RouteSet {
     RouteSet::new()
         .route("/api/admin/library-actions", get(get_library_actions))
         .route("/api/admin/library-actions/allow-download", post(allow_download))
+        .route(
+            "/api/admin/library-actions/ignored-ratings",
+            get(get_ignored_ratings),
+        )
         .route("/api/admin/notices", get(get_notices))
         .route("/api/admin/duplicates/scan", post(scan_duplicates))
         .route("/api/admin/review-sweep", get(get_review_sweep))
         .route("/api/admin/review-sweep/start", post(start_review_sweep))
         .route("/api/admin/review-sweep/pause", post(pause_review_sweep))
         .route("/api/admin/review-sweep/reset", post(reset_review_sweep))
+        .route(
+            "/api/admin/review-sweep/recheck-octo",
+            post(recheck_octo_downloads),
+        )
         .route("/api/admin/quality-upgrade", get(get_quality_upgrade))
         .route("/api/admin/library/resolve", get(resolve_library_song))
 }
@@ -112,6 +120,34 @@ async fn get_library_actions(State(state): State<AppState>, request: Request) ->
     })))
 }
 
+/// The last star ratings that asked for an action and got none, or only a rehearsal, newest
+/// first, each with the reason. Gated like the action history: it names songs and people.
+async fn get_ignored_ratings(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, _) = request.into_parts();
+    let browse = browse_user(&state, &parts);
+    if !browse.signed_in() {
+        return browse.finish(sign_in());
+    }
+    let entries: Vec<Value> = state
+        .library_action_rating_worker
+        .ignored()
+        .iter()
+        .map(|rating| {
+            json!({
+                "atUtc": utc(&rating.at_utc),
+                "username": rating.username,
+                "songId": rating.song_id,
+                "artist": rating.artist,
+                "title": rating.title,
+                "rating": rating.rating,
+                "action": action_name(rating.action),
+                "reason": rating.reason,
+            })
+        })
+        .collect();
+    browse.finish(ok(&json!({ "entries": entries })))
+}
+
 /// The allow-download body: an optional `key`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -160,7 +196,7 @@ async fn get_notices(State(state): State<AppState>, request: Request) -> Respons
         .recent(200)
         .iter()
         .map(|entry| {
-            json!({
+            let mut json = json!({
                 "kind": entry.kind.name(),
                 "username": entry.username,
                 "artist": entry.artist,
@@ -172,7 +208,23 @@ async fn get_notices(State(state): State<AppState>, request: Request) -> Respons
                 "submitted": entry.submitted,
                 "createdUtc": utc(&entry.created_utc),
                 "resolvedUtc": utc_opt(&entry.resolved_utc),
-            })
+            });
+            // AcoustID's numbers and what it matched or came closest to, only when they are known.
+            if let Some(fields) = json.as_object_mut() {
+                if let Some(score) = entry.acoust_id_score {
+                    fields.insert("acoustIdScore".into(), json!(score));
+                }
+                if let Some(threshold) = entry.threshold {
+                    fields.insert("threshold".into(), json!(threshold));
+                }
+                if let Some(matched) = entry.matched.as_deref().filter(|m| !m.is_empty()) {
+                    fields.insert("matched".into(), json!(matched));
+                }
+                if let Some(closest) = entry.closest.as_deref().filter(|c| !c.is_empty()) {
+                    fields.insert("closest".into(), json!(closest));
+                }
+            }
+            json
         })
         .collect();
     let duplicate_scan = state.duplicate_scan_worker.last_result().map(|r| {
@@ -210,10 +262,12 @@ async fn scan_duplicates(State(state): State<AppState>) -> Response {
     accepted(&json!({ "ok": true, "queued": true }))
 }
 
-/// The library Review sweep (#72): how far it has got and why it is waiting. Counts only.
+/// The library Review sweep (#72): how far it has got and why it is waiting. Counts only. The
+/// replacing, the re-check of Octo's downloads and a changed match score are told only when
+/// there is something to tell.
 async fn get_review_sweep(State(state): State<AppState>) -> Response {
     let s = state.library_review_sweep_worker.status();
-    ok(&json!({
+    let mut body = json!({
         "state": s.state,
         "reason": s.reason,
         "paused": s.paused,
@@ -228,7 +282,42 @@ async fn get_review_sweep(State(state): State<AppState>) -> Response {
         "perHour": s.per_hour,
         "lastCheckedUtc": utc_opt(&s.last_checked_utc),
         "passFinishedUtc": utc_opt(&s.pass_finished_utc),
-    }))
+    });
+    if let Some(fields) = body.as_object_mut() {
+        if s.replaced > 0 {
+            fields.insert("replaced".into(), json!(s.replaced));
+        }
+        if s.auto_replace {
+            fields.insert(
+                "autoReplace".into(),
+                json!({
+                    "perDay": s.auto_replace_per_day,
+                    "replacedToday": s.today.replaced,
+                    "failedToday": s.today.failed,
+                }),
+            );
+        }
+        if let Some(recheck) = &s.recheck {
+            fields.insert(
+                "recheck".into(),
+                json!({
+                    "running": recheck.running,
+                    "position": recheck.position,
+                    "total": recheck.total,
+                    "checked": recheck.checked,
+                    "found": recheck.found,
+                    "replaced": recheck.replaced,
+                    "threshold": recheck.threshold,
+                    "startedUtc": utc_opt(&recheck.started_utc),
+                    "finishedUtc": utc_opt(&recheck.finished_utc),
+                }),
+            );
+        }
+        if s.threshold_changed {
+            fields.insert("thresholdChanged".into(), json!(true));
+        }
+    }
+    ok(&body)
 }
 
 async fn start_review_sweep(State(state): State<AppState>) -> Response {
@@ -252,6 +341,21 @@ async fn pause_review_sweep(State(state): State<AppState>) -> Response {
 async fn reset_review_sweep(State(state): State<AppState>) -> Response {
     state.library_review_sweep_worker.reset();
     accepted(&json!({ "ok": true }))
+}
+
+/// "Re-check Octo's downloads": forgets when Octo's own downloads were checked and checks
+/// each once more, then stops, even with the sweep's own rate at 0. Songs already asked about
+/// stay answered.
+async fn recheck_octo_downloads(State(state): State<AppState>) -> Response {
+    let settings = state.settings.current().library_actions.clone();
+    if !settings.enabled || !settings.review_enabled {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Turn on library actions and Review first.",
+        );
+    }
+    let files = state.library_review_sweep_worker.recheck_octo().await;
+    accepted(&json!({ "ok": true, "files": files }))
 }
 
 /// The weekly upgrade's last run and next one. Times and an outcome only, no file or person, so

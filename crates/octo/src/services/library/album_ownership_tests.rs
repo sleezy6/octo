@@ -632,6 +632,96 @@ async fn judge_leaves_library_albums_alone_and_gives_up_on_a_slow_library() {
     assert!(slow.library(Duration::from_millis(50)).await.is_none());
 }
 
+/// A library holding one hearted song of "Real Deal", filed as a one-song "Real Deal".
+fn one_song_of(album: &str, artist: &str, title: &str, seconds: i32) -> Arc<LibraryAlbumIndex> {
+    Arc::new(LibraryAlbumIndex::new([LibrarySongRow {
+        album: Some(album.into()),
+        album_id: Some("al-namesake".into()),
+        album_artist: Some(artist.into()),
+        ..plain_row("1", artist, title, seconds)
+    }]))
+}
+
+fn real_deal() -> Vec<CatalogTrack> {
+    [
+        "Cold Caller",
+        "Female Lead",
+        "Pretty Girls",
+        "Ghost",
+        "Don't",
+        "Movies",
+        "Turn Out Right",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(at, title)| {
+        let seconds = if *title == "Don't" { 165 } else { 200 + at as i32 };
+        CatalogTrack::new(*title, Some("Honeyglaze"), Some(seconds), None)
+    })
+    .collect()
+}
+
+/// A namesake holding far fewer songs than the catalog album is not that album: it is judged by
+/// its songs, so the catalog album stays listed with what is held of it, and can be hearted.
+/// Album ownership over `index`, answering every tracklist with "Real Deal" and counting how
+/// many were read.
+fn counting_reads(index: Arc<LibraryAlbumIndex>) -> (AlbumOwnership, Arc<AtomicUsize>) {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&reads);
+    let service = AlbumOwnership::new(
+        Arc::new(move |_| {
+            let index = Arc::clone(&index);
+            Box::pin(async move { Some(index) })
+        }),
+        Arc::new(move |_, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(real_deal()) })
+        }),
+        Arc::new(|_| None),
+    );
+    (service, reads)
+}
+
+#[tokio::test]
+async fn a_namesake_holding_one_song_does_not_stand_in_for_the_album() {
+    let (service, reads) = counting_reads(one_song_of("Real Deal", "Honeyglaze", "Don't", 165));
+
+    let standings = service
+        .judge(
+            &[drake::outside("Real Deal", "Honeyglaze", 7)],
+            Duration::from_secs(5),
+        )
+        .await;
+
+    assert!(standings[0].same_name.is_empty());
+    assert_eq!(standings[0].owned, Some(1));
+    assert_eq!(standings[0].total, 7);
+    assert!(standings[0].stand_ins().is_empty());
+    // Judged by its songs, so its tracklist was read.
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+}
+
+/// A namesake holding at least half the catalog's songs is still the album, read or not.
+#[tokio::test]
+async fn a_namesake_holding_most_of_the_album_still_stands_in() {
+    let (service, reads) = counting_reads(one_song_of("Real Deal", "Honeyglaze", "Don't", 165));
+
+    let standings = service
+        .judge(
+            &[
+                drake::outside("Real Deal", "Honeyglaze", 2),
+                drake::outside("Real Deal", "Honeyglaze", 0),
+            ],
+            Duration::from_secs(5),
+        )
+        .await;
+
+    // Half of two, and no count at all: the namesake stands in, with no tracklist asked.
+    assert_eq!(ids(standings[0].stand_ins()), ["al-namesake"]);
+    assert_eq!(ids(standings[1].stand_ins()), ["al-namesake"]);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+}
+
 // ---- The library snapshot ----------------------------------------------------------------
 
 #[derive(Default)]

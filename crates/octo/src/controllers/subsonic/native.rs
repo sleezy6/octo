@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use octo_core::common::dotnet;
+use octo_core::common::{dotnet, skipped_takes};
 use octo_core::json::datetime::format_utc;
 use octo_core::json::dom::Node;
 use octo_core::models::domain::{Album, Artist, Song};
@@ -626,7 +626,10 @@ async fn try_inject_native_album_search(state: &AppState, request: &NativeReques
         return None;
     }
 
-    let external_albums = state.metadata_service.search_albums(&term, target as i32).await;
+    let external_albums = skipped_takes::listed_albums(
+        state.metadata_service.search_albums(&term, target as i32).await,
+        state.settings.current().soulseek.skip_covers_and_instrumentals,
+    );
     if external_albums.is_empty() {
         return None;
     }

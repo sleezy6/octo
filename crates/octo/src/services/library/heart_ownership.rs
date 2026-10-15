@@ -63,6 +63,11 @@ impl HeartOwnership {
         Some((song, owned))
     }
 
+    /// Forgets every library answer held, so the next question reads the library again.
+    pub fn forget(&self) {
+        self.ownership.forget();
+    }
+
     /// The catalog this asks for songs and albums.
     pub fn metadata(&self) -> &Arc<dyn IMusicMetadataService> {
         &self.metadata

@@ -171,6 +171,10 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
             ),
             ("DownloadOnPlay", Node::Bool(subsonic.download_on_play)),
             ("LidarrAlbumOnPlay", Node::Bool(subsonic.lidarr_album_on_play)),
+            (
+                "DownloadAlbumOnSongStar",
+                Node::Bool(subsonic.download_album_on_song_star),
+            ),
             // These two are rendered by the dashboard but were missing here, so their fields
             // never pre-filled with the saved value.
             ("DownloadSource", name(subsonic.download_source)),
@@ -254,6 +258,10 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
             ("PreferredExtension", n_str(&soulseek.preferred_extension)),
             ("DownloadTimeoutSeconds", n_num(soulseek.download_timeout_seconds)),
             ("VerifyDownloads", Node::Bool(soulseek.verify_downloads)),
+            (
+                "SkipCoversAndInstrumentals",
+                Node::Bool(soulseek.skip_covers_and_instrumentals),
+            ),
             (
                 "AcoustIdApiKey",
                 n_str(&mask_secret(Some(&soulseek.acoust_id_api_key))),
@@ -437,6 +445,15 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
                 "ReviewSweepOctoDownloads",
                 Node::Bool(actions.review_sweep_octo_downloads),
             ),
+            (
+                "ReviewSweepAutoReplace",
+                Node::Bool(actions.review_sweep_auto_replace),
+            ),
+            (
+                "ReviewSweepAutoReplacePerDay",
+                n_num(actions.review_sweep_auto_replace_per_day),
+            ),
+            ("TagCheckPerHour", n_num(actions.tag_check_per_hour)),
             ("DuplicatesEnabled", Node::Bool(actions.duplicates_enabled)),
             ("DuplicatesPlaylistName", n_str(&actions.duplicates_playlist_name)),
             ("DuplicatesScanHours", n_num(actions.duplicates_scan_hours)),
@@ -444,6 +461,7 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
             ("UpgradeSource", name(actions.upgrade_source)),
             ("NoticeMaxTracks", n_num(actions.notice_max_tracks)),
             ("RatingsScope", name(actions.ratings_scope)),
+            ("KeepRatedCopies", Node::Bool(actions.keep_rated_copies)),
             ("AllowedUsers", n_str_array(&actions.allowed_users)),
             // Effective rather than raw, because the editor needs every action present even
             // when the config names only some of them. Projected so the enum lands as its NAME:
@@ -535,6 +553,10 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
                 "CountryLookupsPerRefresh",
                 n_num(mixes.country_lookups_per_refresh),
             ),
+            ("Years", Node::Bool(mixes.years)),
+            ("MaxYearPlaylists", n_num(mixes.max_year_playlists)),
+            ("Artists", Node::Bool(mixes.artists)),
+            ("ArtistCount", n_num(mixes.artist_count)),
             ("NewReleases", Node::Bool(mixes.new_releases)),
             ("Rediscover", Node::Bool(mixes.rediscover)),
             ("DeepCuts", Node::Bool(mixes.deep_cuts)),
@@ -612,8 +634,6 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
     doc.insert(
         "Imports".into(),
         n_obj([
-            ("SpotifyClientId", n_str(&imports.spotify_client_id)),
-            ("SpotifyRedirectUri", n_str(&imports.effective_redirect_uri())),
             ("SongsPerHour", n_num(imports.songs_per_hour)),
             ("RefreshHours", n_num(imports.refresh_hours)),
         ]),
@@ -1302,7 +1322,7 @@ mod tests {
     /// Wrong lyrics and Wrong cover made seven actions. An eighth is a config that does not mean
     /// anything.
     #[test]
-    fn validate_library_actions_accepts_seven_refuses_eight() {
+    fn validate_library_actions_accepts_eight_refuses_nine() {
         fn with_actions(count: usize) -> JsonObject {
             let actions = (0..count)
                 .map(|i| n_obj([("Name", n_str(&format!("a{i}"))), ("Rating", n_num(0))]))
@@ -1313,14 +1333,14 @@ mod tests {
         }
         let current = LibraryActionSettings::default();
         assert_eq!(
-            validate_library_actions(&with_actions(7), &current).unwrap(),
+            validate_library_actions(&with_actions(8), &current).unwrap(),
             None
         );
         assert_eq!(
-            validate_library_actions(&with_actions(8), &current)
+            validate_library_actions(&with_actions(9), &current)
                 .unwrap()
                 .as_deref(),
-            Some("There are only 7 library actions")
+            Some("There are only 8 library actions")
         );
     }
 

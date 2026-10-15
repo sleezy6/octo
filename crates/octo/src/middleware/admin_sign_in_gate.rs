@@ -55,6 +55,8 @@ pub const APP_CALL_ENDPOINTS: &[(Method, &str, bool)] = &[
     (Method::POST, "/api/admin/lastfm/radio/refresh", false),
     (Method::GET, "/api/admin/library-status", true),
     (Method::GET, "/api/admin/status", true),
+    (Method::GET, "/api/admin/update", true),
+    (Method::POST, "/api/admin/update", true),
 ];
 
 /// The words a Family page sign-in is refused with on every dashboard route.
@@ -90,7 +92,7 @@ pub const LIBRARY_FILE_ROUTES: &[(&str, bool, &str)] = &[
     ("/api/admin/covers", true, SIGN_IN_FIRST),
     // The Lyrics page (writes lyrics files beside songs).
     ("/api/admin/lyrics", true, SIGN_IN_FIRST),
-    // Imports (Spotify sign-ins, lists, the trickle that downloads into the library).
+    // Imports (lists, the trickle that downloads into the library).
     (
         "/api/admin/imports",
         true,

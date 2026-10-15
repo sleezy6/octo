@@ -388,3 +388,253 @@ fn a_question_follows_a_moved_folder() {
         &verdict(InconclusiveReason::NoEntry)
     ));
 }
+
+// ---- AcoustID's numbers on a question ------------------------------------------------------
+
+fn heard_below(score: f64) -> VerificationResult {
+    VerificationResult {
+        lookup: Some(octo_core::fingerprint::AcoustIdLookup::new(
+            true,
+            None,
+            vec![octo_core::fingerprint::AcoustIdResult::new(
+                score,
+                vec![AcoustIdRecording::new(
+                    "rec",
+                    "Teardrop",
+                    vec!["Massive Attack".to_string()],
+                    None,
+                    None,
+                )],
+            )],
+        )),
+        threshold: 0.85,
+        ..verdict(InconclusiveReason::BelowThreshold)
+    }
+}
+
+#[test]
+fn a_question_keeps_how_sure_acoust_id_was_and_what_it_matched() {
+    let queue = NoticeQueue::new();
+    queue.add_review("alice", "/music/a.flac", &song(), &heard_below(0.64));
+    let entry = only(&queue, "alice");
+    assert_eq!(entry.acoust_id_score, Some(64));
+    assert_eq!(entry.threshold, Some(85));
+    // Below the threshold nothing matched: the best recording heard is only the closest.
+    assert_eq!(entry.matched, None);
+    assert_eq!(entry.closest.as_deref(), Some("Massive Attack - Teardrop"));
+
+    let queue = NoticeQueue::new();
+    let disagreed = VerificationResult {
+        matched_artist: Some("Elizabeth Fraser".into()),
+        matched_title: Some("Song to the Siren".into()),
+        score: 0.97,
+        threshold: 0.9,
+        ..verdict(InconclusiveReason::SourceDisagreed)
+    };
+    queue.add_review("alice", "/music/b.flac", &song(), &disagreed);
+    let entry = only(&queue, "alice");
+    assert_eq!(entry.acoust_id_score, Some(97));
+    assert_eq!(entry.threshold, Some(90));
+    assert_eq!(
+        entry.matched.as_deref(),
+        Some("Elizabeth Fraser - Song to the Siren")
+    );
+    assert_eq!(entry.closest, None);
+}
+
+#[test]
+fn a_question_without_a_score_keeps_no_numbers() {
+    let queue = NoticeQueue::new();
+    let no_entry = VerificationResult {
+        lookup: Some(octo_core::fingerprint::AcoustIdLookup::new(
+            true,
+            None,
+            Vec::new(),
+        )),
+        threshold: 0.85,
+        ..verdict(InconclusiveReason::NoEntry)
+    };
+    queue.add_review("alice", "/music/a.flac", &song(), &no_entry);
+    let entry = only(&queue, "alice");
+    assert_eq!(entry.acoust_id_score, None);
+    assert_eq!(entry.threshold, None);
+    assert_eq!(entry.matched, None);
+    assert_eq!(entry.closest, None);
+    // Nothing new is written for it, so its line in the file reads as before.
+    let text = serde_json::to_string(&entry).expect("writes");
+    for key in ["AcoustIdScore", "Threshold", "Matched", "Closest"] {
+        assert!(!text.contains(key), "{key} in {text}");
+    }
+}
+
+/// The notice entry as 2026.10.13 reads it: every field it knows, none of the new ones.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[allow(dead_code)]
+struct EntryBefore {
+    #[serde(default, deserialize_with = "state_file::null_as_default")]
+    key: String,
+    #[serde(default, with = "by_name")]
+    kind: NoticeKind,
+    #[serde(default, deserialize_with = "state_file::null_as_default")]
+    username: String,
+    #[serde(default, deserialize_with = "state_file::null_as_default")]
+    local_path: String,
+    #[serde(default, deserialize_with = "state_file::null_as_default")]
+    artist: String,
+    #[serde(default, deserialize_with = "state_file::null_as_default")]
+    title: String,
+    #[serde(default)]
+    album: Option<String>,
+    #[serde(default)]
+    navidrome_id: Option<String>,
+    #[serde(default)]
+    group_key: Option<String>,
+    #[serde(default)]
+    order: i32,
+    #[serde(default, with = "by_name")]
+    state: NoticeState,
+    #[serde(default, deserialize_with = "state_file::null_as_default")]
+    reason: String,
+    #[serde(default, with = "by_name")]
+    cause: InconclusiveReason,
+    #[serde(default, with = "by_name")]
+    origin: NoticeOrigin,
+    #[serde(default)]
+    fingerprint: Option<String>,
+    #[serde(default)]
+    duration_seconds: i32,
+    #[serde(default)]
+    candidate_recording_id: Option<String>,
+    #[serde(default)]
+    file_format: Option<String>,
+    #[serde(default)]
+    submitted: bool,
+    #[serde(default)]
+    lookup_attempts: i32,
+    #[serde(default = "datetime::min_value", with = "datetime::utc")]
+    next_lookup_utc: DateTime<Utc>,
+    #[serde(default = "Utc::now", with = "datetime::utc")]
+    created_utc: DateTime<Utc>,
+    #[serde(default, with = "datetime::utc_option")]
+    queued_utc: Option<DateTime<Utc>>,
+    #[serde(default, with = "datetime::utc_option")]
+    resolved_utc: Option<DateTime<Utc>>,
+}
+
+/// A queue file written with the numbers still loads where they are unknown, so going back a
+/// release keeps every question and answer.
+#[test]
+fn a_queue_file_with_the_numbers_still_loads_in_the_entry_before_them() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("notice-queue.json");
+    {
+        let queue = NoticeQueue::with_path(Some(path.clone()));
+        queue.add_review("alice", "/music/a.flac", &song(), &heard_below(0.64));
+        queue.add_review(
+            "bob",
+            "/music/b.flac",
+            &song(),
+            &verdict(InconclusiveReason::NoEntry),
+        );
+        assert!(queue.flush());
+    }
+    let text = std::fs::read_to_string(&path).expect("written");
+    assert!(text.contains(r#""AcoustIdScore":64"#), "{text}");
+    assert!(text.contains(r#""Threshold":85"#), "{text}");
+    assert!(
+        text.contains(r#""Closest":"Massive Attack - Teardrop""#),
+        "{text}"
+    );
+    assert!(!text.contains(r#""Matched""#), "{text}");
+
+    let before: Option<Vec<EntryBefore>> = serde_json::from_str(&text).expect("the older entry reads it");
+    let mut before = before.expect("entries");
+    before.sort_by(|a, b| a.username.cmp(&b.username));
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[0].username, "alice");
+    assert_eq!(before[0].cause, InconclusiveReason::BelowThreshold);
+    assert_eq!(before[0].reason, "AcoustID was not sure what this is");
+    assert_eq!(before[1].cause, InconclusiveReason::NoEntry);
+
+    // And the new code reads its own file back whole.
+    let again = NoticeQueue::with_path(Some(path));
+    assert_eq!(only(&again, "alice").acoust_id_score, Some(64));
+}
+
+fn heard_roads() -> VerificationResult {
+    VerificationResult {
+        verdict: octo_core::fingerprint::verification::VerificationVerdict::Mismatch,
+        reason: InconclusiveReason::SoundsLikeAnother,
+        score: 0.97,
+        matched_artist: Some("Portishead".into()),
+        matched_title: Some("Roads".into()),
+        recording_id: Some("rec-roads".into()),
+        duration_seconds: 305,
+        threshold: 0.85,
+        ..Default::default()
+    }
+}
+
+/// A file the library sweep replaced leaves its keeper a settled note in Review: never asked
+/// about again, never put in a playlist, and saying what AcoustID heard.
+#[test]
+fn a_replaced_file_leaves_a_settled_note() {
+    let queue = NoticeQueue::new();
+    assert!(queue.add_replaced("bob ", "/music/a.flac", &song(), &heard_roads(), "nd-1", 85));
+    let note = only(&queue, "bob");
+    assert_eq!(note.username, "bob");
+    assert_eq!(note.state, NoticeState::Acted);
+    assert_eq!(note.cause, InconclusiveReason::SoundsLikeAnother);
+    assert_eq!(note.origin, NoticeOrigin::LibrarySweep);
+    assert_eq!(note.navidrome_id.as_deref(), Some("nd-1"));
+    assert!(note.resolved_utc.is_some() && note.fingerprint.is_none());
+    assert_eq!(
+        note.reason,
+        "Octo replaced this: AcoustID heard Portishead - Roads, 97% sure (needs 85%)"
+    );
+    assert_eq!(queue.open_count(NoticeOrigin::LibrarySweep), 0);
+    assert!(queue.reviewed_paths().contains("/music/a.flac"));
+    // One entry per person and file, as for a question.
+    assert!(!queue.add_replaced("bob", "/music/a.flac", &song(), &heard_roads(), "nd-1", 85));
+    assert!(!queue.add_review_from(
+        "bob",
+        "/music/a.flac",
+        &song(),
+        &heard_roads(),
+        NoticeOrigin::LibrarySweep
+    ));
+}
+
+/// A queue file holding a replaced note loads in the 2026.10.13 entry: its kind, state, cause
+/// and origin are members that release knows, so it never sets the file aside.
+#[test]
+fn a_queue_file_with_a_replaced_note_loads_in_the_2026_10_13_entry() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("notice-queue.json");
+    {
+        let queue = NoticeQueue::with_path(Some(path.clone()));
+        queue.add_replaced("bob", "/music/a.flac", &song(), &heard_roads(), "nd-1", 85);
+        queue.add_review("alice", "/music/b.flac", &song(), &heard_below(0.64));
+        assert!(queue.flush());
+    }
+    let text = std::fs::read_to_string(&path).expect("written");
+    assert!(text.contains(r#""State":"Acted""#), "{text}");
+    assert!(text.contains(r#""Cause":"SoundsLikeAnother""#), "{text}");
+    assert!(text.contains(r#""Origin":"LibrarySweep""#), "{text}");
+
+    let before: Option<Vec<EntryBefore>> =
+        serde_json::from_str(&text).expect("the 2026.10.13 entry reads it");
+    let mut before = before.expect("entries");
+    before.sort_by(|a, b| a.username.cmp(&b.username));
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[1].username, "bob");
+    assert_eq!(before[1].state, NoticeState::Acted);
+    assert_eq!(before[1].cause, InconclusiveReason::SoundsLikeAnother);
+    assert_eq!(before[1].origin, NoticeOrigin::LibrarySweep);
+    assert!(before[1].reason.starts_with("Octo replaced this: AcoustID heard"));
+
+    let again = NoticeQueue::with_path(Some(path.clone()));
+    assert_eq!(only(&again, "bob").state, NoticeState::Acted);
+    assert!(path.exists());
+}

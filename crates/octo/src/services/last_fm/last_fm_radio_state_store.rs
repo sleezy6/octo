@@ -559,18 +559,24 @@ fn rehydrate_routes(registry: &ExternalIdRegistry, user: &mut LastFmRadioUserSta
         .flat_map(|station| station.tracks.iter_mut())
         .filter(|track| !track.is_local)
     {
-        track.resolved_id = Some(registry.register(SoulseekRouting {
-            kind: RoutingKind::Song,
-            artist: Some(track.artist.clone()),
-            title: Some(track.title.clone()),
-            album: track.album.clone(),
-            duration: track.duration,
-            you_tube_id: track.you_tube_id.clone(),
-            ..Default::default()
-        }));
-        if track.external_provider.is_none() {
-            track.external_provider = Some(SoulseekMetadataService::PROVIDER_NAME.to_string());
-        }
+        route_track(registry, track);
+    }
+}
+
+/// Gives an outside track the short id of its external route, registered now, and the provider
+/// that plays it when it names none.
+pub fn route_track(registry: &ExternalIdRegistry, track: &mut LastFmRadioTrack) {
+    track.resolved_id = Some(registry.register(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some(track.artist.clone()),
+        title: Some(track.title.clone()),
+        album: track.album.clone(),
+        duration: track.duration,
+        you_tube_id: track.you_tube_id.clone(),
+        ..Default::default()
+    }));
+    if track.external_provider.is_none() {
+        track.external_provider = Some(SoulseekMetadataService::PROVIDER_NAME.to_string());
     }
 }
 

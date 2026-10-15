@@ -205,6 +205,7 @@ impl Merged {
                 Arc::new(CoverArtAggregator::new(Vec::new())),
                 None,
             ));
+            inner.metadata_service = inner.music_metadata.clone();
         });
         Merged {
             state,

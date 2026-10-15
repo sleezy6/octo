@@ -112,6 +112,11 @@ impl TagFields {
         "MUSICBRAINZ_ALBUMID",
         "MusicBrainz Album Id",
     );
+    pub const RELEASE_GROUP_ID: TagField = txxx(
+        "MusicBrainz Release Group Id",
+        "MUSICBRAINZ_RELEASEGROUPID",
+        "MusicBrainz Release Group Id",
+    );
     pub const ALBUM_ARTISTS: TagField = txxx("ALBUMARTISTS", "ALBUMARTISTS", "ALBUMARTISTS");
     pub const ALBUM_VERSION: TagField = txxx("ALBUMVERSION", "ALBUMVERSION", "ALBUMVERSION");
     pub const RELEASE_DATE: TagField = txxx("RELEASEDATE", "RELEASEDATE", "RELEASEDATE");
@@ -475,6 +480,22 @@ pub fn set_recording_id(file: &mut TagFile, recording_id: &str) {
     }
     if let Some(apple) = tags.apple {
         apple.set_dash_box(APPLE_MEAN, "MusicBrainz Track Id", Some(recording_id));
+    }
+}
+
+/// Takes the recording id off the file, from every frame [`read_recording_id`] reads it from.
+/// For an edit someone asked for and its undo; a download never clears one.
+pub fn clear_recording_id(file: &mut TagFile) {
+    if let Some(id3) = file.id3v2.as_mut() {
+        id3.remove_ufid(MUSIC_BRAINZ_UFID_OWNER);
+    }
+    if let Some(xiph) = file.xiph.as_mut() {
+        xiph.remove_field("MUSICBRAINZ_TRACKID");
+    }
+    if let Some(apple) = file.apple.as_mut() {
+        while apple.dash_boxes(APPLE_MEAN, "MusicBrainz Track Id").is_some() {
+            apple.remove_dash_box(APPLE_MEAN, "MusicBrainz Track Id");
+        }
     }
 }
 

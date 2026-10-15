@@ -42,7 +42,7 @@ pub struct GeneratedPlaylistSettings {
     /// Environment variable: MIX_REFRESH_HOURS
     pub refresh_hours: i32,
 
-    /// Percent of each mix, and of Discovery Mix, kept for tracks new to the listener: never
+    /// Percent of each mix, and of Discovery Radio, kept for tracks new to the listener: never
     /// played, or added in the last NewDays. 0 draws from everything alike, so the default changes
     /// nothing. Environment variable: MIX_NEW_SHARE
     pub new_share: i32,
@@ -50,7 +50,7 @@ pub struct GeneratedPlaylistSettings {
     /// How recently added a track still counts as new. Environment variable: MIX_NEW_DAYS
     pub new_days: i32,
 
-    /// How a mix is named; "{0}" is the genre, decade or country. Empty means "{0} Mix".
+    /// How a mix is named; "{0}" is the genre, decade, year, country or artist. Empty means "{0} Mix".
     /// Environment variable: MIX_NAME_FORMAT
     pub name_format: String,
 
@@ -70,6 +70,24 @@ pub struct GeneratedPlaylistSettings {
     /// The most artists looked up on MusicBrainz in one pass; the rest wait for the next pass.
     /// Environment variable: COUNTRY_LOOKUPS_PER_REFRESH
     pub country_lookups_per_refresh: i32,
+
+    /// A mix per year ("1994 Mix"), counted from one walk of the listener's library (up to
+    /// 40,000 songs). Off by default. Environment variable: MIXES_YEARS
+    pub years: bool,
+
+    /// Most year mixes shown, the years with the most songs first, on top of MaxPlaylists, so a
+    /// year never takes the place of a genre or a decade.
+    /// Environment variable: MIX_MAX_YEAR_PLAYLISTS
+    pub max_year_playlists: i32,
+
+    /// A mix for each of the listener's most played artists ("Radiohead Mix"): half their own
+    /// songs, half songs in the library by artists Last.fm calls similar. Off by default.
+    /// Environment variable: MIXES_ARTISTS
+    pub artists: bool,
+
+    /// How many of the listener's most played artists get a mix.
+    /// Environment variable: MIX_ARTIST_COUNT
+    pub artist_count: i32,
 
     // ---- Made for you: three lists per listener, on whether or not the genre and decade mixes
     // are. Each is rebuilt once a RefreshHours period from that listener's own plays.
@@ -142,6 +160,10 @@ impl Default for GeneratedPlaylistSettings {
             countries: String::new(),
             max_country_playlists: 5,
             country_lookups_per_refresh: 200,
+            years: false,
+            max_year_playlists: 10,
+            artists: false,
+            artist_count: 5,
             new_releases: true,
             rediscover: true,
             deep_cuts: true,
@@ -227,6 +249,14 @@ impl GeneratedPlaylistSettings {
 
     pub fn effective_country_lookups_per_refresh(&self) -> i32 {
         self.country_lookups_per_refresh.clamp(0, 2000)
+    }
+
+    pub fn effective_max_year_playlists(&self) -> i32 {
+        self.max_year_playlists.clamp(1, 30)
+    }
+
+    pub fn effective_artist_count(&self) -> i32 {
+        self.artist_count.clamp(1, 20)
     }
 
     /// The countries named in [`Self::countries`], upper case, in order, each once; codes that
@@ -492,6 +522,35 @@ mod tests {
         assert_eq!(set.country_codes(), ["ES", "JP", "GB"]);
         assert_eq!(set.effective_max_country_playlists(), 1);
         assert_eq!(set.effective_country_lookups_per_refresh(), 2000);
+    }
+
+    #[test]
+    fn year_and_artist_mixes_are_off_by_default_and_clamped() {
+        let defaults = GeneratedPlaylistSettings::default();
+        assert!(!defaults.years && !defaults.artists);
+        assert_eq!(defaults.effective_max_year_playlists(), 10);
+        assert_eq!(defaults.effective_artist_count(), 5);
+
+        let low = GeneratedPlaylistSettings {
+            max_year_playlists: 0,
+            artist_count: -3,
+            ..Default::default()
+        };
+        assert_eq!(low.effective_max_year_playlists(), 1);
+        assert_eq!(low.effective_artist_count(), 1);
+        let high = GeneratedPlaylistSettings {
+            max_year_playlists: 500,
+            artist_count: 500,
+            ..Default::default()
+        };
+        assert_eq!(high.effective_max_year_playlists(), 30);
+        assert_eq!(high.effective_artist_count(), 20);
+
+        let read: GeneratedPlaylistSettings =
+            serde_json::from_str(r#"{"Years":true,"MaxYearPlaylists":4,"Artists":true,"ArtistCount":8}"#)
+                .expect("the keys read");
+        assert!(read.years && read.artists);
+        assert_eq!((read.max_year_playlists, read.artist_count), (4, 8));
     }
 
     #[test]

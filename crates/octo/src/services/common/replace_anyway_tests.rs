@@ -400,3 +400,94 @@ fn a_take_far_from_the_usual_length_asks_when_the_listed_copies_agree() {
         ReplaceCheck::Refused(_)
     ));
 }
+
+// ---- a library file whose album or audio is another take -----------------------------------------
+
+fn parade_on_instrumentals() -> FindTarget {
+    FindTarget {
+        library_id: Some("nd-parade".into()),
+        owned_format: Some("flac".into()),
+        owned_quality: Some("FLAC 16-bit 44.1 kHz".into()),
+        owned_path: Some("/music/My Chemical Romance - Welcome to the Black Parade.flac".into()),
+        ..FindTarget::new(
+            "My Chemical Romance",
+            "Welcome to the Black Parade",
+            Some("The Black Parade (instrumentals)"),
+            Some(305),
+            "nd-parade",
+        )
+    }
+}
+
+#[test]
+fn a_plain_copy_in_place_of_a_song_filed_under_instrumentals_takes_the_plain_album() {
+    // The replace of 2026-10-11: the copy fitted the library song, so it was held to the
+    // instrumentals album and kept it. Now it is held to the plain song.
+    // Its audio was heard and is the studio take, which the album contradicts.
+    let target = FindTarget {
+        audio_take: Some(RecordingKind::Studio),
+        ..parade_on_instrumentals()
+    };
+    let picked = copy(
+        "maximumpeaches",
+        r"music\My Chemical Romance\The Black Parade (2006)\My Chemical Romance - The Black Parade - 05 - Welcome to the Black Parade.flac",
+        "flac",
+        None,
+        Some(311),
+    );
+    match checked(&target, &picked, std::slice::from_ref(&picked)) {
+        ReplaceCheck::Confirm { song, take, words } => {
+            assert_eq!(take, Some(OtherTake::Version));
+            assert_eq!(song.title, "Welcome to the Black Parade");
+            assert_eq!(song.album, None);
+            assert!(song.retitle);
+            assert!(words.starts_with("Yours looks like another version"), "{words}");
+        }
+        other => panic!("expected a question, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_live_take_on_a_plainly_named_album_is_found_by_its_audio() {
+    // Dance Gavin Dance's "Tree City Sessions 2" says nothing about being live; the file's audio
+    // does.
+    let mut target = FindTarget {
+        library_id: Some("nd-dgd".into()),
+        owned_format: Some("flac".into()),
+        owned_quality: Some("FLAC 16-bit 44.1 kHz".into()),
+        owned_path: Some("/music/Dance Gavin Dance - Uneasy Hearts Weigh The Most .flac".into()),
+        ..FindTarget::new(
+            "Dance Gavin Dance",
+            "Uneasy Hearts Weigh The Most",
+            Some("Tree City Sessions 2"),
+            Some(254),
+            "nd-dgd",
+        )
+    };
+    let studio = copy(
+        "peer",
+        r"Music\Dance Gavin Dance\Dance Gavin Dance (2008)\06 - Uneasy Hearts Weigh the Most.flac",
+        "flac",
+        None,
+        Some(218),
+    );
+    // Not knowing what the audio is, the studio copy's length is far from the library's.
+    assert!(!matches!(
+        checked(&target, &studio, std::slice::from_ref(&studio)),
+        ReplaceCheck::Confirm {
+            take: Some(OtherTake::Live),
+            ..
+        }
+    ));
+
+    target.audio_take = Some(RecordingKind::Live);
+    match checked(&target, &studio, std::slice::from_ref(&studio)) {
+        ReplaceCheck::Confirm { song, take, words } => {
+            assert_eq!(take, Some(OtherTake::Live));
+            assert_eq!(song.album, None);
+            assert!(song.retitle);
+            assert!(words.starts_with("Yours looks like a live recording"), "{words}");
+        }
+        other => panic!("expected a question, got {other:?}"),
+    }
+}

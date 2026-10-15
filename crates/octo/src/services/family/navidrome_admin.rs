@@ -187,6 +187,11 @@ impl NavidromeAdmin {
         }
     }
 
+    /// The user name of Octo's admin identity, or None before there is one.
+    pub fn admin_user_name(&self) -> Option<String> {
+        self.identity.admin_user_name()
+    }
+
     /// Every Navidrome user.
     pub async fn list_users(&self) -> Result<Vec<NdUser>, AdminError> {
         Ok(Self::users_from(self.call(Method::GET, "/api/user", None).await?))
