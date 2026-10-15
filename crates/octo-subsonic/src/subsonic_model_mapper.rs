@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use octo_core::common::SongIdentity;
 use octo_core::common::song_identity::SongRef;
-use octo_core::models::domain::Song;
+use octo_core::models::domain::{Album, Song};
 use octo_core::models::search::SearchResult;
 use octo_core::models::subsonic::ExternalPlaylist;
 use serde_json::Value;
@@ -254,18 +254,25 @@ impl SubsonicModelMapper {
             }
         }
 
-        let mut merged_albums = local_albums;
-        merged_albums.extend(
-            external_result
-                .albums
-                .iter()
-                .filter(|a| {
-                    album_key(Some(&a.artist), Some(&a.title))
-                        .and_then(|k| local_album_keys.get(&k).copied())
-                        .is_none_or(|held| !namesake_stands_in(held, a.song_count))
-                })
-                .map(|a| Row::Json(Value::Object(self.response_builder.convert_album_to_json(a)))),
-        );
+        let mut stubs: HashSet<String> = HashSet::new();
+        let outside_albums: Vec<Row> = external_result
+            .albums
+            .iter()
+            .filter(|a| keep_beside_namesake(&local_album_keys, &mut stubs, a))
+            .map(|a| Row::Json(Value::Object(self.response_builder.convert_album_to_json(a))))
+            .collect();
+        // A library stub of an album listed whole is left out: the album stands for it.
+        let mut merged_albums: Vec<Row> = local_albums
+            .into_iter()
+            .filter(|row| {
+                let Row::Json(Value::Object(dict)) = row else {
+                    return true;
+                };
+                album_key(text(dict, "artist").as_deref(), text(dict, "name").as_deref())
+                    .is_none_or(|key| !stubs.contains(&key))
+            })
+            .collect();
+        merged_albums.extend(outside_albums);
         merged_albums.extend(
             external_playlists
                 .iter()
@@ -333,25 +340,31 @@ impl SubsonicModelMapper {
 
         // Albums, deduplicated by artist+name as the JSON merge does.
         let mut local_album_keys: HashMap<String, Option<i64>> = HashMap::new();
-        let mut merged_albums = Vec::new();
+        let mut library_albums = Vec::new();
         for album in local_albums.into_iter().filter_map(Row::into_xml) {
-            if let Some(key) = album_key(album.attribute("artist"), album.attribute("name")) {
+            let key = album_key(album.attribute("artist"), album.attribute("name"));
+            if let Some(key) = &key {
                 let songs = album
                     .attribute("songCount")
                     .and_then(|count| count.trim().parse().ok());
-                add_namesake(&mut local_album_keys, key, songs);
+                add_namesake(&mut local_album_keys, key.clone(), songs);
             }
-            merged_albums.push(Row::Xml(rename(album, "album")));
+            library_albums.push((key, album));
         }
-        for album in &external_result.albums {
-            if album_key(Some(&album.artist), Some(&album.title))
-                .and_then(|key| local_album_keys.get(&key).copied())
-                .is_some_and(|held| namesake_stands_in(held, album.song_count))
-            {
-                continue;
-            }
-            merged_albums.push(Row::Xml(self.response_builder.convert_album_to_xml(album, ns)));
-        }
+        let mut stubs: HashSet<String> = HashSet::new();
+        let outside_albums: Vec<Row> = external_result
+            .albums
+            .iter()
+            .filter(|album| keep_beside_namesake(&local_album_keys, &mut stubs, album))
+            .map(|album| Row::Xml(self.response_builder.convert_album_to_xml(album, ns)))
+            .collect();
+        // A library stub of an album listed whole is left out: the album stands for it.
+        let mut merged_albums: Vec<Row> = library_albums
+            .into_iter()
+            .filter(|(key, _)| key.as_ref().is_none_or(|key| !stubs.contains(key)))
+            .map(|(_, album)| Row::Xml(rename(album, "album")))
+            .collect();
+        merged_albums.extend(outside_albums);
         // Add playlists as albums
         for playlist in external_playlists {
             merged_albums.push(Row::Xml(convert_playlist_to_album_xml(playlist, ns)));
@@ -469,13 +482,36 @@ impl LocalSongs {
 /// Whether the library's albums of an outside album's name, holding `held` songs together
 /// (`None` when a count is missing), stand for it so it is not listed twice: they do unless
 /// they hold less than half the songs it lists. A one-song heart of "Real Deal" files a
-/// one-song "Real Deal" that must not hide the album; the album itself, a song or two short of
-/// the catalog's edition or counted short by ownership, must. Without both counts a namesake
-/// stands for it, as before.
+/// one-song "Real Deal": that stub is listed as the whole album instead (see
+/// [`keep_beside_namesake`]), whose page plays the songs held from the library and whose heart
+/// fetches the rest. The album itself, a song or two short of the catalog's edition or counted
+/// short by ownership, stands for it. Without both counts a namesake stands for it, as before.
 pub fn namesake_stands_in(held: Option<i64>, listed: Option<i32>) -> bool {
     match (held, listed.filter(|count| *count > 0)) {
         (Some(held), Some(listed)) => held * 2 >= i64::from(listed),
         _ => true,
+    }
+}
+
+/// Whether an outside album is listed beside the library's albums of its name (`held`, by
+/// [`album_key`]): always when there are none; not when they stand for it
+/// ([`namesake_stands_in`]); and when they are only a stub of it, in which case their key goes
+/// in `stubs`, so the stub is left out and the whole album listed in its place.
+pub fn keep_beside_namesake(
+    held: &HashMap<String, Option<i64>>,
+    stubs: &mut HashSet<String>,
+    album: &Album,
+) -> bool {
+    let Some(key) = album_key(Some(&album.artist), Some(&album.title)) else {
+        return true;
+    };
+    match held.get(&key) {
+        None => true,
+        Some(songs) if namesake_stands_in(*songs, album.song_count) => false,
+        Some(_) => {
+            stubs.insert(key);
+            true
+        }
     }
 }
 

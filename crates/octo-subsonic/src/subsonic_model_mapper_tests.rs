@@ -252,31 +252,54 @@ fn merge_search_results_xml_deduplicates_album_against_local() {
     assert_eq!(merged.1.len(), 2);
 }
 
-/// A library namesake holding less than half the outside album (a one-song heart of it) does not
-/// hide it, in JSON or XML.
+/// A library stub holding less than half the outside album (a one-song heart of it) is left out
+/// and the whole album listed in its place, in JSON or XML.
 #[test]
-fn merge_search_results_keeps_an_album_beside_a_small_namesake() {
+fn merge_search_results_lists_the_whole_album_in_a_stubs_place() {
     let mut counted = rainbows();
     counted.albums[0].owned_count = Some(1);
     counted.albums[0].song_count = Some(10);
 
     let local_json = json_rows(vec![
         json!({"id": "local1", "name": "In Rainbows", "artist": "Radiohead", "songCount": 1}),
+        json!({"id": "local2", "name": "OK Computer", "artist": "Radiohead", "songCount": 12}),
     ]);
     let merged = mapper().merge_search_results(vec![], local_json, vec![], &counted, &[], true, None);
-    assert_eq!(merged.1.len(), 3);
+    let listed = ids(&merged.1);
+    assert_eq!(listed.len(), 3, "{listed:?}");
+    assert!(
+        !listed.contains(&"local1".to_string()),
+        "the stub is left out: {listed:?}"
+    );
+    assert!(
+        listed.contains(&"local2".to_string()),
+        "other library albums stay: {listed:?}"
+    );
 
-    let local_xml = vec![xml_row(
-        "album",
-        &[
-            ("id", "local1"),
-            ("name", "In Rainbows"),
-            ("artist", "Radiohead"),
-            ("songCount", "1"),
-        ],
-    )];
+    let local_xml = vec![
+        xml_row(
+            "album",
+            &[
+                ("id", "local1"),
+                ("name", "In Rainbows"),
+                ("artist", "Radiohead"),
+                ("songCount", "1"),
+            ],
+        ),
+        xml_row(
+            "album",
+            &[
+                ("id", "local2"),
+                ("name", "OK Computer"),
+                ("artist", "Radiohead"),
+                ("songCount", "12"),
+            ],
+        ),
+    ];
     let merged = mapper().merge_search_results(vec![], local_xml, vec![], &counted, &[], false, None);
-    assert_eq!(merged.1.len(), 3);
+    let listed = ids(&merged.1);
+    assert_eq!(listed.len(), 3, "{listed:?}");
+    assert!(!listed.contains(&"local1".to_string()), "{listed:?}");
 }
 
 /// The library's whole album hides its outside copy, even when ownership counted it a song short

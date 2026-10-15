@@ -689,10 +689,10 @@ impl Respond for WithOneMaidSong {
 }
 
 /// One hearted song of MAID OF HONOUR files a one-song album of that name. The artist page
-/// lists it, and still lists the catalog album beside it with the one song it holds, so the
-/// whole album can be found and hearted.
+/// lists the catalog album in its place, with the one song it holds, so the whole album can be
+/// found and hearted and is listed once.
 #[tokio::test]
-async fn artist_page_keeps_an_album_beside_its_one_song_namesake() {
+async fn artist_page_lists_the_whole_album_in_place_of_its_one_song_namesake() {
     let navidrome = MockServer::start().await;
     Mock::given(any())
         .respond_with(WithOneMaidSong)
@@ -753,8 +753,12 @@ async fn artist_page_keeps_an_album_beside_its_one_song_namesake() {
         })
         .collect();
 
-    assert_eq!(maid.len(), 2, "{albums:?}");
-    assert_eq!(maid[0], (ONE_MAID_SONG_ID, false, None), "{albums:?}");
-    assert!(maid[1].1, "{albums:?}");
-    assert_eq!(maid[1].2, Some(1), "{albums:?}");
+    assert_eq!(maid.len(), 1, "{albums:?}");
+    assert!(maid[0].1, "the catalog album: {albums:?}");
+    assert_eq!(maid[0].2, Some(1), "{albums:?}");
+    // The other library albums are listed as before.
+    assert!(
+        albums.iter().any(|a| text_of(a, "id") == "al-takecare"),
+        "{albums:?}"
+    );
 }

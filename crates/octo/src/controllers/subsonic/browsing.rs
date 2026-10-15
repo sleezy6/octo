@@ -1,7 +1,7 @@
 //! `getSong`, `getArtist` and `getAlbum`: an outside id is answered from the catalog, a library
 //! artist or album is Navidrome's merged with what the catalog has that the library lacks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use octo_subsonic::subsonic_model_mapper::{add_namesake, namesake_stands_in};
 
@@ -247,15 +247,32 @@ pub async fn get_artist(State(state): State<AppState>, req: Request) -> AppResul
     // whole, or by name, is left out.
     let deezer_albums = settle_artist_albums(&state, deezer_albums, &local_albums, scope.clone()).await;
 
-    let mut merged_albums = local_albums;
+    // An outside album the page's stub of it (under half its songs) stands beside is listed in
+    // the stub's place: one entry, whose page plays the songs held and whose heart fetches the
+    // rest.
+    let mut stubs: HashSet<String> = HashSet::new();
+    let mut outside_albums = Vec::new();
     for deezer_album in &deezer_albums {
-        let stands_in = local_album_names
-            .get(&SongIdentity::key(&deezer_album.title))
-            .is_some_and(|held| namesake_stands_in(*held, deezer_album.song_count));
-        if !stands_in {
-            merged_albums.push(Value::Object(builder.convert_album_to_json(deezer_album)));
+        let key = SongIdentity::key(&deezer_album.title);
+        match local_album_names.get(&key) {
+            Some(held) if namesake_stands_in(*held, deezer_album.song_count) => continue,
+            Some(_) => {
+                stubs.insert(key);
+            }
+            None => {}
         }
+        outside_albums.push(Value::Object(builder.convert_album_to_json(deezer_album)));
     }
+    let mut merged_albums: Vec<Value> = local_albums
+        .into_iter()
+        .filter(|album| {
+            album
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| !stubs.contains(&SongIdentity::key(name)))
+        })
+        .collect();
+    merged_albums.extend(outside_albums);
 
     if let Some(artist_dict) = artist_data.as_object_mut() {
         let count = merged_albums.len();
