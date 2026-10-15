@@ -780,11 +780,11 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // GeneratedPlaylists:Years, :MaxYearPlaylists, :Artists and :ArtistCount, the sweep's
     // replacing two: LibraryActions:ReviewSweepAutoReplace and :ReviewSweepAutoReplacePerDay,
     // then LibraryActions:KeepRatedCopies and Subsonic:DownloadAlbumOnSongStar; and this fork's
-    // twelve: Subsonic:StreamSource, Deezer:Arl, :ArlFallback, :Quality and :StreamQuality, the
+    // thirteen: Subsonic:StreamSource, Deezer:Arl, :ArlFallback, :Quality and :StreamQuality, the
     // playback cache's four (Deezer:CacheEnabled, :CachePath, :CacheMaxGiB and
-    // :CacheRetentionDays), YouTube:Enabled, LastFm:EnableStarterRadio and
-    // Metadata:AnimatedArtworkUrl.
-    assert_eq!(rows.len(), 214);
+    // :CacheRetentionDays), YouTube:Enabled, LastFm:EnableStarterRadio,
+    // Metadata:AnimatedArtworkUrl and Subsonic:BadgeOutsideCovers.
+    assert_eq!(rows.len(), 215);
     assert!(!rows.iter().any(|r| {
         r["Key"]
             .as_str()

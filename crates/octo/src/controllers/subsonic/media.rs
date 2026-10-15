@@ -737,9 +737,12 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
     // plain, and a missing one is a 404 it draws its own empty tile for. Every other
     // client keeps the badge, the only sign it gets that a song came from Octo's search.
     let plain = draws_its_own_marks(&call);
+    // No badge either when the owner turned it off; a missing cover still follows `plain`, since
+    // some apps drop a song whose cover is a 404.
+    let unbadged = plain || !state.settings.current().subsonic.badge_outside_covers;
     let badged_key = state.cover_art_service.badged_key(&id);
     if let Some(routing) = state.external_id_registry.lookup(&id) {
-        if !plain && let Some(kept) = state.cover_art_service.kept_badged(&badged_key) {
+        if !unbadged && let Some(kept) = state.cover_art_service.kept_badged(&badged_key) {
             return Ok(file(kept, "image/jpeg"));
         }
         let routing = routing.snapshot();
@@ -754,7 +757,7 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
             );
             return Ok(missing_cover(&state, plain).await);
         };
-        let watermarked = if plain {
+        let watermarked = if unbadged {
             raw.to_vec()
         } else {
             match badge(&state, raw.to_vec()).await {
@@ -781,7 +784,7 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
     // compatibility with any in-flight clients).
     let (is_external, cover_provider, kind, cover_external_id) = state.local_library.parse_external_id(&id);
     if is_external {
-        if !plain && let Some(kept) = state.cover_art_service.kept_badged(&badged_key) {
+        if !unbadged && let Some(kept) = state.cover_art_service.kept_badged(&badged_key) {
             return Ok(file(kept, "image/jpeg"));
         }
         let provider = cover_provider.unwrap_or_default();
@@ -814,7 +817,7 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
             let response = state.http.get(&cover_url).send().await?;
             if response.status().is_success() {
                 let image_bytes = response.bytes().await?.to_vec();
-                let watermarked = if plain {
+                let watermarked = if unbadged {
                     image_bytes
                 } else {
                     match badge(&state, image_bytes.clone()).await {

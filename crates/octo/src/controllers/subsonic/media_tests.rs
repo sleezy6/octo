@@ -845,7 +845,7 @@ impl crate::services::cover_art::ICoverArtSource for OnePicture {
 #[tokio::test]
 async fn a_badged_outside_cover_is_kept_and_served_again_from_memory() {
     let navidrome = MockServer::start().await;
-    let state = state_with(settings(&navidrome.uri()), |inner| {
+    let state = state_with(badging(settings(&navidrome.uri())), |inner| {
         inner.cover_art_aggregator = Arc::new(crate::services::cover_art::CoverArtAggregator::new(vec![
             Arc::new(OnePicture),
         ]));
@@ -882,6 +882,39 @@ async fn a_badged_outside_cover_is_kept_and_served_again_from_memory() {
     assert_ne!(plain.body.as_ref(), b"kept");
 }
 
+/// The settings with the octopus on outside covers turned on (it is off by default).
+fn badging(mut settings: AppSettings) -> AppSettings {
+    settings.subsonic.badge_outside_covers = true;
+    settings
+}
+
+/// With the octopus off, as it is by default, an outside cover goes out as the catalog drew it
+/// to every app, and nothing badged is kept.
+#[tokio::test]
+async fn an_outside_cover_is_plain_while_the_octopus_is_off() {
+    let navidrome = MockServer::start().await;
+    let state = state_with(settings(&navidrome.uri()), |inner| {
+        inner.cover_art_aggregator = Arc::new(crate::services::cover_art::CoverArtAggregator::new(vec![
+            Arc::new(NotAPicture),
+        ]));
+    });
+    let id = state.external_id_registry.register(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("Artist".into()),
+        title: Some("Plain".into()),
+        ..Default::default()
+    });
+    let reply = get(&app(&state), &format!("/rest/getCoverArt?id={id}&size=300")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body.as_ref(), b"not a picture", "as the source gave it");
+    assert_eq!(
+        state
+            .cover_art_service
+            .kept_badged(&state.cover_art_service.badged_key(&id)),
+        None
+    );
+}
+
 #[test]
 fn a_badged_cover_is_kept_by_design_version_and_id() {
     let service = octo_media::cover::CoverArtService::new(None);
@@ -909,7 +942,7 @@ impl crate::services::cover_art::ICoverArtSource for NotAPicture {
 #[tokio::test]
 async fn a_cover_the_badge_failed_on_is_not_kept() {
     let navidrome = MockServer::start().await;
-    let state = state_with(settings(&navidrome.uri()), |inner| {
+    let state = state_with(badging(settings(&navidrome.uri())), |inner| {
         inner.cover_art_aggregator = Arc::new(crate::services::cover_art::CoverArtAggregator::new(vec![
             Arc::new(NotAPicture),
         ]));
