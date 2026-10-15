@@ -10,9 +10,12 @@ Search any song and play it right away. Keep the ones you love as files on your 
 [![License: GPL v3](https://img.shields.io/badge/License-GPL_v3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Rust](https://img.shields.io/badge/Rust-1.99-B7410E)](https://www.rust-lang.org/)
 [![Docker Compose](https://img.shields.io/badge/docker-compose-2496ED)](https://docs.docker.com/compose/)
-[![CI](https://github.com/winters27/octo/actions/workflows/ci.yml/badge.svg)](https://github.com/winters27/octo/actions/workflows/ci.yml)
+[![CI](https://github.com/sleezy6/octo/actions/workflows/ci.yml/badge.svg)](https://github.com/sleezy6/octo/actions/workflows/ci.yml)
 
 </div>
+
+> [!NOTE]
+> **This is a modified version of [winters27/octo](https://github.com/winters27/octo)**, the Octo written by Brandon Winters and its contributors. It takes in upstream's changes as they come and adds the ones listed under [What this version adds](#what-this-version-adds). Please report problems with those additions here, not to the original project. The rest of this README is upstream's, describing Octo as a whole.
 
 ---
 
@@ -23,6 +26,21 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 ![Searching Fleetwood Mac in the Octo desktop app, playing "Go Your Own Way" from Rumours, pressing + and watching Octo download it into the library](docs/images/demo.gif)
 
 <sub>Recorded in the Octo desktop app on a real server: search, play, press <b>+</b>, and the song is downloaded into the library. The download is shown faster than it ran, and the Soulseek users the copies came from are renamed.</sub>
+
+## What this version adds
+
+- **Deezer as a song source.** With your own Deezer account, songs you don't own play from Deezer (MP3 320 or FLAC) instead of a YouTube preview, and hearted songs download from Deezer in FLAC, with a second account to fall back on and an optional playback cache. See [Your own Deezer account](#your-own-deezer-account).
+- **Soulseek and YouTube are optional.** Turn either off with `SOULSEEK_ENABLED=false` or `YOUTUBE_ENABLED=false`; Deezer, Lidarr or the other source carries on without them.
+- **Every song has a length.** A song from outside your library gets its length from Deezer, then Apple's catalog, then Last.fm. Radio stations, instant mixes and song lookups wait a moment for it, so players that read a length only once (iPhone apps such as NaviBeat) show it.
+- **Deezer kept within its limits.** Octo paces its Deezer requests, ahead for what an app is waiting on and behind for background work, and keeps each account's sign-in for ten minutes rather than signing in for every song.
+- **Animated album covers.** Point `ANIMATED_ARTWORK_URL` at your own [m8tec/apple-music-animated-artworks](https://github.com/m8tec/apple-music-animated-artworks) server and the apps can show Apple Music's moving covers, relayed through Octo so they never contact Apple themselves. See [Tags, covers and lyrics](#tags-covers-and-lyrics).
+- **Starter Radio can be turned off.** `LASTFM_ENABLE_STARTER_RADIO=false` gives a new listener no mix of their own until enough plays were learned from.
+- **Bring your own Navidrome.** The built-in installer and bundled Navidrome are gone; Octo runs beside the Navidrome you already have.
+
+Running this version differs from upstream in two ways:
+
+- **Images.** They are published as `ghcr.io/sleezy6/octo`, `octo-yt-dlp-shim` and `octo-sonic`, for amd64 only, on every change to `main` (tagged `main` and the commit), never as dated releases. Set `OCTO_IMAGE_TAG=main` in `.env`.
+- **Updates.** Octo's release check, and **Update now**, follow upstream's releases, which don't have these changes: installing one replaces this version with upstream's. Set `UPDATES_CHECK=false`, and update with `git pull` then `docker compose pull && docker compose up -d`.
 
 ## What you get
 
@@ -42,13 +60,14 @@ You need a computer that stays on, such as a home server, a NAS or a Raspberry P
 You also need a [Navidrome](https://www.navidrome.org/) server, already running, that Octo can reach by a LAN address or a Docker service name (not `localhost`).
 
 ```bash
-git clone https://github.com/winters27/octo.git
+git clone https://github.com/sleezy6/octo.git
 cd octo
 cp .env.example .env
 ```
 
 Edit `.env`. The ones that matter first:
 
+- **`OCTO_IMAGE_TAG=main`** and **`UPDATES_CHECK=false`**: this version's images and updates (see [What this version adds](#what-this-version-adds)).
 - **`SUBSONIC_URL`**: your Navidrome's address as Octo's container sees it, and `SUBSONIC_ADMIN_USERNAME` / `SUBSONIC_ADMIN_PASSWORD` for a Navidrome admin login.
 - **`DOWNLOAD_PATH`**: the music folder Navidrome reads, on this machine.
 - **`LASTFM_API_KEY`**: a free [Last.fm API key](https://www.last.fm/api/account/create) powers radio and discovery. Optional, but without it search only finds your own music.
@@ -163,6 +182,9 @@ don't own → Apps that hide songs without a size** in the admin dashboard
 
 ## Updating
 
+> [!IMPORTANT]
+> On this version, don't use **Update now** or check out a dated release: those are upstream's and would replace this version's changes. Update with `git pull`, then `docker compose pull && docker compose up -d`, with `OCTO_IMAGE_TAG=main` in `.env`. What follows is upstream's own description.
+
 Octo checks GitHub every 6 hours for a newer release. When one is out, the dashboard says so at the top of every page, and **About** shows what's new.
 
 ### From the dashboard
@@ -217,7 +239,7 @@ git checkout 2026.07.29 && docker compose pull && docker compose up -d
 
 ### Published images
 
-Every release publishes three images on GitHub's container registry, each for amd64 and arm64 (a Raspberry Pi 4 or 5 included), tagged with the release date and `latest`. Every push to `main` publishes them too, tagged `main` and the commit sha, never `latest`.
+Upstream publishes three images for every release, each for amd64 and arm64 (a Raspberry Pi 4 or 5 included), tagged with the release date and `latest`. This version publishes them for amd64 only, on every push to `main`, tagged `main` and the commit sha, never with a date or `latest`.
 
 | Image | What it is |
 | --- | --- |
@@ -1082,7 +1104,7 @@ Project layout:
 
 ## License
 
-[GPL-3.0](LICENSE)
+[GPL-3.0](LICENSE). Octo is the work of Brandon Winters ([winters27/octo](https://github.com/winters27/octo)) and its contributors; this modified version's changes are released under the same license.
 
 ## Acknowledgments
 
