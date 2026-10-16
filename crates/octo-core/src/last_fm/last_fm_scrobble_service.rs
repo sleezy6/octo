@@ -35,6 +35,7 @@ impl LastFmTrack {
 ///
 /// `approval_url`: the last.fm page that approves Octo, while a Connect is waiting on it.
 /// `last_sent`: the latest play Last.fm took for this listener since Octo started.
+/// `loves`: how their favorites stand as Last.fm loves, while they are connected and loves are on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LastFmScrobbleUser {
@@ -45,6 +46,30 @@ pub struct LastFmScrobbleUser {
     pub notice: Option<String>,
     pub approval_url: Option<String>,
     pub last_sent: Option<LastFmSentPlay>,
+    pub loves: Option<LastFmLoves>,
+}
+
+/// One listener's favorites as Last.fm loves, as the dashboard shows them.
+///
+/// `favorites_loved`: the favorites they had were loved with this connection. `loving`: that
+/// pass is running now. `last`: the latest love or unlove Last.fm took since Octo started.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastFmLoves {
+    pub favorites_loved: bool,
+    pub loving: bool,
+    pub last: Option<LastFmSentLove>,
+}
+
+/// A love or unlove Last.fm took.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastFmSentLove {
+    pub artist: String,
+    pub title: String,
+    pub loved: bool,
+    #[serde(with = "crate::json::datetime::utc")]
+    pub at_utc: DateTime<Utc>,
 }
 
 /// A play Last.fm accepted, as the dashboard shows it.
@@ -168,10 +193,15 @@ mod tests {
                     .expect("a date")
                     .with_timezone(&Utc),
             }),
+            loves: Some(LastFmLoves {
+                favorites_loved: true,
+                loving: false,
+                last: None,
+            }),
         };
         assert_eq!(
             crate::json::to_string(&user),
-            r#"{"user":"alice","connected":true,"lastFmUser":"lfm-alice","awaitingApproval":false,"notice":null,"approvalUrl":null,"lastSent":{"artist":"Bladee","title":"Be Nice 2 Me","playedAtUtc":"2026-10-04T12:00:00.5Z"}}"#
+            r#"{"user":"alice","connected":true,"lastFmUser":"lfm-alice","awaitingApproval":false,"notice":null,"approvalUrl":null,"lastSent":{"artist":"Bladee","title":"Be Nice 2 Me","playedAtUtc":"2026-10-04T12:00:00.5Z"},"loves":{"favoritesLoved":true,"loving":false,"last":null}}"#
         );
     }
 }

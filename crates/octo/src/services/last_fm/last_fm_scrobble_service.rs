@@ -748,6 +748,12 @@ impl LastFmScrobbleService {
                     Some(_) => self.last_sent.lock().get(&name).cloned(),
                     None => None,
                 };
+                let loves = match &session {
+                    Some(session) if settings.love_favorites => {
+                        Some(self.loves_of(&name, &session.session_key))
+                    }
+                    _ => None,
+                };
                 LastFmScrobbleUser {
                     connected: session.is_some(),
                     last_fm_user: session
@@ -758,6 +764,7 @@ impl LastFmScrobbleService {
                     notice,
                     approval_url,
                     last_sent,
+                    loves,
                     user: name,
                 }
             })

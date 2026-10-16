@@ -20,7 +20,8 @@ pub mod radio_filler;
 
 pub use last_fm_radio_audio_transcoder::RadioAudioProfile;
 pub use last_fm_scrobble_service::{
-    LastFmCredentialCheck, LastFmScrobbleException, LastFmScrobbleUser, LastFmSentPlay, LastFmTrack,
+    LastFmCredentialCheck, LastFmLoves, LastFmScrobbleException, LastFmScrobbleUser, LastFmSentLove,
+    LastFmSentPlay, LastFmTrack,
 };
 pub use last_fm_search_cleanup::LastFmSearchCleanup;
 pub use last_fm_search_ranking::LastFmSearchRanking;

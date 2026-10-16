@@ -377,6 +377,7 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
                 Node::Bool(lastfm.scrobble_external_plays),
             ),
             ("ScrobbleLibraryPlays", Node::Bool(lastfm.scrobble_library_plays)),
+            ("LoveFavorites", Node::Bool(lastfm.love_favorites)),
             ("UserSessions", mask_sessions(&lastfm.user_sessions)),
             ("EnableRadio", Node::Bool(lastfm.enable_radio)),
             ("RadioTrackCount", n_num(lastfm.radio_track_count)),

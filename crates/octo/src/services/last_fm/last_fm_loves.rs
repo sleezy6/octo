@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use octo_core::common::dotnet;
+use octo_core::last_fm::{LastFmLoves, LastFmSentLove};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -39,6 +41,8 @@ pub(super) struct Loves {
     pub(super) synced: Mutex<HashMap<String, String>>,
     /// Listeners whose favorites are being loved right now.
     pub(super) syncing: Mutex<HashSet<String>>,
+    /// Listener (lower case) to the latest love or unlove Last.fm took for them.
+    pub(super) last: Mutex<HashMap<String, LastFmSentLove>>,
 }
 
 impl LastFmScrobbleService {
@@ -63,11 +67,36 @@ impl LastFmScrobbleService {
         let _ = self.loves.file.set(path);
     }
 
-    /// True when this listener's favorites would be loved on Last.fm: the API key and secret are
-    /// saved and their link is usable. Scrobbling need not be on.
+    /// True when this listener's favorites would be loved on Last.fm: loves are on (the
+    /// dashboard's "Love favorites on Last.fm"), the API key and secret are saved and their link
+    /// is usable. Scrobbling need not be on.
     pub fn loves_for(&self, username: &str) -> bool {
         let settings = self.last_fm();
-        super::is_ready_with(&settings) && self.active_session(&settings, username).is_some()
+        settings.love_favorites
+            && super::is_ready_with(&settings)
+            && self.active_session(&settings, username).is_some()
+    }
+
+    /// How this listener's favorites stand as loves, for the dashboard.
+    pub(super) fn loves_of(&self, username: &str, session_key: &str) -> LastFmLoves {
+        let lower = username.trim().to_lowercase();
+        LastFmLoves {
+            favorites_loved: self.loves.synced.lock().get(&lower).map(String::as_str) == Some(session_key),
+            loving: self.loves.syncing.lock().contains(&lower),
+            last: self.loves.last.lock().get(&lower).cloned(),
+        }
+    }
+
+    fn remember_love(&self, user: &str, artist: &str, title: &str, loved: bool, at_utc: DateTime<Utc>) {
+        self.loves.last.lock().insert(
+            user.trim().to_lowercase(),
+            LastFmSentLove {
+                artist: artist.trim().to_string(),
+                title: title.trim().to_string(),
+                loved,
+                at_utc,
+            },
+        );
     }
 
     /// Loves (or with `loved` false, unloves) one song on the listener's Last.fm, in the
@@ -130,7 +159,7 @@ impl LastFmScrobbleService {
     /// a caller can ask before reading the favorites.
     pub fn favorites_unloved(&self, username: &str) -> bool {
         let settings = self.last_fm();
-        if !super::is_ready_with(&settings) {
+        if !settings.love_favorites || !super::is_ready_with(&settings) {
             return false;
         }
         let Some(session) = self.active_session(&settings, username) else {
@@ -177,7 +206,10 @@ impl LastFmScrobbleService {
     /// One `track.love` or `track.unlove`.
     pub(super) async fn send_love(&self, user: &str, artist: &str, title: &str, loved: bool) -> LoveSent {
         let settings = self.last_fm();
-        let Some(session) = self.active_session(&settings, user) else {
+        let Some(session) = self
+            .active_session(&settings, user)
+            .filter(|_| settings.love_favorites)
+        else {
             return LoveSent::Unlinked;
         };
         if self.now() < self.gate.lock().paused_until {
@@ -198,6 +230,8 @@ impl LastFmScrobbleService {
             .await;
         if reply.ok() {
             self.accepted(user, &session.session_key);
+            let now = self.now();
+            self.remember_love(user, artist, title, loved, now);
             return LoveSent::Done;
         }
         if reply.error == Self::ERROR_INVALID_SESSION {

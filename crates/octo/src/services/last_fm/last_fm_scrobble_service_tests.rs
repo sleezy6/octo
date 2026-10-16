@@ -1060,3 +1060,67 @@ fn starred_songs_are_read_from_a_get_starred2_answer() {
         None
     );
 }
+
+/// With "Love favorites on Last.fm" off, nothing is loved and the dashboard shows no love line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loves_off_sends_nothing() {
+    let f = Fixture::new().await;
+    f.set_last_fm(LastFmSettings {
+        love_favorites: false,
+        ..alice_settings()
+    });
+    f.service.love("alice", "Burial", "Archangel", true);
+    f.service.love_favorites_once("alice", async {
+        Some(vec![("Burial".to_string(), "Archangel".to_string())])
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(f.last_fm.calls().is_empty());
+    assert!(!f.service.favorites_unloved("alice"));
+    let row = f
+        .service
+        .users(Vec::<String>::new())
+        .into_iter()
+        .find(|row| row.user == "alice");
+    assert_eq!(row.and_then(|row| row.loves), None);
+}
+
+/// The dashboard row says whether a listener's favorites were loved and which song was last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_dashboard_shows_where_a_listeners_loves_stand() {
+    let f = Fixture::new().await;
+    let loves = |f: &Fixture| {
+        f.service
+            .users(Vec::<String>::new())
+            .into_iter()
+            .find(|row| row.user == "alice")
+            .and_then(|row| row.loves)
+            .expect("alice's loves are shown")
+    };
+    assert!(!loves(&f).favorites_loved);
+
+    f.service.love_favorites_once("alice", async {
+        Some(vec![("Burial".to_string(), "Archangel".to_string())])
+    });
+    let service = Arc::clone(&f.service);
+    until(move || !service.favorites_unloved("alice") && service.loves.syncing.lock().is_empty()).await;
+    f.service.love("alice", "Burial", "Near Dark", false);
+    let last_fm = Arc::clone(&f.last_fm);
+    until(move || last_fm.calls_to("track.unlove").len() == 1).await;
+    let service = Arc::clone(&f.service);
+    until(move || {
+        service
+            .loves
+            .last
+            .lock()
+            .get("alice")
+            .is_some_and(|last| !last.loved)
+    })
+    .await;
+
+    let shown = loves(&f);
+    assert!(shown.favorites_loved);
+    assert!(!shown.loving);
+    let last = shown.last.expect("the last love is shown");
+    assert_eq!((last.title.as_str(), last.loved), ("Near Dark", false));
+}

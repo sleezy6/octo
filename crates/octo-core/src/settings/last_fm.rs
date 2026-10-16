@@ -31,6 +31,11 @@ pub struct LastFmSettings {
     /// Navidrome is linked to the same Last.fm account, or each library play counts twice.
     pub scrobble_library_plays: bool,
 
+    /// Love each connected listener's favorites on their Last.fm: a song favorited in any app
+    /// is loved, and unloved when the favorite is taken back; the favorites they already had
+    /// are loved once after connecting. On by default. Works whether scrobbling is on or not.
+    pub love_favorites: bool,
+
     /// Navidrome username to that listener's Last.fm session, written by Connect on the
     /// dashboard. A session key is a password for scrobbling as that person, so the admin
     /// API only ever shows it masked.
@@ -120,6 +125,7 @@ impl Default for LastFmSettings {
             api_secret: String::new(),
             scrobble_external_plays: true,
             scrobble_library_plays: true,
+            love_favorites: true,
             user_sessions: IndexMap::new(),
             enable_radio: true,
             radio_track_count: 50,

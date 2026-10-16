@@ -3502,7 +3502,7 @@ function lfmRow(u, ready) {
     const sent = u.lastSent
       ? `<span class="set-info-d">Last sent: ${escapeHtml(u.lastSent.title)} by ${escapeHtml(u.lastSent.artist)}, ${lfmAgo(u.lastSent.playedAtUtc)}.</span>`
       : '';
-    detail = `<span class="set-info-d lfm-state"><span class="status-dot ok"></span><span>Connected as <strong>${escapeHtml(u.lastFmUser || 'a Last.fm account')}</strong>.</span></span>${sent}`;
+    detail = `<span class="set-info-d lfm-state"><span class="status-dot ok"></span><span>Connected as <strong>${escapeHtml(u.lastFmUser || 'a Last.fm account')}</strong>.</span></span>${sent}${lfmLovesLine(u.loves)}`;
     actions = `<button class="btn btn-ghost" type="button" data-lfm-action="disconnect" data-user="${name}">Disconnect</button>`;
   } else if (waiting) {
     detail = `<span class="set-info-d lfm-state"><span class="status-dot pending"></span><span>Waiting for Last.fm. Allow access in the tab that opened; this updates by itself.</span></span>
@@ -3516,6 +3516,18 @@ function lfmRow(u, ready) {
   }
   const notice = u.notice ? `<span class="set-info-d lfm-user-notice">${escapeHtml(u.notice)}</span>` : '';
   return `<div class="set-row lfm-user"><div class="set-info"><span class="set-info-t">${name}</span>${detail}${notice}</div><div class="set-ctrl lfm-actions">${actions}</div></div>`;
+}
+
+// How a connected listener's favorites stand as Last.fm loves. Nothing when loves are off.
+function lfmLovesLine(loves) {
+  if (!loves) return '';
+  const state = loves.loving ? 'Loving their favorites on Last.fm now.'
+    : loves.favoritesLoved ? 'Favorites are loved on Last.fm.'
+    : 'Their favorites are loved on Last.fm after their next play.';
+  const last = loves.last
+    ? ` Last ${loves.last.loved ? 'loved' : 'unloved'}: ${escapeHtml(loves.last.title)} by ${escapeHtml(loves.last.artist)}, ${lfmAgo(loves.last.atUtc)}.`
+    : '';
+  return `<span class="set-info-d">${state}${last}</span>`;
 }
 
 function lfmWatch(user) {

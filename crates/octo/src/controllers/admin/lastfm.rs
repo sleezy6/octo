@@ -202,6 +202,7 @@ pub async fn get_last_fm_scrobbling(State(state): State<AppState>) -> Response {
         "hasApiSecret": !is_blank(&lastfm.api_secret),
         "enabled": lastfm.scrobble_external_plays,
         "libraryPlays": lastfm.scrobble_library_plays,
+        "loveFavorites": lastfm.love_favorites,
         "users": state.last_fm_scrobbles.users(known),
     }))
 }

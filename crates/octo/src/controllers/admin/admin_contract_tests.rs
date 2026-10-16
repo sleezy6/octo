@@ -780,11 +780,11 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // GeneratedPlaylists:Years, :MaxYearPlaylists, :Artists and :ArtistCount, the sweep's
     // replacing two: LibraryActions:ReviewSweepAutoReplace and :ReviewSweepAutoReplacePerDay,
     // then LibraryActions:KeepRatedCopies and Subsonic:DownloadAlbumOnSongStar; and this fork's
-    // thirteen: Subsonic:StreamSource, Deezer:Arl, :ArlFallback, :Quality and :StreamQuality, the
+    // fourteen: Subsonic:StreamSource, Deezer:Arl, :ArlFallback, :Quality and :StreamQuality, the
     // playback cache's four (Deezer:CacheEnabled, :CachePath, :CacheMaxGiB and
     // :CacheRetentionDays), YouTube:Enabled, LastFm:EnableStarterRadio,
-    // Metadata:AnimatedArtworkUrl and Subsonic:BadgeOutsideCovers.
-    assert_eq!(rows.len(), 215);
+    // Metadata:AnimatedArtworkUrl, Subsonic:BadgeOutsideCovers and LastFm:LoveFavorites.
+    assert_eq!(rows.len(), 216);
     assert!(!rows.iter().any(|r| {
         r["Key"]
             .as_str()
@@ -856,7 +856,7 @@ async fn last_fm_and_listen_brainz_reads_have_the_recorded_shapes() {
     let scrobble = get(&app, "/api/admin/lastfm/scrobble").await;
     assert_eq!(
         scrobble.text(),
-        r#"{"available":true,"hasApiKey":false,"hasApiSecret":false,"enabled":true,"libraryPlays":true,"users":[]}"#
+        r#"{"available":true,"hasApiKey":false,"hasApiSecret":false,"enabled":true,"libraryPlays":true,"loveFavorites":true,"users":[]}"#
     );
 
     let empty = get(&app, "/api/admin/listenbrainz/validate").await;
