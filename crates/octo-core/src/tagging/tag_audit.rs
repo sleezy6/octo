@@ -24,6 +24,10 @@ pub mod audit_fields {
     pub const RELEASE_TRACK_ID: &str = "releaseTrackId";
     pub const RELEASE_ID: &str = "releaseId";
     pub const RELEASE_GROUP_ID: &str = "releaseGroupId";
+    /// The album artist's other names: only ever taken off.
+    pub const ALBUM_ARTIST_NAMES: &str = "albumArtistNames";
+    /// Other names of the title, album, track and disc numbers and ids: only ever taken off.
+    pub const OTHER_NAMES: &str = "otherNames";
 }
 
 use audit_fields as fields;
@@ -37,6 +41,37 @@ pub struct FileTags {
     pub release_track_id: Option<String>,
     pub release_id: Option<String>,
     pub release_group_id: Option<String>,
+    /// The album artist written again under other names the library server reads beside it.
+    pub other_album_artists: Option<OtherAlbumArtists>,
+    /// Other fields written again under other names the library server reads beside them.
+    pub other_names: Vec<OtherNames>,
+}
+
+/// One field a file holds under other names beside its own value, which the library server
+/// reads as the same field: TRACK beside TRACKNUMBER.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OtherNames {
+    /// The field, in words: "track number".
+    pub field: String,
+    /// The value in the field's own place.
+    pub own: String,
+    /// The other fields' names, as the file spells them.
+    pub names: Vec<String>,
+    pub values: Vec<String>,
+    /// Every value is the field's own value again.
+    pub copies: bool,
+}
+
+/// Fields beside a file's own album artist that the library server reads as more album artists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OtherAlbumArtists {
+    /// The album artist in the file's own field.
+    pub album_artist: String,
+    /// The other fields' names, as the file spells them.
+    pub names: Vec<String>,
+    pub values: Vec<String>,
+    /// Every value names the album artist again, in other capitals or spacing.
+    pub copies: bool,
 }
 
 /// One kind of disagreement between a file's tags and its audio.
@@ -52,15 +87,21 @@ pub enum AuditRule {
     Ids,
     /// Another copy of the same song in the library is a different take.
     Takes,
+    /// The album artist is written again under other names the library server reads.
+    AlbumArtistNames,
+    /// Another field is written again under other names the library server reads.
+    OtherNames,
 }
 
 impl AuditRule {
-    pub const ALL: [AuditRule; 5] = [
+    pub const ALL: [AuditRule; 7] = [
         AuditRule::Spaces,
         AuditRule::Album,
         AuditRule::Title,
         AuditRule::Ids,
         AuditRule::Takes,
+        AuditRule::AlbumArtistNames,
+        AuditRule::OtherNames,
     ];
 
     /// The rule's name, as the state file and the dashboard keep it.
@@ -71,6 +112,8 @@ impl AuditRule {
             AuditRule::Title => "title",
             AuditRule::Ids => "ids",
             AuditRule::Takes => "takes",
+            AuditRule::AlbumArtistNames => "albumArtistNames",
+            AuditRule::OtherNames => "otherNames",
         }
     }
 
@@ -86,6 +129,8 @@ impl AuditRule {
             AuditRule::Title => "Title hides the take",
             AuditRule::Ids => "Ids of another recording",
             AuditRule::Takes => "Another take beside it",
+            AuditRule::AlbumArtistNames => "Album artist under other names",
+            AuditRule::OtherNames => "Tags under other names",
         }
     }
 }
@@ -239,6 +284,100 @@ impl TagAudit {
         }
         changes
     }
+
+    /// The changes put right without asking: stray spaces, and other names of the album artist
+    /// or of another field that only repeat its value.
+    pub fn automatic_changes(&self, tags: &FileTags) -> IndexMap<String, Option<String>> {
+        let mut changes = self.space_changes(tags);
+        if tags
+            .other_album_artists
+            .as_ref()
+            .is_some_and(|other| other.copies)
+        {
+            changes.insert(fields::ALBUM_ARTIST_NAMES.to_string(), None);
+        }
+        if !tags.other_names.is_empty() && tags.other_names.iter().all(|other| other.copies) {
+            changes.insert(fields::OTHER_NAMES.to_string(), None);
+        }
+        changes
+    }
+}
+
+/// The other names of the album artist and of the other fields held alone, for a file whose
+/// other answers are known: the findings and their changes, sure only when every one is a copy.
+pub fn other_names_alone(tags: &FileTags) -> TagAudit {
+    let mut found = TagAudit {
+        sure: true,
+        ..TagAudit::default()
+    };
+    if let Some(other) = &tags.other_album_artists {
+        other_album_artists(other, &mut found);
+    }
+    other_names(&tags.other_names, &mut found);
+    found
+}
+
+/// The findings for fields under other names, one a field, and their change: the other names
+/// come off, each field's own value stays. Ones that say something else wait for a person.
+fn other_names(others: &[OtherNames], found: &mut TagAudit) {
+    for other in others {
+        let names = listed(&other.names);
+        let own = other.own.trim();
+        let field = &other.field;
+        let words = if other.copies {
+            format!(
+                "The {field} '{own}' is written again under {names}, which the library server reads as the {field} too."
+            )
+        } else {
+            let values: Vec<String> = other.values.iter().map(|value| format!("'{value}'")).collect();
+            let say = if other.names.len() == 1 { "says" } else { "say" };
+            found.sure = false;
+            format!(
+                "Beside the {field} '{own}', {names} {say} {}. The library server reads them as the {field} too and can show that instead. Taking them off keeps '{own}'.",
+                listed(&values)
+            )
+        };
+        found.findings.push(AuditFinding {
+            rule: AuditRule::OtherNames,
+            words,
+        });
+    }
+    if !others.is_empty() {
+        found.changes.insert(fields::OTHER_NAMES.to_string(), None);
+    }
+}
+
+/// Names in a sentence: "A", "A and B", "A, B and C".
+fn listed(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [head @ .., last] => format!("{} and {last}", head.join(", ")),
+    }
+}
+
+/// The finding for an album artist under other names, and its change: they come off, the file's
+/// own album artist stays. Ones that name someone else wait for a person.
+fn other_album_artists(other: &OtherAlbumArtists, found: &mut TagAudit) {
+    let names = listed(&other.names);
+    let own = other.album_artist.trim();
+    let words = if other.copies {
+        format!(
+            "The album artist '{own}' is written again under {names}. The library server reads each as another album artist, so this song can sit on an album of its own."
+        )
+    } else {
+        let values: Vec<String> = other.values.iter().map(|value| format!("'{value}'")).collect();
+        found.sure = false;
+        format!(
+            "Beside the album artist '{own}', {names} name {}. The library server reads them with the album artist, so this song can sit on an album of its own. Taking them off keeps '{own}'.",
+            listed(&values)
+        )
+    };
+    found.findings.push(AuditFinding {
+        rule: AuditRule::AlbumArtistNames,
+        words,
+    });
+    found.changes.insert(fields::ALBUM_ARTIST_NAMES.to_string(), None);
 }
 
 /// Holds a file's tags against its audio. Without `heard` only the spaces are checked: with no
@@ -343,6 +482,10 @@ pub fn audit(tags: &FileTags, heard: Option<&HeardAs>) -> TagAudit {
     if let Some(heard) = heard {
         ids(tags, heard, release_cleared, &mut found);
     }
+    if let Some(other) = &tags.other_album_artists {
+        other_album_artists(other, &mut found);
+    }
+    other_names(&tags.other_names, &mut found);
     found
 }
 

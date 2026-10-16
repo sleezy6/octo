@@ -29,6 +29,10 @@ pub enum RecordingKind {
     Acapella,
     Remix,
     Demo,
+    /// A copy played faster than the recording: "sped up", nightcore.
+    Sped,
+    /// A copy played slower than the recording: "slowed", "slowed + reverb".
+    Slowed,
 }
 
 impl RecordingKind {
@@ -44,6 +48,8 @@ impl RecordingKind {
             RecordingKind::Acapella => Some("Acapella"),
             RecordingKind::Remix => Some("Remix"),
             RecordingKind::Demo => Some("Demo"),
+            RecordingKind::Sped => Some("Sped Up"),
+            RecordingKind::Slowed => Some("Slowed"),
         }
     }
 
@@ -58,6 +64,8 @@ impl RecordingKind {
             RecordingKind::Acapella => "an acapella",
             RecordingKind::Remix => "a remix",
             RecordingKind::Demo => "a demo",
+            RecordingKind::Sped => "a sped-up copy",
+            RecordingKind::Slowed => "a slowed copy",
         }
     }
 
@@ -71,6 +79,8 @@ impl RecordingKind {
             "acapella" => RecordingKind::Acapella,
             "remix" | "dj mix" | "vip" | "rework" | "dub" => RecordingKind::Remix,
             "demo" => RecordingKind::Demo,
+            "sped up" | "nightcore" => RecordingKind::Sped,
+            "slowed" => RecordingKind::Slowed,
             _ => return None,
         })
     }
@@ -287,6 +297,8 @@ fn first_kind(kinds: &BTreeSet<RecordingKind>) -> Option<RecordingKind> {
         RecordingKind::Cover,
         RecordingKind::Instrumental,
         RecordingKind::Acapella,
+        RecordingKind::Sped,
+        RecordingKind::Slowed,
         RecordingKind::Live,
         RecordingKind::Demo,
         RecordingKind::Remix,

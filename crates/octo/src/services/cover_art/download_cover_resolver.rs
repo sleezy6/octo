@@ -435,13 +435,21 @@ impl DownloadCoverResolver {
         }
 
         if !found.iter().any(|f| f.side >= Self::SHARP_SIDE) {
+            // An album's cover is looked for under its album artist: every source takes only a
+            // release by that artist. A loose track's is its own, under its own artist.
+            let loose = dotnet::is_blank(&song.album);
+            let by = song
+                .album_artist
+                .as_deref()
+                .filter(|album_artist| !loose && !dotnet::is_blank(album_artist))
+                .unwrap_or(artist);
             let routing = SoulseekRouting {
-                kind: if dotnet::is_blank(&song.album) {
+                kind: if loose {
                     RoutingKind::Song
                 } else {
                     RoutingKind::Album
                 },
-                artist: Some(artist.to_string()),
+                artist: Some(by.to_string()),
                 title: Some(song.title.clone()),
                 album: Some(song.album.clone()),
                 ..Default::default()

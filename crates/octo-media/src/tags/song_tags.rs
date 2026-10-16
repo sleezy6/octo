@@ -26,6 +26,8 @@ use octo_core::common::song_identity::SongIdentity;
 
 use octo_core::common::dotnet::is_null_or_white_space;
 
+use super::credit_names;
+use super::field_names::{self, FieldName};
 use super::release_fact_tags;
 use super::tag_file::{TagError, TagFile, TagPicture};
 use super::tag_writer_extras::{self as extras, TagFields};
@@ -48,50 +50,71 @@ pub enum GenreWrite {
 /// under another album (`release_fact_tags::filed_elsewhere`), whose facts the caller took off
 /// first with `release_fact_tags::tidy`.
 pub fn write_song(file: &mut TagFile, song: &Song, genres: &GenreWrite, filed_elsewhere: bool) {
+    let credits = credit_names::Credits::read(file);
+    let mut written = credit_names::Written::default();
+    // Every other field Octo writes, so the other names each goes by can go after.
+    let mut fields: Vec<&FieldName> = Vec::new();
     // Basic metadata. Title/artist we always have; only overwrite album + album-artist when we
     // actually resolved them, so a well-tagged Soulseek FLAC keeps its own album if Deezer had
     // no match.
     if !song.title.is_empty() {
         file.set_title(Some(&song.title));
+        fields.push(&field_names::TITLE);
     }
     if !song.artist.is_empty() {
         file.set_performers(std::slice::from_ref(&song.artist));
+        written.artist = true;
     }
     // The full credit stays in the artist tag; each artist also gets a value of their own, so
     // Navidrome files a collaboration under every one of them (#49).
     if song.artists.len() > 1 {
         extras::set_multi_value(file, "ARTISTS", &song.artists);
+        written.artists = true;
     }
     if !song.album.is_empty() {
         file.set_album(Some(&song.album));
+        fields.push(&field_names::ALBUM);
     }
+    let mut album_artist_written: Option<String> = None;
     if let Some(album_artist) = song.album_artist.as_ref().filter(|name| !name.is_empty()) {
         file.set_album_artists(std::slice::from_ref(album_artist));
+        written.album_artist = true;
+        album_artist_written = Some(album_artist.clone());
     } else if !song.artist.is_empty() {
         // A list of credits as album artist scatters the album view the way it scattered
         // folders, so the first credit stands in when a source named one.
         let first = song.primary_artist.clone().unwrap_or_else(|| song.artist.clone());
-        file.set_album_artists(&[first]);
+        file.set_album_artists(std::slice::from_ref(&first));
+        written.album_artist = true;
+        album_artist_written = Some(first);
     }
+    // The file's own other names for what was just written would be second values the library
+    // server reads beside it, and split the album from tracks that lack them.
+    credit_names::tidy_written(file, &credits, written);
 
     // Only write the track number when we actually have one, and only pair the total with it
     //: avoids a bogus "0/11" when Deezer's search result carried the album total but not this
     // track's position.
     if let Some(track @ 1..) = song.track {
         file.set_track(track as u32);
+        fields.push(&field_names::TRACK);
         if let Some(total) = song.total_tracks {
             file.set_track_count(total as u32);
+            fields.push(&field_names::TRACK_TOTAL);
         }
     }
     if let Some(disc) = song.disc_number {
         file.set_disc(disc as u32);
+        fields.push(&field_names::DISC);
         if let Some(discs) = song.total_discs.filter(|discs| *discs > 0 && *discs >= disc) {
             file.set_disc_count(discs as u32);
+            fields.push(&field_names::DISC_TOTAL);
         }
     }
     release_fact_tags::drop_other_totals(file);
     if let Some(year) = song.year {
         file.set_year(year as u32);
+        fields.push(&field_names::YEAR);
     }
 
     match genres {
@@ -99,15 +122,21 @@ pub fn write_song(file: &mut TagFile, song: &Song, genres: &GenreWrite, filed_el
         GenreWrite::Write(genres) => file.set_genres(genres),
         GenreWrite::Clear => file.set_genres(&[]),
     }
+    if *genres != GenreWrite::Keep {
+        fields.push(&field_names::GENRE);
+    }
 
     if let Some(bpm) = song.bpm {
         file.set_bpm(bpm as u32);
+        fields.push(&field_names::BPM);
     }
     if !song.contributors.is_empty() {
         file.set_composers(&song.contributors);
+        fields.push(&field_names::COMPOSER);
     }
     if let Some(copyright) = song.copyright.as_deref().filter(|text| !text.is_empty()) {
         file.set_copyright(Some(copyright));
+        fields.push(&field_names::COPYRIGHT);
     }
 
     // What the fingerprint proved (#48), so no later pass has to identify this file again. No
@@ -120,6 +149,7 @@ pub fn write_song(file: &mut TagFile, song: &Song, genres: &GenreWrite, filed_el
         .filter(|id| !id.is_empty())
     {
         extras::set_recording_id(file, recording);
+        fields.push(&field_names::RECORDING_ID);
     }
     let album_is_release = song
         .music_brainz_release_group_id
@@ -128,21 +158,31 @@ pub fn write_song(file: &mut TagFile, song: &Song, genres: &GenreWrite, filed_el
         && VerificationResult::album_is_from_release(song);
     if album_is_release {
         file.set_music_brainz_release_group_id(song.music_brainz_release_group_id.as_deref());
+        fields.push(&field_names::RELEASE_GROUP_ID);
     }
     if !song.music_brainz_artist_ids.is_empty() {
         extras::set_multi(file, TagFields::ARTIST_ID, &song.music_brainz_artist_ids);
+        fields.push(&field_names::ARTIST_ID);
     }
     // The flag is album-level: when the chooser set the album, a peer's stale flag from the
-    // compilation the file was ripped from would file the studio album as one.
+    // compilation the file was ripped from would file the studio album as one. Every sign that
+    // the album is a compilation, the file's own flag for the same album among them, is in
+    // `is_compilation`, so an album artist other than Various Artists takes a flag off too.
     if song.is_compilation {
         extras::set_compilation(file, true);
+        fields.push(&field_names::COMPILATION);
     } else if filed_elsewhere
         || song
             .tag_plan
             .as_ref()
             .is_some_and(|plan| plan.album_from_candidate() && !plan.rehearsed)
+        || ((extras::is_compilation(file) || field_names::has_other_names(file, &field_names::COMPILATION))
+            && album_artist_written
+                .as_deref()
+                .is_some_and(|name| !credit_names::is_various_artists(name)))
     {
         extras::set_compilation(file, false);
+        fields.push(&field_names::COMPILATION);
     }
 
     // The rest of what a release is: its code, its label and catalog number, its barcode, its
@@ -151,8 +191,14 @@ pub fn write_song(file: &mut TagFile, song: &Song, genres: &GenreWrite, filed_el
     // with is left alone. Every setter skips an empty value.
     let isrc = song.isrc.as_deref().and_then(SongIdentity::normalize_isrc);
     extras::set_text(file, TagFields::ISRC, isrc.as_deref());
+    if isrc.is_some() {
+        fields.push(&field_names::ISRC);
+    }
     extras::set_text(file, TagFields::LABEL, song.label.as_deref());
     extras::set_text(file, TagFields::CATALOG_NUMBER, song.catalog_number.as_deref());
+    if !is_null_or_white_space(song.catalog_number.as_deref()) {
+        fields.push(&field_names::CATALOG_NUMBER);
+    }
     extras::set_text(file, TagFields::BARCODE, song.barcode.as_deref());
     if let Some(release_type) = song.release_type.as_deref().filter(|text| !text.is_empty()) {
         let types: Vec<String> = release_type
@@ -165,13 +211,22 @@ pub fn write_song(file: &mut TagFile, song: &Song, genres: &GenreWrite, filed_el
     extras::set_text(file, TagFields::RELEASE_STATUS, song.release_status.as_deref());
     extras::set_text(file, TagFields::RELEASE_COUNTRY, song.release_country.as_deref());
     extras::set_original_date(file, song.original_date.as_deref());
+    if !is_null_or_white_space(song.original_date.as_deref()) {
+        fields.push(&field_names::ORIGINAL_DATE);
+    }
     if album_is_release {
         extras::set_release_track_id(file, song.music_brainz_release_track_id.as_deref());
+        if !is_null_or_white_space(song.music_brainz_release_track_id.as_deref()) {
+            fields.push(&field_names::RELEASE_TRACK_ID);
+        }
         extras::set_multi(
             file,
             TagFields::ALBUM_ARTIST_ID,
             &song.music_brainz_album_artist_ids,
         );
+        if !song.music_brainz_album_artist_ids.is_empty() {
+            fields.push(&field_names::ALBUM_ARTIST_ID);
+        }
     }
     extras::set_text(file, TagFields::FINGERPRINT_ID, song.acoust_id.as_deref());
     extras::set_replay_gain(
@@ -195,6 +250,9 @@ pub fn write_song(file: &mut TagFile, song: &Song, genres: &GenreWrite, filed_el
         }
     }
     extras::set_advisory(file, song.advisory);
+    // A second name the library server reads beside what Octo wrote is a second value, and the
+    // first it finds wins: a peer's TRACK=3 beside TRACKNUMBER=2 shows track 3.
+    field_names::drop_other_names(file, &fields);
 }
 
 /// The cover the chain chose, as the only picture: a front cover described as "Cover", with

@@ -42,8 +42,9 @@ static SONGS: LazyLock<SongMatchOptions> = LazyLock::new(|| SongMatchOptions {
 pub struct LyricsIdentity;
 
 impl LyricsIdentity {
-    /// How far apart two lengths may be and still be one recording.
-    pub const LENGTH_TOLERANCE_SECONDS: i32 = SongIdentity::LENGTH_TOLERANCE_SECONDS;
+    /// How far apart two lengths may be and still be one recording's lyrics: synced lines timed
+    /// for a take two seconds longer already drift out of step.
+    pub const LENGTH_TOLERANCE_SECONDS: i32 = 2;
 
     /// `got_credits` lists the entry's artists one by one, when its source does.
     pub fn same_song<S: AsRef<str>>(
@@ -117,7 +118,7 @@ impl LyricsIdentity {
 
     /// Within a few seconds, or unknown on either side.
     pub fn length_fits(want: Option<i32>, got: Option<f64>) -> bool {
-        SongIdentity::length_fits(want, got, SongIdentity::LENGTH_TOLERANCE_SECONDS)
+        SongIdentity::length_fits(want, got, Self::LENGTH_TOLERANCE_SECONDS)
     }
 
     /// Why a match that passed is still worth a look, or None.

@@ -183,12 +183,7 @@ impl LastFmRadioStateStore {
     pub fn get_summaries(&self) -> Vec<LastFmRadioUserSummary> {
         let mut guard = self.state.lock();
         let state = self.load_locked(&mut guard);
-        let mut users: Vec<&LastFmRadioUserState> = state
-            .users
-            .values()
-            .map(|(_, user)| user)
-            .filter(|user| !is_blank_slate(user))
-            .collect();
+        let mut users: Vec<&LastFmRadioUserState> = state.users.values().map(|(_, user)| user).collect();
         users.sort_by_key(|a| std::cmp::Reverse(a.last_seen_utc));
         users
             .into_iter()
@@ -204,18 +199,29 @@ impl LastFmRadioStateStore {
             .collect()
     }
 
-    /// The listeners radio works for. One whose history was reset and who has played nothing
-    /// since is left out, here and in [`Self::get_summaries`]: nothing is built for them and
-    /// the dashboard does not list them, until they play again.
+    /// Listeners radio builds for: everyone but a listener cleared from the dashboard who has
+    /// not played since, who has nothing to build from.
     pub fn known_users(&self) -> Vec<String> {
         let mut guard = self.state.lock();
         let state = self.load_locked(&mut guard);
         state
             .users
             .values()
-            .filter(|(_, user)| !is_blank_slate(user))
-            .map(|(_, user)| user.username.clone())
+            .filter_map(|(_, user)| {
+                let idle = user.history_cleared_utc.is_some() && user.plays.is_empty();
+                (!idle).then(|| user.username.clone())
+            })
             .collect()
+    }
+
+    /// Whether a starting profile may be learned for the listener: they have no plays and were
+    /// never cleared from the dashboard. Read in place, without copying the listener.
+    pub fn wants_starting_profile(&self, username: &str) -> bool {
+        let mut guard = self.state.lock();
+        let state = self.load_locked(&mut guard);
+        state
+            .get(&user_key(username))
+            .is_none_or(|user| user.plays.is_empty() && user.history_cleared_utc.is_none())
     }
 
     pub fn find_station(&self, username: &str, station_id: &str) -> Option<LastFmRadioStation> {
@@ -345,9 +351,14 @@ impl LastFmRadioStateStore {
         let state = self.load_locked(&mut guard);
         let now = self.clock.now();
         let user = get_or_create(state, username, now);
-        // A reset wipes the mark a refresh sets when it starts. Stations arriving for a reset
-        // listener with no refresh marked were built from the history that was just forgotten.
-        if user.reset_utc.is_some() && !user.refreshing {
+        // Every refresh stamps its start (`mark_refreshing`). One that started before the
+        // listener was cleared built from the history that was dropped, so its result is
+        // discarded.
+        if let Some(cleared) = user.history_cleared_utc
+            && user
+                .last_refresh_attempt_utc
+                .is_none_or(|started| started <= cleared)
+        {
             return;
         }
         let existing = std::mem::take(&mut user.stations);
@@ -397,11 +408,10 @@ impl LastFmRadioStateStore {
         self.save_locked(state);
     }
 
-    /// Forgets a listener's plays, stations, unplayable tracks and radio bans. The listener
-    /// is kept, marked as reset and out of every list until they play again, so the starting profile is not learned again from their
-    /// stars and albums the next time one of their apps lists playlists: that used to bring the
-    /// history straight back. A refresh that was running writes nothing back (see
-    /// [`Self::replace_stations`]). False when the listener was not known.
+    /// Clears everything held for a listener (plays, stations, unplayable tracks, bans) but
+    /// keeps the entry, stamped `history_cleared_utc`. Dropping the entry instead let the next
+    /// playlist listing learn a starting profile from the listener's stars, which brought the
+    /// history back at once. False for an unknown listener.
     pub fn reset(&self, username: &str) -> bool {
         let mut guard = self.state.lock();
         let state = self.load_locked(&mut guard);
@@ -409,23 +419,13 @@ impl LastFmRadioStateStore {
         let Some(user) = state.get_mut(&user_key(username)) else {
             return false;
         };
-        *user = LastFmRadioUserState {
-            username: std::mem::take(&mut user.username),
-            last_seen_utc: now,
-            reset_utc: Some(now),
-            ..Default::default()
-        };
+        let name = std::mem::take(&mut user.username);
+        *user = LastFmRadioUserState::default();
+        user.username = name;
+        user.last_seen_utc = now;
+        user.history_cleared_utc = Some(now);
         self.save_locked(state);
         true
-    }
-
-    /// Whether the listener's history was reset from the dashboard: they get no starting profile.
-    pub fn was_reset(&self, username: &str) -> bool {
-        let mut guard = self.state.lock();
-        let state = self.load_locked(&mut guard);
-        state
-            .get(&user_key(username))
-            .is_some_and(|user| user.reset_utc.is_some())
     }
 
     fn load_locked<'a>(&self, guard: &'a mut Option<Document>) -> &'a mut Document {
@@ -471,6 +471,9 @@ impl LastFmRadioStateStore {
                 );
                 return Document::empty();
             }
+            // No refresh outlives the process that ran it.
+            let mut user = user;
+            user.refreshing = false;
             state.users.set(folded, (key, user));
         }
         self.prune_locked(&mut state, self.clock.now());
@@ -521,11 +524,6 @@ impl LastFmRadioStateStore {
             warn!("Last.fm radio state save failed: {error}");
         }
     }
-}
-
-/// A listener kept only as the mark of a reset: reset, with no play and no station since.
-fn is_blank_slate(user: &LastFmRadioUserState) -> bool {
-    user.reset_utc.is_some() && user.plays.is_empty() && user.stations.is_empty()
 }
 
 fn get_or_create<'a>(

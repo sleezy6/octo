@@ -123,6 +123,11 @@ impl LibraryAlbumIndex {
         &self.rows
     }
 
+    /// Every album in the library.
+    pub fn albums(&self) -> impl Iterator<Item = &Arc<LibraryAlbum>> {
+        self.albums.values()
+    }
+
     pub fn album(&self, id: &str) -> Option<&Arc<LibraryAlbum>> {
         self.albums.get(id)
     }

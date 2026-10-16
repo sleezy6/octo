@@ -44,13 +44,18 @@ use crate::services::subsonic::subsonic_proxy_service::content_type_of;
 use crate::services::subsonic::{CredentialVerdict, SubsonicProxyService};
 
 pub fn routes() -> RouteSet {
-    RouteSet::new()
-        // HEAD too: a player asks it of an outside song for its length and type (Apple's
-        // player on iPhone does), and Navidrome, which the catch-all would ask, has no such
-        // song. A library song's HEAD still goes to Navidrome.
-        .subsonic_with_head("stream", get(stream).post(stream).head(stream_head))
-        .subsonic("download", get(download).post(download))
-        .subsonic("getCoverArt", get(get_cover_art).post(get_cover_art))
+    // The audio endpoints take HEAD themselves (see `audio_head`), at both spellings.
+    let audio = [
+        ("stream", get(stream).post(stream).head(audio_head)),
+        ("download", get(download).post(download).head(audio_head)),
+    ];
+    let mut set = RouteSet::new();
+    for (name, methods) in audio {
+        for template in [format!("/rest/{name}"), format!("/rest/{name}.view")] {
+            set = set.route_with_head(&template, methods.clone());
+        }
+    }
+    set.subsonic("getCoverArt", get(get_cover_art).post(get_cover_art))
         .subsonic(
             "getTranscodeDecision",
             get(get_transcode_decision).post(get_transcode_decision),
@@ -151,27 +156,22 @@ pub async fn stream(State(state): State<AppState>, req: Request) -> AppResult {
     }
 }
 
-/// HEAD of `stream`: an outside song is answered as its GET would be, headers only (no play
-/// is counted, and the body is never sent); anything else goes to the catch-all, which asks
-/// Navidrome as before.
-async fn stream_head(State(state): State<AppState>, req: Request) -> AppResult {
-    let id = req
-        .uri()
-        .query()
-        .map(|query| {
-            url::form_urlencoded::parse(query.as_bytes())
-                .find(|(key, _)| key == "id")
-                .map(|(_, value)| value.into_owned())
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    let (is_external, _, _) = state.local_library.parse_song_id(&id);
-    if is_blank(&id) || !is_external {
-        return Ok(crate::http::catch_all::catch_all(State(state), req).await);
+/// HEAD of `stream` or `download`. Players on iPhone send one before playing, for the type and
+/// size. Navidrome has never heard of an outside song, so for one of those the GET path runs
+/// here and its answer goes back with the body swapped out, which also closes the source. Any
+/// other id is Navidrome's to answer. `is_first_byte_request` never counts a HEAD as a play.
+async fn audio_head(State(state): State<AppState>, req: Request) -> AppResult {
+    let (parts, body) = req.into_parts();
+    let id = SubsonicCall::from_parts(&state, &parts, Default::default())
+        .param("id")
+        .to_string();
+    let req = Request::from_parts(parts, body);
+    if !state.local_library.parse_song_id(&id).0 {
+        return Ok(catch_all::catch_all(State(state), req).await);
     }
-    let response = stream(State(state), req).await?;
-    let (parts, _) = response.into_parts();
-    Ok(Response::from_parts(parts, Body::empty()))
+    let mut reply = stream(State(state), req).await?;
+    *reply.body_mut() = Body::empty();
+    Ok(reply)
 }
 
 // ---------------------------------------------------------------------------------------

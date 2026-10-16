@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use octo_core::common::cover_names::cover_name_score;
+use octo_core::common::cover_names::{
+    cover_name_score, release_artist_fits, release_fits, release_title_fits,
+};
 use octo_core::common::{SongIdentity, dotnet};
 use octo_core::json::element::{array_length, enumerate_array, get_string, str_prop, try_get_property};
 use octo_core::metadata::accept_language_header;
@@ -284,9 +286,17 @@ fn pick_best_album_cover(
             Some(a) => str_prop(a, "title")?,
             None => None,
         };
+        // Only the asked-for track's or release's own art, by its own artist: never another
+        // artist's record of a near name.
+        let track_title = str_prop(item, "title")?;
+        let fits = release_artist_fits(&[expected_artist], artist)
+            && (track_title.is_some_and(|t| release_title_fits(expected_title, t))
+                || album_title.is_some_and(|t| release_title_fits(expected_title, t)));
+        if !fits {
+            continue;
+        }
         let score = i32::from(cover_name_score(expected_artist, artist))
-            + title_bonus(expected_title, str_prop(item, "title")?)
-                .max(title_bonus(expected_title, album_title));
+            + title_bonus(expected_title, track_title).max(title_bonus(expected_title, album_title));
         if score > best_score {
             best_score = score;
             best = Some(cover.to_string());
@@ -311,8 +321,11 @@ fn pick_best_direct_cover(
         let Some(cover) = cover.filter(|c| !c.is_empty()) else {
             continue;
         };
-        let score = i32::from(cover_name_score(expected_artist, artist))
-            + title_bonus(expected_title, str_prop(item, "title")?);
+        let title = str_prop(item, "title")?;
+        if !title.is_some_and(|t| release_fits(expected_title, &[expected_artist], t, artist)) {
+            continue;
+        }
+        let score = i32::from(cover_name_score(expected_artist, artist)) + title_bonus(expected_title, title);
         if score > best_score {
             best_score = score;
             best = Some(cover.to_string());

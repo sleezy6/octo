@@ -19,13 +19,67 @@ impl DeezerMetadataService {
     /// The catalog's track for this ISRC, or none when it has none. In the background lane,
     /// for a library-wide job that must never crowd out a search someone is waiting on.
     pub async fn track_by_isrc(&self, isrc: &str) -> CatalogTrackAnswer {
+        self.track_by_isrc_on(isrc, true).await
+    }
+
+    /// Every release a loose search for `query` offers a cover of, as (release, its artist, the
+    /// cover): the albums it finds, and the album of each track it finds. Whoever made them: the
+    /// version check holds a file's cover against these to tell when it is another artist's.
+    /// In the background lane.
+    pub async fn release_covers(&self, query: &str) -> Vec<(String, String, String)> {
+        let mut found: Vec<(String, String, String)> = Vec::new();
+        for path in ["search/album", "search"] {
+            let url = format!("{}/{path}?q={}&limit=10", self.base(), escape_data_string(query));
+            let r = self.get_json(&url, true).await;
+            let Some(items) = r
+                .doc
+                .as_ref()
+                .and_then(|doc| doc.get("data"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for item in items {
+                let album = if path == "search" {
+                    item.get("album")
+                } else {
+                    Some(item)
+                };
+                let Some(album) = album else {
+                    continue;
+                };
+                let title = album.get("title").and_then(Value::as_str).unwrap_or("");
+                let artist = album
+                    .get("artist")
+                    .or_else(|| item.get("artist"))
+                    .and_then(|artist| artist.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let cover = ["cover_xl", "cover_big", "cover_medium"]
+                    .iter()
+                    .find_map(|key| album.get(*key).and_then(Value::as_str))
+                    .unwrap_or("");
+                if !cover.is_empty() && !found.iter().any(|(_, _, seen)| seen == cover) {
+                    found.push((title.to_string(), artist.to_string(), cover.to_string()));
+                }
+            }
+        }
+        found
+    }
+
+    /// [`Self::track_by_isrc`] for a download someone waits on, in the foreground lane.
+    pub async fn track_by_isrc_now(&self, isrc: &str) -> CatalogTrackAnswer {
+        self.track_by_isrc_on(isrc, false).await
+    }
+
+    async fn track_by_isrc_on(&self, isrc: &str, background: bool) -> CatalogTrackAnswer {
         let Some(code) = SongIdentity::normalize_isrc(isrc) else {
             return CatalogTrackAnswer::default();
         };
         let r = self
             .get_json(
                 &format!("{}/track/isrc:{}", self.base(), escape_data_string(&code)),
-                true,
+                background,
             )
             .await;
         if r.transient {

@@ -57,6 +57,7 @@ pub fn routes() -> RouteSet {
         .route("/api/admin/health/tags/start", post(start_tags))
         .route("/api/admin/health/tags/pause", post(pause_tags))
         .route("/api/admin/health/tags/reset", post(reset_tags))
+        .merge(super::health_versions::routes())
 }
 
 /// The Navidrome admin asking: signed in on the dashboard, or the app with an admin's sign-in.
@@ -76,6 +77,16 @@ fn navidrome_user(state: &AppState, parts: &Parts) -> Option<String> {
 // As every endpoint that reads or changes library files answers the recovery code: no.
 fn not_admin() -> Response {
     error(StatusCode::UNAUTHORIZED, SIGN_IN_FIRST)
+}
+
+/// [`navidrome_user`] for the version check's endpoints.
+pub(super) fn navidrome_user_of(state: &AppState, parts: &Parts) -> Option<String> {
+    navidrome_user(state, parts)
+}
+
+/// [`not_admin`] for the version check's endpoints.
+pub(super) fn not_signed_in() -> Response {
+    not_admin()
 }
 
 type Fields = ServerSongFields;
@@ -238,6 +249,31 @@ async fn get_report(State(state): State<AppState>, request: Request) -> Response
         checks.push(tags_check(&tag_findings));
         used.extend(tag_findings.iter().map(|finding| finding.id.clone()));
     }
+    // The version check's songs and imported songs that point at another version.
+    let versions = super::health_versions::versions_check(&state, &found.songs);
+    let mut version_rows: Vec<(String, String, String, String, String)> = Vec::new();
+    if let Some(versions) = &versions {
+        for id in versions["songs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            used.insert(id.to_string());
+        }
+        for item in versions["imports"].as_array().into_iter().flatten() {
+            if let Some(id) = item["pointsAt"].as_str() {
+                used.insert(id.to_string());
+            }
+        }
+        for row in state.library_identity_sweep.version_findings() {
+            version_rows.push((row.id, row.title, row.artist, row.album, row.path));
+        }
+        for row in state.library_identity_sweep.cover_findings() {
+            version_rows.push((row.id, row.title, row.artist, row.album, row.path));
+        }
+        checks.push(versions.clone());
+    }
 
     let mut by_id = Map::new();
     for song in found.songs.iter().filter(|song| used.contains(&song.id)) {
@@ -248,10 +284,28 @@ async fn get_report(State(state): State<AppState>, request: Request) -> Response
             by_id.insert(finding.id.clone(), finding_song_view(finding));
         }
     }
+    for (id, title, artist, album, path) in version_rows {
+        by_id.entry(id.clone()).or_insert_with(|| {
+            json!({
+                "id": id,
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "albumArtist": Value::Null,
+                "year": Value::Null,
+                "quality": Value::Null,
+                "lossless": false,
+                "path": path,
+            })
+        });
+    }
     ok(&json!({
         "checked": report.checked,
-        "overview": words::overview_and(report, usize::from(!tag_findings.is_empty())),
-        "clean": report.clean() && tag_findings.is_empty(),
+        "overview": words::overview_and(
+            report,
+            usize::from(!tag_findings.is_empty()) + usize::from(versions.is_some()),
+        ),
+        "clean": report.clean() && tag_findings.is_empty() && versions.is_none(),
         "tagCheck": tag_check_view(&tag_status),
         "allClear": words::ALL_CLEAR,
         "readUtc": utc(&found.read_utc),
@@ -349,6 +403,13 @@ async fn preview(State(state): State<AppState>, request: Request) -> Response {
         .is_some_and(|check| eq_ignore_case(check, TAGS))
     {
         return tags_preview(&state, &user, request.keys.as_deref());
+    }
+    if request
+        .check
+        .as_deref()
+        .is_some_and(|check| eq_ignore_case(check, super::health_versions::VERSIONS))
+    {
+        return super::health_versions::preview(&state, &user, request.keys.as_deref());
     }
     let Some(check) = parse_check(request.check.as_deref()) else {
         return error(StatusCode::BAD_REQUEST, "Say which finding to fix.");
@@ -748,6 +809,7 @@ fn tag_check_view(status: &IdentitySweepStatus) -> Value {
         "found": status.found,
         "sure": status.sure,
         "spacesFixed": status.spaces_fixed,
+        "namesFixed": status.names_fixed,
         "perHour": status.per_hour,
         "line": words::tag_check_line(&status.state, status.checked, status.total, status.per_hour),
         "lastCheckedUtc": utc_opt(&status.last_checked_utc),
@@ -1452,7 +1514,7 @@ fn change_view(change: &TagChange) -> Value {
     })
 }
 
-fn step_view(step: &FixStep) -> Value {
+pub(super) fn step_view(step: &FixStep) -> Value {
     json!({ "action": step.action, "id": step.id, "title": step.title, "with": step.with })
 }
 

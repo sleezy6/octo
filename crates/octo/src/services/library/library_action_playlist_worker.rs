@@ -184,6 +184,12 @@ impl LibraryActionPlaylistWorker {
                 .apply_playlist(&playlist, action.action, budget, stopping)
                 .await;
             budget -= applied;
+            // Check version says on the playlist what adding a song does and what was found.
+            if action.action == LibraryAction::CheckVersion {
+                let comment =
+                    super::version_check::check_playlist_comment(&self.executor.recent_version_checks());
+                self.describe(&playlist.id, &comment).await;
+            }
         }
 
         let music_root = self.resolver.music_root();

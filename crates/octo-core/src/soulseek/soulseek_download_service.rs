@@ -288,6 +288,8 @@ pub fn rank(
         .filter(|h| filename_plausibly_matches_title(&h.filename, title, want.strict))
         .filter(|h| duration_plausible(h.length, want.duration, want.strict))
         .filter(|h| !adds_version(&h.filename, title, artist))
+        // "(Teklife remix)" is never the Bear//Face remix asked for, however alike the rest reads.
+        .filter(|h| !version_variant::other_remixer(&h.filename, Some(title), artist))
         .filter(|h| !from_version_folder(&h.filename, title, want.album.as_deref(), artist))
         // "Song (Acoustic)" is never answered by the plain studio file. A radio edit may be
         // named plainly, so that one is only ranked, below.

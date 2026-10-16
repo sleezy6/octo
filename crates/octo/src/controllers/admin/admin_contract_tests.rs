@@ -779,11 +779,11 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // LibraryActions:TagCheckPerHour (in their sections), the year and artist mixes' four:
     // GeneratedPlaylists:Years, :MaxYearPlaylists, :Artists and :ArtistCount, the sweep's
     // replacing two: LibraryActions:ReviewSweepAutoReplace and :ReviewSweepAutoReplacePerDay,
-    // then LibraryActions:KeepRatedCopies and Subsonic:DownloadAlbumOnSongStar; and this fork's
-    // fourteen: Subsonic:StreamSource, Deezer:Arl, :ArlFallback, :Quality and :StreamQuality, the
-    // playback cache's four (Deezer:CacheEnabled, :CachePath, :CacheMaxGiB and
-    // :CacheRetentionDays), YouTube:Enabled, LastFm:EnableStarterRadio,
-    // Metadata:AnimatedArtworkUrl, Subsonic:BadgeOutsideCovers and LastFm:LoveFavorites.
+    // then LibraryActions:KeepRatedCopies, Subsonic:DownloadAlbumOnSongStar and
+    // Metadata:AnimatedArt, listed last; and this fork's thirteen: Subsonic:StreamSource,
+    // Deezer:Arl, :ArlFallback, :Quality and :StreamQuality, the playback cache's four
+    // (Deezer:CacheEnabled, :CachePath, :CacheMaxGiB and :CacheRetentionDays), YouTube:Enabled,
+    // LastFm:EnableStarterRadio, Subsonic:BadgeOutsideCovers and LastFm:LoveFavorites.
     assert_eq!(rows.len(), 216);
     assert!(!rows.iter().any(|r| {
         r["Key"]
@@ -804,6 +804,7 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     );
     assert_eq!(rows[years + 6]["Key"], "LibraryActions:KeepRatedCopies");
     assert_eq!(rows[years + 7]["Key"], "Subsonic:DownloadAlbumOnSongStar");
+    assert_eq!(rows[years + 9]["Key"], "Metadata:AnimatedArt");
     assert_eq!(row("Subsonic:DownloadAlbumOnSongStar")["IsSecret"], false);
     assert_eq!(
         row("LibraryActions:ReviewSweepAutoReplacePerDay")["IsSecret"],
@@ -912,7 +913,7 @@ async fn radio_refresh_and_reset_refuse_a_missing_user() {
     .await;
     assert_eq!(
         reply.text(),
-        r#"{"ok":false,"user":"admin","removedPlays":0,"removedStations":0,"message":"This listener has no radio history to remove."}"#
+        r#"{"ok":false,"user":"admin","removedPlays":0,"removedStations":0,"message":"Radio history and generated snapshots were removed. Downloaded music was untouched."}"#
     );
 }
 

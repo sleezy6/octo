@@ -9,6 +9,8 @@ use octo_core::common::Clock;
 use octo_core::common::dotnet::is_blank;
 use octo_core::common::romanize::{has_non_ascii_letters, romanized_key};
 use octo_core::common::song_identity::{SongIdentity, SongRef};
+use octo_core::common::version_gap::{self, Against};
+use octo_core::common::{live_version, version_variant};
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
@@ -25,6 +27,17 @@ use crate::services::library::quality_upgrade_worker::LibrarySongRow;
 /// One page of the library; None when Navidrome could not be read. Tests answer from a list.
 pub type ReadPage =
     Arc<dyn Fn(i32, i32) -> BoxFuture<'static, Option<(Vec<LibrarySongRow>, usize)>> + Send + Sync>;
+
+/// One recording an ISRC names in the music database: its id, its title and its length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsrcRecording {
+    pub id: String,
+    pub title: String,
+    pub seconds: Option<i32>,
+}
+
+/// The recordings the music database lists for an ISRC; None when it could not be asked.
+pub type IsrcRecordings = Arc<dyn Fn(String) -> BoxFuture<'static, Option<Vec<IsrcRecording>>> + Send + Sync>;
 
 /// Whether the library already has each imported song, the way Octo decides it everywhere else:
 /// one ISRC, or one MatchKey (the primary artist and the title, one version, so a live take or a
@@ -45,6 +58,9 @@ pub struct ImportMatcher {
     read_page: Mutex<ReadPage>,
     clock: Mutex<Clock>,
     scope: Option<ScopeResolver>,
+    /// The music database's recordings for each ISRC asked about, kept while Octo runs.
+    isrc_recordings: Mutex<HashMap<String, Vec<IsrcRecording>>>,
+    ask_isrc: Mutex<Option<IsrcRecordings>>,
 }
 
 impl ImportMatcher {
@@ -70,7 +86,62 @@ impl ImportMatcher {
             read_page: Mutex::new(read_page),
             clock: Mutex::new(Clock::system()),
             scope: None,
+            isrc_recordings: Mutex::new(HashMap::new()),
+            ask_isrc: Mutex::new(None),
         }
+    }
+
+    /// Asks the music database which recordings an imported song's ISRC names, so a library
+    /// file tagged with one of those recordings is found when it carries no ISRC itself.
+    pub fn with_isrc_recordings(self, ask: IsrcRecordings) -> Self {
+        *self.ask_isrc.lock() = Some(ask);
+        self
+    }
+
+    /// How many ISRCs one match asks the music database about, one a second: a long list is
+    /// asked about over several matches.
+    pub const ISRC_ASKS_PER_MATCH: usize = 20;
+
+    /// Asks about the ISRCs of songs no library file carries, up to [`Self::ISRC_ASKS_PER_MATCH`]
+    /// that were not asked about before.
+    async fn learn_isrcs(&self, index: &LibraryIndex, tracks: &[ImportTrack]) {
+        let Some(ask) = self.ask_isrc.lock().clone() else {
+            return;
+        };
+        let wanted: Vec<String> = {
+            let known = self.isrc_recordings.lock();
+            let mut wanted: Vec<String> = Vec::new();
+            for track in tracks {
+                for isrc in SongIdentity::isrcs(track.isrc.iter()) {
+                    if !known.contains_key(&isrc)
+                        && !index.by_isrc.contains_key(&isrc)
+                        && !wanted.contains(&isrc)
+                    {
+                        wanted.push(isrc);
+                    }
+                }
+            }
+            wanted.truncate(Self::ISRC_ASKS_PER_MATCH);
+            wanted
+        };
+        for isrc in wanted {
+            match ask(isrc.clone()).await {
+                Some(recordings) => {
+                    self.isrc_recordings.lock().insert(isrc, recordings);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// What the music database said about the track's ISRCs, as far as it was asked.
+    fn known_recordings(&self, track: &ImportTrack) -> Vec<IsrcRecording> {
+        let known = self.isrc_recordings.lock();
+        SongIdentity::isrcs(track.isrc.iter())
+            .into_iter()
+            .filter_map(|isrc| known.get(&isrc).cloned())
+            .flatten()
+            .collect()
     }
 
     /// Matches each person's lists against their own scope of the library.
@@ -107,8 +178,12 @@ impl ImportMatcher {
         let Some(index) = self.library_index().await else {
             return false;
         };
+        self.learn_isrcs(&index, tracks).await;
         for track in tracks.iter_mut() {
-            track.library_id = index.find(track).map(|row| row.id.clone());
+            let recordings = self.known_recordings(track);
+            track.library_id = index
+                .find_known(track, &recordings, &|_| true)
+                .map(|row| row.id.clone());
         }
         true
     }
@@ -119,9 +194,14 @@ impl ImportMatcher {
         let Some(index) = self.library_index().await else {
             return false;
         };
+        self.learn_isrcs(&index, tracks).await;
+        let known: Vec<Vec<IsrcRecording>> =
+            tracks.iter().map(|track| self.known_recordings(track)).collect();
         self.within(owner, |visible| {
-            for track in tracks.iter_mut() {
-                track.library_id = index.find_where(track, visible).map(|row| row.id.clone());
+            for (track, recordings) in tracks.iter_mut().zip(&known) {
+                track.library_id = index
+                    .find_known(track, recordings, visible)
+                    .map(|row| row.id.clone());
             }
         });
         true
@@ -201,6 +281,8 @@ impl ImportMatcher {
 pub struct LibraryIndex {
     rows: Vec<LibrarySongRow>,
     by_isrc: HashMap<String, Vec<usize>>,
+    /// By MusicBrainz recording id, lowercased.
+    by_recording: HashMap<String, Vec<usize>>,
     by_key: HashMap<String, Vec<usize>>,
     by_title: HashMap<String, Vec<usize>>,
     /// Titles with letters outside ASCII, by their Latin spelling.
@@ -218,6 +300,7 @@ impl LibraryIndex {
         let mut index = LibraryIndex {
             rows: Vec::new(),
             by_isrc: HashMap::new(),
+            by_recording: HashMap::new(),
             by_key: HashMap::new(),
             by_title: HashMap::new(),
             by_cross_key: HashMap::new(),
@@ -230,6 +313,9 @@ impl LibraryIndex {
             let at = index.rows.len();
             for isrc in SongIdentity::isrcs(&row.isrcs) {
                 add(&mut index.by_isrc, isrc, at);
+            }
+            if let Some(recording) = row.recording_id.as_deref().filter(|id| !is_blank(id)) {
+                add(&mut index.by_recording, recording.trim().to_ascii_lowercase(), at);
             }
             add(
                 &mut index.by_key,
@@ -269,23 +355,70 @@ impl LibraryIndex {
         track: &ImportTrack,
         visible: &dyn Fn(&LibrarySongRow) -> bool,
     ) -> Option<&LibrarySongRow> {
+        self.find_known(track, &[], visible)
+    }
+
+    /// [`Self::find_where`] with the recordings the music database lists for the song's ISRC:
+    /// a file tagged with one of them is the song even when it carries no ISRC, and their
+    /// length stands in for a list that gave none. Every step takes only a file of the version
+    /// the song names: its title says no other version (a remix by someone else, a sped-up
+    /// copy, the plain song for a remix), and for the steps by name, its album names no other
+    /// version either ("Let's Get Lost" on "Let's Get Lost Remixes" is not the original).
+    pub fn find_known(
+        &self,
+        track: &ImportTrack,
+        recordings: &[IsrcRecording],
+        visible: &dyn Fn(&LibrarySongRow) -> bool,
+    ) -> Option<&LibrarySongRow> {
         for isrc in SongIdentity::isrcs(track.isrc.iter()) {
             if let Some(coded) = self.by_isrc.get(&isrc)
-                && let Some(hit) = best(self.rows_of(coded).filter(|row| visible(row)), track, None)
+                && let Some(hit) = best(
+                    self.rows_of(coded)
+                        .filter(|row| visible(row))
+                        .filter(|row| !version_gap::other_version(&track.title, &row.title, Against::Title)),
+                    track,
+                    None,
+                )
             {
                 return Some(hit);
             }
         }
 
-        let wanted = SongRef::new(track.title.clone(), track.artist.clone())
-            .with_seconds(track.seconds.filter(|s| *s > 0).map(f64::from));
+        let mut by_recording: Vec<usize> = Vec::new();
+        for recording in recordings {
+            if let Some(found) = self.by_recording.get(&recording.id.trim().to_ascii_lowercase()) {
+                by_recording.extend(found);
+            }
+        }
+        dedupe(&mut by_recording);
+        if let Some(hit) = best(
+            self.rows_of(&by_recording)
+                .filter(|row| visible(row))
+                .filter(|row| !version_gap::other_version(&track.title, &row.title, Against::Title)),
+            track,
+            None,
+        ) {
+            return Some(hit);
+        }
+
+        let seconds = track.seconds.filter(|s| *s > 0).or_else(|| {
+            recordings
+                .iter()
+                .find(|recording| {
+                    !version_gap::other_version(&track.title, &recording.title, Against::Recording)
+                })
+                .and_then(|recording| recording.seconds)
+        });
+        let wanted =
+            SongRef::new(track.title.clone(), track.artist.clone()).with_seconds(seconds.map(f64::from));
         if let Some(same) = self
             .by_key
             .get(&SongIdentity::match_key(&track.artist, &track.title))
             && let Some(exact) = best(
                 self.rows_of(same)
                     .filter(|row| visible(row))
-                    .filter(|row| length_fits(track.seconds, row.duration)),
+                    .filter(|row| version_agrees(track, row))
+                    .filter(|row| length_fits(seconds, row.duration)),
                 track,
                 Some(&wanted),
             )
@@ -299,7 +432,9 @@ impl LibraryIndex {
         }
         let options = SongIdentity::owned(LibraryOwnership::DURATION_TOLERANCE_SECONDS);
         let accepted = |row: &&LibrarySongRow| {
-            visible(row) && SongIdentity::same(&wanted, &song_ref(row), Some(&options)).is_same()
+            visible(row)
+                && version_agrees(track, row)
+                && SongIdentity::same(&wanted, &song_ref(row), Some(&options)).is_same()
         };
 
         if let Some(titled) = self.by_title.get(&title.key)
@@ -372,6 +507,37 @@ impl LibraryIndex {
     fn rows_of<'a, 'b>(&'a self, at: &'b [usize]) -> impl Iterator<Item = &'a LibrarySongRow> + use<'a, 'b> {
         at.iter().map(move |&i| &self.rows[i])
     }
+}
+
+/// Whether a library file is the version an imported song names, by the file's own title and
+/// album: no version marker or remixer differs between the two titles, and an album that names
+/// a version ("Remixes", "Sped Up", "Live at ...") names one the song's title or its own album
+/// asks for, or the file's title says.
+pub fn version_agrees(track: &ImportTrack, row: &LibrarySongRow) -> bool {
+    if version_gap::other_version(&track.title, &row.title, Against::Title) {
+        return false;
+    }
+    let Some(album) = row.album.as_deref().filter(|album| !is_blank(album)) else {
+        return true;
+    };
+    let artist = Some(row.artist.as_str());
+    let mut named = version_variant::in_folder(album, artist);
+    if live_version::mentions(Some(&version_variant::without_artist(album, artist))) {
+        named.insert("live".to_string());
+    }
+    if named.is_empty() {
+        return true;
+    }
+    let mut allowed = version_variant::requested(Some(&track.title), track.album.as_deref());
+    allowed.extend(version_variant::requested(Some(&row.title), None));
+    if track
+        .album
+        .as_deref()
+        .is_some_and(|own| live_version::mentions(Some(own)))
+    {
+        allowed.insert("live".to_string());
+    }
+    named.iter().all(|version| allowed.contains(version))
 }
 
 fn song_ref(row: &LibrarySongRow) -> SongRef {
@@ -461,6 +627,49 @@ fn best<'a>(
             .then_with(|| b.bit_rate.cmp(&a.bit_rate))
     });
     rows.into_iter().next().map(|(row, _)| row)
+}
+
+/// [`IsrcRecordings`] over MusicBrainz's code lookup, in the order it lists the recordings. A
+/// timeout or an unreadable answer is None, so the next match asks again.
+pub fn isrc_recordings_from(
+    music_brainz: Arc<crate::services::fingerprint::music_brainz_client::MusicBrainzClient>,
+) -> IsrcRecordings {
+    Arc::new(move |isrc: String| {
+        let music_brainz = music_brainz.clone();
+        Box::pin(async move {
+            let doc = music_brainz.lookup_isrc(&isrc).await.ok()?;
+            Some(doc.map(|doc| isrc_recordings_of(&doc)).unwrap_or_default())
+        })
+    })
+}
+
+/// The recordings of a MusicBrainz code lookup's answer.
+pub fn isrc_recordings_of(doc: &serde_json::Value) -> Vec<IsrcRecording> {
+    doc.get("recordings")
+        .and_then(serde_json::Value::as_array)
+        .map(|recordings| {
+            recordings
+                .iter()
+                .filter_map(|recording| {
+                    let id = recording.get("id")?.as_str()?.to_string();
+                    let title = recording
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let seconds = recording
+                        .get("length")
+                        .and_then(serde_json::Value::as_i64)
+                        .filter(|ms| *ms > 0)
+                        .map(|ms| ((ms + 500) / 1000) as i32);
+                    Some(IsrcRecording {
+                        id,
+                        title: title.to_string(),
+                        seconds,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

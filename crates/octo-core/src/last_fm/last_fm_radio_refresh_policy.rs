@@ -11,6 +11,10 @@ use crate::settings::LastFmSettings;
 
 const FAILURE_RETRY_DELAY: TimeDelta = TimeDelta::minutes(15);
 
+/// A refresh still marked as running this long after it started has died (a refresh gives up
+/// well within a minute), so it no longer holds the next one back.
+pub const REFRESH_PRESUMED_DEAD: TimeDelta = TimeDelta::minutes(5);
+
 /// No successful refresh yet, or the last one is older than the refresh interval.
 pub fn is_stale(user: &LastFmRadioUserState, settings: &LastFmSettings, now_utc: DateTime<Utc>) -> bool {
     match user.last_refresh_success_utc {
@@ -21,8 +25,9 @@ pub fn is_stale(user: &LastFmRadioUserState, settings: &LastFmSettings, now_utc:
     }
 }
 
-/// After a recorded play: no stations yet, stale, enough new plays, or the play that makes the
-/// profile learned.
+/// After a recorded play: no stations yet, stale, or the play that makes the profile learned.
+/// Plays alone never rebuild stations that are still fresh: a rebuild draws every station again,
+/// and an app that holds a station as a playlist would have it change under the listener.
 pub fn should_refresh_after_play(
     user: &LastFmRadioUserState,
     settings: &LastFmSettings,
@@ -31,8 +36,15 @@ pub fn should_refresh_after_play(
     let learned_count = user.plays.iter().filter(|play| play.learned_signal).count() as i32;
     user.stations.is_empty()
         || is_stale(user, settings, now_utc)
-        || user.new_plays_since_refresh >= 3.max(settings.effective_minimum_plays() / 2)
         || learned_count == settings.effective_minimum_plays()
+}
+
+/// Whether a refresh is running now: marked as running, and started recently enough to still be.
+pub fn is_refreshing(user: &LastFmRadioUserState, now_utc: DateTime<Utc>) -> bool {
+    user.refreshing
+        && user
+            .last_refresh_attempt_utc
+            .is_some_and(|started| started > now_utc - REFRESH_PRESUMED_DEAD)
 }
 
 /// The minute scan: stale and not refreshing, and a failed refresh is retried only after a
@@ -42,7 +54,7 @@ pub fn should_schedule_periodic_refresh(
     settings: &LastFmSettings,
     now_utc: DateTime<Utc>,
 ) -> bool {
-    if user.refreshing || !is_stale(user, settings, now_utc) {
+    if is_refreshing(user, now_utc) || !is_stale(user, settings, now_utc) {
         return false;
     }
     user.last_refresh_error.is_none()
@@ -86,8 +98,11 @@ mod tests {
             ..Default::default()
         };
         assert!(!should_refresh_after_play(&user, &settings, now));
-        user.new_plays_since_refresh = 5;
-        assert!(should_refresh_after_play(&user, &settings, now));
+        user.new_plays_since_refresh = 50;
+        assert!(
+            !should_refresh_after_play(&user, &settings, now),
+            "plays alone never redraw fresh stations"
+        );
         user.new_plays_since_refresh = 0;
         user.plays.push(LastFmRadioPlay {
             artist: "A".into(),
@@ -101,7 +116,10 @@ mod tests {
         assert!(is_stale(&user, &settings, now));
         assert!(should_schedule_periodic_refresh(&user, &settings, now));
         user.refreshing = true;
+        user.last_refresh_attempt_utc = Some(now - TimeDelta::seconds(30));
         assert!(!should_schedule_periodic_refresh(&user, &settings, now));
+        user.last_refresh_attempt_utc = None;
+        assert!(should_schedule_periodic_refresh(&user, &settings, now));
         user.refreshing = false;
         user.last_refresh_error = Some("provider unavailable".into());
         user.last_refresh_attempt_utc = Some(now - TimeDelta::minutes(5));
@@ -111,6 +129,65 @@ mod tests {
         let jitter = startup_jitter("Alice");
         assert_eq!(jitter, startup_jitter("alice"));
         assert!((100..=499).contains(&jitter.as_millis()));
+    }
+
+    /// Through a day of listening a station is drawn again on the refresh interval and on
+    /// nothing else; through a day of silence it is drawn again on the same schedule.
+    #[test]
+    fn stations_are_drawn_again_on_the_interval_listening_or_not() {
+        let settings = LastFmSettings {
+            minimum_plays: 10,
+            refresh_interval_hours: 12,
+            ..Default::default()
+        };
+        let start = Utc::now();
+        let user = |last: DateTime<Utc>, plays: i32| LastFmRadioUserState {
+            stations: vec![LastFmRadioStation::default()],
+            last_refresh_success_utc: Some(last),
+            new_plays_since_refresh: plays,
+            ..Default::default()
+        };
+        // A play every three and a half minutes for eleven hours redraws nothing.
+        for minute in (0..11 * 60).step_by(7) {
+            let now = start + TimeDelta::minutes(minute) + TimeDelta::seconds(30);
+            let listener = user(start, (minute / 7) as i32 + 1);
+            assert!(
+                !should_refresh_after_play(&listener, &settings, now),
+                "minute {minute}"
+            );
+            assert!(
+                !should_schedule_periodic_refresh(&listener, &settings, now),
+                "minute {minute}"
+            );
+        }
+        // Twelve hours on, the minute scan redraws it whether or not anyone listened.
+        for plays in [0, 40] {
+            let at = start + TimeDelta::hours(12) + TimeDelta::minutes(1);
+            assert!(should_schedule_periodic_refresh(
+                &user(start, plays),
+                &settings,
+                at
+            ));
+            assert!(!should_schedule_periodic_refresh(
+                &user(start, plays),
+                &settings,
+                start + TimeDelta::hours(11) + TimeDelta::minutes(59)
+            ));
+        }
+        // A refresh left marked as running by a process that stopped holds nothing back.
+        let mut stuck = user(start, 0);
+        stuck.refreshing = true;
+        stuck.last_refresh_attempt_utc = Some(start + TimeDelta::hours(3));
+        assert!(should_schedule_periodic_refresh(
+            &stuck,
+            &settings,
+            start + TimeDelta::hours(12) + TimeDelta::minutes(1)
+        ));
+        assert!(!is_refreshing(&stuck, start + TimeDelta::hours(12)));
+        assert!(is_refreshing(
+            &stuck,
+            start + TimeDelta::hours(3) + TimeDelta::minutes(1)
+        ));
     }
 
     /// The reference values for these names.

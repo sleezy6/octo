@@ -276,7 +276,6 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "Metadata:ReplayGain",
     "Metadata:ReplayGainTimeoutSeconds",
     "Metadata:TagRehearsal",
-    "Metadata:AnimatedArtworkUrl",
     "GeneratedPlaylists:PopularNow",
     "GeneratedPlaylists:Charts",
     "GeneratedPlaylists:ChartCountry",
@@ -331,6 +330,7 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "LibraryActions:KeepRatedCopies",
     "Subsonic:DownloadAlbumOnSongStar",
     "Subsonic:BadgeOutsideCovers",
+    "Metadata:AnimatedArt",
 ];
 
 /// Whether a config-sources key names a secret: a password, an API key, a secret, a token

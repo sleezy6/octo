@@ -204,8 +204,8 @@ async fn a_search_takes_the_hit_that_names_the_artist() {
     let server = MockServer::start().await;
     let results = format!(
         r#"{{"results":[
-            {{"artistName":"Kinoman","artworkUrl100":"{0}/image/kinoman/100x100bb.jpg"}},
-            {{"artistName":"Кино","artworkUrl100":"{0}/image/kino/100x100bb.jpg"}}
+            {{"artistName":"Kinoman","trackName":"Gruppa krovi","artworkUrl100":"{0}/image/kinoman/100x100bb.jpg"}},
+            {{"artistName":"Кино","trackName":"Группа крови","artworkUrl100":"{0}/image/kino/100x100bb.jpg"}}
         ]}}"#,
         server.uri()
     );

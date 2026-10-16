@@ -24,11 +24,14 @@ pub enum LibraryAction {
     /// The song is one of several copies: fix them all as Library health does, keeping every
     /// copy anyone starred or rated while Keep every rated copy is on.
     FixDuplicates,
+    /// Check now that the song's file is the version its tags say; what is found is listed in
+    /// Library health and on the action's playlist. Changes no file.
+    CheckVersion,
 }
 
 impl LibraryAction {
     /// Every action, in declaration order.
-    pub const ALL: [LibraryAction; 8] = [
+    pub const ALL: [LibraryAction; 9] = [
         LibraryAction::Delete,
         LibraryAction::WrongSong,
         LibraryAction::WrongVersion,
@@ -37,11 +40,19 @@ impl LibraryAction {
         LibraryAction::WrongLyrics,
         LibraryAction::WrongCover,
         LibraryAction::FixDuplicates,
+        LibraryAction::CheckVersion,
     ];
 
     /// Whether the action answers about the song's lyrics or cover, leaving its audio alone.
     pub fn leaves_the_audio(self) -> bool {
         matches!(self, LibraryAction::WrongLyrics | LibraryAction::WrongCover)
+    }
+
+    /// Whether a definition still as the defaults have it is left out of the settings file: a
+    /// build that does not know the action refuses a file naming it, so it is written only once
+    /// someone changes it.
+    pub fn written_once_changed(self) -> bool {
+        self.leaves_the_audio() || self == LibraryAction::CheckVersion
     }
 
     /// The number the journal stores (`(int)action`).
@@ -80,6 +91,8 @@ impl LibraryAction {
             // No star by default either: every star already asks for something, and this one
             // removes files.
             LibraryAction::FixDuplicates => ("Fix duplicates", 0),
+            // No star either: a check changes nothing, and every star already asks for something.
+            LibraryAction::CheckVersion => ("Check version", 0),
         }
     }
 }

@@ -484,13 +484,17 @@ impl LyricsSidecarWriter {
         self.lyrics.find(&self.query_of(job), ct, songs_own).await
     }
 
+    /// The lyrics are looked up at the length the file really plays: synced lines timed for
+    /// another take of another length never fit. The length the job was given counts only when
+    /// the file cannot say.
     fn query_of(&self, job: &LyricsJob) -> LyricsQuery {
         LyricsQuery::new(
             job.artist.clone(),
             job.title.clone(),
             job.album.clone(),
-            job.duration_seconds
-                .or_else(|| self.tags.duration_seconds(&job.audio_path)),
+            self.tags
+                .duration_seconds(&job.audio_path)
+                .or(job.duration_seconds),
         )
     }
 

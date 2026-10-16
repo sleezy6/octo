@@ -1370,14 +1370,14 @@ fn library_actions_offer_what_is_enabled() {
     assert_eq!(json["subsonic-response"]["libraryActions"]["admin"], true);
     assert_eq!(
         json["subsonic-response"]["libraryActions"]["actions"],
-        json!(["remove", "upgrade", "lyrics", "cover-swap"])
+        json!(["remove", "upgrade", "lyrics", "cover-swap", "checkVersion"])
     );
     let json = json_of(
         &builder().create_library_actions_response(&on, None, 3, false, "Lidarr", true, false, false),
     );
     assert_eq!(
         json["subsonic-response"]["libraryActions"]["actions"],
-        json!(["remove", "lyrics", "cover-swap"])
+        json!(["remove", "lyrics", "cover-swap", "checkVersion"])
     );
     // Version 3: remove only for a Navidrome admin; the edits whenever the server can make them,
     // cover last and only with a cover finder.
@@ -1389,6 +1389,7 @@ fn library_actions_offer_what_is_enabled() {
             "upgrade",
             "lyrics",
             "cover-swap",
+            "checkVersion",
             "retag",
             "joinAlbum",
             "lookup",
@@ -1539,6 +1540,7 @@ fn the_places_extension_is_listed_last_only_with_place_data() {
                 false,
                 false,
                 places,
+                false,
             )
             .text()
             .to_string()
@@ -1550,7 +1552,7 @@ fn the_places_extension_is_listed_last_only_with_place_data() {
     assert!(!listed(false).contains("octoPlaces"));
     let own = builder()
         .merge_open_subsonic_extensions_with(
-            "xml", None, None, false, false, false, false, false, false, true,
+            "xml", None, None, false, false, false, false, false, false, true, false,
         )
         .text()
         .to_string();
@@ -1687,7 +1689,7 @@ fn responses_say_explicit_or_clean_for_outside_songs_and_albums_in_json_and_xml(
 fn the_stations_extension_is_listed_last_and_only_when_asked() {
     let names = |stations: bool| -> Vec<String> {
         let reply = builder().merge_open_subsonic_extensions_with(
-            "json", None, None, true, true, true, true, true, stations, false,
+            "json", None, None, true, true, true, true, true, stations, false, false,
         );
         let answer: Value = serde_json::from_str(&reply.text()).unwrap();
         answer["subsonic-response"]["openSubsonicExtensions"]

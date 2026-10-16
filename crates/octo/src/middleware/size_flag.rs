@@ -74,14 +74,14 @@ async fn flag(response: Response) -> Response {
 }
 
 /// An answer's body, read whole, or handed back unchanged.
-enum Read {
+pub(crate) enum Read {
     Whole(Bytes),
     /// Longer than the limit, or failed part way: the bytes read so far followed by the rest,
     /// exactly as the app would have had them.
     Unread(Body),
 }
 
-async fn read_whole(mut body: Body, limit: usize) -> Read {
+pub(crate) async fn read_whole(mut body: Body, limit: usize) -> Read {
     let mut chunks: Vec<Bytes> = Vec::new();
     let mut length = 0;
     loop {
@@ -115,7 +115,7 @@ async fn read_whole(mut body: Body, limit: usize) -> Read {
 }
 
 /// The answer's shape when it is a plain 200 Subsonic XML or JSON answer small enough to read.
-fn answer_format(status: StatusCode, headers: &HeaderMap) -> Option<Format> {
+pub(crate) fn answer_format(status: StatusCode, headers: &HeaderMap) -> Option<Format> {
     if status != StatusCode::OK || headers.contains_key(CONTENT_ENCODING) {
         return None;
     }

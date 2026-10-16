@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use octo_core::charts::apple_pages::{
-    ApplePage, ApplePageError, RoomKind, SongRoom, is_country_code, parse_countries, parse_song_rooms,
-    parse_songs, room_for,
+    ApplePage, ApplePageError, PageLoops, RoomKind, SongRoom, is_country_code, parse_animated_art,
+    parse_countries, parse_song_rooms, parse_songs, room_for,
 };
 use octo_core::charts::chart_settings::{APPLE_COUNTRIES, OVERALL};
 use parking_lot::Mutex;
@@ -36,6 +36,8 @@ const UNREACHABLE_TTL: Duration = Duration::from_secs(5 * 60);
 /// How long a fetched page is kept here: long enough that finding the country, which reads the
 /// overall chart, does not read it a second time a moment later.
 const PAGE_TTL: Duration = Duration::from_secs(10 * 60);
+/// How much of an album page is read past the tall clip's key: the clip object is under 1 KB.
+const TALL_LOOP_TAIL: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageError {
@@ -249,6 +251,73 @@ impl AppleMusicPages {
         let page = Arc::new(parse_songs(&html)?);
         self.pages.set(key, page.clone(), 1, PAGE_TTL);
         Ok((room.room_id.clone(), page))
+    }
+
+    /// An album's animated art from its page in `country`'s store, then the US store when that
+    /// store has no such page. The page is read only up to the end of the tall clip, which
+    /// sits about two thirds of the way in.
+    pub async fn album_animated_art(&self, country: &str, album_id: u64) -> Result<PageLoops, PageError> {
+        let mut stores = vec![country];
+        if country != "us" {
+            stores.push("us");
+        }
+        let mut last = PageError::NoSuchPage;
+        for store in stores.into_iter().filter(|c| is_country_code(c)) {
+            let url = format!("{}/{store}/album/{album_id}", self.base);
+            match self.fetch_through_tall_loop(&url).await {
+                Ok(html) => return Ok(parse_animated_art(&html)),
+                Err(PageError::NoSuchPage) => {}
+                Err(other) => last = other,
+            }
+        }
+        Err(last)
+    }
+
+    /// The page at `url` up to [`TALL_LOOP_TAIL`] past the tall clip's key, or whole when it has
+    /// none. Takes its turn at the gate like every other page.
+    async fn fetch_through_tall_loop(&self, url: &str) -> Result<String, PageError> {
+        const TALL: &[u8] = b"\"motionDetailTall\":";
+        if let Some(error) = self.missing.get(url) {
+            return Err(error);
+        }
+        self.gate.wait().await;
+        let mut response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| PageError::Unavailable(short(&e)))?;
+        let status = response.status();
+        if status.as_u16() == 404 {
+            self.missing.set(url, PageError::NoSuchPage, 1, MISSING_TTL);
+            return Err(PageError::NoSuchPage);
+        }
+        if !status.is_success() {
+            return Err(PageError::Unavailable(format!("HTTP {}", status.as_u16())));
+        }
+        let mut body: Vec<u8> = Vec::with_capacity(512 * 1024);
+        let mut stop_at: Option<usize> = None;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| PageError::Unavailable(short(&e)))?
+        {
+            // Only the new bytes, and the key's length before them, are searched.
+            let from = body.len().saturating_sub(TALL.len());
+            body.extend_from_slice(&chunk);
+            if stop_at.is_none()
+                && let Some(found) = body[from..].windows(TALL.len()).position(|w| w == TALL)
+            {
+                stop_at = Some(from + found + TALL_LOOP_TAIL);
+            }
+            if stop_at.is_some_and(|at| body.len() >= at) {
+                break;
+            }
+            if body.len() > MAX_BODY {
+                return Err(PageError::TooBig);
+            }
+        }
+        Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
     /// Apple Music's countries, from the last overall chart's country switcher, else the list

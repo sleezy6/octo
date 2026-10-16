@@ -199,6 +199,30 @@ impl MusicBrainzClient {
         Ok(pure::isrcs_of_recordings(&doc, artist, title, seconds))
     }
 
+    /// Every recording of one song by one artist, whatever its version or length: the version
+    /// check reads which of them a file's length is. On the background lane; answers are kept
+    /// as long as a search's.
+    pub async fn song_recordings_in_background(
+        &self,
+        artist: &str,
+        title: &str,
+    ) -> Result<Option<Value>, MusicBrainzError> {
+        if dotnet::is_blank(artist) || dotnet::is_blank(title) {
+            return Ok(None);
+        }
+        let key = format!("song|{}", SongIdentity::match_key(artist, title));
+        if let Some(Cached::Json(cached)) = self.cache.get(&key) {
+            return Ok(Some(cached));
+        }
+        let url = pure::build_recording_search_url(artist, title, 0);
+        let Some(doc) = self.get_background(&url, "song recordings search").await? else {
+            return Ok(None);
+        };
+        self.cache
+            .set(key, Cached::Json(doc.clone()), 1, Self::SEARCH_TTL);
+        Ok(Some(doc))
+    }
+
     /// The recordings that carry one code, with their releases.
     pub async fn lookup_isrc(&self, isrc: &str) -> Result<Option<Value>, MusicBrainzError> {
         let Some(code) = SongIdentity::normalize_isrc(isrc) else {

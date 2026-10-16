@@ -745,6 +745,12 @@ pub struct AlbumOnDisk {
     folder_cover: Option<String>,
 }
 
+/// A picture and where it came from, for [`CoverUpgradeWorker::put_album_cover`].
+struct FoundCoverBytes {
+    bytes: Vec<u8>,
+    source: String,
+}
+
 /// What replacing one album's cover did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlbumCoverReplaced {
@@ -1717,6 +1723,25 @@ impl CoverUpgradeWorker {
         let Some(found) = self.finder.find_excluding(&album.query, rejected).await else {
             return Ok(None);
         };
+        self.put_album_cover(album, found.bytes, found.source)
+            .await
+            .map(Some)
+    }
+
+    /// Puts this picture on every song of one album and in its folder's cover file, each replaced
+    /// picture kept first, as a run keeps them, so Undo puts these back too. For a cover found
+    /// above, or Octo's drawn cover when no cover of the album by its own artist exists. An error
+    /// says why nothing could be written.
+    pub async fn put_album_cover(
+        &self,
+        album: &AlbumOnDisk,
+        bytes: Vec<u8>,
+        source: String,
+    ) -> Result<AlbumCoverReplaced, String> {
+        if self.is_busy() {
+            return Err("The cover upgrade is running; this waits until it is done.".into());
+        }
+        let found = FoundCoverBytes { bytes, source };
         let embed = if self.settings.current().metadata.embed_full_size_covers {
             found.bytes.clone()
         } else {
@@ -1753,11 +1778,11 @@ impl CoverUpgradeWorker {
                 .unwrap_or_else(|| "There was no song to write the cover into.".into()));
         }
         self.rescan().await;
-        Ok(Some(AlbumCoverReplaced {
+        Ok(AlbumCoverReplaced {
             source: found.source,
             files,
             folder_cover,
-        }))
+        })
     }
 
     /// A share of the music folder's gate for one file's write: waits while a job holds it.

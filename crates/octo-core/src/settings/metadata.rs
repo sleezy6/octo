@@ -125,12 +125,34 @@ pub struct MetadataSettings {
     /// Environment variable: TAG_REHEARSAL
     pub tag_rehearsal: bool,
 
-    /// The address of a server of m8tec/apple-music-animated-artworks the owner runs, for
-    /// Apple Music's animated album covers. Octo asks it once per album and keeps the answer,
-    /// and the Octo apps are told of the covers (the `octoAnimatedArtwork` extension, and an
-    /// `animatedArtwork` on getAlbum). Empty: off.
-    /// Environment variable: ANIMATED_ARTWORK_URL
-    pub animated_artwork_url: String,
+    /// Apple Music's animated album art for the Octo apps, read from the album's Apple Music
+    /// page. `direct`: the apps play them from Apple's video network. `relay`: through Octo,
+    /// so the apps reach nothing but this server. `off`: none.
+    /// Environment variable: ANIMATED_ART
+    pub animated_art: String,
+}
+
+/// How the Octo apps get an album's animated art ([`MetadataSettings::animated_art`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimatedArtMode {
+    Direct,
+    Relay,
+    Off,
+}
+
+impl AnimatedArtMode {
+    pub const DIRECT: &'static str = "direct";
+    pub const RELAY: &'static str = "relay";
+    pub const OFF: &'static str = "off";
+
+    /// The setting as saved; anything not known reads as `direct`.
+    pub fn parse(text: &str) -> Self {
+        match text.trim().to_ascii_lowercase().as_str() {
+            Self::RELAY => Self::Relay,
+            Self::OFF | "false" | "none" => Self::Off,
+            _ => Self::Direct,
+        }
+    }
 }
 
 impl Default for MetadataSettings {
@@ -154,23 +176,19 @@ impl Default for MetadataSettings {
             replay_gain: true,
             replay_gain_timeout_seconds: 45,
             tag_rehearsal: false,
-            animated_artwork_url: String::new(),
+            animated_art: AnimatedArtMode::DIRECT.to_string(),
         }
     }
 }
 
 impl MetadataSettings {
+    pub fn animated_art(&self) -> AnimatedArtMode {
+        AnimatedArtMode::parse(&self.animated_art)
+    }
+
     /// The longest side of an embedded cover when `embed_full_size_covers` is off: sharp
     /// across a phone's whole screen, a few hundred kilobytes.
     pub const EMBEDDED_COVER_SIDE: i32 = 1500;
-
-    /// [`Self::animated_artwork_url`] when it is an http(s) address, without a trailing slash.
-    pub fn animated_artwork_base(&self) -> Option<String> {
-        let url = self.animated_artwork_url.trim().trim_end_matches('/');
-        let lower = url.to_ascii_lowercase();
-        ((lower.starts_with("http://") || lower.starts_with("https://")) && url.len() > "https://".len())
-            .then(|| url.to_string())
-    }
 
     pub const DEFAULT_LYRICS_SOURCES: &'static str = "song,kugou,lrclib,lyricsovh";
 
@@ -253,26 +271,6 @@ impl LyricsSaveTo {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_animated_artwork_address_is_an_http_one_without_its_trailing_slash() {
-        let with = |url: &str| MetadataSettings {
-            animated_artwork_url: url.into(),
-            ..Default::default()
-        };
-        assert_eq!(MetadataSettings::default().animated_artwork_base(), None);
-        assert_eq!(with("  ").animated_artwork_base(), None);
-        assert_eq!(with("artwork:8080").animated_artwork_base(), None);
-        assert_eq!(with("https://").animated_artwork_base(), None);
-        assert_eq!(
-            with(" http://artwork:8080/ ").animated_artwork_base().as_deref(),
-            Some("http://artwork:8080")
-        );
-        assert_eq!(
-            with("https://art.example.com").animated_artwork_base().as_deref(),
-            Some("https://art.example.com")
-        );
-    }
 
     #[test]
     fn order_saved_without_the_song_puts_it_first() {

@@ -331,9 +331,9 @@ services:
       Metadata__ReplayGain: ${REPLAYGAIN:-true}
       Metadata__ReplayGainTimeoutSeconds: ${REPLAYGAIN_TIMEOUT_SECONDS:-45}
       Metadata__TagRehearsal: ${TAG_REHEARSAL:-false}
-      # Your own server of m8tec/apple-music-animated-artworks (http://host:8080), for Apple
-      # Music's animated album covers in the Octo apps. Empty: off.
-      Metadata__AnimatedArtworkUrl: ${ANIMATED_ARTWORK_URL:-}
+      # Apple Music's animated album art in the Octo apps: direct (from Apple's video
+      # network), relay (through Octo) or off.
+      Metadata__AnimatedArt: ${ANIMATED_ART:-direct}
       # Lyrics: a .lrc (synced) or .txt (plain) beside each download, and live lyrics
       # for songs as they play. kugou and netease are unofficial APIs; netease only
       # runs if listed, and leaving kugou out switches it off.

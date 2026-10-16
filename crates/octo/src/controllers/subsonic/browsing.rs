@@ -302,14 +302,7 @@ pub async fn get_artist(State(state): State<AppState>, req: Request) -> AppResul
 }
 
 /// Enriches local albums with Deezer songs.
-/// getAlbum, with the album's animated cover added for the Octo apps when there is one
-/// ([`super::animated_artwork::with_album_artwork`]).
 pub async fn get_album(State(state): State<AppState>, req: Request) -> AppResult {
-    let response = album_answer(State(state.clone()), req).await?;
-    Ok(super::animated_artwork::with_album_artwork(&state, response).await)
-}
-
-async fn album_answer(State(state): State<AppState>, req: Request) -> AppResult {
     let scope = scope_of(crate::services::family::family_caller(req.extensions()));
     let call = match SubsonicCall::read(&state, req).await {
         Ok(call) => call,
@@ -366,6 +359,15 @@ async fn album_answer(State(state): State<AppState>, req: Request) -> AppResult 
                 .create_error(&format, 70, "Album not found")
                 .into_response());
         };
+        let barcode = album.songs.iter().find_map(|song| song.barcode.clone());
+        let animated = super::animated_art::album_field(
+            &state,
+            &call,
+            &format,
+            &album.artist,
+            &album.title,
+            barcode.as_deref(),
+        );
 
         // The songs the library already holds go out as the library's own copies.
         if let Some(owned) = outside_album_with_owned_songs(
@@ -378,10 +380,17 @@ async fn album_answer(State(state): State<AppState>, req: Request) -> AppResult 
         )
         .await
         {
-            return Ok(owned);
+            return Ok(match &animated {
+                Some(field) => super::animated_art::response_with_album_field(owned, field).await,
+                None => owned,
+            });
         }
 
-        return Ok(builder.create_album_response(&format, &album).into_response());
+        let mut reply = builder.create_album_response(&format, &album);
+        if let Some(field) = &animated {
+            reply.body = super::animated_art::with_album_field(std::mem::take(&mut reply.body), field);
+        }
+        return Ok(reply.into_response());
     }
 
     // Merged from Navidrome's JSON whatever the client asked for, then answered in the
@@ -511,6 +520,13 @@ async fn album_answer(State(state): State<AppState>, req: Request) -> AppResult 
             album_dict.insert("songCount".into(), count.into());
             album_dict.insert("duration".into(), total_duration.into());
         }
+    }
+
+    if let Some(field) =
+        super::animated_art::album_field(&state, &call, &format, &artist_name, &album_name, None)
+        && let Some(album_dict) = album_data.as_object_mut()
+    {
+        album_dict.insert("animatedArt".into(), field);
     }
 
     Ok(builder

@@ -357,7 +357,27 @@ impl TagPlan {
                         song.music_brainz_album_artist_ids = c.album_artist_ids.clone();
                     }
                 }
+                // Only the cover of the album itself, by its own artist: a release of a near name
+                // ("I'm On One" for "I'm On One 3") lends its facts, never its picture.
+                let cover_fits = {
+                    let release = c.album_title().unwrap_or("");
+                    let by = c
+                        .album_artist
+                        .as_deref()
+                        .or(c.primary_artist.as_deref())
+                        .unwrap_or(&c.artist_credit);
+                    let wanted: Vec<&str> = [
+                        song.album_artist.as_deref(),
+                        song.primary_artist.as_deref(),
+                        Some(song.artist.as_str()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    crate::common::cover_names::release_fits(&song.album, &wanted, release, by)
+                };
                 if let Some(cover) = c.cover_url.as_deref().filter(|v| !v.is_empty())
+                    && cover_fits
                     && song.cover_art_url_large.as_deref().is_none_or(str::is_empty)
                 {
                     song.cover_art_url_large = Some(cover.to_string());

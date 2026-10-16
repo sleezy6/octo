@@ -12,7 +12,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use indexmap::IndexMap;
-use octo_core::common::cover_names::cover_name_score;
+use octo_core::common::cover_names::{cover_name_score, release_artist_fits, release_title_fits};
 use octo_core::common::{Clock, SongIdentity, SongMatchOptions, dotnet};
 // `BarcodeForms` came over with tagging, which reads it too.
 use octo_core::json::element::{array_length, enumerate_array, get_string, str_prop, try_get_property};
@@ -337,6 +337,80 @@ impl ITunesCoverArtLookup {
         matched
     }
 
+    /// Apple's id for an album, which names its Apple Music page. The barcode's release when
+    /// one is given and Apple carries it, else what a search finds; either way the artist and
+    /// the title must be the same release, the explicit one ahead of a clean one. Asks go
+    /// through the shared Apple pacing; callers keep the answer. An error when Apple answered
+    /// none of the asks, so a caller does not keep that as "not on Apple".
+    pub async fn album_collection_id(
+        &self,
+        artist: &str,
+        album: &str,
+        barcode: Option<&str>,
+    ) -> anyhow::Result<Option<u64>> {
+        let (artist, album) = (artist.trim(), album.trim());
+        if artist.is_empty() || album.is_empty() {
+            return Ok(None);
+        }
+        let codes = barcode_forms(barcode);
+        let by_code = (!codes.is_empty()).then(|| {
+            format!(
+                "{}/lookup?entity=album&upc={}",
+                self.base,
+                codes
+                    .iter()
+                    .map(|c| dotnet::escape_data_string(c))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        });
+        let by_name = format!(
+            "{}/search?term={}&entity=album&limit=15",
+            self.base,
+            dotnet::escape_data_string(&format!("{artist} {album}"))
+        );
+        let mut answered = false;
+        for url in by_code.into_iter().chain([by_name]) {
+            let answer = match self.apple_get(&url).await {
+                Ok(Some(answer)) if answer.is_success() => answer,
+                Ok(_) => continue,
+                Err(e) => {
+                    debug!("iTunes album id lookup failed for {artist} - {album}: {e}");
+                    continue;
+                }
+            };
+            let Ok(doc) = serde_json::from_str::<Value>(&answer.text()) else {
+                continue;
+            };
+            let Ok(collections) = collections_of(&doc) else {
+                continue;
+            };
+            answered = true;
+            let best = collections
+                .iter()
+                .filter(|c| c.id.is_some())
+                .filter(|c| {
+                    SongIdentity::same_text(
+                        album,
+                        artist,
+                        &c.name,
+                        c.by.as_deref().unwrap_or(""),
+                        Some(&album_titles()),
+                    )
+                    .is_same()
+                })
+                .min_by_key(|c| c.clean);
+            if let Some(found) = best {
+                return Ok(found.id);
+            }
+        }
+        if answered {
+            Ok(None)
+        } else {
+            anyhow::bail!("Apple answered none of the album id asks")
+        }
+    }
+
     /// The album's own cover at the largest size Apple has, or None. Strict where
     /// [`ICoverArtSource::try_fetch`] is loose: the artist AND the album title must be the same
     /// release (a single is matched by its song), because this cover is written into files,
@@ -587,8 +661,16 @@ impl ITunesCoverArtLookup {
     /// Issue a search and rank the up-to-5 results by closeness of the artist
     /// match, returning the artworkUrl100 of the best one. Without scoring,
     /// "Drake: Hold On, We're Going Home" would frequently come back as the
-    /// karaoke version's cover when it appeared first in the index.
-    async fn search_and_score(&self, term: &str, entity: &str, expected_artist: &str) -> Option<String> {
+    /// karaoke version's cover when it appeared first in the index. With `release`, only a
+    /// hit whose album or track is that name, by the expected artist, counts: another artist's
+    /// record of a near name is never the cover.
+    async fn search_and_score(
+        &self,
+        term: &str,
+        entity: &str,
+        expected_artist: &str,
+        release: Option<&str>,
+    ) -> Option<String> {
         let attempt = async {
             let url = format!(
                 "{}/search?term={}&entity={entity}&limit=5",
@@ -621,6 +703,21 @@ impl ITunesCoverArtLookup {
                 let Some(artwork) = artwork.filter(|a| !a.is_empty()) else {
                     continue;
                 };
+                if let Some(release) = release {
+                    let named = |field: &str| -> anyhow::Result<bool> {
+                        Ok(match try_get_property(item, field)? {
+                            Some(value) => {
+                                get_string(value)?.is_some_and(|name| release_title_fits(release, name))
+                            }
+                            None => false,
+                        })
+                    };
+                    if !release_artist_fits(&[expected_artist], artist)
+                        || !(named("collectionName")? || named("trackName")?)
+                    {
+                        continue;
+                    }
+                }
 
                 let score = i32::from(cover_name_score(expected_artist, artist));
                 if score > best_score {
@@ -643,7 +740,12 @@ impl ITunesCoverArtLookup {
     /// but only as a track. Re-query with entity=song so we still get cover art.
     async fn search_song_fallback(&self, artist: &str, album_or_title: &str) -> Option<Bytes> {
         let hit = self
-            .search_and_score(&format!("{artist} {album_or_title}"), "song", artist)
+            .search_and_score(
+                &format!("{artist} {album_or_title}"),
+                "song",
+                artist,
+                Some(album_or_title),
+            )
             .await?;
         self.download_hi_res(&hit).await
     }
@@ -688,7 +790,7 @@ impl ICoverArtSource for ITunesCoverArtLookup {
                 // song title: iTunes may return a song-level hit shaped like an
                 // album anyway, or fall through to song-entity fallback below.
                 if let Some(hit) = self
-                    .search_and_score(&format!("{artist} {album}"), "album", artist)
+                    .search_and_score(&format!("{artist} {album}"), "album", artist, Some(album))
                     .await
                 {
                     return self.download_hi_res(&hit).await;
@@ -699,7 +801,7 @@ impl ICoverArtSource for ITunesCoverArtLookup {
                 if artist.is_empty() {
                     return None;
                 }
-                let hit = self.search_and_score(artist, "musicArtist", artist).await?;
+                let hit = self.search_and_score(artist, "musicArtist", artist, None).await?;
                 self.download_hi_res(&hit).await
             }
             RoutingKind::Song => {
@@ -708,7 +810,7 @@ impl ICoverArtSource for ITunesCoverArtLookup {
                     return None;
                 }
                 let hit = self
-                    .search_and_score(&format!("{artist} {title}"), "song", artist)
+                    .search_and_score(&format!("{artist} {title}"), "song", artist, Some(title))
                     .await?;
                 self.download_hi_res(&hit).await
             }
@@ -718,6 +820,7 @@ impl ICoverArtSource for ITunesCoverArtLookup {
 
 /// One album of a barcode lookup's answer.
 struct Collection {
+    id: Option<u64>,
     name: String,
     by: Option<String>,
     art: String,
@@ -743,6 +846,7 @@ fn collections_of(doc: &Value) -> anyhow::Result<Vec<Collection>> {
             continue;
         };
         collections.push(Collection {
+            id: r.get("collectionId").and_then(Value::as_u64),
             name,
             by,
             art: art.to_string(),

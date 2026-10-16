@@ -47,7 +47,7 @@ pub use library_action::{
 };
 pub use lidarr::{LidarrCompletionMode, LidarrSettings};
 pub use listen_brainz::ListenBrainzSettings;
-pub use metadata::{LyricsSaveTo, MetadataSettings};
+pub use metadata::{AnimatedArtMode, LyricsSaveTo, MetadataSettings};
 pub use notification::NotificationSettings;
 pub use radio_source::RadioSourceSettings;
 pub use restart_tracker::RestartTracker;

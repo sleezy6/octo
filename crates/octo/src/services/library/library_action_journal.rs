@@ -71,6 +71,7 @@ pub fn action_name(action: LibraryAction) -> &'static str {
         LibraryAction::WrongLyrics => "WrongLyrics",
         LibraryAction::WrongCover => "WrongCover",
         LibraryAction::FixDuplicates => "FixDuplicates",
+        LibraryAction::CheckVersion => "CheckVersion",
     }
 }
 

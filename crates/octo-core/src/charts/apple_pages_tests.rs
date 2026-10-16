@@ -224,3 +224,47 @@ fn artwork_at_fills_the_template() {
         "https://is1-ssl.mzstatic.com/a/b.jpg/1200x1200bb.jpg"
     );
 }
+
+#[test]
+fn an_album_page_names_its_square_and_tall_loops() {
+    let page = concat!(
+        "<script type=\"application/json\" id=\"serialized-server-data\">{\"x\":[",
+        "{\"videoArtwork\":{\"dictionary\":{\"motionDetailSquare\":{\"previewFrame\":{",
+        "\"bgColor\":\"03091e\",\"height\":3840,\"width\":3840,",
+        "\"url\":\"https://is1-ssl.mzstatic.com/image/thumb/V/a.png/{w}x{h}bb.{f}\"},",
+        "\"video\":\"https://mvod.itunes.apple.com/itunes-assets/HLSMusic116/v4/ca/P5_default.m3u8\"}}}},",
+        "{\"tallVideoArtwork\":{\"dictionary\":{\"motionDetailTall\":{\"previewFrame\":{",
+        "\"bgColor\":\"344654\",\"height\":2732,\"width\":2048,",
+        "\"url\":\"https://is1-ssl.mzstatic.com/image/thumb/V/b.png/{w}x{h}bb.{f}\"},",
+        "\"video\":\"https://mvod.itunes.apple.com/itunes-assets/HLSMusic126/v4/e9/P6_default.m3u8\"}}}}",
+        "]}</script>"
+    );
+    let art = parse_animated_art(page);
+    let square = art.square.expect("square");
+    assert_eq!(
+        square.video,
+        "https://mvod.itunes.apple.com/itunes-assets/HLSMusic116/v4/ca/P5_default.m3u8"
+    );
+    assert_eq!(
+        square.poster.as_deref(),
+        Some("https://is1-ssl.mzstatic.com/image/thumb/V/a.png/1200x1200bb.jpg")
+    );
+    assert_eq!(square.color.as_deref(), Some("03091e"));
+    let tall = art.tall.expect("tall");
+    assert_eq!((tall.width, tall.height), (2048, 2732));
+    assert_eq!(
+        tall.poster.as_deref(),
+        Some("https://is1-ssl.mzstatic.com/image/thumb/V/b.png/1200x1600bb.jpg")
+    );
+}
+
+#[test]
+fn a_page_without_loops_or_with_a_loop_elsewhere_has_none() {
+    assert_eq!(parse_animated_art("<html>no loops</html>"), PageLoops::default());
+    let elsewhere = r#""motionDetailSquare":{"video":"https://example.com/itunes-assets/x.m3u8"}"#;
+    assert!(parse_animated_art(elsewhere).square.is_none());
+    let plain = r#""motionDetailSquare":{"video":"http://mvod.itunes.apple.com/itunes-assets/x.m3u8"}"#;
+    assert!(parse_animated_art(plain).square.is_none(), "https only");
+    let broken = r#""motionDetailSquare":{"video":"https://mvod.itunes.apple.com/x.m3u8""#;
+    assert!(parse_animated_art(broken).square.is_none());
+}

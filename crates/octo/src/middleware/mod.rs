@@ -17,7 +17,9 @@
 //! 11. [`family_gate`]: with Family on, who is asking, members signed in to Navidrome with
 //!     their hidden passwords, and the family rules. With Family off it hands every request
 //!     on untouched.
-//! 12. The routes (static files are routes too), falling back to the catch-all.
+//! 12. [`heart_marks`]: the outside songs a caller hearted read as their favorites, waiting
+//!     downloads and library copies a heart made the favorite.
+//! 13. The routes (static files are routes too), falling back to the catch-all.
 //!
 //! There is no raw-body layer: an axum handler that needs the raw body extracts it as `Bytes`
 //! and parses the form or JSON from those bytes itself, so the bytes are still there for the
@@ -35,5 +37,6 @@ pub mod family_gate;
 #[cfg(test)]
 mod family_reading_tests;
 pub mod forwarded;
+pub mod heart_marks;
 pub mod request_log;
 pub mod size_flag;

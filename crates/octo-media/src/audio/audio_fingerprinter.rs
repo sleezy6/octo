@@ -51,6 +51,9 @@ impl FingerprintResult {
 /// difference: that one translates a missing binary into an error, because radio
 /// cannot work without ffmpeg. Here a missing binary must NEVER fail a download that has
 /// already succeeded. Every failure path is "no opinion", and the caller keeps the file.
+/// Numbers each resampled copy's temporary file, so two at once never share one.
+static SPEED_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug, Default)]
 pub struct AudioFingerprinter {
     /// Latched so a misbuilt image costs one log line, not a spawned process per download.
@@ -131,6 +134,57 @@ impl AudioFingerprinter {
             run.stderr.trim()
         );
         FingerprintResult::new(FingerprintOutcome::Undecodable, None, 0)
+    }
+
+    /// The fingerprint of the file played back at `speed` times its speed, pitch and all, as a
+    /// record player at the wrong speed would: a sped-up or slowed copy played back at the
+    /// inverse of its change fingerprints as the recording it was made from. ffmpeg writes the
+    /// first `length_seconds` of that to a temporary WAV, which fpcalc reads and which is
+    /// removed afterwards. Every failure is "no opinion".
+    pub async fn fingerprint_at_speed(
+        &self,
+        path: &Path,
+        speed: f64,
+        length_seconds: i32,
+        timeout_seconds: i32,
+    ) -> FingerprintResult {
+        if !(0.5..=2.0).contains(&speed) || self.binary_missing.load(Ordering::Relaxed) {
+            return FingerprintResult::missing();
+        }
+        let wav = std::env::temp_dir().join(format!(
+            "octo-speed-{}-{}.wav",
+            std::process::id(),
+            SPEED_RUN.fetch_add(1, Ordering::Relaxed)
+        ));
+        let filter = format!("aresample=44100,asetrate={:.0},aresample=44100", 44_100.0 * speed);
+        let length = length_seconds.max(1).to_string();
+        let source = path.to_string_lossy();
+        let target = wav.to_string_lossy();
+        let arguments = [
+            "-v", "error", "-nostdin", "-y", "-i", &source, "-vn", "-af", &filter, "-t", &length, "-f",
+            "wav", &target,
+        ];
+        let timeout = Duration::from_secs(timeout_seconds.max(0).unsigned_abs() as u64);
+        let made = match tool::spawn("ffmpeg", &arguments) {
+            Ok(mut child) => match tokio::time::timeout(timeout, tool::collect(&mut child, false)).await {
+                Ok(Ok(run)) => run.exit_code == 0,
+                Ok(Err(_)) | Err(_) => {
+                    tool::kill(&mut child);
+                    false
+                }
+            },
+            Err(error) => {
+                warn!("ffmpeg could not start for a resampled fingerprint: {error}");
+                false
+            }
+        };
+        let result = if made {
+            self.fingerprint(&wav, length_seconds, timeout_seconds).await
+        } else {
+            FingerprintResult::missing()
+        };
+        let _ = std::fs::remove_file(&wav);
+        result
     }
 
     /// fpcalc -json writes one object to stdout: {"duration": 253.14, "fingerprint": "AQADt..."}.

@@ -183,6 +183,9 @@ pub fn judge(hit: &SoulseekFileHit, song: Judged<'_>) -> (Option<String>, i32) {
     if adds_version(&hit.filename, title, artist) {
         return not("Another version: a remix, an edit or a live take", 2);
     }
+    if version_variant::other_remixer(&hit.filename, Some(title), artist) {
+        return not("A remix by someone else", 2);
+    }
     if from_live_folder(&hit.filename, title, album, artist) {
         return not("From a live album", 2);
     }

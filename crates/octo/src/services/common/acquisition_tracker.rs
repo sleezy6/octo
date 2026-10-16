@@ -126,6 +126,11 @@ pub struct AcquisitionEnd {
     pub done: bool,
     pub library_id: Option<String>,
     pub album_keys: Vec<String>,
+    /// Where the file was placed, when the row was told.
+    pub path: Option<String>,
+    /// The file was already in the library before this run asked for it: nothing was
+    /// downloaded, the row only found the copy that was there.
+    pub already_there: bool,
 }
 
 /// Finds the Navidrome id of a placed file from its artist, title and path. `Err` when the
@@ -233,6 +238,12 @@ struct Entry {
 
     /// The source the log last said it was looking on, so it says so once.
     logged_source: Option<String>,
+
+    /// Where this run placed or found the file.
+    path: Option<String>,
+
+    /// This run found the file already in the library rather than downloading it.
+    already_there: bool,
 }
 
 impl Entry {
@@ -710,6 +721,9 @@ impl AcquisitionTracker {
             entry.state = AcquisitionState::Importing;
             entry.progress = None;
             entry.updated_at = now;
+            if let Some(path) = path.filter(|p| !blank(p)) {
+                entry.path = Some(path.to_string());
+            }
             add(
                 entry,
                 now,
@@ -750,6 +764,30 @@ impl AcquisitionTracker {
             }
             _ => self.finish(&key, run, None),
         }
+    }
+
+    /// [`Self::imported`] for a file that was already in the library when this run asked for it,
+    /// so its end says nothing was downloaded: a heart on it is a heart on a song you have.
+    pub fn already_in_library(
+        self: &Arc<Self>,
+        provider: &str,
+        external_id: &str,
+        artist: Option<&str>,
+        title: Option<&str>,
+        path: Option<&str>,
+    ) {
+        self.update(provider, external_id, false, |entry| entry.already_there = true);
+        self.imported(provider, external_id, artist, title, path);
+    }
+
+    /// The Navidrome id of the song a finished row placed, while the row is kept.
+    pub fn landed_library_id(&self, provider: &str, external_id: &str) -> Option<String> {
+        let state = self.state.lock();
+        let entry = state.entries.get(&key_of(provider, external_id))?;
+        if entry.state != AcquisitionState::Done {
+            return None;
+        }
+        entry.library_id.clone().filter(|id| !blank(id))
     }
 
     /// In the library.
@@ -1245,6 +1283,8 @@ fn open<'a>(
         entry.peer = None;
         entry.logged_source = None;
         entry.events.clear();
+        entry.path = None;
+        entry.already_there = false;
     } else {
         state.entries.set(
             key.clone(),
@@ -1273,6 +1313,8 @@ fn open<'a>(
                 peer: None,
                 events: Vec::new(),
                 logged_source: None,
+                path: None,
+                already_there: false,
             },
         );
     }
@@ -1300,6 +1342,8 @@ fn end_of(state: &State, key: &str) -> Option<AcquisitionEnd> {
             .filter(|(_, claim)| claim.track_keys.iter().any(|k| k == key))
             .map(|(album, _)| album.clone())
             .collect(),
+        path: entry.path.clone(),
+        already_there: entry.already_there,
     })
 }
 

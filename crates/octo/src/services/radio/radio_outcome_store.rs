@@ -391,27 +391,27 @@ impl RadioOutcomeStore {
             .collect()
     }
 
-    /// Forget what was learned about one listener, from the dashboard's history reset. True
-    /// when there was anything to forget.
+    /// Drops one listener's counts and their outcomes still in flight. True when anything of
+    /// theirs was held.
     pub fn forget_listener(&self, listener: &str) -> bool {
         let listener = who(listener);
-        let forgotten = {
+        let dropped = {
             let mut inner = self.inner.lock();
-            let counted = inner.state.listeners.shift_remove(&listener).is_some();
-            let before = inner.served.len() + inner.open.len() + inner.swept.len();
-            inner.served.retain(|(of, _), _| *of != listener);
-            inner.open.retain(|(of, _), _| *of != listener);
-            inner.swept.retain(|(of, _), _| *of != listener);
-            let pending = before != inner.served.len() + inner.open.len() + inner.swept.len();
-            if counted {
-                inner.dirty = true;
-            }
-            counted || pending
+            let counts = inner.state.listeners.shift_remove(&listener).is_some();
+            let theirs = |key: &Key| key.0 == listener;
+            let in_flight = inner.served.keys().any(theirs)
+                || inner.open.keys().any(theirs)
+                || inner.swept.keys().any(theirs);
+            inner.served.retain(|key, _| !theirs(key));
+            inner.open.retain(|key, _| !theirs(key));
+            inner.swept.retain(|key, _| !theirs(key));
+            inner.dirty |= counts;
+            counts || in_flight
         };
-        if forgotten {
+        if dropped {
             self.flush();
         }
-        forgotten
+        dropped
     }
 
     /// Forget everything learned, from the dashboard.

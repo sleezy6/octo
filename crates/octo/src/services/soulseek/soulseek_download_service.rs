@@ -1377,6 +1377,8 @@ impl SoulseekDownloadService {
         profile: &SearchProfile,
         ct: &CancellationToken,
     ) -> anyhow::Result<String> {
+        let measured = self.with_expected_length(base, routing, download).await;
+        let routing = measured.as_ref().unwrap_or(routing);
         let (artist, title) = names(routing);
         let primary_query = planned_queries(&title, &artist, routing.album.as_deref(), routing.duration)[0]
             .0
@@ -1820,6 +1822,17 @@ impl SoulseekDownloadService {
                             )
                             .await;
                     }
+                    if verdict.verdict == VerificationVerdict::Mismatch && file_exists(&local_path) {
+                        let file_ms = TagFile::open(&local_path)
+                            .ok()
+                            .map(|file| file.duration().as_millis() as i64);
+                        verdict = DownloadVerificationService::settle_stray_link(
+                            verdict,
+                            routing.title.as_deref().unwrap_or(""),
+                            routing.duration,
+                            file_ms,
+                        );
+                    }
                     if verdict.verdict == VerificationVerdict::Mismatch {
                         if !file_exists(&local_path) {
                             // Nothing was judged, so nothing is held against the peer: a deny-list entry
@@ -2125,6 +2138,55 @@ impl SoulseekDownloadService {
             last_error.unwrap_or_default(),
             base.download_path()
         )
+    }
+}
+
+impl SoulseekDownloadService {
+    /// The request with the length of the recording its ISRC names, when it came with an ISRC
+    /// and no length (an imported list row, most often): without one, a remix of another length
+    /// passes the length check, and every copy of the song in any version passes the search's.
+    /// The catalog's title must name the same version the request does, or nothing is taken
+    /// from it. None when the request already had a length or none could be found.
+    async fn with_expected_length(
+        &self,
+        base: &BaseDownloadService,
+        routing: &SoulseekRouting,
+        download: &TrackDownload,
+    ) -> Option<SoulseekRouting> {
+        if routing.duration.is_some_and(|seconds| seconds > 0) {
+            return None;
+        }
+        let isrc = download.song.isrc.clone().or(routing.isrc.clone())?;
+        let deezer = base.services().deezer.as_ref()?;
+        let answer = deezer.track_by_isrc_now(&isrc).await;
+        let track = answer.tracks.into_iter().next()?;
+        let seconds = track.duration.filter(|seconds| *seconds > 0)?;
+        let asked = routing.title.as_deref().unwrap_or("");
+        if octo_core::common::version_gap::other_version(
+            asked,
+            &track.title,
+            octo_core::common::version_gap::Against::Title,
+        ) {
+            warn!(
+                "the catalog's track for ISRC {isrc} is '{}', another version than '{asked}'; its length is not used",
+                track.title
+            );
+            return None;
+        }
+        let track_key = download.song.external_id.clone().unwrap_or_default();
+        base.log_step(
+            &track_key,
+            acquisition_event_kinds::SEARCH,
+            &format!("The song runs {}", soulseek_candidates::length_text(seconds)),
+            Some(&format!(
+                "The catalog's length for ISRC {isrc}, '{}'",
+                track.title
+            )),
+        );
+        Some(SoulseekRouting {
+            duration: Some(seconds),
+            ..routing.clone()
+        })
     }
 }
 

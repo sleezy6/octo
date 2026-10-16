@@ -281,3 +281,73 @@ async fn a_songs_cover_follows_the_artist_written_another_way() {
 
     assert_eq!(&bytes[..], b"/cdn/vida.jpg");
 }
+
+/// "Still Got It" by Tyga feat. Drake, on the "I'm On One 3" mixtape with album artist Drake:
+/// the catalog has no such album, and its track search for the album's name offers DJ Khaled's
+/// "I'm On One" on "We The Best Forever". That is another artist's release of another name, so
+/// no cover is taken from it.
+#[tokio::test]
+async fn another_artists_release_of_a_near_name_is_never_the_albums_cover() {
+    let (_server, lookup) = catalog(|cdn| {
+        HashMap::from([
+            ("/search/album", r#"{"data":[]}"#.to_string()),
+            (
+                "/search",
+                format!(
+                    r#"{{"data":[
+                        {{"title":"I'm On One (Explicit Version)","artist":{{"name":"DJ Khaled"}},
+                          "album":{{"title":"We The Best Forever","cover_xl":"{cdn}/we-the-best-forever.jpg"}}}}
+                      ]}}"#
+                ),
+            ),
+        ])
+    })
+    .await;
+
+    let bytes = lookup
+        .try_fetch(
+            &SoulseekRouting {
+                kind: RoutingKind::Album,
+                artist: Some("Drake".into()),
+                title: Some("Still Got It".into()),
+                album: Some("I'm On One 3".into()),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+
+    assert_eq!(bytes, None);
+}
+
+/// The same search does give the album's own cover when the catalog has it, by its own artist.
+#[tokio::test]
+async fn the_albums_own_release_by_its_artist_is_taken() {
+    let (_server, lookup) = catalog(|cdn| {
+        HashMap::from([(
+            "/search/album",
+            format!(
+                r#"{{"data":[
+                    {{"title":"I'm On One","artist":{{"name":"DJ Khaled"}},"cover_xl":"{cdn}/khaled.jpg"}},
+                    {{"title":"I'm On One 3","artist":{{"name":"Drake"}},"cover_xl":"{cdn}/mixtape.jpg"}}
+                  ]}}"#
+            ),
+        )])
+    })
+    .await;
+
+    let bytes = lookup
+        .try_fetch(
+            &SoulseekRouting {
+                kind: RoutingKind::Album,
+                artist: Some("Drake".into()),
+                album: Some("I'm On One 3".into()),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .expect("a cover");
+
+    assert_eq!(&bytes[..], b"/cdn/mixtape.jpg");
+}

@@ -564,7 +564,7 @@
             <div class="set-row">
               <div class="set-info">
                 <div class="set-info-t">Favorite downloads when they land</div>
-                <div class="set-info-d">Off by default: a heart on a song you do not have only downloads it, and you heart it again once it is in your library. On, Octo also favorites it in Navidrome when it lands, for the person who hearted it.</div>
+                <div class="set-info-d">Off by default: a heart on a song you do not have only downloads it, and you heart it again once it is in your library (the same song in the app will do). On, Octo also favorites it in Navidrome when it lands, for the person who hearted it, and the heart stays on the song in their apps the whole way.</div>
                 <div class="set-info-more">A heart on a song you already have is always a favorite, whatever this says, and downloads nothing. Octo's own apps are left out, because their heart means Add. The person's sign-in is held in memory until the song arrives, and a restart drops it.</div>
               </div>
               <label class="switch"><input type="checkbox" id="f-star-downloads-for-requester" name="Subsonic.StarDownloadsForRequester" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
@@ -2035,15 +2035,41 @@
               </div>
               <label class="switch"><input type="checkbox" name="Subsonic.BadgeOutsideCovers" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Animated art</h3>
+            <p class="set-desc">Apple Music&rsquo;s animated album art in the Octo apps, where an album has it.</p>
+          </div>
+          <form data-section="animated-art" class="set-card">
             <div class="set-row stack">
               <div class="set-info">
-                <div class="set-info-t">Animated album covers <span class="set-opt">optional</span></div>
-                <div class="set-info-d">The address of your own apple-music-animated-artworks server, for example <code>http://apple-music-animated-artworks:8080</code>. The Octo apps then show Apple Music&rsquo;s animated covers where an album has one.</div>
-                <div class="set-info-more">Octo asks the server once per album and keeps the answer, &ldquo;no animated cover&rdquo; included. Other Subsonic apps see no difference. Empty is off.</div>
+                <div class="set-info-t">Play animated art</div>
+                <div class="set-info-d"><strong>From Apple</strong> plays it straight from Apple&rsquo;s video network, the fastest anywhere. <strong>Through Octo</strong> sends it through this server, so the apps reach nothing else.</div>
+                <div class="set-info-more">Octo reads each album&rsquo;s Apple Music page once and keeps the answer for a month. Albums have a square loop for the cover and often a tall one for a full-screen player; each app chooses which to show. Other Subsonic apps see no difference.</div>
               </div>
-              <input class="set-input" id="f-animated-artwork-url" name="Metadata.AnimatedArtworkUrl" placeholder="http://host:8080" maxlength="256" />
+              <select class="set-input" name="Metadata.AnimatedArt" aria-label="Play animated art">
+                <option value="direct">From Apple</option>
+                <option value="relay">Through Octo</option>
+                <option value="off">Off</option>
+              </select>
             </div>
           </form>
+          <div class="set-card cover-tool art-card" id="art-card" hidden>
+            <div class="art-head">
+              <div class="art-text">
+                <span class="set-info-t" id="art-count"></span>
+                <span class="set-info-d" id="art-sweep"></span>
+              </div>
+              <button class="btn btn-ghost" type="button" id="art-look-up"><svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg><span>Look up my library now</span></button>
+            </div>
+            <div class="cover-progress" id="art-progress" hidden><span id="art-progress-fill"></span></div>
+            <p class="set-info-d art-hint" id="art-hint" hidden>Pick a cover to hide it in every app; pick it again to bring it back.</p>
+            <div class="cover-wall" id="art-wall" role="list"></div>
+            <button class="btn btn-ghost art-more" type="button" id="art-more" hidden>Show more</button>
+          </div>
         </div>
       </section>
 
@@ -2366,16 +2392,44 @@
             <div class="lossy-filters">
               <input class="set-input" id="lossy-q" type="search" placeholder="Title, artist or album" aria-label="Filter songs" />
               <select class="set-input" id="lossy-format" aria-label="Format"><option value="">Every format</option></select>
+              <select class="set-input" id="lossy-bitrate" aria-label="Bitrate">
+                <option value="">Any bitrate</option>
+                <option value="128">Below 128 kbps</option>
+                <option value="192">Below 192 kbps</option>
+                <option value="256">Below 256 kbps</option>
+                <option value="320">Below 320 kbps</option>
+              </select>
+              <select class="set-input" id="lossy-match" aria-label="AcoustID match">
+                <option value="">Any AcoustID match</option>
+                <option value="unsure">Unsure AcoustID match</option>
+                <option value="unchecked">Not checked by AcoustID</option>
+                <option value="sure">Sure AcoustID match</option>
+              </select>
+              <select class="set-input" id="lossy-added" aria-label="Date added">
+                <option value="">Added any time</option>
+                <option value="7">Added in the last week</option>
+                <option value="30">Added in the last 30 days</option>
+                <option value="90">Added in the last 90 days</option>
+                <option value="365">Added in the last year</option>
+                <option value="-365">Added over a year ago</option>
+              </select>
+              <select class="set-input" id="lossy-genre" aria-label="Genre"><option value="">Every genre</option></select>
               <label class="lossy-check"><input type="checkbox" class="pick" id="lossy-youtube" /><span>Only songs Octo got from YouTube</span></label>
               <label class="lossy-check"><input type="checkbox" class="pick" id="lossy-hide-tried" /><span>Hide songs tried in the last 4 weeks</span></label>
               <button class="btn btn-ghost" type="button" id="lossy-refresh"><svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg><span>Refresh</span></button>
             </div>
+            <p class="set-info-d lossy-shown" id="lossy-shown" aria-live="polite"></p>
             <div id="lossy-list"></div>
             <div id="lossy-results"></div>
             <div class="cover-bar" id="lossy-bar">
               <span class="cover-count" id="lossy-count">Nothing picked</span>
-              <span class="cover-hint"></span>
-              <button class="btn btn-ghost" type="button" id="lossy-all">Select all</button>
+              <span class="cover-hint" id="lossy-hint"></span>
+              <span class="lossy-amount" id="lossy-amount-group" hidden>
+                <button class="btn btn-ghost" type="button" id="lossy-all">Select</button>
+                <span>the first</span>
+                <input class="set-input" id="lossy-amount" type="number" min="1" step="1" inputmode="numeric" aria-label="How many of the songs shown to select" />
+                <span id="lossy-of">of the songs shown</span>
+              </span>
               <button class="btn btn-ghost" type="button" id="lossy-none" hidden>Clear</button>
               <button class="btn btn-ghost" type="button" id="lossy-cancel">Cancel queued</button>
               <button class="btn btn-ghost" type="button" id="lossy-clear">Clear finished</button>
@@ -2384,6 +2438,7 @@
             <details class="cover-how">
               <summary>How it works</summary>
               <p>Each song goes through Better quality, exactly as the action playlist does it: a lossless copy is looked for, checked to be the same recording and really lossless, and put in the original's place, so the song keeps its plays, favorites and playlist places. The original waits in quarantine until its replacement passes. A song with no lossless copy on any of them stays as it is and is not looked for again by the weekly upgrade for 4 weeks. Copies come from the sources named above, Deezer first, then Soulseek, then Lidarr; while every one of them is out, songs wait.</p>
+              <p>Narrow the list with the filters, then Select picks the first songs it shows, up to 2,000 a press; Find higher quality queues them and they run as many at a time as Parallel downloads allows. Press Select again for the next ones. An unsure AcoustID match is a song whose download Octo could not confirm as the recording asked for, or one the library tag check could not pin down. From any other app, add songs to the Better quality action playlist or give them its rating (4 stars unless you changed it).</p>
             </details>
           </div>
         </div>
@@ -2587,7 +2642,7 @@
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title">The actions</h3>
-            <p class="set-desc">Eight actions. Rename each one, switch it on, and choose the star rating that asks for it; 0 stars leaves it playlist-only. Keep removes nothing: it answers Review with &ldquo;this is right&rdquo;. Wrong lyrics and Wrong cover change only the lyrics or the album&rsquo;s cover, never the song itself, and start with no star. Fix duplicates fixes every copy of a song from any app, the way Library health&rsquo;s Fix these copies does: add any one copy to its playlist. With Keep every rated copy on (Library health page), every copy anyone hearted or rated stays. It starts with no star and needs Delete on.</p>
+            <p class="set-desc">Nine actions. Rename each one, switch it on, and choose the star rating that asks for it; 0 stars leaves it playlist-only. Keep removes nothing: it answers Review with &ldquo;this is right&rdquo;. Wrong lyrics and Wrong cover change only the lyrics or the album&rsquo;s cover, never the song itself, and start with no star. Fix duplicates fixes every copy of a song from any app, the way Library health&rsquo;s Fix these copies does: add any one copy to its playlist. With Keep every rated copy on (Library health page), every copy anyone hearted or rated stays. It starts with no star and needs Delete on. Check version checks a song now for being another take than its tags say (a remix, a sped-up or slowed copy) and lists what it finds in Library health and on its playlist; it changes nothing and starts with no star.</p>
           </div>
           <form data-section="library-actions-list" class="set-card" id="library-actions-list-form">
             <div id="library-action-list" class="genre-mapping-list"></div>

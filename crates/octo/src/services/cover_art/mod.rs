@@ -3,7 +3,7 @@
 //! upgrade with the album cover finder it asks. List-cover rendering is `octo_media::cover`.
 
 pub mod album_cover_finder;
-pub mod animated_artwork;
+pub mod animated_art;
 pub mod artwork_hints;
 pub mod cover_art_aggregator;
 pub mod cover_art_archive_lookup;
@@ -19,7 +19,7 @@ pub mod local_cover_cache;
 pub use album_cover_finder::{
     AlbumCoverFinder, AlbumCoverQuery, FoundCover, IAlbumCoverFinder, RejectedCovers,
 };
-pub use animated_artwork::{AnimatedArtwork, AnimatedCover, AnimatedLookup};
+pub use animated_art::{AnimatedArt, ArtLookup};
 pub use artwork_hints::{ArtworkHints, HintedArtwork};
 pub use cover_art_aggregator::CoverArtAggregator;
 pub use cover_art_archive_lookup::CoverArtArchiveLookup;

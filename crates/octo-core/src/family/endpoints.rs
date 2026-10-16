@@ -127,8 +127,6 @@ pub const REST_ENDPOINTS: &[(&str, EndpointClass)] = &[
     ("findSongs", LibraryWrite),
     ("getAcquisition", Read),
     ("getAcquisitions", Read),
-    // A link to an album's animated cover, as getAlbum carries it.
-    ("getAnimatedArtwork", Read),
     ("getArtistTopSongs", Read),
     ("getCharts", Read),
     ("getFoundSongs", Read),
@@ -140,6 +138,7 @@ pub const REST_ENDPOINTS: &[(&str, EndpointClass)] = &[
     ("getLyricsCandidates", Read),
     ("getStationSongs", Read),
     ("getPlace", Read),
+    ("getAnimatedArt", Read),
     ("getTopChart", Read),
     ("getTransitionProfile", Read),
     ("getUpgrades", Read),

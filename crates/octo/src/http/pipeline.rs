@@ -35,7 +35,7 @@ use crate::app::AppState;
 use crate::middleware::admin_sign_in_gate::GateState;
 use crate::middleware::{
     admin_guard, admin_headers, admin_port_split, admin_sign_in_gate, cors, exception, family_gate,
-    forwarded, request_log, size_flag,
+    forwarded, heart_marks, request_log, size_flag,
 };
 use crate::services::you_tube::stream_size_warmer;
 
@@ -76,6 +76,7 @@ pub fn build_with_port(state: AppState, routes: RouteSet, admin_port: u16) -> Ap
     let size_flag_state = state.clone();
     // The family gate reads the path after it is spelled as the routes spell it.
     let family_state = state.clone();
+    let marks_state = state.clone();
     let router = router.with_state(state);
     let service = ServiceBuilder::new()
         .layer(from_fn(request_log::request_log))
@@ -99,6 +100,8 @@ pub fn build_with_port(state: AppState, routes: RouteSet, admin_port: u16) -> Ap
             req
         })
         .layer(from_fn_with_state(family_state, family_gate::family_gate))
+        // Inside the family gate, so it reads a request the way the actions do.
+        .layer(from_fn_with_state(marks_state, heart_marks::heart_marks))
         // axum adds `Allow` to whatever a route's method fallback answers; that fallback is
         // the catch-all, which answers with no such header (no Octo answer has one).
         .map_response(|mut res: Response| {

@@ -53,7 +53,10 @@ impl Default for ImportStore {
 impl ImportStore {
     /// No path keeps the lists in memory only, as the tests build it.
     pub fn new(path: Option<PathBuf>) -> Self {
-        let lists = path.as_deref().map(|p| load(p).lists).unwrap_or_default();
+        let mut lists = path.as_deref().map(|p| load(p).lists).unwrap_or_default();
+        for track in lists.iter_mut().flat_map(|list| list.tracks.iter_mut()) {
+            track.key = super::import_keys::ImportKeys::current(&track.key, &track.artist, &track.title);
+        }
         ImportStore {
             path,
             lists: Mutex::new(lists),

@@ -86,6 +86,43 @@ async fn a_member_adopted_under_a_capitalised_name_gets_links_in_their_lower_cas
 }
 
 #[tokio::test]
+async fn a_member_who_kept_a_capitalized_account_name_links_into_the_lower_case_folder() {
+    let world = World::new(None);
+    world
+        .family
+        .upsert_member(crate::services::family::test_support::member(
+            "Jamie",
+            octo_core::family::abilities::Preset::Member,
+            5,
+        ));
+    let pooled = world.pool_file(SONG, 1_000);
+    let folder = format!("{}/jamie", world.members());
+
+    let link = world.pool.link(&pooled, "JAMIE").await.expect("linked");
+    assert_eq!(link, format!("{folder}/{SONG}"));
+    assert!(is_link(&link));
+    for spelling in ["Jamie", "jamie", " JAMIE "] {
+        assert_eq!(world.pool.member_root(spelling), folder, "{spelling}");
+        assert_eq!(
+            world.pool.link_path(&pooled, spelling).as_deref(),
+            Some(link.as_str())
+        );
+    }
+
+    world.pool.let_go(&pooled, "jamie").await;
+    assert!(std::fs::symlink_metadata(&link).is_err(), "the link is gone");
+}
+
+#[test]
+fn a_folder_name_is_only_copied_when_it_has_capitals() {
+    assert!(matches!(folder_of("alex"), Cow::Borrowed("alex")));
+    assert!(matches!(folder_of(" alex "), Cow::Borrowed("alex")));
+    assert_eq!(folder_of("Jamie.B"), "jamie.b");
+    assert!(has_valid_folder("Jamie"));
+    assert!(!has_valid_folder("Jamie/../x"));
+}
+
+#[tokio::test]
 async fn link_is_relative() {
     let world = World::new(None);
     let pooled = world.pool_file(SONG, 10);

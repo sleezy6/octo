@@ -325,6 +325,100 @@ pub fn is_country_code(value: &str) -> bool {
     value.len() == 2 && value.bytes().all(|b| b.is_ascii_lowercase())
 }
 
+/// An album's animated art as its Apple Music page (`/{country}/album/{id}`) describes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageLoops {
+    /// The square loop, shown where the still cover is.
+    pub square: Option<ArtLoop>,
+    /// The tall loop, for a full-screen player.
+    pub tall: Option<ArtLoop>,
+}
+
+/// One loop: its HLS playlist and the still frame to show while it loads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtLoop {
+    /// The HLS playlist, always on [`LOOP_VIDEO_HOST`] over https.
+    pub video: String,
+    /// The still frame as a JPEG at a size a phone shows sharply.
+    pub poster: Option<String>,
+    /// The frame's background color, `rrggbb`.
+    pub color: Option<String>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Where Apple serves the loops from. A loop anywhere else is not taken.
+pub const LOOP_VIDEO_HOST: &str = "mvod.itunes.apple.com";
+
+/// The width the stills are asked at; the tall one keeps its own shape.
+const POSTER_WIDTH: u32 = 1200;
+
+#[derive(Deserialize)]
+struct RawClip {
+    video: Option<String>,
+    #[serde(rename = "previewFrame")]
+    preview_frame: Option<RawFrame>,
+}
+
+#[derive(Deserialize)]
+struct RawFrame {
+    url: Option<String>,
+    #[serde(rename = "bgColor")]
+    bg_color: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+/// The album page's animated art. Only the two clip objects are parsed, each straight from
+/// where its key sits in the page, so the half-megabyte page never becomes a tree. An album
+/// without one, or a page of another shape, gives an empty [`PageLoops`].
+pub fn parse_animated_art(html: &str) -> PageLoops {
+    PageLoops {
+        square: art_loop(html, "\"motionDetailSquare\":"),
+        tall: art_loop(html, "\"motionDetailTall\":"),
+    }
+}
+
+fn art_loop(html: &str, key: &str) -> Option<ArtLoop> {
+    let at = html.find(key)? + key.len();
+    let raw: RawClip = serde_json::Deserializer::from_str(&html[at..])
+        .into_iter()
+        .next()?
+        .ok()?;
+    let video = raw.video.filter(|v| is_loop_video(v))?;
+    let frame = raw.preview_frame;
+    let (width, height) = frame
+        .as_ref()
+        .and_then(|f| Some((f.width?, f.height?)))
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .unwrap_or((1, 1));
+    let poster_height =
+        u32::try_from(u64::from(POSTER_WIDTH) * u64::from(height) / u64::from(width)).unwrap_or(POSTER_WIDTH);
+    let poster = frame.as_ref().and_then(|f| f.url.as_deref()).map(|template| {
+        template
+            .replace("{w}", &POSTER_WIDTH.to_string())
+            .replace("{h}", &poster_height.to_string())
+            .replace("{f}", "jpg")
+    });
+    let color = frame
+        .and_then(|f| f.bg_color)
+        .filter(|c| c.len() == 6 && c.bytes().all(|b| b.is_ascii_hexdigit()));
+    Some(ArtLoop {
+        video,
+        poster,
+        color,
+        width,
+        height,
+    })
+}
+
+/// An https address on Apple's video host.
+pub fn is_loop_video(url: &str) -> bool {
+    url.strip_prefix("https://")
+        .and_then(|rest| rest.split('/').next())
+        .is_some_and(|host| host.eq_ignore_ascii_case(LOOP_VIDEO_HOST))
+}
+
 /// Apple's artwork template at one size, as a JPEG.
 pub fn artwork_at(template: &str, side: u32) -> String {
     let side = side.to_string();

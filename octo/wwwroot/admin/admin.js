@@ -623,6 +623,7 @@ async function loadSettings() {
   loadTidy();
   loadExplicitBackfill();
   loadCoverUpgrade();
+  loadAnimatedArt();
   loadLyricsLibrary();
   loadLyricsChoices();
   loadRadioStatus();
@@ -983,6 +984,7 @@ document.querySelectorAll('form[data-section]').forEach(form => {
       renderSetupChecklist();
       // The scrobbling card reads the running settings, which catch up with the file a moment later.
       if (form.dataset.section?.startsWith('lastfm')) setTimeout(loadLastFmScrobbling, 700);
+      if (form.dataset.section === 'animated-art') setTimeout(loadAnimatedArt, 700);
       // The re-check offer on the Verify card follows the saved match score.
       if (form.dataset.section === 'soulseek-verify' || form.dataset.section?.startsWith('library-actions')) {
         setTimeout(loadReviewSweep, 700);
@@ -2478,6 +2480,7 @@ const libraryActionLabels = {
   WrongLyrics: 'Wrong lyrics: look for other lyrics, and never show these again',
   WrongCover: 'Wrong cover: look for another cover, and never use this one again',
   FixDuplicates: 'Fix duplicates: fix every copy of the song, as Library health does. Needs Delete on',
+  CheckVersion: 'Check version: check that the file is the version its tags say. Changes nothing',
 };
 
 function normalizeLibraryAction(action = {}) {
@@ -2794,6 +2797,7 @@ function tagCheckWords(t, here = false) {
   const parts = [t.line];
   if (t.found && !here) parts.push(`${healthPlural(t.found, 'song')} to look at in Library health${t.sure ? `, ${t.sure.toLocaleString()} sure` : ''}.`);
   if (t.spacesFixed) parts.push(`Stray spaces taken off ${healthPlural(t.spacesFixed, 'song')}.`);
+  if (t.namesFixed) parts.push(`Tags under other names taken off ${healthPlural(t.namesFixed, 'song')}.`);
   if (t.reason && t.state !== 'Done' && !t.paused) parts.push(t.reason);
   return parts.join(' ');
 }
@@ -6091,9 +6095,19 @@ document.getElementById('lyrics-choices-list')?.addEventListener('click', async 
 // ────────────────────────────────────────────────────────────────
 // Better quality: the library's lossy songs, found again in higher quality
 // ────────────────────────────────────────────────────────────────
-const lossy = { rows: [], picked: new Set(), shown: 200, timer: null, view: null, open: 0 };
+const lossy = {
+  rows: [], picked: new Set(), shown: 200, timer: null, view: null, open: 0,
+  // What one press may send and how many songs may wait at once; the server's answer replaces these.
+  limits: { perPress: 2000, openJobs: 5000 },
+  // Why the last pick stopped short, until the picks change again.
+  note: '',
+};
 const LOSSY_PAGE = 200;
 const LOSSY_RECENT_MS = 28 * 24 * 3600 * 1000;
+const LOSSY_DAY_MS = 24 * 3600 * 1000;
+const lossyFilterIds = ['lossy-q', 'lossy-format', 'lossy-bitrate', 'lossy-match', 'lossy-added', 'lossy-genre', 'lossy-youtube', 'lossy-hide-tried'];
+const lossyNum = n => Number(n).toLocaleString();
+const lossySongs = n => `${lossyNum(n)} ${n === 1 ? 'song' : 'songs'}`;
 const upgradeWords = {
   queued: 'Queued', waiting: 'Waiting for Soulseek', working: 'Looking', upgraded: 'Upgraded',
   notFound: 'No higher quality found', rehearsed: 'Rehearsed', skipped: 'Skipped', failed: 'Failed',
@@ -6119,6 +6133,7 @@ async function loadLossy(refresh = false) {
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error || body.title || `HTTP ${response.status}`);
     lossy.rows = body.songs || [];
+    if (body.limits) lossy.limits = body.limits;
     lossy.shown = LOSSY_PAGE;
     const formats = [...new Set(lossy.rows.map(row => (row.suffix || '').toLowerCase()).filter(Boolean))].sort();
     const select = document.getElementById('lossy-format');
@@ -6126,6 +6141,15 @@ async function loadLossy(refresh = false) {
     select.innerHTML = '<option value="">Every format</option>'
       + formats.map(f => `<option value="${esc(f)}">${esc(f.toUpperCase())}</option>`).join('');
     select.value = formats.includes(current) ? current : '';
+    // Genres by how many of these songs carry them, the commonest first.
+    const genres = new Map();
+    for (const row of lossy.rows) for (const genre of row.genres || []) genres.set(genre, (genres.get(genre) || 0) + 1);
+    const genreSelect = document.getElementById('lossy-genre');
+    const genre = genreSelect.value;
+    const named = [...genres].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    genreSelect.innerHTML = '<option value="">Every genre</option>'
+      + named.map(([name, n]) => `<option value="${esc(name)}">${esc(name)} (${lossyNum(n)})</option>`).join('');
+    genreSelect.value = genres.has(genre) ? genre : '';
     await loadUpgrades();
   } catch (error) {
     list.innerHTML = stateBlock('error', error.message);
@@ -6156,14 +6180,64 @@ async function loadUpgrades() {
 function lossyVisible() {
   const q = document.getElementById('lossy-q').value.trim().toLowerCase();
   const format = document.getElementById('lossy-format').value;
+  const below = Number(document.getElementById('lossy-bitrate').value) || 0;
+  const match = document.getElementById('lossy-match').value;
+  const days = Number(document.getElementById('lossy-added').value) || 0;
+  const genre = document.getElementById('lossy-genre').value;
   const youTubeOnly = document.getElementById('lossy-youtube').checked;
   const hideTried = document.getElementById('lossy-hide-tried').checked;
   const now = Date.now();
+  // A positive count of days is "added since then", a negative one "added before then".
+  const addedOk = row => {
+    if (!days) return true;
+    const added = Date.parse(row.added ?? '');
+    if (Number.isNaN(added)) return false;
+    return days > 0 ? now - added <= days * LOSSY_DAY_MS : now - added > -days * LOSSY_DAY_MS;
+  };
   return lossy.rows.filter(row =>
     (!q || `${row.title} ${row.artist} ${row.album ?? ''}`.toLowerCase().includes(q))
     && (!format || (row.suffix || '').toLowerCase() === format)
+    && (!below || (row.bitRate > 0 && row.bitRate < below))
+    && (!match || (row.match?.state ?? 'unchecked') === match)
+    && addedOk(row)
+    && (!genre || (row.genres || []).includes(genre))
     && (!youTubeOnly || row.fromYouTube)
     && (!hideTried || !row.lastTried || now - Date.parse(row.lastTried.atUtc) > LOSSY_RECENT_MS));
+}
+
+// Whether any filter narrows the list.
+function lossyFiltered() {
+  return lossyFilterIds.some(id => {
+    const input = document.getElementById(id);
+    return input && (input.type === 'checkbox' ? input.checked : input.value.trim() !== '');
+  });
+}
+
+// How many more songs may be picked before one press is full.
+const lossyRoom = () => Math.max(0, lossy.limits.perPress - lossy.picked.size);
+
+// Picks `rows` in order until one press is full; says so when that stopped it.
+function lossyPick(rows) {
+  let added = 0;
+  for (const row of rows) {
+    if (lossy.picked.has(row.id)) continue;
+    if (!lossyRoom()) {
+      lossy.note = `${lossyNum(lossy.limits.perPress)} is the most one press sends; Select again once these are queued.`;
+      return added;
+    }
+    lossy.picked.add(row.id);
+    added += 1;
+  }
+  lossy.note = '';
+  return added;
+}
+
+// The song's AcoustID match in words, when it is worth saying: unsure, with its score.
+function lossyMatchWords(row) {
+  const match = row.match;
+  if (match?.state !== 'unsure') return '';
+  const score = typeof match.score === 'number' ? ` (${match.score}%)` : '';
+  return match.by === 'tagCheck' ? 'tag check unsure' : `AcoustID unsure${score}`;
 }
 
 function lossyGateClosed() {
@@ -6245,27 +6319,53 @@ function renderLossy() {
     document.getElementById('lossy-open-actions')?.addEventListener('click', () => openTab('libraryactions'));
   }
 
+  const shownLine = document.getElementById('lossy-shown');
+  if (shownLine) {
+    const filtered = lossyFiltered();
+    shownLine.hidden = !lossy.rows.length;
+    shownLine.innerHTML = filtered
+      ? `${esc(lossySongs(visible.length))} of ${esc(lossyNum(lossy.rows.length))} match these filters. <button type="button" class="link-btn" id="lossy-unfilter">Clear filters</button>`
+      : `Showing all ${esc(lossySongs(lossy.rows.length))}.`;
+    document.getElementById('lossy-unfilter')?.addEventListener('click', () => {
+      for (const id of lossyFilterIds) {
+        const input = document.getElementById(id);
+        if (!input) continue;
+        if (input.type === 'checkbox') input.checked = false; else input.value = '';
+      }
+      lossy.shown = LOSSY_PAGE;
+      renderLossy();
+    });
+  }
+
   if (!lossy.rows.length) {
     list.innerHTML = stateBlock('empty', 'Every song in your library is lossless.');
   } else if (!visible.length) {
     list.innerHTML = stateBlock('empty', 'No song matches these filters.');
   } else {
     const shown = visible.slice(0, lossy.shown);
+    const added = row => {
+      const at = Date.parse(row.added ?? '');
+      return Number.isNaN(at) ? '' : `Added ${new Date(at).toLocaleDateString()}`;
+    };
     list.innerHTML = `
       <div class="config-table">
         <div class="config-row config-row-head lossy-row">
-          <span><input type="checkbox" class="pick" id="lossy-pick-all" aria-label="Select every song shown" /></span>
+          <span><input type="checkbox" class="pick" id="lossy-pick-all" aria-label="Select the songs on this page" title="Select the songs on this page" /></span>
           <span>Song</span><span>Album</span><span>Format</span><span>Status</span>
         </div>
-        ${shown.map(row => `
+        ${shown.map(row => {
+          const match = lossyMatchWords(row);
+          const albumSub = [added(row), (row.genres || []).join(', ')].filter(Boolean).join(' · ');
+          return `
           <label class="config-row lossy-row${lossy.picked.has(row.id) ? ' picked' : ''}">
             <span><input type="checkbox" class="pick" data-lossy-id="${esc(row.id)}" ${lossy.picked.has(row.id) ? 'checked' : ''}
               ${isOpenJob(row.job) ? 'disabled' : ''} aria-label="Pick ${esc(row.title)}" /></span>
-            <span class="key">${esc(row.title)}<span class="lossy-sub">${esc(row.artist)}${row.fromYouTube ? ' · from YouTube' : ''}</span></span>
-            <span class="value">${esc(row.album ?? '')}</span>
-            <span><span class="dl-badge mp3">${esc((row.suffix || '?').toUpperCase())}</span></span>
+            <span class="key">${esc(row.title)}<span class="lossy-sub">${esc(row.artist)}${row.fromYouTube ? ' · from YouTube' : ''}${match ? ` · <span class="lossy-unsure">${esc(match)}</span>` : ''}</span></span>
+            <span class="value">${esc(row.album ?? '')}${albumSub ? `<span class="lossy-sub">${esc(albumSub)}</span>` : ''}</span>
+            <span><span class="dl-badge mp3">${esc((row.suffix || '?').toUpperCase())}</span>${row.bitRate > 0 ? `<span class="lossy-sub">${esc(lossyNum(row.bitRate))} kbps</span>` : ''}</span>
             <span>${lossyStatus(row)}${lossyFindButton(row)}</span>
-          </label>`).join('')}
+          </label>`;
+        }).join('')}
       </div>
       ${visible.length > shown.length
         ? `<button type="button" class="btn btn-ghost" id="lossy-more">Show ${Math.min(LOSSY_PAGE, visible.length - shown.length)} more of ${visible.length - shown.length}</button>`
@@ -6277,22 +6377,46 @@ function renderLossy() {
   for (const row of lossy.rows) if (isOpenJob(row.job)) lossy.picked.delete(row.id);
   const n = lossy.picked.size;
 
-  // Select all means every song the filters show, drawn or not, that is not already running.
+  // The box in the header is this page's rows; Select is the first songs the filters show,
+  // drawn or not, that are not already running or picked, as many as one press still takes.
   const pickable = visible.filter(row => !isOpenJob(row.job));
-  const pickedShown = pickable.filter(row => lossy.picked.has(row.id)).length;
+  const onPage = visible.slice(0, lossy.shown).filter(row => !isOpenJob(row.job));
+  const pickedOnPage = onPage.filter(row => lossy.picked.has(row.id)).length;
   const all = document.getElementById('lossy-pick-all');
   if (all) {
-    all.checked = pickable.length > 0 && pickedShown === pickable.length;
-    all.indeterminate = pickedShown > 0 && pickedShown < pickable.length;
-    all.disabled = pickable.length === 0;
+    all.checked = onPage.length > 0 && pickedOnPage === onPage.length;
+    all.indeterminate = pickedOnPage > 0 && pickedOnPage < onPage.length;
+    all.disabled = onPage.length === 0;
   }
-  const selectAll = document.getElementById('lossy-all');
-  selectAll.textContent = pickable.length ? `Select all ${pickable.length}` : 'Select all';
-  selectAll.hidden = pickable.length === 0 || pickedShown === pickable.length;
+  const unpicked = pickable.filter(row => !lossy.picked.has(row.id)).length;
+  const offer = Math.min(unpicked, lossyRoom());
+  const amount = document.getElementById('lossy-amount');
+  amount.max = String(Math.max(1, offer));
+  amount.placeholder = String(offer);
+  document.getElementById('lossy-of').textContent = n
+    ? `of the ${lossySongs(unpicked)} shown and not picked yet`
+    : `of the ${lossySongs(unpicked)} shown`;
+  document.getElementById('lossy-amount-group').hidden = offer === 0;
+  document.getElementById('lossy-all').disabled = offer === 0;
   document.getElementById('lossy-none').hidden = n === 0;
-  document.getElementById('lossy-count').textContent = n ? `${n} ${n === 1 ? 'song' : 'songs'} picked` : 'Nothing picked';
+  document.getElementById('lossy-count').textContent = n ? `${lossySongs(n)} picked` : 'Nothing picked';
+  // What pressing Find does with these picks: how many go, how many run at once, and how many
+  // the queue still has room for.
+  const hint = [];
+  if (lossy.note) hint.push(lossy.note);
+  if (n) {
+    const room = Math.max(0, lossy.limits.openJobs - lossy.open);
+    if (n > room) {
+      hint.push(`Only ${lossyNum(room)} fit in the queue now, with ${lossyNum(lossy.open)} already waiting; the rest are left out.`);
+    } else if (typeof view?.parallel === 'number') {
+      hint.push(`${lossyNum(view.parallel)} run at a time.`);
+    }
+  } else if (!lossy.note) {
+    hint.push(`Up to ${lossyNum(lossy.limits.perPress)} songs a press.`);
+  }
+  document.getElementById('lossy-hint').textContent = hint.join(' ');
   const go = document.getElementById('lossy-go');
-  go.textContent = n ? `Find higher quality for ${n} ${n === 1 ? 'song' : 'songs'}` : 'Find higher quality';
+  go.textContent = n ? `Find higher quality for ${lossySongs(n)}` : 'Find higher quality';
   go.disabled = !n || !!closed;
   document.getElementById('lossy-cancel').hidden = !(view?.jobs || []).some(job => ['queued', 'waiting'].includes(job.state));
   renderLossyResults();
@@ -6328,34 +6452,47 @@ function renderLossyResults() {
 
 document.getElementById('lossy-list')?.addEventListener('change', event => {
   if (event.target.id === 'lossy-pick-all') {
-    const pickable = lossyVisible().filter(row => !isOpenJob(row.job));
-    for (const row of pickable) {
-      if (event.target.checked) lossy.picked.add(row.id); else lossy.picked.delete(row.id);
+    const onPage = lossyVisible().slice(0, lossy.shown).filter(row => !isOpenJob(row.job));
+    if (event.target.checked) {
+      lossyPick(onPage);
+    } else {
+      for (const row of onPage) lossy.picked.delete(row.id);
+      lossy.note = '';
     }
     renderLossy();
     return;
   }
   const box = event.target.closest('[data-lossy-id]');
   if (!box) return;
-  if (box.checked) lossy.picked.add(box.dataset.lossyId); else lossy.picked.delete(box.dataset.lossyId);
+  if (box.checked) lossyPick(lossy.rows.filter(row => row.id === box.dataset.lossyId));
+  else { lossy.picked.delete(box.dataset.lossyId); lossy.note = ''; }
   renderLossy();
 });
-for (const id of ['lossy-q', 'lossy-format', 'lossy-youtube', 'lossy-hide-tried']) {
-  document.getElementById(id)?.addEventListener(id === 'lossy-q' ? 'input' : 'change', () => { lossy.shown = LOSSY_PAGE; renderLossy(); });
+for (const id of lossyFilterIds) {
+  const input = document.getElementById(id);
+  input?.addEventListener(id === 'lossy-q' ? 'input' : 'change', () => { lossy.shown = LOSSY_PAGE; renderLossy(); });
 }
 document.getElementById('lossy-refresh')?.addEventListener('click', () => loadLossy(true));
-// Every song the filters show, drawn or not.
+// The first songs the filters show, drawn or not, as many as asked (all that fit when blank).
 document.getElementById('lossy-all')?.addEventListener('click', () => {
-  for (const row of lossyVisible()) if (!isOpenJob(row.job)) lossy.picked.add(row.id);
+  const candidates = lossyVisible().filter(row => !isOpenJob(row.job) && !lossy.picked.has(row.id));
+  const asked = Math.floor(Number(document.getElementById('lossy-amount').value));
+  const wanted = asked > 0 ? asked : candidates.length;
+  lossyPick(candidates.slice(0, wanted));
+  document.getElementById('lossy-amount').value = '';
   renderLossy();
 });
-document.getElementById('lossy-none')?.addEventListener('click', () => { lossy.picked.clear(); renderLossy(); });
+document.getElementById('lossy-amount')?.addEventListener('keydown', event => {
+  if (event.key === 'Enter') { event.preventDefault(); document.getElementById('lossy-all').click(); }
+});
+document.getElementById('lossy-none')?.addEventListener('click', () => { lossy.picked.clear(); lossy.note = ''; renderLossy(); });
 
 document.getElementById('lossy-go')?.addEventListener('click', async () => {
-  const songs = lossy.rows.filter(row => lossy.picked.has(row.id));
+  const songs = lossy.rows.filter(row => lossy.picked.has(row.id)).slice(0, lossy.limits.perPress);
   if (!songs.length) return;
   const n = songs.length;
-  if (!(await askConfirm(`Find higher quality for ${n} ${n === 1 ? 'song' : 'songs'}?`, `Octo looks for a lossless copy of each on ${lossy.view?.source ?? 'the upgrade source'}. Each original is kept in quarantine until its replacement passes the checks.`, 'Find higher quality'))) return;
+  const pace = typeof lossy.view?.parallel === 'number' ? ` ${lossyNum(lossy.view.parallel)} run at a time; the rest wait their turn.` : '';
+  if (!(await askConfirm(`Find higher quality for ${lossySongs(n)}?`, `Octo looks for a lossless copy of each on ${lossy.view?.source ?? 'the upgrade source'}.${pace} Each original is kept in quarantine until its replacement passes the checks.`, 'Find higher quality'))) return;
   const response = await lossyFetch('/api/admin/upgrades', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -6367,8 +6504,9 @@ document.getElementById('lossy-go')?.addEventListener('click', async () => {
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) { toast(body.error || `HTTP ${response.status}`, 'error'); return; }
-  toast(`Looking for higher quality for ${body.queued} ${body.queued === 1 ? 'song' : 'songs'}.${body.refused ? ` ${body.refused}` : ''}`);
+  toast(`Looking for higher quality for ${lossySongs(body.queued)}.${body.refused ? ` ${body.refused}` : ''}`);
   lossy.picked.clear();
+  lossy.note = '';
   await loadUpgrades();
 });
 
@@ -7845,6 +7983,7 @@ function healthWhyNot(check, fixes) {
 }
 
 function healthSection(check) {
+  if (check.check === 'versions') return healthVersionSection(check);
   const fixes = healthFixes(check);
   const fixable = fixes.all || fixes.lookUp || (check.check === 'tags' && healthReport.can?.edit);
   const whyNot = healthWhyNot(check, fixes);
@@ -7962,6 +8101,243 @@ function healthItems(check) {
     return healthRow(song, extra, buttons ? `<div class="health-actions">${buttons}</div>` : '');
   }).join('');
   return `<div class="dl-list health-songs">${rows}</div>${healthMore(check.check, check.songs.length)}`;
+}
+
+// ── the version check ────────────────────────────────────────────
+// Songs whose file is not the version its tags say, and imported songs pointing at another
+// version. Filters with counts, a pick per row and Select all, and per row or for the picked
+// ones: Retag as what it is, Replace with the right version, Keep. Nothing runs by itself.
+let versionFilter = 'all';
+const versionPicked = new Set();
+
+function versionItemsShown(check) {
+  if (versionFilter === 'imports') return [];
+  return (check.items || []).filter(item => versionFilter === 'all' || item.problem === versionFilter);
+}
+
+function versionImportsShown(check) {
+  return versionFilter === 'all' || versionFilter === 'imports' ? (check.imports || []) : [];
+}
+
+function healthVersionSection(check) {
+  const can = healthReport.can || {};
+  const off = healthReport.run?.state === 'running' ? ' disabled' : '';
+  const items = versionItemsShown(check);
+  const imports = versionImportsShown(check);
+  for (const id of [...versionPicked]) if (!items.some(item => item.id === id)) versionPicked.delete(id);
+  const filters = (check.filters || []).filter(f => f.id === 'all' || f.count > 0).map(f => {
+    const on = f.id === versionFilter;
+    return `<button class="btn btn-ghost btn-sm version-filter" type="button" data-version-filter="${esc(f.id)}" aria-pressed="${on}">${on ? icon('i-check') : ''}<span>${esc(f.label)}</span><span class="version-filter-count">${f.count.toLocaleString()}</span></button>`;
+  }).join('');
+  const picked = versionPicked.size;
+  const allPicked = items.length > 0 && items.every(item => versionPicked.has(item.id));
+  const anyRetag = items.some(item => versionPicked.has(item.id) && item.canRetag);
+  const bar = items.length ? `<div class="version-bar" role="group" aria-label="Picked songs">
+      <label class="lossy-check"><input type="checkbox" id="version-pick-all"${allPicked ? ' checked' : ''} /><span>Select all shown (${items.length.toLocaleString()})</span></label>
+      <span class="version-picked" aria-live="polite">${picked ? `${healthPlural(picked, 'song')} picked` : 'None picked'}</span>
+      <div class="health-actions">
+        ${can.edit ? `<button class="btn btn-ghost btn-sm" type="button" data-version-bulk="retag"${picked && anyRetag ? '' : ' disabled'}${off}>${esc(check.retagLabel)}</button>` : ''}
+        ${can.edit ? `<button class="btn btn-ghost btn-sm" type="button" data-version-bulk="replace"${picked ? '' : ' disabled'}${off}>${esc(check.replaceLabel)}</button>` : ''}
+        <button class="btn btn-ghost btn-sm" type="button" data-version-bulk="keep"${picked ? '' : ' disabled'}>${esc(check.keepLabel)}</button>
+      </div>
+    </div>` : '';
+  const shown = healthShown.versions ?? healthPage('versions');
+  const rows = items.slice(0, shown).map(item => {
+    const song = healthSong(item.id);
+    const lines = [
+      `<div class="dl-sub"><strong>${esc(item.problemLabel)}.</strong> ${esc(item.words)}</div>`,
+      item.is ? `<div class="dl-sub">It is <strong>${esc(item.is)}</strong>.</div>` : '',
+      item.cover ? '<div class="dl-sub">Replace cover puts in the album\'s own cover by its artist, or Octo\'s drawn cover when there is none. Undo puts this one back.</div>'
+        : item.retag?.length ? `<div class="dl-sub">Retag writes ${esc(item.retag.map(change => change.words).join('; '))}.</div>` : '<div class="dl-sub">Nothing says what it really is, so it can be replaced or kept.</div>',
+    ].join('');
+    const pick = `<label class="lossy-check version-pick-label"><input type="checkbox" class="pick version-pick" data-id="${esc(item.id)}"${versionPicked.has(item.id) ? ' checked' : ''} aria-label="Pick ${esc(song.title)}" /><span>Pick</span></label>`;
+    const badge = `<span class="dl-badge ${item.heard ? 'good' : 'warn'}">${esc(item.sureLabel)}</span>`;
+    const buttons = item.cover ? [
+      can.edit ? `<button class="btn btn-ghost btn-sm" type="button" data-version-cover="${esc(item.id)}"${off}>${esc(check.replaceCoverLabel)}</button>` : '',
+      `<button class="btn btn-ghost btn-sm" type="button" data-version-keep-cover="${esc(item.id)}">${esc(check.keepLabel)}</button>`,
+    ].join('') : [
+      can.edit && item.canRetag ? `<button class="btn btn-ghost btn-sm" type="button" data-version-retag="${esc(item.id)}"${off}>${esc(check.retagLabel)}</button>` : '',
+      can.edit ? `<button class="btn btn-ghost btn-sm" type="button" data-version-replace="${esc(item.id)}"${off}>${esc(check.replaceLabel)}</button>` : '',
+      `<button class="btn btn-ghost btn-sm" type="button" data-version-keep="${esc(item.id)}">${esc(check.keepLabel)}</button>`,
+      `<button class="btn btn-ghost btn-sm" type="button" data-version-check="${esc(item.id)}">${esc(check.checkNowLabel)}</button>`,
+    ].join('');
+    return healthRow(song, lines, `${badge}${pick}<div class="health-actions">${buttons}</div>`);
+  }).join('');
+  const importRows = imports.map(item => {
+    const right = item.right
+      ? `<div class="dl-sub">The right version: <strong>${esc(item.right.title)}</strong>${item.right.album ? ` on ${esc(item.right.album)}` : ''}${item.right.where === 'removed' ? ', in Recently removed' : ', in the library'}.</div>`
+      : '<div class="dl-sub">The library has no file of that version, so matching again leaves it missing; turn on Get missing songs for the list to fetch it.</div>';
+    const buttons = [
+      item.right?.where === 'removed' && can.edit ? `<button class="btn btn-ghost btn-sm" type="button" data-version-putback="${esc(item.right.id)}" data-owner="${esc(item.owner)}">${esc(check.putBackLabel)}</button>` : '',
+      `<button class="btn btn-ghost btn-sm" type="button" data-version-rematch="${esc(item.owner)}">${esc(check.rematchLabel)}</button>`,
+    ].join('');
+    const by = [item.artist, item.album].filter(Boolean).map(esc).join(' <span class="dl-dash">·</span> ');
+    return `<div class="dl-item health-item">
+      <div class="dl-main">
+        <div class="dl-title">${esc(item.title)}</div>
+        ${by ? `<div class="dl-by">${by}</div>` : ''}
+        <div class="dl-sub">In ${esc(item.listName)}${item.owner ? ` (${esc(item.owner)})` : ''}. ${esc(item.words)}</div>
+        ${right}
+      </div>
+      <div class="dl-side"><div class="health-actions">${buttons}</div></div>
+    </div>`;
+  }).join('');
+  const importBlock = imports.length ? `<div class="version-imports">
+      <h4 class="set-info-t">${esc(check.importsTitle)}</h4>
+      <p class="set-info-d">${esc(check.importsMeaning)}</p>
+      <div class="dl-list health-songs">${importRows}</div>
+    </div>` : '';
+  return `
+    <div class="set-section health-check" data-check="versions">
+      <div class="set-head">
+        <h3 class="set-title">${esc(check.title)}</h3>
+        <p class="set-desc"><strong class="health-count">${esc(check.countLabel)}.</strong> ${esc(check.meaning)}</p>
+      </div>
+      <div class="set-card">
+        <div class="set-row">
+          <div class="set-info">
+            <div class="set-info-t">What to do</div>
+            <div class="set-info-d">${esc(check.advice)}</div>
+            <div class="set-info-more">Retag goes through the same undoable edits as the other fixes. Replace finds the version the tags name through the download checks; the old file waits in Recently removed.</div>
+          </div>
+        </div>
+        ${healthTagCheckRow()}
+        ${healthVersionFindRow()}
+        <div class="set-row stack health-preview" id="health-preview-versions" hidden></div>
+      </div>
+      <div class="version-filters" role="group" aria-label="Show">${filters}</div>
+      ${bar}
+      ${items.length ? `<div class="dl-list health-songs">${rows}</div>${healthMore('versions', items.length)}` : ''}
+      ${importBlock}
+    </div>`;
+}
+
+// Check one song now: find it by its title or artist, then check it.
+function healthVersionFindRow() {
+  return `<div class="set-row stack version-find">
+    <div class="set-info">
+      <div class="set-info-t" id="version-find-label">Check one song now</div>
+      <div class="set-info-d">Its tags and its version, whatever the pace above. Takes a few seconds.</div>
+    </div>
+    <form class="version-find-form" data-version-find-form>
+      <input type="search" id="version-find-q" aria-labelledby="version-find-label" placeholder="Title or artist" autocomplete="off" />
+      <button class="btn btn-ghost" type="submit">${icon('i-magnifying-glass')}<span>Find</span></button>
+    </form>
+    <div id="version-find-results" aria-live="polite"></div>
+  </div>`;
+}
+
+async function versionPost(path, body, where) {
+  const { ok, data } = await healthCall(path, body);
+  if (!ok) {
+    if (where) note(where, data.error || 'That did not work.', 'error');
+    else showHealthResult(data.error || 'That did not work.', false);
+  }
+  return { ok, data };
+}
+
+async function versionFind(query) {
+  const box = document.getElementById('version-find-results');
+  if (!box) return;
+  if (!query.trim()) { box.innerHTML = ''; return; }
+  box.innerHTML = stateBlock('loading', 'Looking in your library…');
+  const { ok, data } = await healthCall('/api/admin/health/versions/find', { id: query.trim() });
+  if (!ok) { box.innerHTML = stateBlock('error', data.error || 'The library could not be searched.'); return; }
+  if (!data.songs?.length) { box.innerHTML = '<p class="set-info-d">No song in the library matches that.</p>'; return; }
+  box.innerHTML = `<div class="dl-list">${data.songs.map(song => healthRow(song, '', `<div class="health-actions"><button class="btn btn-ghost btn-sm" type="button" data-version-check="${esc(song.id)}">Check now</button></div>`)).join('')}</div>`;
+}
+
+async function versionCheckNow(id, button) {
+  const label = button?.textContent;
+  if (button) { button.disabled = true; button.textContent = 'Checking…'; }
+  const { ok, data } = await versionPost('/api/admin/health/versions/check', { id }, button?.closest('.dl-item'));
+  if (!ok) { if (button) { button.disabled = false; button.textContent = label; } return; }
+  showHealthResult(`${data.title}: ${data.words}`, false);
+  loadHealth();
+}
+
+function versionReplaceAsk(ids) {
+  const holder = healthPreviewHolder('versions');
+  if (!holder) return;
+  holder.hidden = false;
+  holder.innerHTML = `<div class="set-info">
+      <div class="set-info-t">Replace ${esc(healthPlural(ids.length, 'song'))} with the version the tags name?</div>
+      <div class="set-info-d">Octo looks for each one through its download checks and refuses another take. The file there now goes to Recently removed, where Put back undoes it.</div>
+    </div>
+    <div class="form-actions health-preview-actions">
+      <button class="btn btn-ghost" type="button" data-health-cancel="versions">Cancel</button>
+      <button class="btn btn-primary" type="button" data-version-replace-go="${esc(ids.join(','))}">${icon('i-check')}<span>Replace ${esc(healthPlural(ids.length, 'song'))}</span></button>
+    </div>`;
+  holder.scrollIntoView({ block: 'nearest' });
+}
+
+async function versionReplace(ids, button) {
+  if (button) button.disabled = true;
+  const { ok, data } = await versionPost('/api/admin/health/versions/replace', { ids }, button?.closest('.health-preview'));
+  if (!ok) { if (button) button.disabled = false; return; }
+  closeHealthPreview('versions');
+  ids.forEach(id => versionPicked.delete(id));
+  showHealthResult(data.words, false);
+}
+
+async function versionKeep(ids) {
+  const check = healthReport?.checks.find(entry => entry.check === 'versions');
+  const covers = new Set((check?.items || []).filter(item => item.cover).map(item => item.id));
+  const coverIds = ids.filter(id => covers.has(id));
+  const songIds = ids.filter(id => !covers.has(id));
+  let kept = 0;
+  if (coverIds.length) {
+    const answer = await versionPost('/api/admin/health/versions/keepcover', { ids: coverIds });
+    if (!answer.ok) return;
+    kept += answer.data.kept;
+  }
+  const { ok, data } = songIds.length ? await versionPost('/api/admin/health/versions/keep', { ids: songIds }) : { ok: true, data: { kept: 0 } };
+  if (!ok) return;
+  data.kept += kept;
+  ids.forEach(id => versionPicked.delete(id));
+  showHealthResult(`Kept ${healthPlural(data.kept, 'song')} as ${data.kept === 1 ? 'it is' : 'they are'}. ${data.kept === 1 ? 'It is' : 'They are'} asked about again only if the file changes.`, false);
+  loadHealth();
+}
+
+function versionHandle(target, d) {
+  if (d.versionFilter) { versionFilter = d.versionFilter; healthShown.versions = undefined; renderHealth(); return true; }
+  if (d.versionRetag) { openHealthPreview('versions', { keys: [d.versionRetag] }); return true; }
+  if (d.versionReplace) { versionReplaceAsk([d.versionReplace]); return true; }
+  if (d.versionReplaceGo) { versionReplace(d.versionReplaceGo.split(','), target); return true; }
+  if (d.versionKeep) { versionKeep([d.versionKeep]); return true; }
+  if (d.versionKeepCover) { versionKeep([d.versionKeepCover]); return true; }
+  if (d.versionCover) {
+    target.disabled = true;
+    target.textContent = 'Replacing…';
+    versionPost('/api/admin/health/versions/cover', { ids: [d.versionCover] }, target.closest('.dl-item'))
+      .then(({ ok, data }) => { if (ok) { showHealthResult(data.words, false); loadHealth(); } else { target.disabled = false; target.textContent = 'Replace cover'; } });
+    return true;
+  }
+  if (d.versionCheck) { versionCheckNow(d.versionCheck, target); return true; }
+  if (d.versionBulk) {
+    const ids = [...versionPicked];
+    if (!ids.length) return true;
+    const check = healthReport.checks.find(entry => entry.check === 'versions');
+    const covers = new Set((check?.items || []).filter(item => item.cover).map(item => item.id));
+    const songs = ids.filter(id => !covers.has(id));
+    if (d.versionBulk === 'retag' && songs.length) openHealthPreview('versions', { keys: songs });
+    if (d.versionBulk === 'replace' && songs.length) versionReplaceAsk(songs);
+    if (d.versionBulk === 'keep') versionKeep(ids);
+    return true;
+  }
+  if (d.versionPutback) {
+    target.disabled = true;
+    versionPost('/api/admin/health/versions/putback', { id: d.versionPutback, owner: d.owner || null }, target.closest('.dl-item'))
+      .then(({ ok, data }) => { if (ok) { showHealthResult(data.words, false); loadHealth(); } else target.disabled = false; });
+    return true;
+  }
+  if (d.versionRematch !== undefined) {
+    target.disabled = true;
+    versionPost('/api/admin/health/versions/rematch', { owner: d.versionRematch || null }, target.closest('.dl-item'))
+      .then(({ ok, data }) => { if (ok) { showHealthResult(data.words, false); loadHealth(); } else target.disabled = false; });
+    return true;
+  }
+  return false;
 }
 
 // The tag check's line, with Pause and Start over, as the Library actions card shows it.
@@ -8352,6 +8728,7 @@ document.querySelector('section[data-pane="health"]')?.addEventListener('click',
     return;
   }
   if (d.healthTagsUse) { openHealthPreview('tags', { keys: [d.healthTagsUse] }); return; }
+  if (target.type !== 'checkbox' && versionHandle(target, d)) return;
   if (d.tagCheck === 'toggle') { tagCheckToggle(target); return; }
   if (d.tagCheck === 'reset') { tagCheckReset(target); return; }
   if (d.healthFixSet) { openHealthPreview('duplicates', { keys: [d.healthFixSet] }); return; }
@@ -8376,6 +8753,31 @@ document.querySelector('section[data-pane="health"]')?.addEventListener('click',
 
 // "Keep every rated copy" is saved as a setting as soon as it changes; an open preview of the
 // duplicates is worked out again with it.
+// A pick on the version check's songs, or Select all of the ones shown.
+document.getElementById('health-body')?.addEventListener('change', event => {
+  const box = event.target;
+  if (!healthReport || !(box instanceof HTMLInputElement)) return;
+  if (box.classList.contains('version-pick')) {
+    if (box.checked) versionPicked.add(box.dataset.id); else versionPicked.delete(box.dataset.id);
+    renderHealth();
+    document.querySelector(`.version-pick[data-id="${CSS.escape(box.dataset.id)}"]`)?.focus();
+    return;
+  }
+  if (box.id === 'version-pick-all') {
+    const check = healthReport.checks.find(entry => entry.check === 'versions');
+    const shown = check ? versionItemsShown(check) : [];
+    shown.forEach(item => { if (box.checked) versionPicked.add(item.id); else versionPicked.delete(item.id); });
+    renderHealth();
+    document.getElementById('version-pick-all')?.focus();
+  }
+});
+document.getElementById('health-body')?.addEventListener('submit', event => {
+  const form = event.target.closest?.('[data-version-find-form]');
+  if (!form) return;
+  event.preventDefault();
+  versionFind(document.getElementById('version-find-q')?.value || '');
+});
+
 document.getElementById('health-body')?.addEventListener('change', async event => {
   const box = event.target.closest?.('#health-keep-rated');
   if (!box || !healthReport) return;
@@ -8754,3 +9156,86 @@ ready.then(() => loadDeezerAccount());
 document.querySelector('.sidebar-nav-item[data-tab="deezer"]')?.addEventListener('click', loadDeezerCache);
 document.getElementById('deezer-cache-form')?.addEventListener('submit', () => setTimeout(loadDeezerCache, 1500));
 ready.then(loadDeezerCache);
+// ── Animated art: what is known, the library sweep, and hiding a cover ──────────────────────
+
+let artPoll = null;
+let artShown = 0;
+const ART_PAGE = 60;
+
+function artTile(album) {
+  const name = `${album.album} by ${album.artist}`;
+  const art = album.poster ? `<img loading="lazy" alt="" src="${esc(album.poster)}" onerror="this.remove()">` : '';
+  // One badge: Hidden says the most, and a full-screen loop is worth knowing otherwise.
+  const badges = album.hidden
+    ? '<span class="cover-badge warn">Hidden</span>'
+    : album.tall ? '<span class="cover-badge">Full screen</span>' : '';
+  return `<button type="button" class="cover-tile art-tile" role="switch" aria-checked="${!album.hidden}" data-art-key="${esc(album.key)}"
+      aria-label="${esc(name)}" title="${esc(album.hidden ? 'Hidden in every app. Pick to show it again.' : 'Shown in the Octo apps. Pick to hide it.')}">
+    <span class="cover-art">${art}${badges}</span>
+    <span class="cover-title">${esc(album.album)}</span>
+    <span class="cover-artist">${esc(album.artist)}</span>
+  </button>`;
+}
+
+async function loadAnimatedArt() {
+  const card = document.getElementById('art-card');
+  if (!card) return;
+  const response = await api('/api/admin/animated-art').catch(() => null);
+  if (!response?.ok) { card.hidden = true; return; }
+  const summary = await response.json();
+  card.hidden = summary.mode === 'off';
+  if (card.hidden) return;
+  const sweep = summary.sweep || {};
+  const found = Number(summary.found || 0);
+  document.getElementById('art-count').textContent = found === 1
+    ? '1 album has animated art'
+    : `${found.toLocaleString()} albums have animated art`;
+  let line;
+  if (sweep.running) line = `Looking up your library: ${Number(sweep.checked).toLocaleString()} of ${Number(sweep.total).toLocaleString()} albums.`;
+  else if (sweep.finishedUtc) line = `Library looked up ${new Date(sweep.finishedUtc).toLocaleString()}. New albums are looked up daily.`;
+  else line = 'Your library is looked up a couple of minutes after Octo starts, then daily.';
+  if (summary.hidden) line += ` ${Number(summary.hidden).toLocaleString()} hidden.`;
+  document.getElementById('art-sweep').textContent = line;
+  const progress = document.getElementById('art-progress');
+  progress.hidden = !sweep.running;
+  if (sweep.running && sweep.total) document.getElementById('art-progress-fill').style.width = `${Math.round(100 * sweep.checked / sweep.total)}%`;
+  document.getElementById('art-look-up').disabled = !!sweep.running;
+  await loadArtWall(true);
+  if (sweep.running) {
+    if (!artPoll) artPoll = setInterval(loadAnimatedArt, 4000);
+  } else if (artPoll) {
+    clearInterval(artPoll);
+    artPoll = null;
+  }
+}
+
+async function loadArtWall(fromStart) {
+  const wall = document.getElementById('art-wall');
+  const more = document.getElementById('art-more');
+  const count = fromStart ? Math.max(artShown, ART_PAGE) : artShown + ART_PAGE;
+  const response = await api(`/api/admin/animated-art/albums?offset=0&limit=${Math.min(count, 200)}`).catch(() => null);
+  if (!response?.ok) return;
+  const page = await response.json();
+  artShown = page.albums.length;
+  wall.innerHTML = page.albums.map(artTile).join('');
+  document.getElementById('art-hint').hidden = artShown === 0;
+  more.hidden = artShown >= page.total || artShown >= 200;
+}
+
+document.getElementById('art-look-up')?.addEventListener('click', async event => {
+  event.currentTarget.disabled = true;
+  await api('/api/admin/animated-art/sweep', { method: 'POST' }).catch(() => null);
+  setTimeout(loadAnimatedArt, 800);
+});
+document.getElementById('art-more')?.addEventListener('click', () => loadArtWall(false));
+document.getElementById('art-wall')?.addEventListener('click', async event => {
+  const tile = event.target.closest('.art-tile');
+  if (!tile) return;
+  const hidden = tile.getAttribute('aria-checked') === 'true';
+  const response = await api('/api/admin/animated-art/hide', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key: tile.dataset.artKey, hidden }),
+  }).catch(() => null);
+  if (response?.ok) loadAnimatedArt();
+});

@@ -102,7 +102,8 @@ impl TrickleQueue {
         };
         if let Some(path) = path.as_deref().filter(|p| p.exists()) {
             let file = load(path);
-            for job in file.jobs {
+            for mut job in file.jobs {
+                job.key = super::import_keys::ImportKeys::current(&job.key, &job.artist, &job.title);
                 state.jobs.set(key_of(&job.owner, &job.key), job);
             }
             for name in file.paused {

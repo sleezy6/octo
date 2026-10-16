@@ -267,6 +267,10 @@ pub struct LibraryActionExecutor {
     seams: Mutex<ExecutorSeams>,
     /// Library health's duplicate fix, which Fix duplicates hands each request to.
     fixer: OnceLock<Arc<dyn DuplicateFixer>>,
+    /// The library's version check, which Check version hands each request to.
+    version_checker: OnceLock<Arc<dyn super::version_check::VersionChecker>>,
+    /// What the last Check version requests found, newest first.
+    version_checks: Mutex<std::collections::VecDeque<String>>,
 }
 
 /// Takes a song out of the busy set when the action on it ends, however it ends.
@@ -372,6 +376,7 @@ fn describe(action: LibraryAction) -> &'static str {
         LibraryAction::WrongLyrics => "look for other lyrics for",
         LibraryAction::WrongCover => "look for another cover for",
         LibraryAction::FixDuplicates => "fix the copies of",
+        LibraryAction::CheckVersion => "check the version of",
     }
 }
 
@@ -422,6 +427,8 @@ impl LibraryActionExecutor {
             reconciled: AtomicBool::new(false),
             busy: Mutex::new(HashSet::new()),
             fixer: OnceLock::new(),
+            version_checker: OnceLock::new(),
+            version_checks: Mutex::new(std::collections::VecDeque::new()),
             seams: Mutex::new(ExecutorSeams::default()),
         }
     }
@@ -438,6 +445,41 @@ impl LibraryActionExecutor {
     /// Hands every Fix duplicates request to Library health's duplicate fix.
     pub fn use_duplicate_fixer(&self, fixer: Arc<dyn DuplicateFixer>) {
         let _ = self.fixer.set(fixer);
+    }
+
+    /// Hands every Check version request to the library's version check.
+    pub fn use_version_checker(&self, checker: Arc<dyn super::version_check::VersionChecker>) {
+        let _ = self.version_checker.set(checker);
+    }
+
+    /// What the last few Check version requests found, newest first, for the action playlist's
+    /// description.
+    pub fn recent_version_checks(&self) -> Vec<String> {
+        self.version_checks.lock().iter().cloned().collect()
+    }
+
+    /// How many Check version answers the playlist's description keeps.
+    const VERSION_CHECKS_KEPT: usize = 5;
+
+    /// Check version: the song's tags and version checked now, as Library health's Check now
+    /// does. Never changes a file, so a dry run checks too. Consumed whatever it finds: what it
+    /// found waits in Library health and on the playlist's description.
+    async fn check_version(&self, request: &LibraryActionRequest) -> LibraryActionOutcome {
+        let Some(checker) = self.version_checker.get() else {
+            return LibraryActionOutcome::said(
+                LibraryActionState::Skipped,
+                "This server cannot check versions.",
+            );
+        };
+        match checker.check(&request.navidrome_id).await {
+            Ok(words) => {
+                let mut kept = self.version_checks.lock();
+                kept.push_front(words.clone());
+                kept.truncate(Self::VERSION_CHECKS_KEPT);
+                LibraryActionOutcome::said(LibraryActionState::Applied, words)
+            }
+            Err(why) => LibraryActionOutcome::said(LibraryActionState::Failed, why),
+        }
     }
 
     /// Fix duplicates: every copy of the song is fixed as Library health's Fix these copies
@@ -533,6 +575,9 @@ impl LibraryActionExecutor {
 
         if request.action == LibraryAction::FixDuplicates {
             return Ok(self.fix_duplicates(&request).await);
+        }
+        if request.action == LibraryAction::CheckVersion {
+            return Ok(self.check_version(&request).await);
         }
 
         // Keep is an answer, not an operation. It touches no file, so there is nothing to rehearse
@@ -905,6 +950,58 @@ impl LibraryActionExecutor {
 
     /// Turns down the picture the song's album shows now and puts another cover on the album,
     /// through the cover upgrade's journaled writes, so its Undo puts the old one back.
+    /// Replace cover, from Library health's version check: the song's album cover is another
+    /// artist's release's, so it is rejected and another found as Wrong cover finds one, whether
+    /// or not that action is on. When no cover of the album by its own artist exists, `drawn`
+    /// (Octo's own cover for it) goes in instead: never another artist's art. Undo puts the old
+    /// picture back as it does for a cover run.
+    pub async fn replace_cover_from_check(
+        &self,
+        navidrome_id: &str,
+        drawn: impl FnOnce(&str, &str) -> Vec<u8>,
+    ) -> LibraryActionOutcome {
+        let Some(answers) = self.answers.as_ref() else {
+            return LibraryActionOutcome::said(
+                LibraryActionState::Skipped,
+                "This server cannot change covers.",
+            );
+        };
+        let Some(resolved) = self.resolver.resolve(navidrome_id).await else {
+            return LibraryActionOutcome::said(
+                LibraryActionState::Unresolved,
+                "Octo could not find that song's file.",
+            );
+        };
+        let outcome = Self::wrong_cover(answers, &resolved).await;
+        if outcome.state != LibraryActionState::Skipped {
+            return outcome;
+        }
+        let Some(album) = answers.covers.album_on_disk(&resolved.absolute_path).await else {
+            return outcome;
+        };
+        let title = if resolved.album.trim().is_empty() {
+            &resolved.title
+        } else {
+            &resolved.album
+        };
+        let by = resolved.album_artist.as_deref().unwrap_or(&resolved.artist);
+        let bytes = drawn(title, by);
+        match answers
+            .covers
+            .put_album_cover(&album, bytes, "Octo's drawn cover".to_string())
+            .await
+        {
+            Ok(put) => LibraryActionOutcome::said(
+                LibraryActionState::Applied,
+                format!(
+                    "No cover of this album by its own artist was found, so Octo's drawn cover went in on {} song(s).",
+                    put.files
+                ),
+            ),
+            Err(reason) => LibraryActionOutcome::said(LibraryActionState::Failed, reason),
+        }
+    }
+
     async fn wrong_cover(answers: &SongAnswers, resolved: &ResolvedSongFile) -> LibraryActionOutcome {
         let Some(album) = answers.covers.album_on_disk(&resolved.absolute_path).await else {
             return LibraryActionOutcome::said(

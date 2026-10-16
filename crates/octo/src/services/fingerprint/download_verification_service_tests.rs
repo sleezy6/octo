@@ -1570,3 +1570,245 @@ fn an_instrumental_only_the_database_note_names_is_refused() {
         "is an instrumental, from 'A Muse in Her Feelings'"
     );
 }
+
+// ---- the version asked for, the real case of G-Eazy's "Let's Get Lost" ----------------------
+
+const BEAR_FACE_ASKED: &str = "Let's Get Lost (feat. Devon Baldwin) [Bear//Face Remix]";
+const ORIGINAL_ASKED: &str = "Let's Get Lost (feat. Devon Baldwin)";
+
+fn g_eazy(id: &str, title: &str, ms: i64) -> AcoustIdRecording {
+    AcoustIdRecording {
+        duration_ms: Some(ms),
+        duration_seconds: Some(((ms + 500) / 1000) as i32),
+        ..AcoustIdRecording::new(
+            id,
+            title,
+            ["G\u{2010}Eazy"],
+            Some("Let's Get Lost Remixes"),
+            Some(2015),
+        )
+    }
+}
+
+fn decide_download(lookup: &AcoustIdLookup, title: &str, file_ms: i64) -> VerificationResult {
+    DownloadVerificationService::decide_with(
+        lookup,
+        Some("G-Eazy"),
+        Some(title),
+        THRESHOLD,
+        true,
+        (((file_ms + 500) / 1000) as i32, Some(file_ms)),
+        &Takes::for_request(Some(title), None, &Default::default()),
+        &FactsById::new(),
+    )
+}
+
+#[test]
+fn a_remix_by_someone_else_is_refused_for_the_remix_asked_for() {
+    let lookup = ok(vec![result(
+        0.99,
+        vec![g_eazy(
+            "5a584600-24a3-47a0-8f9d-d15e58bfa694",
+            "Let's Get Lost (Teklife remix)",
+            269_653,
+        )],
+    )]);
+    let verdict = decide_download(&lookup, BEAR_FACE_ASKED, 269_653);
+    assert_eq!(verdict.verdict, VerificationVerdict::Mismatch);
+    assert_eq!(
+        verdict.deny_reason,
+        "is another version, 'G\u{2010}Eazy - Let's Get Lost (Teklife remix)': a remix by someone else"
+    );
+}
+
+#[test]
+fn the_remix_is_refused_for_the_original_asked_for_and_the_original_for_the_remix() {
+    let remix = ok(vec![result(
+        0.99,
+        vec![g_eazy(
+            "3f839c1f-10a7-4640-a9b3-2d100acdae37",
+            "Let's Get Lost (Bear//Face remix)",
+            242_202,
+        )],
+    )]);
+    let verdict = decide_download(&remix, ORIGINAL_ASKED, 242_202);
+    assert_eq!(verdict.verdict, VerificationVerdict::Mismatch);
+
+    let original = ok(vec![result(
+        0.97,
+        vec![g_eazy(
+            "20cb620c-1b37-4e93-9b4b-c64b0a2faddc",
+            "Let\u{2019}s Get Lost",
+            240_680,
+        )],
+    )]);
+    let verdict = decide_download(&original, BEAR_FACE_ASKED, 240_680);
+    assert_eq!(verdict.verdict, VerificationVerdict::Mismatch);
+    assert!(
+        verdict.deny_reason.contains("not the remix asked for"),
+        "{}",
+        verdict.deny_reason
+    );
+}
+
+#[test]
+fn the_remix_asked_for_written_otherwise_is_confirmed() {
+    let lookup = ok(vec![result(
+        0.99,
+        vec![g_eazy(
+            "3f839c1f-10a7-4640-a9b3-2d100acdae37",
+            "Let's Get Lost (Bear//Face remix)",
+            242_202,
+        )],
+    )]);
+    let verdict = decide_download(&lookup, BEAR_FACE_ASKED, 242_202);
+    assert_eq!(verdict.verdict, VerificationVerdict::Confirmed);
+}
+
+#[test]
+fn every_titled_variant_is_refused_for_the_plain_song() {
+    for title in [
+        "Heat Waves (Sped Up)",
+        "Heat Waves (Slowed + Reverb)",
+        "Heat Waves (Nightcore)",
+        "Heat Waves (Extended Mix)",
+        "Heat Waves (Club Mix)",
+        "Heat Waves (Instrumental)",
+        "Heat Waves (A Cappella)",
+        "Heat Waves (Karaoke Version)",
+    ] {
+        let lookup = ok(vec![result(
+            0.98,
+            vec![recording(title, "Glass Animals", Some("Dreamland"), Some(2020))],
+        )]);
+        let verdict = DownloadVerificationService::decide_with(
+            &lookup,
+            Some("Glass Animals"),
+            Some("Heat Waves"),
+            THRESHOLD,
+            true,
+            (238, None),
+            &plain_download(),
+            &FactsById::new(),
+        );
+        assert_eq!(verdict.verdict, VerificationVerdict::Mismatch, "{title}");
+    }
+}
+
+#[test]
+fn a_live_take_asked_for_is_not_answered_by_the_studio_recording_the_database_knows() {
+    use octo_core::fingerprint::recording_identity::RecordingFacts;
+    let mut studio = recording("Creep", "Radiohead", Some("Pablo Honey"), Some(1993));
+    studio.recording_id = "studio".to_string();
+    let lookup = ok(vec![result(0.95, vec![studio])]);
+    let mut facts = FactsById::new();
+    facts.insert(
+        "studio".to_string(),
+        RecordingFacts {
+            recording_id: "studio".to_string(),
+            title: "Creep".to_string(),
+            ..Default::default()
+        },
+    );
+    let asked = Takes::for_request(Some("Creep (Live)"), None, &Default::default());
+    let verdict = DownloadVerificationService::decide_with(
+        &lookup,
+        Some("Radiohead"),
+        Some("Creep (Live)"),
+        THRESHOLD,
+        true,
+        (238, None),
+        &asked,
+        &facts,
+    );
+    assert_eq!(verdict.verdict, VerificationVerdict::Mismatch);
+    assert_eq!(
+        verdict.deny_reason,
+        "is the studio recording, not a live recording asked for"
+    );
+    // Without the database's word the studio recording is not held against it.
+    let unasked = DownloadVerificationService::decide_with(
+        &lookup,
+        Some("Radiohead"),
+        Some("Creep (Live)"),
+        THRESHOLD,
+        true,
+        (238, None),
+        &asked,
+        &FactsById::new(),
+    );
+    assert_eq!(unasked.verdict, VerificationVerdict::Confirmed);
+}
+
+#[test]
+fn a_file_whose_own_tags_name_another_remix_is_that_remix() {
+    use octo_core::fingerprint::recording_identity::RecordingFacts;
+    let teklife = RecordingFacts {
+        recording_id: "5a584600-24a3-47a0-8f9d-d15e58bfa694".to_string(),
+        title: "Let's Get Lost (Teklife remix)".to_string(),
+        length_ms: Some(269_653),
+        ..Default::default()
+    };
+    let unsure = VerificationResult {
+        reason: InconclusiveReason::NoEntry,
+        ..Default::default()
+    };
+    let verdict =
+        DownloadVerificationService::settle_by_tagged_recording(unsure.clone(), BEAR_FACE_ASKED, &teklife);
+    assert_eq!(verdict.verdict, VerificationVerdict::Mismatch);
+    assert_eq!(
+        verdict.deny_reason,
+        "is another version by its own tags, 'Let's Get Lost (Teklife remix)': a remix by someone else"
+    );
+    let bear_face = RecordingFacts {
+        title: "Let's Get Lost (Bear//Face remix)".to_string(),
+        ..teklife.clone()
+    };
+    let kept =
+        DownloadVerificationService::settle_by_tagged_recording(unsure.clone(), BEAR_FACE_ASKED, &bear_face);
+    assert_eq!(kept.verdict, VerificationVerdict::Inconclusive);
+    let other_song = RecordingFacts {
+        title: "Me, Myself & I".to_string(),
+        ..teklife
+    };
+    let kept = DownloadVerificationService::settle_by_tagged_recording(unsure, BEAR_FACE_ASKED, &other_song);
+    assert_eq!(kept.verdict, VerificationVerdict::Inconclusive);
+}
+
+#[test]
+fn another_artists_song_of_the_same_name_and_another_length_is_doubted_not_refused() {
+    let superstar = AcoustIdRecording {
+        duration_ms: Some(235_800),
+        duration_seconds: Some(236),
+        ..AcoustIdRecording::new(
+            "76a71dbe-3b16-4bb3-a7db-cb860d3bbee4",
+            "Let's Get Lost",
+            ["Superstar"],
+            Some("Greatest Hits Vol. One"),
+            None,
+        )
+    };
+    let lookup = ok(vec![result(0.998, vec![superstar])]);
+    let verdict = decide_download(&lookup, BEAR_FACE_ASKED, 242_202);
+    assert_eq!(verdict.verdict, VerificationVerdict::Mismatch);
+    let settled = DownloadVerificationService::settle_stray_link(
+        verdict.clone(),
+        BEAR_FACE_ASKED,
+        Some(242),
+        Some(242_202),
+    );
+    assert_eq!(settled.verdict, VerificationVerdict::Inconclusive);
+    assert_eq!(settled.reason, InconclusiveReason::SourceDisagreed);
+    assert!(settled.needs_review());
+    // A file of another length than the song's stays refused, and so does an unknown length.
+    let refused = DownloadVerificationService::settle_stray_link(
+        verdict.clone(),
+        BEAR_FACE_ASKED,
+        Some(242),
+        Some(269_653),
+    );
+    assert_eq!(refused.verdict, VerificationVerdict::Mismatch);
+    let refused =
+        DownloadVerificationService::settle_stray_link(verdict, BEAR_FACE_ASKED, None, Some(242_202));
+    assert_eq!(refused.verdict, VerificationVerdict::Mismatch);
+}

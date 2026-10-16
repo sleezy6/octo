@@ -13,8 +13,8 @@ use axum::response::Response;
 use octo_core::common::dotnet::{is_blank, ordinal_ignore_case_key, utf16_len};
 use octo_core::json::dom::Node;
 use octo_core::settings::{
-    FamilySettings, GenreMatchMode, JsonObject, LastFmUserSession, LibraryAction, LibraryActionSettings,
-    LyricsSaveTo, SettingsWriteError,
+    AnimatedArtMode, FamilySettings, GenreMatchMode, JsonObject, LastFmUserSession, LibraryAction,
+    LibraryActionSettings, LyricsSaveTo, SettingsWriteError,
 };
 use std::collections::HashSet;
 use tracing::{error, info, warn};
@@ -527,7 +527,14 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
                 n_num(metadata.replay_gain_timeout_seconds),
             ),
             ("TagRehearsal", Node::Bool(metadata.tag_rehearsal)),
-            ("AnimatedArtworkUrl", n_str(&metadata.animated_artwork_url)),
+            (
+                "AnimatedArt",
+                n_str(match metadata.animated_art() {
+                    AnimatedArtMode::Direct => AnimatedArtMode::DIRECT,
+                    AnimatedArtMode::Relay => AnimatedArtMode::RELAY,
+                    AnimatedArtMode::Off => AnimatedArtMode::OFF,
+                }),
+            ),
         ]),
     );
     doc.insert(
@@ -847,7 +854,7 @@ fn untouched_answer_action(definition: &JsonObject) -> bool {
         Some(Node::Number(number)) => number.parse().ok().and_then(LibraryAction::from_index),
         _ => None,
     };
-    let Some(action) = action.filter(|action| action.leaves_the_audio()) else {
+    let Some(action) = action.filter(|action| action.written_once_changed()) else {
         return false;
     };
     let name = string_value(field("Name")).map(str::trim).unwrap_or("");
@@ -1321,10 +1328,9 @@ mod tests {
         );
     }
 
-    /// Wrong lyrics and Wrong cover made seven actions. An eighth is a config that does not mean
-    /// anything.
+    /// Check version made nine actions. A tenth is a config that does not mean anything.
     #[test]
-    fn validate_library_actions_accepts_eight_refuses_nine() {
+    fn validate_library_actions_accepts_nine_refuses_ten() {
         fn with_actions(count: usize) -> JsonObject {
             let actions = (0..count)
                 .map(|i| n_obj([("Name", n_str(&format!("a{i}"))), ("Rating", n_num(0))]))
@@ -1335,14 +1341,14 @@ mod tests {
         }
         let current = LibraryActionSettings::default();
         assert_eq!(
-            validate_library_actions(&with_actions(8), &current).unwrap(),
+            validate_library_actions(&with_actions(9), &current).unwrap(),
             None
         );
         assert_eq!(
-            validate_library_actions(&with_actions(9), &current)
+            validate_library_actions(&with_actions(10), &current)
                 .unwrap()
                 .as_deref(),
-            Some("There are only 8 library actions")
+            Some("There are only 9 library actions")
         );
     }
 

@@ -27,6 +27,10 @@ pub const LYRICS_ACTION: &str = "lyrics";
 /// The Wrong cover action: put another cover on the song's album and never use this one again.
 pub const COVER_SWAP_ACTION: &str = "cover-swap";
 
+/// Check now that the song's file is the version its tags say. Changes no file; what is found
+/// is in the answer's detail and in Library health.
+pub const CHECK_VERSION_ACTION: &str = "checkVersion";
+
 /// Version 3: write tags into a song's file, in place.
 pub const RETAG_ACTION: &str = "retag";
 
@@ -142,6 +146,9 @@ fn offered_actions(
     }
     if enabled.contains(&LibraryAction::WrongCover) {
         offered.push(COVER_SWAP_ACTION);
+    }
+    if enabled.contains(&LibraryAction::CheckVersion) {
+        offered.push(CHECK_VERSION_ACTION);
     }
     if edits {
         offered.extend([

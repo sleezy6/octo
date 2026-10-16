@@ -328,6 +328,18 @@ pub fn lacks_requested(filename: &str, title: Option<&str>, artist: Option<&str>
         .any(|version| !CUTS.contains(&version.as_str()))
 }
 
+/// Whether the file's own name credits its remix (or mix, dub, edit) to someone the request's
+/// title does not: "Let's Get Lost (Teklife remix)" for "Let's Get Lost [Bear//Face Remix]".
+/// Both must say who made it; a file that only says "Remix" is left to the other checks.
+pub fn other_remixer(filename: &str, title: Option<&str>, artist: Option<&str>) -> bool {
+    let Some(title) = title.filter(|title| !is_blank(title)) else {
+        return false;
+    };
+    let leaf = without_artist(&leaf_title(filename), artist);
+    super::version_gap::version_gap(title, &leaf, super::version_gap::Against::Title)
+        .is_some_and(|gap| gap.other_remixer)
+}
+
 // ---- A shortened cut named plainly, and songs joined into one ----------------------------
 
 /// Whether the request asks for a shortened cut ("(Radio Edit)") the file does not name, and

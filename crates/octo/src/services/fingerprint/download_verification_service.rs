@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use octo_core::common::SongIdentity;
 use octo_core::common::dotnet;
 use octo_core::common::song_versions::strip_versions;
+use octo_core::common::version_gap::{self, Against};
 use octo_core::fingerprint::recording_identity::{self, RecordingFacts, RecordingKind, Takes};
 use octo_core::fingerprint::{
     AcoustIdLookup, AcoustIdRecording, AcoustIdResult, InconclusiveReason, TrackMatchComparer,
@@ -227,6 +228,13 @@ impl DownloadVerificationService {
         };
 
         let verdict = Self::with_tagged_isrc(verdict, isrc.as_deref(), tagged_match);
+        let verdict =
+            if verdict.verdict == VerificationVerdict::Inconclusive && matches!(takes, Takes::Only(_)) {
+                self.with_tagged_recording(verdict, path, requested_title, background)
+                    .await
+            } else {
+                verdict
+            };
         let (artist, title) = (requested_artist.unwrap_or(""), requested_title.unwrap_or(""));
         let isrc_text = isrc.as_deref().unwrap_or("");
         match (&verdict.verdict, &verdict.evidence) {
@@ -270,6 +278,146 @@ impl DownloadVerificationService {
             evidence: Some(format!(
                 "the file's own tags carry the requested ISRC {}",
                 isrc.unwrap_or("")
+            )),
+            ..verdict
+        }
+    }
+
+    /// A download AcoustID could not settle whose own tags name a MusicBrainz recording of the
+    /// same song in another version ("Let's Get Lost (Teklife remix)" in a file asked for as the
+    /// Bear//Face remix) is that other version: a peer's tagger read the audio once, and nothing
+    /// heard since says otherwise. A recording of another song, or one the database does not
+    /// answer for, changes nothing.
+    async fn with_tagged_recording(
+        &self,
+        verdict: VerificationResult,
+        path: &str,
+        requested_title: Option<&str>,
+        background: bool,
+    ) -> VerificationResult {
+        let (Some(music_brainz), Some(requested_title)) = (&self.music_brainz, requested_title) else {
+            return verdict;
+        };
+        let Some(tagged) = tag_writer_extras::read_facts(path, true).recording_id else {
+            return verdict;
+        };
+        let timeout = Duration::from_secs(
+            self.settings
+                .current()
+                .soulseek
+                .effective_acoust_id_timeout_seconds()
+                .max(1) as u64
+                + 2,
+        );
+        let facts =
+            match tokio::time::timeout(timeout, music_brainz.recording_facts(&tagged, background)).await {
+                Ok(Ok(Some(facts))) => facts,
+                _ => return verdict,
+            };
+        Self::settle_by_tagged_recording(verdict, requested_title, &facts)
+    }
+
+    /// [`Self::with_tagged_recording`]'s decision, apart from the I/O.
+    pub fn settle_by_tagged_recording(
+        verdict: VerificationResult,
+        requested_title: &str,
+        tagged: &RecordingFacts,
+    ) -> VerificationResult {
+        if !same_song_any_version(requested_title, &tagged.title) {
+            return verdict;
+        }
+        let Some(gap) = version_gap::version_gap(requested_title, &tagged.title, Against::Recording) else {
+            return verdict;
+        };
+        let kind = recording_identity::kind_of(
+            &AcoustIdRecording::new(
+                &tagged.recording_id,
+                &tagged.title,
+                Vec::<String>::new(),
+                None,
+                None,
+            ),
+            Some(tagged),
+        );
+        VerificationResult {
+            verdict: VerificationVerdict::Mismatch,
+            matched_title: Some(tagged.title.clone()),
+            recording_id: Some(tagged.recording_id.clone()),
+            deny_reason: format!(
+                "is another version by its own tags, '{}': {}",
+                tagged.title,
+                gap.words()
+            ),
+            evidence: Some(format!(
+                "the file's own tags name the MusicBrainz recording '{}'",
+                tagged.title
+            )),
+            kind: Some(kind),
+            ..verdict
+        }
+    }
+
+    /// A file AcoustID names as another artist's song of the same title, at a length well apart
+    /// from the file's, while the file runs exactly the length the request's catalog entry gives:
+    /// AcoustID has tied this sound to the wrong song ("Superstar - Let's Get Lost", 3:55, for
+    /// G-Eazy's Bear//Face remix, 4:02). Kept and asked about rather than thrown away. Any other
+    /// verdict, a recording of another version, or a request of unknown length stays as it was.
+    pub fn settle_stray_link(
+        verdict: VerificationResult,
+        requested_title: &str,
+        expected_seconds: Option<i32>,
+        file_ms: Option<i64>,
+    ) -> VerificationResult {
+        if verdict.verdict != VerificationVerdict::Mismatch
+            || verdict.kind.is_some_and(|kind| kind != RecordingKind::Studio)
+        {
+            return verdict;
+        }
+        let (Some(expected), Some(file_ms)) =
+            (expected_seconds.filter(|s| *s > 0), file_ms.filter(|ms| *ms > 0))
+        else {
+            return verdict;
+        };
+        let Some(named) = verdict.lookup.as_ref().and_then(|lookup| {
+            lookup
+                .results
+                .iter()
+                .flat_map(|result| &result.recordings)
+                .find(|r| {
+                    verdict
+                        .recording_id
+                        .as_deref()
+                        .is_some_and(|id| dotnet::eq_ignore_case(id, &r.recording_id))
+                })
+        }) else {
+            return verdict;
+        };
+        let same_title = SongIdentity::same_title(&strip_versions(requested_title), &named.title, None)
+            .is_same()
+            || SongIdentity::same_title(requested_title, &named.title, None).verdict
+                != octo_core::common::SongVerdict::Different;
+        let Some(named_ms) = named
+            .duration_ms
+            .or_else(|| named.duration_seconds.map(|s| i64::from(s) * 1000))
+            .filter(|ms| *ms > 0)
+        else {
+            return verdict;
+        };
+        let fits_request = (file_ms - i64::from(expected) * 1000).abs() <= STRAY_FITS_MS;
+        let named_apart = (named_ms - file_ms).abs() >= STRAY_APART_MS;
+        if !same_title || !fits_request || !named_apart {
+            return verdict;
+        }
+        VerificationResult {
+            verdict: VerificationVerdict::Inconclusive,
+            reason: InconclusiveReason::SourceDisagreed,
+            deny_reason: String::new(),
+            evidence: Some(format!(
+                "that recording runs {}:{:02} and this file runs the song's own {}:{:02}",
+                named_ms / 60_000,
+                (named_ms / 1000) % 60,
+                expected / 60,
+                expected % 60
             )),
             ..verdict
         }
@@ -807,6 +955,12 @@ fn qualifying(lookup: &AcoustIdLookup, threshold: f64) -> Vec<&AcoustIdResult> {
     qualifying
 }
 
+/// How close a file must run to the request's catalog length for a stray link to be doubted:
+/// whole seconds on the catalog side, so a little over half a second.
+const STRAY_FITS_MS: i64 = 1_500;
+/// How far the linked recording must run from the file for the link to be doubted.
+const STRAY_APART_MS: i64 = 4_000;
+
 /// A link this much weaker than the strongest recording of another song is taken as a stray.
 const STRAY_RATIO: i32 = 20;
 /// The least length gap, in seconds, that counts as a different recording.
@@ -848,8 +1002,9 @@ fn length_off(agreed: &AcoustIdRecording, file_seconds: i32) -> bool {
     (length - file_seconds).abs() > slack
 }
 
-/// The recordings of a result that agree with the request on title and artist and can be
-/// believed (see [`trustworthy`]).
+/// The recordings of a result that agree with the request on title, artist and version and can
+/// be believed (see [`trustworthy`]). A recording of the same song in another version (a remix by
+/// someone else, the plain song for a remix, a sped-up copy) never agrees.
 fn agreeing_in<'a>(
     result: &'a AcoustIdResult,
     requested_artist: &str,
@@ -861,10 +1016,59 @@ fn agreeing_in<'a>(
         .iter()
         .filter(|r| {
             TrackMatchComparer::title_matches(requested_title, &r.title)
+                && !version_gap::other_version(requested_title, &r.title, Against::Recording)
                 && TrackMatchComparer::artist_matches(requested_artist, &r.artist_credit(), &r.artists)
                 && trustworthy(r, result, duration_seconds)
         })
         .collect()
+}
+
+/// A recording of the same song by the same artist in another version than the one asked for,
+/// believed by its links and its length: what the file is when no recording of the asked
+/// version agreed. The one most submissions tie the audio to, the first listed on a tie.
+fn other_version_in<'a>(
+    result: &'a AcoustIdResult,
+    requested_artist: &str,
+    requested_title: &str,
+    duration_seconds: i32,
+) -> Option<&'a AcoustIdRecording> {
+    result
+        .recordings
+        .iter()
+        .rev()
+        .filter(|r| {
+            same_song_any_version(requested_title, &r.title)
+                && version_gap::other_version(requested_title, &r.title, Against::Recording)
+                && TrackMatchComparer::artist_matches(requested_artist, &r.artist_credit(), &r.artists)
+                && trustworthy(r, result, duration_seconds)
+        })
+        .max_by_key(|r| r.sources)
+}
+
+/// Whether two titles name one song, whatever version each is.
+fn same_song_any_version(requested: &str, matched: &str) -> bool {
+    SongIdentity::same_title(requested, matched, None).verdict != octo_core::common::SongVerdict::Different
+}
+
+/// A take the request's title asks for that the chosen recording is not, when MusicBrainz was
+/// asked what that recording is: "Song (Live)" against a recording the database knows only as
+/// the studio take. Without the database's word nothing is said, since a live take's title often
+/// leaves the word out.
+fn asked_take_missing(
+    asked: &std::collections::BTreeSet<RecordingKind>,
+    kind: RecordingKind,
+    recording: &AcoustIdRecording,
+    facts: &FactsById,
+) -> Option<RecordingKind> {
+    if asked.contains(&kind) || !facts.contains_key(&dotnet::to_lower_invariant(&recording.recording_id)) {
+        return None;
+    }
+    asked.iter().copied().find(|wanted| {
+        matches!(
+            wanted,
+            RecordingKind::Live | RecordingKind::Demo | RecordingKind::Cover | RecordingKind::Acapella
+        ) && *wanted != kind
+    })
 }
 
 /// The kind of take a recording is, with what MusicBrainz said about it when it was asked.
@@ -937,6 +1141,23 @@ fn decide_core(
     {
         // The right song and artist, but a take the request never asked for: the same title and
         // nearly the same length, so only its exact length and what it is on tell it apart.
+        if let Some(missing) = asked_take_missing(&asked, kind, agreed, facts) {
+            return VerificationResult {
+                verdict: VerificationVerdict::Mismatch,
+                score: best.score,
+                matched_title: Some(agreed.title.clone()),
+                matched_artist: Some(agreed.artist_credit()),
+                matched_album: recording_album(agreed, kind),
+                matched_year: agreed.year,
+                recording_id: Some(agreed.recording_id.clone()),
+                deny_reason: format!("is {}, not {} asked for", kind.described(), missing.described()),
+                kind: Some(kind),
+                by_length,
+                kind_certain,
+                sole,
+                ..Default::default()
+            };
+        }
         if takes.refuses(kind) {
             let album = recording_album(agreed, kind);
             return VerificationResult {
@@ -971,6 +1192,7 @@ fn decide_core(
     // different cut, and the requested song is never named as another one.
     if let Some(doubted) = best.recordings.iter().find(|r| {
         TrackMatchComparer::title_matches(requested_title, &r.title)
+            && !version_gap::other_version(requested_title, &r.title, Against::Recording)
             && TrackMatchComparer::artist_matches(requested_artist, &r.artist_credit(), &r.artists)
             && !is_stray(r, best)
     }) {
@@ -984,6 +1206,30 @@ fn decide_core(
             matched_year: doubted.year,
             recording_id: Some(doubted.recording_id.clone()),
             r#match: Some(doubted.clone()),
+            ..Default::default()
+        };
+    }
+
+    // The same song in another version: never the file asked for, however alike the rest reads.
+    if let Some(other) = other_version_in(best, requested_artist, requested_title, duration_seconds) {
+        let kind = kind_with(other, facts);
+        let gap = version_gap::version_gap(requested_title, &other.title, Against::Recording)
+            .map(|gap| gap.words())
+            .unwrap_or_default();
+        return VerificationResult {
+            verdict: VerificationVerdict::Mismatch,
+            score: best.score,
+            matched_title: Some(other.title.clone()),
+            matched_artist: Some(other.artist_credit()),
+            matched_album: recording_album(other, kind),
+            matched_year: other.year,
+            recording_id: Some(other.recording_id.clone()),
+            deny_reason: format!(
+                "is another version, '{} - {}': {gap}",
+                other.artist_credit(),
+                other.title
+            ),
+            kind: Some(kind),
             ..Default::default()
         };
     }

@@ -1544,3 +1544,75 @@ fn find_songs_gives_the_same_name_verdict_as_the_download() {
         vec![run_together]
     );
 }
+
+// ---- A remix by someone else is never the remix asked for -----------------------------------
+
+/// The five copies the 2026-10-13 search for the Bear//Face remix found, as the peers named them.
+fn lost_hits() -> Vec<SoulseekFileHit> {
+    vec![
+        hit(
+            "bear-ep",
+            "G\u{2010}Eazy/Let's Get Lost Remixes (2015) (EP)/02 - G\u{2010}Eazy - Let's Get Lost (Bear++Face remix).flac",
+            242,
+            "flac",
+            0,
+        ),
+        hit(
+            "teklife",
+            "G\u{2010}Eazy/Let's Get Lost Remixes (2015) (EP)/04 - G\u{2010}Eazy - Let's Get Lost (Teklife remix).flac",
+            269,
+            "flac",
+            0,
+        ),
+        hit(
+            "funkin",
+            "G\u{2010}Eazy/Let's Get Lost Remixes (2015) (EP)/03 - G\u{2010}Eazy - Let's Get Lost (Funkin Matt remix).flac",
+            273,
+            "flac",
+            0,
+        ),
+        hit(
+            "futon",
+            "G\u{2010}Eazy/Let's Get Lost Remixes (2015) (EP)/01 - G\u{2010}Eazy - Let's Get Lost (Louis Futon remix).flac",
+            267,
+            "flac",
+            0,
+        ),
+        hit(
+            "bear",
+            "G\u{2010}Eazy/Let's Get Lost Remixes (2015)/02 - Let's Get Lost (Bear++Face remix).flac",
+            242,
+            "flac",
+            0,
+        ),
+    ]
+}
+
+#[test]
+fn only_the_bear_face_copies_are_tried_for_the_bear_face_remix_even_with_no_length() {
+    let title = "Let's Get Lost (feat. Devon Baldwin) [Bear//Face Remix]";
+    let album = Some("Let's Get Lost Remixes (feat. Devon Baldwin) - EP");
+    for seconds in [None, Some(242)] {
+        let ranked = rank_all(&lost_hits(), &want(title, seconds, album, Some("G-Eazy")));
+        assert_eq!(users(&ranked), ["bear-ep", "bear"], "length {seconds:?}");
+    }
+    assert!(version_variant::other_remixer(
+        "04 - G\u{2010}Eazy - Let's Get Lost (Teklife remix).flac",
+        Some(title),
+        Some("G-Eazy")
+    ));
+    let settings = SoulseekSettings::default();
+    let judged = soulseek_candidates::why_not(
+        &lost_hits()[1],
+        Judged {
+            title,
+            album,
+            duration: None,
+            settings: &settings,
+            rejected: None,
+            remembers_rejections: false,
+            artist: Some("G-Eazy"),
+        },
+    );
+    assert_eq!(judged.as_deref(), Some("A remix by someone else"));
+}

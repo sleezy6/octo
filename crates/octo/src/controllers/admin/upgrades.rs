@@ -10,6 +10,8 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::common::dotnet::{eq_ignore_case, ordinal_ignore_case_key, to_lower_invariant};
+use octo_core::fingerprint::check_line::{CheckedMatch, checked_match};
+use octo_core::models::download::acquisition_event::acquisition_event_kinds;
 use octo_core::settings::LibraryAction;
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -25,8 +27,11 @@ use crate::http::error::validation_problem;
 use crate::http::routes::RouteSet;
 use crate::services::common::acquisition_tracker::AcquisitionSnapshot;
 use crate::services::library::duplicate_scan_worker::is_lossless_file;
+use crate::services::library::library_identity_sweep::CheckedSong;
 use crate::services::library::quality_upgrade_worker::{LibrarySongRow, QualityUpgradeWorker};
-use crate::services::library::upgrade_queue::{UpgradeAsk, UpgradeJob, UpgradeResult, UpgradeStates};
+use crate::services::library::upgrade_queue::{
+    UpgradeAsk, UpgradeJob, UpgradeQueue, UpgradeResult, UpgradeStates,
+};
 use crate::services::library::upgrade_sources::UpgradeSources;
 use crate::services::soulseek::ISoulseekLink;
 
@@ -55,9 +60,35 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// A file Octo fetched, as its fetched-songs entry remembers it.
+struct Fetched {
+    path: String,
+    from_you_tube: bool,
+    /// What AcoustID said of the file when the download checked it.
+    checked: Option<CheckedMatch>,
+}
+
+/// How sure Octo is that a song is the recording its tags name: from the download's own AcoustID
+/// check (with its score), else from the library tag check, else not checked.
+fn match_json(checked: Option<CheckedMatch>, swept: Option<&CheckedSong>) -> Value {
+    let word = |sure: bool| if sure { "sure" } else { "unsure" };
+    if let Some(checked) = checked {
+        return json!({ "state": word(checked.sure), "score": checked.score, "by": "download" });
+    }
+    match swept.filter(|song| !song.retry && song.checked_utc.is_some()) {
+        Some(song) => json!({
+            "state": word(song.sure && song.recording_id.is_some()),
+            "score": null,
+            "by": "tagCheck",
+        }),
+        None => json!({ "state": "unchecked", "score": null, "by": null }),
+    }
+}
+
 /// The Better quality page's list: every song in the library that is not lossless, with whether
-/// Octo got it from YouTube, when the weekly upgrade last tried it, and any job for it now.
-/// Session-gated, because it lists paths.
+/// Octo got it from YouTube, how sure the AcoustID match is, when it was added, its genres, when
+/// the weekly upgrade last tried it, and any job for it now. Session-gated, because it lists
+/// paths.
 async fn get_lossy(State(state): State<AppState>, request: Request) -> Response {
     let (parts, _) = request.into_parts();
     let browse = browse_user(&state, &parts);
@@ -94,17 +125,33 @@ async fn get_lossy(State(state): State<AppState>, request: Request) -> Response 
         *LOSSY_CACHE.lock() = Some((Utc::now(), rows.clone()));
     }
 
-    // Octo's own record of what it fetched from YouTube, matched by file name, then by path.
-    let mut you_tube: HashMap<String, Vec<String>> = HashMap::new();
+    // Octo's own record of what it fetched, newest first, matched by file name, then by path:
+    // whether it came from YouTube, and what AcoustID said of it.
+    let mut fetched: HashMap<String, Vec<Fetched>> = HashMap::new();
     for entry in state.download_history.get_recent(i32::MAX) {
-        if !eq_ignore_case(&entry.source, "YouTube") || entry.path.is_empty() {
+        if entry.path.is_empty() {
+            continue;
+        }
+        let from_you_tube = eq_ignore_case(&entry.source, "YouTube");
+        let checked = entry
+            .log
+            .iter()
+            .flatten()
+            .rev()
+            .filter(|line| line.kind == acquisition_event_kinds::CHECK)
+            .find_map(|line| line.detail.as_deref().and_then(checked_match));
+        if !from_you_tube && checked.is_none() {
             continue;
         }
         let path = entry.path.replace('\\', "/");
-        you_tube
+        fetched
             .entry(ordinal_ignore_case_key(file_name(&path)))
             .or_default()
-            .push(path);
+            .push(Fetched {
+                path,
+                from_you_tube,
+                checked,
+            });
     }
     let tried = state.quality_upgrade_worker.tried().attempts;
     // Keyed by Navidrome id: ids are unique in the queue.
@@ -115,35 +162,49 @@ async fn get_lossy(State(state): State<AppState>, request: Request) -> Response 
         .map(|job| (job.navidrome_id.clone(), job))
         .collect();
 
-    let songs: Vec<Value> = rows
-        .iter()
-        .map(|row| {
-            let key = QualityUpgradeWorker::key_of(row);
-            let relative = &key[..key.rfind('|').unwrap_or(key.len())];
-            let from_you_tube = you_tube
-                .get(&ordinal_ignore_case_key(file_name(relative)))
-                .is_some_and(|named| {
-                    named.iter().any(|path| {
-                        ends_with_ignore_case(path, &format!("/{relative}")) || path == relative
+    let songs: Vec<Value> = state.identity_sweep_store.read(|sweep| {
+        rows.iter()
+            .map(|row| {
+                let key = QualityUpgradeWorker::key_of(row);
+                let relative = &key[..key.rfind('|').unwrap_or(key.len())];
+                let own: Vec<&Fetched> = fetched
+                    .get(&ordinal_ignore_case_key(file_name(relative)))
+                    .map(|named| {
+                        named
+                            .iter()
+                            .filter(|f| ends_with_ignore_case(&f.path, &format!("/{relative}")) || f.path == relative)
+                            .collect()
                     })
-                });
-            json!({
-                "id": row.id,
-                "title": row.title,
-                "artist": row.artist,
-                "album": row.album,
-                "suffix": row.suffix,
-                "bitRate": row.bit_rate,
-                "size": row.size,
-                "path": relative,
-                "fromYouTube": from_you_tube,
-                "attemptKey": key,
-                "lastTried": tried.get(&key).map(|a| json!({ "atUtc": utc(&a.at_utc), "outcome": a.outcome })),
-                "job": jobs.get(&row.id).map(|j| json!({ "state": j.state, "detail": j.detail })),
+                    .unwrap_or_default();
+                let from_you_tube = own.iter().any(|f| f.from_you_tube);
+                let checked = own.iter().find_map(|f| f.checked);
+                json!({
+                    "id": row.id,
+                    "title": row.title,
+                    "artist": row.artist,
+                    "album": row.album,
+                    "suffix": row.suffix,
+                    "bitRate": row.bit_rate,
+                    "size": row.size,
+                    "path": relative,
+                    "fromYouTube": from_you_tube,
+                    "attemptKey": key,
+                    "lastTried": tried.get(&key).map(|a| json!({ "atUtc": utc(&a.at_utc), "outcome": a.outcome })),
+                    "job": jobs.get(&row.id).map(|j| json!({ "state": j.state, "detail": j.detail })),
+                    "added": utc_opt(&row.added_utc),
+                    "genres": row.genres,
+                    "year": row.year,
+                    "match": match_json(checked, sweep.songs.get(&row.id)),
+                })
             })
-        })
-        .collect();
-    browse.finish(ok(&json!({ "total": rows.len(), "songs": songs })))
+            .collect()
+    });
+    browse.finish(ok(&json!({
+        "total": rows.len(),
+        "songs": songs,
+        // How many one press may send, and how many may wait in the queue at once.
+        "limits": { "perPress": MAX_UPGRADES_PER_REQUEST, "openJobs": UpgradeQueue::MAX_OPEN_JOBS },
+    })))
 }
 
 /// Whether `text` ends with `suffix`, ignoring case.

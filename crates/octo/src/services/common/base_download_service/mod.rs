@@ -641,7 +641,9 @@ impl BaseDownloadService {
                     .zip(pool_members.as_ref().and_then(|members| members.first()))
                     .and_then(|(family, first)| family.link_path_for(&existing, first))
                     .unwrap_or_else(|| existing.clone());
-                self.track(|t| t.imported(external_provider, external_id, None, None, Some(&shown)));
+                self.track(|t| {
+                    t.already_in_library(external_provider, external_id, None, None, Some(&shown))
+                });
                 return Ok(existing);
             }
         } else if is_cache
@@ -786,7 +788,7 @@ impl BaseDownloadService {
                 )
             });
             self.track(|t| {
-                t.imported(
+                t.already_in_library(
                     external_provider,
                     external_id,
                     Some(&song.artist),
@@ -831,7 +833,7 @@ impl BaseDownloadService {
                 .and_then(|first| family.link_path_for(&path, first))
                 .unwrap_or_else(|| path.clone());
             self.track(|t| {
-                t.imported(
+                t.already_in_library(
                     external_provider,
                     external_id,
                     Some(&song.artist),
@@ -1370,7 +1372,7 @@ impl BaseDownloadService {
                     kept += 1;
                 }
                 self.track(|t| {
-                    t.imported(
+                    t.already_in_library(
                         &provider,
                         external_id_of(track),
                         Some(&track.artist),
@@ -1484,7 +1486,7 @@ impl BaseDownloadService {
             {
                 debug!("Track {track_id} already downloaded, skipping");
                 self.track(|t| {
-                    t.imported(
+                    t.already_in_library(
                         provider,
                         track_id,
                         Some(&track.artist),
@@ -1505,7 +1507,7 @@ impl BaseDownloadService {
                 if active.status == DownloadStatus::Completed {
                     debug!("Track {track_id} already downloaded in this session, skipping");
                     self.track(|t| {
-                        t.imported(
+                        t.already_in_library(
                             provider,
                             track_id,
                             Some(&track.artist),

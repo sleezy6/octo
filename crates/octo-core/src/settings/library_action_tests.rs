@@ -69,7 +69,7 @@ fn effective_actions_back_fills_every_action_and_keeps_configured_names() {
 
     let actions = settings.effective_actions();
 
-    assert_eq!(actions.len(), 8);
+    assert_eq!(actions.len(), 9);
     let delete = find(&actions, LibraryAction::Delete);
     assert_eq!(delete.name, "Bin it");
     assert!(delete.enabled);
@@ -94,8 +94,8 @@ fn effective_actions_drops_a_duplicate_effective_title() {
         ..Default::default()
     };
 
-    // Eight actions, less the one whose title repeats.
-    assert_eq!(settings.effective_actions().len(), 7);
+    // Nine actions, less the one whose title repeats.
+    assert_eq!(settings.effective_actions().len(), 8);
 }
 
 #[test]
@@ -417,7 +417,8 @@ fn library_action_indexes_match_the_journal_numbers() {
     assert_eq!(LibraryAction::from_index(5), Some(LibraryAction::WrongLyrics));
     assert_eq!(LibraryAction::from_index(6), Some(LibraryAction::WrongCover));
     assert_eq!(LibraryAction::from_index(7), Some(LibraryAction::FixDuplicates));
-    assert_eq!(LibraryAction::from_index(8), None);
+    assert_eq!(LibraryAction::from_index(8), Some(LibraryAction::CheckVersion));
+    assert_eq!(LibraryAction::from_index(9), None);
     assert_eq!(LibraryAction::from_index(-1), None);
 }
 

@@ -38,6 +38,7 @@ mod state_dictionary;
 pub mod tidy;
 pub mod upgrade_queue;
 pub mod upgrade_sources;
+pub mod version_check;
 
 #[cfg(test)]
 mod library_action_keep_file_tests;

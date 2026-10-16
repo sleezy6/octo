@@ -429,10 +429,8 @@ pub async fn refresh_last_fm_radio(
     accepted(&json!({ "ok": true, "queued": queued }))
 }
 
-/// `DELETE /api/admin/lastfm/radio/history?user=`: forgets a listener's plays and stations, and
-/// what radio learned about which sources they keep. The listener then starts from nothing:
-/// no starting profile is learned again from their stars.
-/// `user` is required: missing or empty, it is the 400 validation problem.
+/// `DELETE /api/admin/lastfm/radio/history?user=`: forgets a listener's plays and stations,
+/// and the radio source outcomes counted for them. `user` is required: missing or empty, it is the 400 validation problem.
 pub async fn reset_last_fm_radio(State(state): State<AppState>, RawQuery(query): RawQuery) -> Response {
     let Some(user) = query_value(query.as_deref(), "user") else {
         return validation_problem(&[("user", &["The user field is required."])]);
@@ -443,17 +441,12 @@ pub async fn reset_last_fm_radio(State(state): State<AppState>, RawQuery(query):
     let radio = &state.last_fm_radio_state;
     let before = radio.get_user(&user);
     let removed = radio.reset(&user);
-    // What radio learned about the sources this listener keeps is history too.
     state.radio_outcomes.forget_listener(&user);
     ok(&json!({
         "ok": removed,
         "user": user,
         "removedPlays": if removed { before.plays.len() } else { 0 },
         "removedStations": if removed { before.stations.len() } else { 0 },
-        "message": if removed {
-            "Radio history and generated snapshots were removed. Radio starts over from what this listener plays next. Downloaded music was untouched."
-        } else {
-            "This listener has no radio history to remove."
-        },
+        "message": "Radio history and generated snapshots were removed. Downloaded music was untouched.",
     }))
 }

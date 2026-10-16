@@ -28,6 +28,7 @@
 //! pool folder without it is taken for an empty mount point where the members disk should be:
 //! no record is forgotten and no member download is placed there until it is back.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
@@ -499,27 +500,31 @@ impl Places {
 
     /// A member's own folder.
     fn member_root(&self, name: &str) -> String {
-        format!("{}/{}", self.members, folder_name(name))
+        format!("{}/{}", self.members, folder_of(name))
     }
 
     /// Where `name`'s library has the pool file at `relative`.
     fn under(&self, name: &str, relative: &str) -> String {
-        format!("{}/{}/{relative}", self.members, folder_name(name))
+        format!("{}/{}/{relative}", self.members, folder_of(name))
     }
 }
 
-/// The name of a member's own folder: their username in lower case. A member made in Octo has a
-/// lower-case username already. One brought in from an existing Navidrome account keeps that
-/// account's spelling ("Richard"), while the folder made for them, and the library Navidrome
-/// reads, is the lower-case one ("richard"); on a file system that tells the two apart, every
-/// path to their library has to be built from this.
-pub fn folder_name(username: &str) -> String {
-    username.trim().to_lowercase()
+/// The folder a member's library lives in. Adding a member makes it from the lower-case
+/// username, while a member who joined with an existing Navidrome account keeps that account's
+/// spelling ("Jamie"). Every path to a member's folder goes through here. A name with no capital
+/// letter, which is every member Octo created itself, is borrowed as it is.
+fn folder_of(name: &str) -> Cow<'_, str> {
+    let name = name.trim();
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    }
 }
 
-/// Whether a member's folder name is one plain folder name (see [`valid_username`]).
-fn valid_folder(username: &str) -> bool {
-    valid_username(&folder_name(username))
+/// Whether `name`'s folder is one plain folder name (see [`valid_username`]).
+fn has_valid_folder(name: &str) -> bool {
+    valid_username(&folder_of(name))
 }
 
 /// The family pool. See the module comment.
@@ -710,9 +715,9 @@ impl FamilyPool {
             .unwrap_or_else(|| user.trim().to_string())
     }
 
-    /// A member's own folder, `<members>/<user>` (their name as Octo keeps it).
+    /// A member's own folder, `<members>/<user>`, named as [`folder_of`] says.
     pub fn member_root(&self, user: &str) -> String {
-        format!("{}/{}", self.members_root(), folder_name(&self.member_name(user)))
+        format!("{}/{}", self.members_root(), folder_of(&self.member_name(user)))
     }
 
     /// A pool file's path inside the pool (`Artist/Album/01 Song.flac`).
@@ -1038,7 +1043,7 @@ impl FamilyPool {
     fn member_named(&self, user: &str) -> Result<Member, PoolError> {
         self.family
             .member(user)
-            .filter(|member| valid_folder(&member.username))
+            .filter(|member| has_valid_folder(&member.username))
             .ok_or_else(|| PoolError::NotMember(user.to_string()))
     }
 
@@ -1160,7 +1165,7 @@ impl FamilyPool {
     async fn let_go_now(&self, pool_path: &str, name: &str) {
         let name = name.to_string();
         let _claim = self.claims.claim(&[pool_path]).await;
-        if valid_folder(&name) {
+        if has_valid_folder(&name) {
             self.remove_link_claimed(pool_path, &name).await;
         }
         let left = {
@@ -1320,7 +1325,7 @@ impl FamilyPool {
             .members()
             .into_iter()
             .map(|member| member.username)
-            .filter(|name| valid_folder(name))
+            .filter(|name| has_valid_folder(name))
             .collect();
         let (places, path, quarantine) = (self.places(), pool_path.to_string(), Arc::clone(&self.quarantine));
         let outcome = on_disk(move || trash_unless_linked(&places, &names, &path, &quarantine)).await;

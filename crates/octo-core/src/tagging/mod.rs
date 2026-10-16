@@ -19,6 +19,7 @@ pub mod tag_evidence;
 pub mod tag_guard;
 pub mod tag_plan;
 pub mod tag_preview;
+pub mod version_audit;
 
 pub use album_tag_context::{AlbumTagContext, SettledRelease};
 pub use candidate_sources::CandidateSources;

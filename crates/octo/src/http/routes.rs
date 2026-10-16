@@ -24,7 +24,8 @@ use crate::app::AppState;
 /// HEAD: axum answers HEAD with a route's GET handler, while a GET route of Octo's does not
 /// match HEAD at all, so `HEAD /api/admin/settings` reaches the catch-all. [`RouteSet::route`]
 /// therefore sends HEAD to the catch-all; the few endpoints that do answer HEAD (static files,
-/// `radio/stream/{token}`) register with [`RouteSet::route_with_head`]. Don't put a `.head(..)`
+/// `radio/stream/{token}`, `rest/stream`, `rest/download`) register with
+/// [`RouteSet::route_with_head`]. Don't put a `.head(..)`
 /// on a router given to `route`: the catch-all's HEAD would overlap it (a panic at startup).
 pub struct RouteSet {
     routes: Vec<(String, MethodRouter<AppState>, bool)>,

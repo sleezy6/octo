@@ -58,10 +58,23 @@ pub struct WaitingStar {
     pub starred_at: DateTime<Utc>,
 }
 
+/// An outside song a heart made a favorite: the id it was hearted by, and the library's copy
+/// that is now the favorite.
+#[derive(Debug, Clone)]
+struct Landed {
+    song_id: String,
+    library_id: String,
+    who: String,
+    at: DateTime<Utc>,
+}
+
 #[derive(Default)]
 struct Holds {
     songs: Vec<Hold>,
     albums: Vec<Hold>,
+    /// Hearted outside songs whose library copy Octo made the favorite, so the id the app
+    /// hearted keeps reading as a favorite, and can take it back.
+    landed: Vec<Landed>,
 }
 
 /// The test seams, and how long a landed song is watched for in Navidrome.
@@ -220,6 +233,88 @@ impl StarOnArrival {
         !self.holds.lock().songs.is_empty()
     }
 
+    /// Whether a download that lands is made the favorite of whoever hearted it
+    /// (`StarDownloadsForRequester`).
+    pub fn favorites_downloads(&self) -> bool {
+        self.settings.current().subsonic.star_downloads_for_requester
+    }
+
+    /// Whether anyone has an outside song that reads as their favorite: one waiting that will be
+    /// a favorite when it lands, or one whose library copy already is.
+    pub fn marks_anyone(&self) -> bool {
+        let holds = self.holds.lock();
+        !holds.landed.is_empty()
+            || (self.favorites_downloads() && holds.songs.iter().any(|hold| hold.song_id.is_some()))
+    }
+
+    /// The outside song ids that read as favorites for the person filed as `who`, with when they
+    /// were hearted: the hearts waiting to become favorites ([`Self::waiting_songs`]) and the
+    /// songs whose library copy a heart already made the favorite.
+    pub fn marks(&self, who: &str) -> Vec<(String, DateTime<Utc>)> {
+        let mut marks: Vec<(String, DateTime<Utc>)> = self
+            .waiting_songs(who)
+            .into_iter()
+            .map(|waiting| (waiting.song_id, waiting.starred_at))
+            .collect();
+        let now = self.now();
+        let mut holds = self.holds.lock();
+        prune(&mut holds, now);
+        for landed in holds.landed.iter().filter(|l| eq_ignore_case(&l.who, who)) {
+            if !marks.iter().any(|(id, _)| *id == landed.song_id) {
+                marks.push((landed.song_id.clone(), landed.at));
+            }
+        }
+        marks
+    }
+
+    /// The library copy of the outside song `song_id` that a heart made the favorite of the
+    /// person filed as `who`.
+    pub fn landed_copy(&self, song_id: &str, who: &str) -> Option<String> {
+        let now = self.now();
+        let mut holds = self.holds.lock();
+        prune(&mut holds, now);
+        holds
+            .landed
+            .iter()
+            .rev()
+            .find(|l| l.song_id == song_id && eq_ignore_case(&l.who, who))
+            .map(|l| l.library_id.clone())
+    }
+
+    /// Whether any outside song has a library copy a heart made the favorite.
+    pub fn has_landed(&self) -> bool {
+        !self.holds.lock().landed.is_empty()
+    }
+
+    /// Notes that the library copy `library_id` of the outside song `song_id` is now the favorite
+    /// of the person filed as `who`.
+    pub fn remember_landed(&self, song_id: &str, library_id: &str, who: &str) {
+        if dotnet::is_blank(song_id) || dotnet::is_blank(library_id) || song_id == library_id {
+            return;
+        }
+        let now = self.now();
+        let mut holds = self.holds.lock();
+        prune(&mut holds, now);
+        holds
+            .landed
+            .retain(|l| !(l.song_id == song_id && eq_ignore_case(&l.who, who)));
+        holds.landed.push(Landed {
+            song_id: song_id.to_string(),
+            library_id: library_id.to_string(),
+            who: who.to_string(),
+            at: now,
+        });
+        let over = holds.landed.len().saturating_sub(AcquisitionTracker::CAPACITY);
+        holds.landed.drain(..over);
+    }
+
+    /// Forgets the favorites `who` took back, named by the outside id or the library id.
+    pub fn forget_landed(&self, ids: &[&str], who: &str) {
+        self.holds.lock().landed.retain(|l| {
+            !(eq_ignore_case(&l.who, who) && ids.iter().any(|id| *id == l.song_id || *id == l.library_id))
+        });
+    }
+
     /// Whether anyone's star waits on this song.
     pub fn holds_song(&self, provider: &str, external_id: &str) -> bool {
         let key = acquisition_tracker::key_of(provider, external_id);
@@ -227,8 +322,12 @@ impl StarOnArrival {
     }
 
     /// The starred songs still waiting for their download for the person filed as `who`
-    /// ([`Self::holder_name`]), oldest first.
+    /// ([`Self::holder_name`]), oldest first. None while a download that lands is not made a
+    /// favorite: such a heart only fetches the song, so it is not listed as one.
     pub fn waiting_songs(&self, who: &str) -> Vec<WaitingStar> {
+        if !self.favorites_downloads() {
+            return Vec::new();
+        }
         let now = self.now();
         let mut holds = self.holds.lock();
         prune(&mut holds, now);
@@ -329,22 +428,30 @@ impl StarOnArrival {
         if songs.len() + albums.len() == 0 {
             return;
         }
+        // A file that was already in the library is a heart on a song you have, which is always
+        // a favorite; a download is one only when the setting says so.
+        if !end.already_there && !self.favorites_downloads() {
+            return;
+        }
         let Some(library_id) = end.library_id.clone() else {
-            if end.done {
-                for hold in &songs {
-                    info!(
-                        "'{} - {}' is in the folder but Navidrome did not show it, so it was not favorited for {}",
-                        end.artist.as_deref().unwrap_or_default(),
-                        end.title.as_deref().unwrap_or_default(),
+            if !end.done {
+                return;
+            }
+            let path = end.path.clone().filter(|p| !dotnet::is_blank(p));
+            let artist = end.artist.clone().unwrap_or_default();
+            let title = end.title.clone().unwrap_or_default();
+            for hold in songs {
+                match &path {
+                    // Navidrome is slower than the row's own watch: the favorite keeps looking.
+                    Some(path) => self.watch_then_star(hold, artist.clone(), title.clone(), path.clone()),
+                    None => info!(
+                        "'{artist} - {title}' is in the folder but Navidrome did not show it, so it was not favorited for {}",
                         hold.who
-                    );
+                    ),
                 }
             }
             return;
         };
-        if !self.settings.current().subsonic.star_downloads_for_requester {
-            return;
-        }
         // Off whatever reported the end, and carrying no request's context, so a call made as
         // one person can never pick up another request's parameters.
         let stars = Arc::clone(self);
@@ -359,7 +466,8 @@ impl StarOnArrival {
                 self.star_own_copy(Arc::clone(copies), hold, link);
                 continue;
             }
-            self.star_song(&hold.credential, &hold.who, &library_id).await;
+            self.star_song(&hold.credential, &hold.who, &library_id, hold.song_id.as_deref())
+                .await;
         }
         for hold in &albums {
             let attempt: anyhow::Result<()> = async {
@@ -398,7 +506,11 @@ impl StarOnArrival {
         let stars = Arc::clone(self);
         spawn(async move {
             match copies.own_song_at(&hold.who, &link).await {
-                Some(id) => stars.star_song(&hold.credential, &hold.who, &id).await,
+                Some(id) => {
+                    stars
+                        .star_song(&hold.credential, &hold.who, &id, hold.song_id.as_deref())
+                        .await
+                }
                 None => info!(
                     "{link} never showed in the library of {}, so it was not favorited for them",
                     hold.who
@@ -430,9 +542,13 @@ impl StarOnArrival {
                 Some(library_id) => {
                     let stars = Arc::clone(self);
                     let library_id = library_id.to_string();
-                    spawn(async move { stars.star_song(&hold.credential, &hold.who, &library_id).await });
+                    spawn(async move {
+                        stars
+                            .star_song(&hold.credential, &hold.who, &library_id, hold.song_id.as_deref())
+                            .await
+                    });
                 }
-                None => self.star_when_visible(&hold.credential, &hold.who, artist, title, path),
+                None => self.watch_then_star(hold, artist.to_string(), title.to_string(), path.to_string()),
             }
         }
         true
@@ -482,14 +598,25 @@ impl StarOnArrival {
         title: &str,
         path: &str,
     ) {
+        let hold = Hold {
+            key: String::new(),
+            song_id: None,
+            credential: credential.clone(),
+            who: who.to_string(),
+            held_at: self.now(),
+        };
+        self.watch_then_star(hold, artist.to_string(), title.to_string(), path.to_string());
+    }
+
+    /// [`Self::star_when_visible`] for a held heart, which keeps the id it was hearted by.
+    fn watch_then_star(self: &Arc<Self>, hold: Hold, artist: String, title: String, path: String) {
         let stars = Arc::clone(self);
-        let (credential, who, artist, title, path) = (
-            credential.clone(),
-            who.to_string(),
-            artist.to_string(),
-            title.to_string(),
-            path.to_string(),
-        );
+        let Hold {
+            credential,
+            who,
+            song_id,
+            ..
+        } = hold;
         spawn(async move {
             let seams = stars.seams.lock().clone();
             let Some(lookup) = seams.library_lookup.or_else(|| stars.resolve_lookup()) else {
@@ -509,7 +636,7 @@ impl StarOnArrival {
                         None
                     });
                 if let Some(id) = id.filter(|i| !dotnet::is_blank(i)) {
-                    stars.star_song(&credential, &who, &id).await;
+                    stars.star_song(&credential, &who, &id, song_id.as_deref()).await;
                     return;
                 }
             }
@@ -517,24 +644,37 @@ impl StarOnArrival {
         });
     }
 
-    async fn star_song(&self, credential: &SubsonicCredential, who: &str, library_id: &str) {
-        let attempt: anyhow::Result<()> = async {
+    /// Favorites the library song `library_id` for `who`. With `song_id`, the outside id it was
+    /// hearted by, that id reads as the favorite from then on ([`Self::marks`]).
+    async fn star_song(
+        &self,
+        credential: &SubsonicCredential,
+        who: &str,
+        library_id: &str,
+        song_id: Option<&str>,
+    ) {
+        let attempt: anyhow::Result<bool> = async {
             // Already a favorite: starring again would only move it to the top of the list.
             let body = self
                 .call("rest/getSong", credential.parameters(&[("id", library_id)]))
                 .await?;
             if song_facts(&body)?.is_some_and(|facts| facts.starred) {
-                return Ok(());
+                return Ok(true);
             }
             let body = self
                 .call("rest/star", credential.parameters(&[("id", library_id)]))
                 .await?;
-            report(&body, who, library_id);
-            Ok(())
+            Ok(report(&body, who, library_id))
         }
         .await;
-        if let Err(e) = attempt {
-            info!("Could not favorite {library_id} for {who}: {e}");
+        match attempt {
+            Ok(true) => {
+                if let Some(song_id) = song_id {
+                    self.remember_landed(song_id, library_id, who);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => info!("Could not favorite {library_id} for {who}: {e}"),
         }
     }
 
@@ -585,12 +725,15 @@ impl Drop for StarOnArrival {
     }
 }
 
-fn report(body: &[u8], who: &str, what: &str) {
+/// Logs Navidrome's answer to a favorite; true when it took it.
+fn report(body: &[u8], who: &str, what: &str) -> bool {
     if CredentialCheck::status(body).as_deref() == Some("ok") {
         info!("Favorited {what} for {who}, who starred it");
+        true
     } else {
         // Most likely the password changed while the download ran.
         info!("Navidrome would not favorite {what} for {who}");
+        false
     }
 }
 
@@ -635,6 +778,9 @@ fn prune(holds: &mut Holds, now: DateTime<Utc>) {
     holds
         .albums
         .retain(|hold| now - hold.held_at < AcquisitionTracker::STALLED_RETENTION);
+    holds
+        .landed
+        .retain(|landed| now - landed.at < AcquisitionTracker::STALLED_RETENTION);
 }
 
 fn take(holds: &mut Vec<Hold>, matches: impl Fn(&Hold) -> bool) -> Vec<Hold> {

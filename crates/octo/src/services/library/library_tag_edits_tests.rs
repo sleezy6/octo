@@ -469,3 +469,160 @@ fn the_journal_is_bounded_and_an_in_memory_one_always_keeps() {
     assert_eq!(recent.last().map(|e| e.id.as_str()), Some("5"));
     assert!(journal.flush());
 }
+
+/// A FLAC whose album artist is `own`, written again under the other names given.
+fn spelled(dir: &Path, own: &str, others: &[(&str, &str)]) -> PathBuf {
+    let path = song(dir, "a.flac", "Miki", "industry plant", "industry plant");
+    let mut file = TagFile::open(&path).expect("opens");
+    file.set_album_artists(&[own.to_string()]);
+    for (name, value) in others {
+        extras::set_multi_value(&mut file, name, &[value.to_string()]);
+    }
+    file.save().expect("saved");
+    path
+}
+
+/// The album artist fields as the library server reads them.
+fn album_artists_read(path: &Path) -> Vec<(String, Vec<String>)> {
+    let view = KeptIdentityTags::navidrome_view(&TagFile::open(path).expect("opens"));
+    ["albumartist", "album artist", "album_artist", "albumartists"]
+        .into_iter()
+        .filter_map(|key| Some((key.to_string(), view.get(key)?.clone())))
+        .collect()
+}
+
+fn read_as(pairs: &[(&str, &str)]) -> Vec<(String, Vec<String>)> {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.to_string(), vec![value.to_string()]))
+        .collect()
+}
+
+#[test]
+fn an_album_artist_edit_takes_its_other_names_off_and_the_undo_puts_them_back() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = spelled(
+        dir.path(),
+        "Miki",
+        &[("ALBUM ARTIST", "Miki"), ("ALBUMARTISTS", "Miki")],
+    );
+
+    let result = write(&path, &changes(&[("albumArtist", Some("miki"))]));
+    assert!(result.changed, "{:?}", result.error);
+    assert!(value(&result.before, "albumArtistNames").is_some());
+    assert_eq!(result.after.get("albumArtistNames"), Some(&None));
+    assert_eq!(album_artists_read(&path), read_as(&[("albumartist", "miki")]));
+
+    // The undo writes back what the edit changed, as the edit service does.
+    let back: IndexMap<String, Option<String>> = result
+        .before
+        .iter()
+        .filter(|(key, value)| result.after.get(*key).cloned().flatten() != **value)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    assert!(write(&path, &back).changed);
+    assert_eq!(
+        album_artists_read(&path),
+        read_as(&[
+            ("albumartist", "Miki"),
+            ("album artist", "Miki"),
+            ("albumartists", "Miki")
+        ])
+    );
+}
+
+#[test]
+fn the_album_artists_other_names_alone_come_off_and_a_file_without_them_is_left_alone() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = spelled(dir.path(), "Ye", &[("ALBUM ARTIST", "Kanye West")]);
+    let take_off = changes(&[("albumArtistNames", None)]);
+
+    let result = write(&path, &take_off);
+    assert!(result.changed, "{:?}", result.error);
+    assert_eq!(album_artists_read(&path), read_as(&[("albumartist", "Ye")]));
+
+    let again = write(&path, &take_off);
+    assert!(!again.changed);
+    assert!(!again.before.contains_key("albumArtistNames"));
+    // A plain edit of a file without them says nothing of them either.
+    let edit = write(&path, &changes(&[("title", Some("Stronger"))]));
+    assert!(edit.changed);
+    assert!(!edit.before.contains_key("albumArtistNames"));
+}
+
+#[test]
+fn the_album_artists_other_names_can_only_be_taken_off() {
+    assert!(invalid(&changes(&[("albumArtistNames", Some("x"))])).is_some());
+    assert_eq!(invalid(&changes(&[("albumArtistNames", None)])), None);
+    assert_eq!(words("albumArtistNames"), "album artist's other names");
+}
+
+/// A FLAC on track `own`, with the track number written again under the other names given.
+fn numbered(dir: &Path, own: u32, others: &[(&str, &str)]) -> PathBuf {
+    let path = song(dir, "a.flac", "Dua Lipa", "Don't Start Now", "Future Nostalgia");
+    let mut file = TagFile::open(&path).expect("opens");
+    file.set_track(own);
+    for (name, value) in others {
+        extras::set_multi_value(&mut file, name, &[value.to_string()]);
+    }
+    file.save().expect("saved");
+    path
+}
+
+/// The track number fields as the library server reads them.
+fn track_numbers_read(path: &Path) -> Vec<(String, Vec<String>)> {
+    let view = KeptIdentityTags::navidrome_view(&TagFile::open(path).expect("opens"));
+    ["track", "tracknumber"]
+        .into_iter()
+        .filter_map(|key| Some((key.to_string(), view.get(key)?.clone())))
+        .collect()
+}
+
+#[test]
+fn a_track_edit_takes_its_other_names_off_and_the_undo_puts_them_back() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = numbered(dir.path(), 2, &[("TRACK", "3")]);
+
+    let result = write(&path, &changes(&[("track", Some("4"))]));
+    assert!(result.changed, "{:?}", result.error);
+    assert!(value(&result.before, "otherNames").is_some());
+    assert_eq!(result.after.get("otherNames"), Some(&None));
+    assert_eq!(track_numbers_read(&path), read_as(&[("tracknumber", "04")]));
+
+    let back: IndexMap<String, Option<String>> = result
+        .before
+        .iter()
+        .filter(|(key, value)| result.after.get(*key).cloned().flatten() != **value)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    assert!(write(&path, &back).changed);
+    assert_eq!(
+        track_numbers_read(&path),
+        read_as(&[("track", "3"), ("tracknumber", "02")])
+    );
+}
+
+#[test]
+fn other_names_alone_come_off_and_a_file_without_them_is_left_alone() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = numbered(dir.path(), 2, &[("TRACK", "3")]);
+    let take_off = changes(&[("otherNames", None)]);
+
+    let result = write(&path, &take_off);
+    assert!(result.changed, "{:?}", result.error);
+    assert_eq!(track_numbers_read(&path), read_as(&[("tracknumber", "02")]));
+
+    let again = write(&path, &take_off);
+    assert!(!again.changed);
+    assert!(!again.before.contains_key("otherNames"));
+    let edit = write(&path, &changes(&[("title", Some("Levitating"))]));
+    assert!(edit.changed);
+    assert!(!edit.before.contains_key("otherNames"));
+}
+
+#[test]
+fn other_names_can_only_be_taken_off() {
+    assert!(invalid(&changes(&[("otherNames", Some("x"))])).is_some());
+    assert_eq!(invalid(&changes(&[("otherNames", None)])), None);
+    assert_eq!(words("otherNames"), "tags' other names");
+}

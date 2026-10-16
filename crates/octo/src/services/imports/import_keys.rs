@@ -9,12 +9,32 @@ use serde_json::Value;
 pub struct ImportKeys;
 
 impl ImportKeys {
-    /// The song by its words, the same for "Drake feat. Rihanna" and "Drake, Rihanna".
+    /// The song by its words, the same for "Drake feat. Rihanna" and "Drake, Rihanna". A remix
+    /// credited to someone keeps their name, so two remixes of one song are two songs.
     pub fn for_words(artist: Option<&str>, title: Option<&str>) -> String {
-        format!(
-            "song:{}",
-            SongIdentity::match_key(artist.unwrap_or(""), title.unwrap_or(""))
-        )
+        let (artist, title) = (artist.unwrap_or(""), title.unwrap_or(""));
+        let key = format!("song:{}", SongIdentity::match_key(artist, title));
+        let mut remixers = SongIdentity::parse_title(title, Some(artist)).remixers;
+        remixers.retain(|remixer| !remixer.is_empty());
+        if remixers.is_empty() {
+            return key;
+        }
+        remixers.sort();
+        format!("{key}|by:{}", remixers.join("+"))
+    }
+
+    /// A key saved before remixes kept their remixer's name, as [`Self::for_words`] writes it
+    /// now; any other key as it is.
+    pub fn current(key: &str, artist: &str, title: &str) -> String {
+        if !key.starts_with("song:") {
+            return key.to_string();
+        }
+        let now = Self::for_words(Some(artist), Some(title));
+        if now.len() > key.len() && now.starts_with(key) && now[key.len()..].starts_with("|by:") {
+            now
+        } else {
+            key.to_string()
+        }
     }
 
     /// Spotify's key for a track id or a spotify:track: URI, or None.

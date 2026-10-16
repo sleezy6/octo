@@ -332,8 +332,10 @@ impl AlbumCoverFinder {
             .deezer
             .search_albums(&format!("{artist} {album}"), 10, true)
             .await;
+        // The album by its own artist, never another artist's record of a near name.
         let hit = hits.into_iter().find(|hit| {
             SongIdentity::same_text(album, artist, &hit.title, &hit.artist, Some(&options)).is_same()
+                && octo_core::common::cover_names::release_fits(album, &[artist], &hit.title, &hit.artist)
         });
         let mut catalog = self.catalog.lock();
         if catalog.len() > 5000 {

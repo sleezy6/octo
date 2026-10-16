@@ -22,6 +22,7 @@ pub mod skipped_takes;
 pub mod song_identity;
 pub mod song_versions;
 pub mod supersedable_build_coordinator;
+pub mod version_gap;
 pub mod version_variant;
 
 pub use album_fill_in::{AlbumFillIn, LibraryTrack};

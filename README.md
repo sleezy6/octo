@@ -33,7 +33,6 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 - **Soulseek and YouTube are optional.** Turn either off with `SOULSEEK_ENABLED=false` or `YOUTUBE_ENABLED=false`; Deezer, Lidarr or the other source carries on without them.
 - **Every song has a length.** A song from outside your library gets its length from Deezer, then Apple's catalog, then Last.fm. Radio stations, instant mixes and song lookups wait a moment for it, so players that read a length only once (iPhone apps such as NaviBeat) show it.
 - **Deezer kept within its limits.** Octo paces its Deezer requests, ahead for what an app is waiting on and behind for background work, and keeps each account's sign-in until Deezer says it expires, signing in again only when Deezer says it is no longer good. An ARL Deezer refuses is not used again until you change it, and a song Deezer has no audio for is not asked about again for six hours.
-- **Animated album covers.** Point `ANIMATED_ARTWORK_URL` at your own [m8tec/apple-music-animated-artworks](https://github.com/m8tec/apple-music-animated-artworks) server and the apps can show Apple Music's moving covers, relayed through Octo so they never contact Apple themselves. See [Tags, covers and lyrics](#tags-covers-and-lyrics).
 - **Plain covers for outside music.** Octo no longer stamps its octopus on the covers of songs and albums from outside your library; switch **Octopus on outside covers** on in the dashboard's cover settings (or `BADGE_OUTSIDE_COVERS=true`) to have it back.
 - **One entry for an album you hold a little of.** When your library has only a song or two of an album (from hearting them), search and artist pages list the whole album once, with how many songs you have, instead of your partial copy beside it.
 - **Favorites become Last.fm loves.** A listener connected to Last.fm on the dashboard has every song they favorite, in any app, loved on their Last.fm, and unloved when they take the favorite back. The favorites they already had are loved once, after their next play. The dashboard's Last.fm page shows where each listener stands and the last song loved; switch **Love favorites on Last.fm** off there to stop it. See [Playback and acquisition](#playback-and-acquisition).
@@ -159,8 +158,9 @@ playlists find their tracks, and hearting one downloads it exactly as it does fr
 other app. What you can't do is search for any song at all: search on the phone only finds
 what the stations have suggested.
 
-- Run a full sync in Symfonium to pick up new suggestions. Stations refresh as you listen,
-  and Octo rebuilds the list when they change, or an hour after its last build.
+- Run a full sync in Symfonium to pick up new suggestions. Stations are drawn again every
+  `LASTFM_REFRESH_INTERVAL_HOURS` (12 by default), and Octo rebuilds the list when they change,
+  or an hour after its last build.
 - A song you heart shows up twice for a while: the preview, and the downloaded copy once
   Navidrome has scanned it. The next sync after the list is rebuilt drops the preview.
 - Controlled under **Behavior → Discovery for offline-search apps** in the admin dashboard
@@ -223,7 +223,7 @@ scripts/updater/install-updater.sh --remove
 Without the helper, **About** shows the command for the new release. From the Octo folder:
 
 ```bash
-git fetch --tags && git checkout --detach 2026.10.14
+git fetch --tags && git checkout --detach 2026.10.15
 docker compose pull octo yt-dlp-shim octo-sonic || docker compose --profile source build octo-source yt-dlp-shim-source octo-sonic-source
 docker compose up -d
 ```
@@ -408,9 +408,14 @@ than hiding it afterwards, so nothing downstream holds it; names already written
 
 A heart on a song you already have is a favorite in Navidrome, straight away, and downloads
 nothing. A heart on a song you do not have only downloads it; heart it again once it is in your
-library to make it a favorite. `STAR_DOWNLOADS_FOR_REQUESTER` (off by default) makes Octo also
-favorite a download when it lands, for the person who hearted it; an album heart then
-favorites the album. Octo's own apps are left out,
+library to make it a favorite. That second heart may be on the same song the app still shows:
+once the download has landed, Octo favorites the library's copy at once and fetches nothing.
+`STAR_DOWNLOADS_FOR_REQUESTER` (off by default; **Favorite downloads when they land** on the
+dashboard) makes Octo also favorite a download when it lands, for the person who hearted it; an
+album heart then favorites the album. With it on, the heart stays on the song in that person's
+apps the whole way: in their starred lists and on the song wherever it is listed while it
+downloads, and on the song they hearted once its library copy is the favorite, where taking the
+heart back takes the copy's favorite back too. Octo's own apps are left out,
 because their star button means Add. The person's sign-in is held in memory
 with the download until the song arrives (a password is first turned into a token, so the
 password itself is never held), and a restart drops it.
@@ -743,7 +748,11 @@ Other Radio defaults use
 encoding structured rows in `.env` is brittle.
 
 The in-process worker refreshes stale snapshots in the background while retaining the
-last good version. State is bounded and versioned in
+last good version. Stations are drawn again every `LASTFM_REFRESH_INTERVAL_HOURS` (12 by
+default), whether or not anyone is listening; plays never draw a station again early, so an app
+that holds a station as a playlist keeps the same songs between refreshes. A listener's first
+stations, and Your Radio once `LASTFM_MINIMUM_PLAYS` plays have taught it, come as soon as
+there is something to build them from. State is bounded and versioned in
 `/app/config/lastfm-radio-state.json`; do not share that file across Octo instances
 because cross-process locking is not supported.
 
@@ -939,9 +948,9 @@ Under each row of **Fetched songs**, "How it was tagged" shows the release that 
 
 Cover art comes from a chain, and the largest cover found wins: Apple's full-size master of the same album (often 3000 px, taken only when the artist and album name match), the Cover Art Archive when a fingerprint named the release (`COVER_ART_ARCHIVE`), then the catalog's own cover, then Deezer, iTunes and Last.fm by name, and last the file's own art. A cover that is not square is a video thumbnail and counts as missing (`REPLACE_VIDEO_COVERS`); when nothing better turns up its centre square is used, which for a YouTube "Topic" upload is the real cover inside the letterbox. Each song carries the cover at 1500 px, or at the full size it was found with `FULL_SIZE_COVERS=true`. `COVER_FILE` also writes a full-size `cover.jpg` beside the file, only in the `Organized` layout and only in a folder the download created, because Navidrome ranks `cover.*` above embedded art and a new file in an existing album folder would change that album's cover. A `cover.jpg` Octo wrote itself gives way to a larger one later; one you put there never changes.
 
-Animated album covers: point `ANIMATED_ARTWORK_URL` at your own server of [m8tec/apple-music-animated-artworks](https://github.com/m8tec/apple-music-animated-artworks) (for example `http://apple-music-animated-artworks:8080`) and the Octo apps are told of Apple Music's animated covers, square and tall (HLS streams), where an album has one. Octo asks the server once per album and keeps the answer, "no animated cover" included, in `animated-artwork.json`. The apps see the `octoAnimatedArtwork` extension, an `animatedArtwork` field on `getAlbum` (JSON) and `getAnimatedArtwork?id=` (or `?artist=&album=`); other Subsonic apps see no difference. `animatedArtwork` holds the square and tall playlists (`url`, `urlTall`) relayed through Octo, relative to the server address as `rest/` is (for example `animated-artwork/<key>/square.m3u8`): Octo fetches the playlists and video from Apple's video host and passes them on, so Apple's addresses never leave Octo and the apps never contact Apple. An answer for another artist, or another title once edition words are set aside, is not used. Empty is off.
-
 **Soft covers** (dashboard, Cover art) finds soft covers and replaces the ones you pick. A scan reads your songs only (album by album, using Navidrome's own song list), Octo's downloads or the whole library, and shows every album whose cover is smaller than the size you choose (or missing) as a wall of covers. Pick all of them or just some and find better covers: albums are matched at Apple in bulk by barcode (from the song's own tag, or from Deezer), 20 to 40 per request, and each tile then shows the larger cover found, with its true size, without downloading it yet. A cover that does not look like the album's current one (another edition, or another album with the same name) is marked Different art and left unpicked. Replace downloads Apple's master at up to 5000 px and puts it in every song and, if you ask, in a JPEG `cover.jpg` or `folder.jpg` beside it. A cover is replaced only when the new one is clearly larger, and every cover replaced is kept so Undo puts them all back.
+
+**Animated art.** Where an album has it on Apple Music, the Octo apps can play its animated art: a square loop in place of the cover, and often a tall one that fills a full-screen player. Octo matches the album to its Apple release (by barcode when it knows one, otherwise by artist and title, the same strict way it matches covers), reads the album's Apple Music page once and keeps what it found for a month (a week when there was none). An app opening an album gets the artwork with the album if it is already known; the first time, Octo looks it up in the background and the app asks again with `getAnimatedArt`. `ANIMATED_ART` sets how it plays: `direct` (the default) from Apple's own video network, `relay` through Octo so the apps reach nothing but your server, or `off`. Other Subsonic apps see no difference.
 
 `LYRICS_FETCH` (off by default) writes lyrics beside each download, looked up in the background so a slow service never holds up the next download, and answers `getLyricsBySongId` live for any song as it plays, external songs included. Synced lyrics go in a `.lrc` and plain ones in a `.txt` with the audio file's name, both of which Navidrome reads at request time without a rescan; an instrumental gets nothing, and a file that already has lyrics is never touched. `LYRICS_SOURCES` sets the order: `song` (the lyrics a song already has, in its tags or a file beside it, which cannot be switched off and comes first when it is not listed), `kugou` (timed word by word for most songs, but an unofficial API that can change without notice), `lrclib` (open, timed line by line), `lyricsovh` (plain text), and `netease`, which goes much deeper on non-Western and older music but is also an unofficial API, so it only runs when you list it. Leave a source out and it is never contacted. A song's own lyrics rank like any source, so with `kugou` above `song`, a song whose tags hold line-timed lyrics plays KuGou's word-timed ones; with `LYRICS_PREFER_WORD_TIMED` on, word timing wins wherever it ranks. `LYRICS_SAVE_TO` says where found lyrics are saved: `beside` (the default), `inside` the song's tags (which rewrites the audio file, and shows after a Navidrome scan that Octo asks for), or `both`. What Octo writes is marked `[re:Octo]`, and lyrics Octo did not write are never replaced. The order was chosen by measurement: see [docs/lyrics-source-eval.md](docs/lyrics-source-eval.md). Every source is held to the same rule before its lyrics are used: the same title (a remix or a live take never stands in for the original), the same artist, and a length within three seconds. Credits at the top of a lyric are stripped.
 
@@ -1007,7 +1016,7 @@ The dashboard's **Better quality** page lists every song in your library that is
 
 Copies come from Deezer, from Soulseek, from Lidarr, or from all of them: **Library actions → Where to look for a higher quality copy** (`LIBRARY_ACTIONS_UPGRADE_SOURCE`: `Auto`, `Deezer`, `Soulseek` or `Lidarr`). Automatic, the default, asks Deezer first when an account is set (for a FLAC and nothing less, so an account whose plan gives no FLAC is passed over), then Soulseek, then Lidarr, each for what the one before cannot find, and leaves Soulseek out while it is offline. Lidarr only fetches whole albums, so Octo borrows the album: it copies out the one song, which then goes through the same checks and the same in-place swap as a Soulseek copy, deletes the other files that search brought in, and puts the album's monitoring back as it was. A song whose file Lidarr itself manages is left to Lidarr, which upgrades it in place when its quality profile asks for lossless.
 
-> **A heart is "fetch" for a song you do not have, and "favorite" for one you do.** Octo checks your library first. A song you already have, even the copy Octo found outside your library, becomes your favorite in Navidrome straight away and downloads nothing (an MP3 is queued for Better quality). A song you do not have is downloaded and nothing more: once it is in your library, heart it there to make it a favorite. `STAR_DOWNLOADS_FOR_REQUESTER` makes Octo favorite downloads when they land instead. Octo's own apps are left out of both, since their heart means Add.
+> **A heart is "fetch" for a song you do not have, and "favorite" for one you do.** Octo checks your library first. A song you already have, even the copy Octo found outside your library, becomes your favorite in Navidrome straight away and downloads nothing (an MP3 is queued for Better quality). A song you do not have is downloaded and nothing more: once it is in your library, heart it again (the song the app still shows will do) to make it a favorite. `STAR_DOWNLOADS_FOR_REQUESTER` makes Octo favorite downloads when they land instead. Octo's own apps are left out of both, since their heart means Add.
 
 ### Sharing back on Soulseek
 
@@ -1119,7 +1128,6 @@ Project layout:
 
 - [**winters27/octo**](https://github.com/winters27/octo): Octo itself, by Brandon Winters and its contributors. Everything here is built on it, and this version keeps taking in its changes.
 - [**am-yy/octo**](https://github.com/am-yy/octo): the Deezer backend this version's Deezer support was ported from.
-- [**m8tec/apple-music-animated-artworks**](https://github.com/m8tec/apple-music-animated-artworks): the server behind animated album covers.
 - [**Navidrome**](https://www.navidrome.org/): the music server Octo proxies.
 - [**slskd**](https://github.com/slskd/slskd): Soulseek with a REST API.
 - [**GeoNames**](https://www.geonames.org/): place data from GeoNames ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)), converted and simplified by Octo, behind `getPlace`; the image carries GeoNames' readme as `licenses/GeoNames-postal-codes.txt`.

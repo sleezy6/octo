@@ -231,6 +231,77 @@ async fn wait_for_lossless_still_acquires_before_playback_when_enabled() {
 }
 
 #[tokio::test]
+async fn head_on_an_outside_song_gives_the_play_headers_without_a_body_or_a_play() {
+    let navidrome = ping_ok().await;
+    let downloads = Arc::new(FakeStreams::streaming(
+        "soulseek",
+        "track-id",
+        &[7, 8, 9, 10],
+        "audio/flac",
+    ));
+    let library = Arc::new(FakeLibrary::with_external(
+        "external-track",
+        "soulseek",
+        "track-id",
+    ));
+    let state = state_with(playback_settings(&navidrome.uri(), false, true), |inner| {
+        inner.download_service = downloads.clone();
+        inner.local_library = library.clone();
+    });
+
+    for endpoint in ["stream", "stream.view"] {
+        let url = format!("/rest/{endpoint}?id=external-track&f=json&u=alice&t=good&s=salt&v=1.16.1&c=test");
+        let reply = send(&app(&state), Method::HEAD, &url, &[], Body::empty()).await;
+
+        assert_eq!(reply.status, StatusCode::OK, "{endpoint}");
+        assert_eq!(reply.header("content-type"), Some("audio/flac"), "{endpoint}");
+        assert!(reply.body.is_empty(), "{endpoint}");
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(state.track_acquisition_queue.waiting_plays(), 0);
+    let relayed: Vec<String> = navidrome
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        !relayed.iter().any(|path| path.starts_with("/rest/stream")),
+        "{relayed:?}"
+    );
+}
+
+#[tokio::test]
+async fn head_on_a_library_song_is_relayed_to_navidrome() {
+    let navidrome = ping_ok().await;
+    let state = state_with(playback_settings(&navidrome.uri(), false, false), |_| {});
+
+    let reply = send(
+        &app(&state),
+        Method::HEAD,
+        "/rest/stream?id=library-track&u=alice&t=good&s=salt&v=1.16.1&c=test",
+        &[],
+        Body::empty(),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let relayed: Vec<(String, String)> = navidrome
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| (r.method.to_string(), r.url.path().to_string()))
+        .collect();
+    assert!(
+        relayed.contains(&("HEAD".to_string(), "/rest/stream".to_string())),
+        "{relayed:?}"
+    );
+}
+
+#[tokio::test]
 async fn streaming_an_outside_song_queues_its_download_only_from_the_first_byte() {
     for (range, waiting) in [(None, 1), (Some("bytes=0-"), 1), (Some("bytes=4096-"), 0)] {
         let navidrome = ping_ok().await;

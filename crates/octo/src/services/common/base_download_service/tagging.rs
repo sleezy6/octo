@@ -226,7 +226,23 @@ impl BaseDownloadService {
             {
                 song.is_compilation = true;
             }
-            if empty(&song.cover_art_url_large) {
+            // The catalog album's cover only when it is that album by the song's own artist.
+            let by = m
+                .album_artist_name
+                .as_deref()
+                .or(m.artist_name.as_deref())
+                .unwrap_or("");
+            let wanted: Vec<&str> = [
+                song.album_artist.as_deref(),
+                song.primary_artist.as_deref(),
+                Some(song.artist.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if empty(&song.cover_art_url_large)
+                && octo_core::common::cover_names::release_artist_fits(&wanted, by)
+            {
                 song.cover_art_url_large = m.album_cover_url.clone();
             }
             if song.year.is_none() {
@@ -576,6 +592,22 @@ impl BaseDownloadService {
                         Some(&detail),
                     );
                 }
+                if let Some(theirs) = stray_recording_id(&mut file, song) {
+                    let detail = format!(
+                        "The peer's file named the recording {theirs}, which the audio was not found to be"
+                    );
+                    if let Some(plan) = song.tag_plan.as_deref_mut() {
+                        plan.notes
+                            .push(format!("took off the file's own recording id {theirs}"));
+                    }
+                    info!("Took the peer's recording id {theirs} off {file_path}");
+                    self.log_song_step(
+                        song,
+                        acquisition_event_kinds::TAGS,
+                        "Took off the peer's recording id",
+                        Some(&detail),
+                    );
+                }
                 (existing, embedded, filed_elsewhere)
             }
             Err(e) => {
@@ -714,6 +746,9 @@ impl BaseDownloadService {
         let written = (|| {
             let mut file = TagFile::open(file_path)?;
             release_fact_tags::tidy(&mut file, filed_elsewhere, song.joins_album.as_ref());
+            if stray_recording_id(&mut file, song).is_some() {
+                tag_writer_extras::clear_recording_id(&mut file);
+            }
             write_song(&mut file, song, &genres, filed_elsewhere);
             if let Some(bytes) = embed {
                 let mime = cover_image::mime_type(&bytes);
@@ -805,6 +840,18 @@ struct AlbumSiblingFile {
 /// A single joining an album folder that is already there takes that album's release facts from
 /// one of its files, so the album the library server shows keeps one label, one catalog number
 /// and one year.
+/// The recording id a peer's file arrived with when it is not the one the song is written as:
+/// every tag a download writes belongs to one identity, so a title from the request never sits
+/// beside a recording id from someone else's tagger.
+fn stray_recording_id(file: &mut TagFile, song: &Song) -> Option<String> {
+    let theirs = tag_writer_extras::read_recording_id(file)?;
+    let ours = song
+        .music_brainz_recording_id
+        .as_deref()
+        .filter(|id| !dotnet::is_blank(id));
+    (!ours.is_some_and(|ours| dotnet::eq_ignore_case(ours, &theirs))).then_some(theirs)
+}
+
 fn pin_to_sibling(song: &mut Song, sibling: &AlbumSiblingFile) {
     let facts = &sibling.facts;
     if let Some(year) = facts.year.filter(|y| *y > 0) {

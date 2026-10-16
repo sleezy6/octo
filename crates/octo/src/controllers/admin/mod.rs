@@ -14,6 +14,7 @@
 
 pub mod activity;
 pub mod ambient;
+pub mod animated_art;
 pub mod browse;
 pub mod charts;
 pub mod cover_upgrade;
@@ -21,6 +22,7 @@ pub mod downloads;
 pub mod explicit_backfill;
 pub mod genre;
 pub mod health;
+pub mod health_versions;
 pub mod imports;
 pub mod json_body;
 pub mod lastfm;
@@ -136,6 +138,7 @@ pub fn library_and_job_routes() -> RouteSet {
         .merge(library_actions::routes())
         .merge(trash::routes())
         .merge(health::routes())
+        .merge(animated_art::routes())
         .merge(upgrades::routes())
         .merge(genre::routes())
         .merge(tidy::routes())

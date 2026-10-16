@@ -580,3 +580,113 @@ async fn the_member_heart_stars_their_own_linked_song() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(f.star_count(), 1, "the shared song is never starred");
 }
+
+/// A heart whose download finds the file already in the library (fetched before, under this
+/// outside id) is a heart on a song you have: a favorite even with the setting off.
+#[tokio::test]
+async fn a_song_already_in_the_folder_is_favorited_with_the_setting_off() {
+    let f = Fixture::new();
+    f.set_starring(false);
+    let tracker = f.tracker(true);
+    let stars = f.stars(&tracker, Clock::system());
+    begin(&tracker, "abc", "alice", Some("Massive Attack"), Some("Teardrop"));
+    stars.hold_starred_song("soulseek", "abc", "ext-abc", &credential("alice"), Some("alice"));
+
+    tracker.already_in_library(
+        "soulseek",
+        "abc",
+        Some("Massive Attack"),
+        Some("Teardrop"),
+        Some("/music/teardrop.flac"),
+    );
+
+    until(|| f.star_count() == 1).await;
+    assert_eq!(f.calls_to("rest/star")[0]["id"], "nd-teardrop");
+    until(|| stars.landed_copy("ext-abc", "alice").is_some()).await;
+    assert_eq!(
+        stars.landed_copy("ext-abc", "alice").as_deref(),
+        Some("nd-teardrop")
+    );
+}
+
+/// A download Navidrome had not shown by the end of the row's own watch is still favorited once
+/// it does, rather than dropped.
+#[tokio::test]
+async fn a_favorite_keeps_looking_after_the_row_stopped_watching() {
+    let f = Fixture::new();
+    let tracker = f.tracker(false);
+    let stars = f.stars(&tracker, Clock::system());
+    let looks = Arc::new(Mutex::new(0));
+    let counted = looks.clone();
+    stars.configure(|seams| {
+        seams.library_lookup = Some(Arc::new(move |_, _, _| {
+            let mut looks = counted.lock();
+            *looks += 1;
+            let found = (*looks >= 3).then(|| "nd-late".to_string());
+            async move { Ok(found) }.boxed()
+        }));
+    });
+    begin(&tracker, "abc", "alice", Some("A"), Some("Song"));
+    stars.hold_starred_song("soulseek", "abc", "ext-abc", &credential("alice"), Some("alice"));
+
+    tracker.imported(
+        "soulseek",
+        "abc",
+        Some("A"),
+        Some("Song"),
+        Some("/music/song.flac"),
+    );
+
+    until(|| f.star_count() == 1).await;
+    assert_eq!(f.calls_to("rest/star")[0]["id"], "nd-late");
+    assert_eq!(*looks.lock(), 3);
+    until(|| stars.landed_copy("ext-abc", "alice").is_some()).await;
+}
+
+/// With the setting off a waiting heart is not listed as a favorite; on, it is, for its own
+/// starrer only; a landed one reads as a favorite until it is taken back, by either id.
+#[tokio::test]
+async fn marks_follow_the_setting_and_the_landing() {
+    let f = Fixture::new();
+    let tracker = f.tracker(true);
+    let stars = f.stars(&tracker, Clock::system());
+    stars.hold_starred_song("soulseek", "abc", "ext-abc", &credential("alice"), Some("alice"));
+
+    assert!(stars.marks_anyone());
+    let marked: Vec<String> = stars.marks("alice").into_iter().map(|(id, _)| id).collect();
+    assert_eq!(marked, ["ext-abc"]);
+    assert!(stars.marks("bob").is_empty());
+
+    f.set_starring(false);
+    assert!(stars.marks("alice").is_empty());
+    assert!(stars.waiting_songs("alice").is_empty());
+    assert!(!stars.marks_anyone());
+
+    stars.remember_landed("ext-abc", "nd-abc", "alice");
+    assert!(stars.marks_anyone());
+    let marked: Vec<String> = stars.marks("alice").into_iter().map(|(id, _)| id).collect();
+    assert_eq!(marked, ["ext-abc"]);
+    stars.forget_landed(&["nd-abc"], "bob");
+    assert!(stars.landed_copy("ext-abc", "alice").is_some());
+    stars.forget_landed(&["nd-abc"], "alice");
+    assert!(stars.landed_copy("ext-abc", "alice").is_none());
+
+    stars.remember_landed("ext-abc", "nd-abc", "alice");
+    stars.forget_landed(&["ext-abc"], "Alice");
+    assert!(!stars.has_landed());
+}
+
+/// A landed favorite is remembered for a day, like a hold.
+#[tokio::test]
+async fn a_landed_favorite_is_remembered_for_a_day() {
+    let f = Fixture::new();
+    let now = Arc::new(Mutex::new(Utc.with_ymd_and_hms(2026, 10, 14, 18, 0, 0).unwrap()));
+    let read = now.clone();
+    let stars = f.stars(&f.tracker(true), Clock::new(move || *read.lock()));
+    stars.remember_landed("ext-abc", "nd-abc", "alice");
+
+    *now.lock() += TimeDelta::hours(23);
+    assert!(stars.landed_copy("ext-abc", "alice").is_some());
+    *now.lock() += TimeDelta::hours(2);
+    assert!(stars.landed_copy("ext-abc", "alice").is_none());
+}

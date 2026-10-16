@@ -279,13 +279,10 @@ fn the_store_keeps_keys_and_finds_them_ignoring_case() {
         "{written}"
     );
     assert!(fixture.store.reset("BRANDON"));
-    // Reset, not removed: the listener is kept, under the name as it was written, but is not
-    // listed until they play again.
-    assert_eq!(fixture.store.get_user("brandon").username, "Brandon");
     assert!(fixture.store.known_users().is_empty());
 }
 
-fn mix(owner: &str) -> LastFmRadioStation {
+fn one_station(owner: &str) -> LastFmRadioStation {
     LastFmRadioStation {
         id: station_id(owner, "mix"),
         name: "Mix".into(),
@@ -299,80 +296,64 @@ fn mix(owner: &str) -> LastFmRadioStation {
     }
 }
 
-/// A reset empties the listener and marks them, so the starting profile is not learned again
-/// the next time one of their apps lists playlists.
 #[test]
-fn a_reset_empties_the_listener_and_marks_them_as_reset() {
+fn a_cleared_listener_keeps_the_entry_but_nothing_learned() {
     let fixture = StateFixture::new(None, None);
-    assert!(fixture.store.record_play("alice", play("A", "One", None)));
-    assert!(fixture.store.record_play("alice", play("B", "Two", None)));
-    fixture.store.replace_stations("alice", &[mix("alice")]);
-    assert!(!fixture.store.was_reset("alice"));
+    fixture.store.record_play("alice", play("A", "T", None));
+    fixture.store.replace_stations("alice", &[one_station("alice")]);
+    assert!(!fixture.store.wants_starting_profile("alice"));
+    assert!(fixture.store.wants_starting_profile("nobody yet"));
 
-    assert!(fixture.store.reset(" Alice "));
+    assert!(fixture.store.reset("ALICE"));
+    assert!(!fixture.store.reset("nobody yet"));
 
-    let user = fixture.store.get_user("alice");
-    assert_eq!(user.username, "alice");
-    assert!(user.plays.is_empty() && user.stations.is_empty());
-    assert!(user.radio_bans.is_empty() && user.unavailable_tracks.is_empty());
-    assert_eq!(user.new_plays_since_refresh, 0);
-    assert!(user.reset_utc.is_some());
-    assert!(fixture.store.was_reset("ALICE"));
-    let written = std::fs::read_to_string(&fixture.path).unwrap();
-    assert!(written.contains("\"ResetUtc\": \""), "{written}");
+    let alice = fixture.store.get_user("alice");
+    assert_eq!(alice.username, "alice");
+    assert!(alice.plays.is_empty() && alice.stations.is_empty());
+    assert!(alice.history_cleared_utc.is_some());
+    // No starting profile from stars, and no refresh work until a new play.
+    assert!(!fixture.store.wants_starting_profile("alice"));
+    assert!(fixture.store.known_users().is_empty());
+    // The dashboard still lists the listener, now with nothing held.
+    let summaries = fixture.store.get_summaries();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].play_count, 0);
 
-    // It survives a restart, and a play after it is learned as usual.
+    fixture.store.record_play("alice", play("B", "U", None));
+    assert_eq!(fixture.store.known_users(), ["alice"]);
+
+    // The mark survives a restart.
     let restarted = LastFmRadioStateStore::new(
         fixture.path.clone(),
         settings_store(LastFmSettings::default()),
         Arc::new(ExternalIdRegistry::in_memory()),
     );
-    assert!(restarted.was_reset("alice"));
-    // Until then they are in no list: not the dashboard's, not the refresh worker's.
-    assert!(restarted.known_users().is_empty());
-    assert!(restarted.get_summaries().is_empty());
-    assert!(restarted.record_play("alice", play("C", "Three", None)));
-    assert_eq!(restarted.get_user("alice").plays.len(), 1);
-    assert_eq!(restarted.known_users(), ["alice"]);
-    assert_eq!(restarted.get_summaries().len(), 1);
+    assert!(restarted.get_user("alice").history_cleared_utc.is_some());
 }
 
 #[test]
-fn a_listener_nobody_knows_has_nothing_to_reset() {
+fn stations_from_a_refresh_begun_before_a_clear_are_discarded() {
     let fixture = StateFixture::new(None, None);
-    assert!(!fixture.store.reset("nobody"));
-    assert!(!fixture.store.was_reset("nobody"));
-    assert!(fixture.store.known_users().is_empty());
-}
-
-/// A listener who was never reset is written without the field, so files from before it are
-/// unchanged.
-#[test]
-fn a_listener_never_reset_is_written_without_the_reset_time() {
-    let fixture = StateFixture::new(None, None);
-    fixture.store.record_play("alice", play("A", "One", None));
-    let written = std::fs::read_to_string(&fixture.path).unwrap();
-    assert!(!written.contains("ResetUtc"), "{written}");
-}
-
-/// A refresh that was running when the history was reset built its stations from the plays
-/// that were just forgotten: they are not written back. A refresh started afterwards is.
-#[test]
-fn a_refresh_running_at_the_reset_writes_nothing_back() {
-    let fixture = StateFixture::new(None, None);
-    fixture.store.record_play("alice", play("A", "One", None));
+    fixture.store.record_play("alice", play("A", "T", None));
     fixture.store.mark_refreshing("alice");
     assert!(fixture.store.reset("alice"));
 
-    fixture.store.replace_stations("alice", &[mix("alice")]);
-    let user = fixture.store.get_user("alice");
-    assert!(user.stations.is_empty());
-    assert!(user.last_refresh_success_utc.is_none());
+    fixture.store.replace_stations("alice", &[one_station("alice")]);
+    assert!(fixture.store.get_user("alice").stations.is_empty());
 
     fixture.store.mark_refreshing("alice");
-    fixture.store.replace_stations("alice", &[mix("alice")]);
-    assert_eq!(fixture.store.get_user("alice").stations.len(), 1);
-    assert!(!fixture.store.get_user("alice").refreshing);
+    fixture.store.replace_stations("alice", &[one_station("alice")]);
+    let alice = fixture.store.get_user("alice");
+    assert_eq!(alice.stations.len(), 1);
+    assert!(!alice.refreshing);
+}
+
+#[test]
+fn a_listener_never_cleared_leaves_no_mark_in_the_file() {
+    let fixture = StateFixture::new(None, None);
+    fixture.store.record_play("alice", play("A", "T", None));
+    let written = std::fs::read_to_string(&fixture.path).unwrap();
+    assert!(!written.contains("HistoryCleared"), "{written}");
 }
 
 /// Two keys that differ only in case fail the load, so it starts clean.

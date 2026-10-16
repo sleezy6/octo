@@ -525,8 +525,8 @@ fn bootstrap_songs(body: &[u8], container: &str, learned: bool) -> Vec<(Song, bo
 }
 
 /// The first time a listener lists playlists or stations, Octo learns a starting profile
-/// from what they starred, played often or recently, or failing that a few random songs.
-/// Not after their history was reset from the dashboard: that listener starts from nothing.
+/// from what they starred, played often or recently, or failing that a few random songs. A
+/// listener cleared from the dashboard gets none: their radio learns only from what they play.
 pub async fn bootstrap_radio_profile(
     state: &AppState,
     proxy: &SubsonicProxyService,
@@ -538,8 +538,7 @@ pub async fn bootstrap_radio_profile(
     if username.is_empty()
         || !last_fm.enable_radio
         || !last_fm.enable_personalized_stations
-        || !state.last_fm_radio_state.get_user(username).plays.is_empty()
-        || state.last_fm_radio_state.was_reset(username)
+        || !state.last_fm_radio_state.wants_starting_profile(username)
     {
         return;
     }

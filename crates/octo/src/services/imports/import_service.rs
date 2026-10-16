@@ -146,6 +146,18 @@ impl ImportService {
         self.clock.lock().now()
     }
 
+    /// Every person's lists, for the version check's look at what each song points at.
+    pub fn all_lists(&self) -> Vec<super::import_models::ImportList> {
+        self.store.all()
+    }
+
+    /// Matches a person's lists again from a fresh read of the library: after a file was put
+    /// back or replaced, so each song points at the version it names.
+    pub async fn rematch(&self, user: &str) {
+        self.matcher.forget();
+        self.match_and_follow(user).await;
+    }
+
     pub fn matcher(&self) -> &Arc<ImportMatcher> {
         &self.matcher
     }

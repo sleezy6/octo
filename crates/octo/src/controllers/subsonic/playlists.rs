@@ -87,17 +87,21 @@ pub async fn get_playlists(State(state): State<AppState>, req: Request) -> Respo
 
     // Navidrome answered ok above, so `u` is authenticated. Ensure this user's action
     // playlists exist, using the body we already have so the common case costs no extra
-    // request. Fire-and-forget: creating a playlist must never delay the listing.
+    // request. What is missing is worked out here, without I/O; only creating runs apart
+    // (it must never delay the listing), and nothing is spawned when all are there.
     let names = playlist_names(Some(&relay.body), &format);
     let provisioner = LibraryActionPlaylistProvisioner::new(call.proxy.clone(), state.settings.clone())
         .with_family(state.family_store.clone());
-    let ensured_user = username.clone();
-    let ensured_parameters = call.parameters.clone();
-    tokio::spawn(async move {
-        provisioner
-            .ensure(&ensured_user, &names, &ensured_parameters)
-            .await;
-    });
+    let missing = provisioner.missing(&username, &names);
+    if !missing.is_empty() {
+        let ensured_user = username.clone();
+        let ensured_parameters = call.parameters.clone();
+        tokio::spawn(async move {
+            provisioner
+                .create(&ensured_user, missing, &ensured_parameters)
+                .await;
+        });
+    }
 
     bootstrap_radio_profile(&state, &call.proxy, &username, &call.parameters).await;
     let stations = playlist_stations(&state, &username);
@@ -661,6 +665,9 @@ async fn get_playlist_inner(state: &AppState, req: Request, aborted: &RequestAbo
                 .create_error(format, 40, "Wrong username or password")
                 .into_response();
         }
+        // An app that keeps its list of playlists and reads each by id still has the lists made
+        // again when they are due; the refresh runs behind this answer.
+        let _ = state.generated_playlists.list(&username, &call.parameters).await;
         // A failure here answers 500.
         let mut entries = match state
             .generated_playlists

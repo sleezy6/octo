@@ -1230,3 +1230,125 @@ async fn ignored_ratings_list_the_reason_behind_the_session() {
         ]})
     );
 }
+
+/// The page's list says, for each lossy song, when it was added, its genres and year, and how
+/// sure its AcoustID match is: from its download's own check (with the score), else from the
+/// library tag check, else not checked; and how many songs one press and the queue take.
+#[tokio::test]
+async fn the_list_carries_what_the_page_filters_on() {
+    use chrono::{TimeZone, Utc};
+    use futures::FutureExt;
+    use octo_core::models::download::acquisition_event::acquisition_event_kinds;
+    use octo_core::models::download::{AcquisitionEvent, DownloadHistoryEntry};
+
+    use crate::services::library::library_identity_sweep::CheckedSong;
+    use crate::services::library::quality_upgrade_worker::LibrarySongRow;
+
+    let mut settings = AppSettings::default();
+    settings.subsonic.admin_username = Some("admin".into());
+    settings.subsonic.admin_password = Some("synthetic-admin-password".into());
+    let state = AppState::for_tests(settings);
+    let song = |id: &str, file: &str, genres: &[&str]| LibrarySongRow {
+        id: id.into(),
+        path: format!("/music/{file}"),
+        library_path: Some("/music".into()),
+        size: 4_000_000,
+        suffix: "mp3".into(),
+        bit_rate: 128,
+        title: id.into(),
+        artist: "Massive Attack".into(),
+        genres: genres.iter().map(|g| g.to_string()).collect(),
+        year: Some(1998),
+        added_utc: Some(Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap()),
+        ..Default::default()
+    };
+    let rows = vec![
+        song("nd-unsure", "unsure.mp3", &["Trip Hop"]),
+        song("nd-swept", "swept.mp3", &["Electronic", "Trip Hop"]),
+        song("nd-plain", "plain.mp3", &[]),
+    ];
+    state.quality_upgrade_worker.configure(move |seams| {
+        let rows = rows.clone();
+        seams.list_songs = Arc::new(move || {
+            let rows = rows.clone();
+            async move { (rows, true) }.boxed()
+        });
+    });
+    state.download_history.record(DownloadHistoryEntry {
+        artist: "Massive Attack".into(),
+        title: "nd-unsure".into(),
+        path: "/music/unsure.mp3".into(),
+        format: "MP3".into(),
+        source: "YouTube".into(),
+        downloaded_at: "2026-09-01T12:00:00Z".into(),
+        log: Some(vec![AcquisitionEvent {
+            at: Utc::now(),
+            kind: acquisition_event_kinds::CHECK.into(),
+            text: "Checked the recording".into(),
+            detail: Some("AcoustID: no match above 85% (best 61%)".into()),
+            candidates: None,
+            heard: None,
+        }]),
+        ..Default::default()
+    });
+    state.identity_sweep_store.update(|sweep| {
+        sweep.songs.insert(
+            "nd-swept".into(),
+            CheckedSong {
+                stamp: "x".into(),
+                path: "/music/swept.mp3".into(),
+                artist: "Massive Attack".into(),
+                title: "nd-swept".into(),
+                album: String::new(),
+                recording_id: Some("rec-1".into()),
+                kind: None,
+                kind_certain: false,
+                sure: true,
+                retry: false,
+                findings: Vec::new(),
+                changes: Default::default(),
+                checked_utc: Some(Utc::now()),
+                ..CheckedSong::default()
+            },
+        );
+    });
+    let token = state.browse_sessions.create("admin");
+
+    let reply = send(
+        &app(&state),
+        request(Method::GET, "/api/admin/lossy?refresh=true", Some(&token), None),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let doc = reply.json();
+    assert_eq!(doc["limits"], json!({ "perPress": 2000, "openJobs": 5000 }));
+    let by_id = |id: &str| {
+        doc["songs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|song| song["id"] == json!(id))
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} listed"))
+    };
+    let unsure = by_id("nd-unsure");
+    assert_eq!(
+        unsure["match"],
+        json!({ "state": "unsure", "score": 61, "by": "download" })
+    );
+    assert_eq!(unsure["fromYouTube"], json!(true));
+    assert_eq!(unsure["added"], json!("2026-09-01T12:00:00Z"));
+    assert_eq!(unsure["genres"], json!(["Trip Hop"]));
+    assert_eq!(unsure["year"], json!(1998));
+    assert_eq!(unsure["bitRate"], json!(128));
+    assert_eq!(
+        by_id("nd-swept")["match"],
+        json!({ "state": "sure", "score": null, "by": "tagCheck" })
+    );
+    assert_eq!(
+        by_id("nd-plain")["match"],
+        json!({ "state": "unchecked", "score": null, "by": null })
+    );
+    assert_eq!(by_id("nd-plain")["fromYouTube"], json!(false));
+}

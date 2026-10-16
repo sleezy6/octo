@@ -91,6 +91,51 @@ impl AcoustIdClient {
         }
     }
 
+    /// AcoustID's ids for the sound of one MusicBrainz recording: every fingerprint someone tied
+    /// to it. Empty when nobody did; None on any transport or parse failure.
+    pub async fn tracks_of_recording(
+        &self,
+        api_key: &str,
+        recording_id: &str,
+        timeout_seconds: i32,
+    ) -> Option<Vec<String>> {
+        if dotnet::is_blank(recording_id) {
+            return None;
+        }
+        let body = encode_form(&[
+            ("client".to_string(), api_key.to_string()),
+            ("format".to_string(), "json".to_string()),
+            ("mbid".to_string(), recording_id.trim().to_string()),
+        ]);
+        let attempt = async {
+            let answer = self
+                .post_within("v2/track/list_by_mbid", body, timeout_seconds)
+                .await?;
+            if !answer.is_success() {
+                return anyhow::Ok(None);
+            }
+            let doc = parse_json(&answer.body)?;
+            let tracks = doc
+                .get("tracks")
+                .and_then(serde_json::Value::as_array)
+                .map(|tracks| {
+                    tracks
+                        .iter()
+                        .filter_map(|track| track.get("id").and_then(serde_json::Value::as_str))
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                });
+            Ok(tracks)
+        };
+        match attempt.await {
+            Ok(tracks) => tracks,
+            Err(e) => {
+                debug!("acoustid could not list the sound of recording {recording_id}: {e}");
+                None
+            }
+        }
+    }
+
     /// Send confirmed fingerprints back to AcoustID (#47). Each carries a MusicBrainz recording a
     /// person vouched for by keeping the track; nothing is ever sent on Octo's own judgment.
     /// Posted through the same client as lookups, so one 3/s budget covers both. True

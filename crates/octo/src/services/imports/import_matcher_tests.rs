@@ -470,3 +470,211 @@ async fn a_list_written_title_first_is_read_the_other_way_round() {
         Orientation::ArtistTitle
     );
 }
+
+// ---- the version a song names, the real case of G-Eazy's "Let's Get Lost" ---------------------
+
+fn on(mut song: LibrarySongRow, album: &str) -> LibrarySongRow {
+    song.album = Some(album.into());
+    song
+}
+
+/// The library as it was on 2026-10-14: the original was in Recently removed, the Bear//Face
+/// remix sat tagged as the plain song on the remix EP, and the Teklife remix carried the
+/// Bear//Face title and ISRC.
+fn lost_library(with_original: bool) -> Vec<LibrarySongRow> {
+    let mut rows = vec![
+        on(
+            r("5usZcgFijfma1blnIYNjXB", "G-Eazy", "Let's Get Lost", 242),
+            "Let's Get Lost Remixes",
+        ),
+        coded(
+            on(
+                r(
+                    "1l7NVUVMjStbjNcPflszjx",
+                    "G-Eazy",
+                    "Let's Get Lost (feat. Devon Baldwin) [Bear//Face Remix]",
+                    270,
+                ),
+                "Let's Get Lost Remixes (feat. Devon Baldwin) - EP",
+            ),
+            "USRC11501446",
+        ),
+    ];
+    if with_original {
+        rows.push(on(
+            r(
+                "6Ab7filWyAu4VzstkaDG3a",
+                "G-Eazy",
+                "Let's Get Lost (feat. Devon Baldwin)",
+                241,
+            ),
+            "These Things Happen",
+        ));
+    }
+    rows
+}
+
+fn original_row() -> ImportTrack {
+    with_isrc(
+        track(
+            "G-Eazy",
+            "Let's Get Lost (feat. Devon Baldwin)",
+            None,
+            Some("These Things Happen"),
+        ),
+        "USRC11400725",
+    )
+}
+
+#[test]
+fn the_original_never_maps_to_the_plain_titled_remix_on_the_remix_ep() {
+    let index = LibraryIndex::new(lost_library(false));
+    assert_eq!(
+        found(&index, &original_row()),
+        None,
+        "fetched rather than a near match"
+    );
+    let index = LibraryIndex::new(lost_library(true));
+    assert_eq!(found(&index, &original_row()), Some("6Ab7filWyAu4VzstkaDG3a"));
+}
+
+#[test]
+fn the_remix_row_maps_by_its_isrc() {
+    let index = LibraryIndex::new(lost_library(true));
+    let remix = with_isrc(
+        track(
+            "G-Eazy",
+            "Let's Get Lost (feat. Devon Baldwin) [Bear//Face Remix]",
+            None,
+            Some("Let's Get Lost Remixes (feat. Devon Baldwin) - EP"),
+        ),
+        "USRC11501446",
+    );
+    assert_eq!(found(&index, &remix), Some("1l7NVUVMjStbjNcPflszjx"));
+}
+
+#[test]
+fn remixes_by_different_people_are_different_songs_and_keys() {
+    let index = LibraryIndex::new([on(
+        r("astro", "Pegboard Nerds", "Psychonaut (AstroLizard Remix)", 250),
+        "Psychonaut (Remixes)",
+    )]);
+    for title in [
+        "Psychonaut (12th Planet Remix)",
+        "Psychonaut (Hydraulix Remix)",
+        "Psychonaut (Krischvn Remix)",
+    ] {
+        let row = track("Pegboard Nerds", title, None, Some("Psychonaut (Remixes)"));
+        assert_eq!(found(&index, &row), None, "{title}");
+    }
+    assert_eq!(
+        found(
+            &index,
+            &track(
+                "Pegboard Nerds",
+                "Psychonaut (AstroLizard Remix)",
+                None,
+                Some("Psychonaut (Remixes)")
+            )
+        ),
+        Some("astro")
+    );
+    let twelfth = ImportKeys::for_words(Some("Pegboard Nerds"), Some("Psychonaut (12th Planet Remix)"));
+    let hydraulix = ImportKeys::for_words(Some("Pegboard Nerds"), Some("Psychonaut (Hydraulix Remix)"));
+    assert_ne!(twelfth, hydraulix);
+    assert!(twelfth.ends_with("|remix|by:12thplanet"), "{twelfth}");
+    // A key saved before remixes kept their remixer's name reads as the new one.
+    assert_eq!(
+        ImportKeys::current(
+            "song:pegboardnerds|psychonaut|remix",
+            "Pegboard Nerds",
+            "Psychonaut (12th Planet Remix)"
+        ),
+        twelfth
+    );
+    assert_eq!(
+        ImportKeys::current("spotify:abc", "Pegboard Nerds", "Psychonaut (12th Planet Remix)"),
+        "spotify:abc"
+    );
+}
+
+#[test]
+fn a_live_album_copy_titled_plainly_is_not_the_studio_song() {
+    let index = LibraryIndex::new([on(
+        r("live", "Garth Brooks", "Rodeo", 230),
+        "Live in Germany 1995",
+    )]);
+    assert_eq!(
+        found(
+            &index,
+            &track("Garth Brooks", "Rodeo", None, Some("The Ultimate Hits Disc: 2"))
+        ),
+        None
+    );
+    assert_eq!(
+        found(
+            &index,
+            &track("Garth Brooks", "Rodeo", None, Some("Live in Germany 1995"))
+        ),
+        Some("live")
+    );
+}
+
+#[tokio::test]
+async fn a_file_tagged_with_the_recording_an_isrc_names_is_found_without_an_isrc_tag() {
+    let mut tagged = on(
+        r("tagged", "G-Eazy", "Let's Get Lost (feat. Devon Baldwin)", 241),
+        "These Things Happen",
+    );
+    tagged.recording_id = Some("20CB620C-1B37-4E93-9B4B-C64B0A2FADDC".into());
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = asked.clone();
+    let matcher = matcher_over(vec![tagged]).with_isrc_recordings(Arc::new(move |isrc: String| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            Some(if isrc == "USRC11400725" {
+                vec![IsrcRecording {
+                    id: "20cb620c-1b37-4e93-9b4b-c64b0a2faddc".into(),
+                    title: "Let\u{2019}s Get Lost".into(),
+                    seconds: Some(241),
+                }]
+            } else {
+                Vec::new()
+            })
+        })
+    }));
+    let mut rows = vec![with_isrc(
+        track("G-Eazy", "Let's Get Lost", None, Some("Somewhere Else")),
+        "USRC11400725",
+    )];
+    assert!(matcher.match_tracks(&mut rows).await);
+    assert_eq!(rows[0].library_id.as_deref(), Some("tagged"));
+    // Asked once; the answer is kept for the next match.
+    assert!(matcher.match_tracks(&mut rows).await);
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn the_music_databases_isrc_answer_reads_into_recordings() {
+    let doc = serde_json::json!({
+        "recordings": [
+            {"id": "20cb620c", "title": "Let\u{2019}s Get Lost", "length": 240680},
+            {"id": "nolength", "title": "Let\u{2019}s Get Lost"}
+        ]
+    });
+    assert_eq!(
+        isrc_recordings_of(&doc),
+        vec![
+            IsrcRecording {
+                id: "20cb620c".into(),
+                title: "Let\u{2019}s Get Lost".into(),
+                seconds: Some(241),
+            },
+            IsrcRecording {
+                id: "nolength".into(),
+                title: "Let\u{2019}s Get Lost".into(),
+                seconds: None,
+            },
+        ]
+    );
+}

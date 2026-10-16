@@ -190,7 +190,7 @@ fn standard_top_songs_xml_writes_library_songs_as_navidromes_xml() {
 fn the_top_songs_extension_is_listed_only_while_search_discovery_is_on() {
     let listed = |top_songs: bool| {
         let reply = builder().merge_open_subsonic_extensions_with(
-            "json", None, None, true, false, top_songs, false, false, false, false,
+            "json", None, None, true, false, top_songs, false, false, false, false, false,
         );
         answer(&reply)["subsonic-response"]["openSubsonicExtensions"]
             .as_array()

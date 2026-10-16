@@ -11,8 +11,8 @@ use indexmap::IndexMap;
 use octo_core::common::dotnet::{self, is_blank};
 use octo_core::settings::LibraryAction;
 use octo_subsonic::subsonic_response_builder::{
-    COVER_ACTION, COVER_SWAP_ACTION, EDIT_ACTIONS, JOIN_ALBUM_ACTION, LOOKUP_ACTION, LYRICS_ACTION,
-    REMOVE_ACTION, RETAG_ACTION, UNDO_ACTION, UPGRADE_ACTION,
+    CHECK_VERSION_ACTION, COVER_ACTION, COVER_SWAP_ACTION, EDIT_ACTIONS, JOIN_ALBUM_ACTION, LOOKUP_ACTION,
+    LYRICS_ACTION, REMOVE_ACTION, RETAG_ACTION, UNDO_ACTION, UPGRADE_ACTION,
 };
 use serde_json::Value;
 use tracing::info;
@@ -122,6 +122,7 @@ pub async fn get_open_subsonic_extensions(State(state): State<AppState>, req: Re
             super::transitions::offered(&state),
             super::stations::offered(&state),
             places_available(&state).await,
+            state.animated_art.offered(),
         );
     if capped && let Some(body) = audio_gate::without_extension(&reply.body, format == "json", "transcoding")
     {
@@ -129,11 +130,7 @@ pub async fn get_open_subsonic_extensions(State(state): State<AppState>, req: Re
     }
     // octoFamily is listed only while Family is on.
     if settings.family.enabled {
-        reply = super::family::with_family_extension(reply, &format);
-    }
-    // octoAnimatedArtwork only while an animated artwork server is set.
-    if state.animated_artwork.enabled() {
-        reply = super::family::with_extension(reply, &format, super::animated_artwork::EXTENSION);
+        return super::family::with_family_extension(reply, &format).into_response();
     }
     reply.into_response()
 }
@@ -151,7 +148,7 @@ fn upgrade_ready(state: &AppState) -> bool {
     state.upgrade_sources.ready()
 }
 
-/// Where Better quality looks, in words: "Soulseek", "Lidarr", "Soulseek or Lidarr", "Deezer or Soulseek or Lidarr".
+/// Where Better quality looks, in words: "Soulseek", "Lidarr", or "Soulseek or Lidarr".
 fn upgrade_source_name(state: &AppState) -> String {
     state.upgrade_sources.name()
 }
@@ -293,6 +290,7 @@ pub async fn apply_library_action(State(state): State<AppState>, req: Request) -
     if let Some((answer, name)) = [
         (LibraryAction::WrongLyrics, LYRICS_ACTION),
         (LibraryAction::WrongCover, COVER_SWAP_ACTION),
+        (LibraryAction::CheckVersion, CHECK_VERSION_ACTION),
     ]
     .into_iter()
     .find(|(_, name)| dotnet::eq_ignore_case(name, &action))
@@ -305,7 +303,7 @@ pub async fn apply_library_action(State(state): State<AppState>, req: Request) -
                 FORMAT,
                 0,
                 &format!(
-                    "Unknown action \"{action}\"; this server knows remove, upgrade, {LYRICS_ACTION}, {COVER_SWAP_ACTION}, {}",
+                    "Unknown action \"{action}\"; this server knows remove, upgrade, {LYRICS_ACTION}, {COVER_SWAP_ACTION}, {CHECK_VERSION_ACTION}, {}",
                     EDIT_ACTIONS.join(", ")
                 ),
             )

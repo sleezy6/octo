@@ -5,9 +5,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use indexmap::IndexMap;
-use octo_core::common::{SingleFlight, dotnet};
+use octo_core::common::{Clock, SingleFlight, dotnet};
 use octo_core::last_fm::last_fm_radio_refresh_policy::{
     is_stale, should_schedule_periodic_refresh, startup_jitter,
 };
@@ -56,6 +55,7 @@ pub struct LastFmRadioRefreshWorker {
     watched: Mutex<Watched>,
     /// Settings changes, subscribed at construction.
     changes: watch::Receiver<Arc<AppSettings>>,
+    clock: Clock,
 }
 
 impl LastFmRadioRefreshWorker {
@@ -77,7 +77,14 @@ impl LastFmRadioRefreshWorker {
             warmup,
             watched: Mutex::new(watched),
             changes,
+            clock: Clock::system(),
         }
+    }
+
+    /// The worker on another clock, for tests.
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     pub fn in_flight_count(&self) -> usize {
@@ -141,7 +148,7 @@ impl LastFmRadioRefreshWorker {
                 break;
             }
             let user = self.state.get_user(&username);
-            if is_stale(&user, &self.settings.current().last_fm, Utc::now()) {
+            if is_stale(&user, &self.settings.current().last_fm, self.clock.now()) {
                 self.queue.enqueue(&username, None);
             }
             tokio::select! {
@@ -176,20 +183,26 @@ impl LastFmRadioRefreshWorker {
                 () = stopping.cancelled() => return,
                 _ = timer.tick() => {}
             }
-            let settings = self.settings.current();
-            if !settings.last_fm.enable_radio {
-                continue;
-            }
-            for username in self.state.known_users() {
-                if should_schedule_periodic_refresh(
-                    &self.state.get_user(&username),
-                    &settings.last_fm,
-                    Utc::now(),
-                ) {
-                    self.queue.enqueue(&username, None);
-                }
+            self.queue_due();
+        }
+    }
+
+    /// One pass of the minute scan: every known listener whose stations are due a rebuild is
+    /// queued, whether or not they have listened since. Answers how many were queued.
+    pub fn queue_due(&self) -> usize {
+        let settings = self.settings.current();
+        if !settings.last_fm.enable_radio {
+            return 0;
+        }
+        let now = self.clock.now();
+        let mut queued = 0;
+        for username in self.state.known_users() {
+            if should_schedule_periodic_refresh(&self.state.get_user(&username), &settings.last_fm, now) {
+                self.queue.enqueue(&username, None);
+                queued += 1;
             }
         }
+        queued
     }
 
     /// One refresh, shared with any refresh of the same listener already running. A failure is
@@ -695,5 +708,89 @@ mod tests {
             fixture.state.get_user("alice").last_refresh_error.as_deref(),
             Some("Pinned station returned no usable tracks")
         );
+    }
+
+    /// With nobody listening, the minute scan queues a listener once their stations are as old
+    /// as the refresh interval, and not a minute before; a refresh that was running when Octo
+    /// stopped holds nothing back once Octo is running again.
+    #[tokio::test]
+    async fn the_minute_scan_redraws_on_the_interval_without_listening() {
+        use chrono::{TimeDelta, TimeZone, Utc};
+
+        let dir = TempDir::new().unwrap();
+        let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+            last_fm: LastFmSettings {
+                enable_radio: true,
+                enable_discovery_stations: true,
+                refresh_interval_hours: 12,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let start = Utc.with_ymd_and_hms(2026, 10, 14, 8, 0, 0).unwrap();
+        let now = Arc::new(Mutex::new(start));
+        let read = now.clone();
+        let clock = Clock::new(move || *read.lock());
+        let path = dir.path().join("state.json");
+        let registry = Arc::new(ExternalIdRegistry::in_memory());
+        let before = LastFmRadioStateStore::with_clock(
+            path.clone(),
+            settings.clone(),
+            registry.clone(),
+            clock.clone(),
+        );
+        before.replace_stations(
+            "alice",
+            &[LastFmRadioStation {
+                id: station_id("alice", "your-radio"),
+                key: "your-radio".into(),
+                name: "Your Radio".into(),
+                owner: "alice".into(),
+                tracks: vec![LastFmRadioTrack {
+                    artist: "A".into(),
+                    title: "T".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        );
+        *now.lock() = start + TimeDelta::hours(1);
+        before.mark_refreshing("alice");
+        drop(before);
+
+        // Octo starts again.
+        let state = Arc::new(LastFmRadioStateStore::with_clock(
+            path,
+            settings.clone(),
+            registry,
+            clock.clone(),
+        ));
+        assert!(!state.get_user("alice").refreshing);
+        let server = MockServer::start().await;
+        let last_fm = Arc::new(LastFmService::with_base_url(
+            settings.clone(),
+            &format!("{}/", server.uri()),
+        ));
+        let recommendations = Arc::new(LastFmRadioRecommendationService::new(
+            last_fm,
+            state.clone(),
+            settings.clone(),
+            None,
+        ));
+        let queue = Arc::new(LastFmRadioRefreshQueue::new());
+        let worker = LastFmRadioRefreshWorker::new(queue.clone(), recommendations, state, settings, None)
+            .with_clock(clock);
+
+        for hours in [2, 6, 11] {
+            *now.lock() = start + TimeDelta::hours(hours) + TimeDelta::minutes(59);
+            assert_eq!(worker.queue_due(), 0, "{hours} h");
+        }
+        *now.lock() = start + TimeDelta::hours(12) + TimeDelta::minutes(1);
+        assert_eq!(worker.queue_due(), 1);
+        let job = tokio::time::timeout(Duration::from_secs(1), queue.dequeue(&CancellationToken::new()))
+            .await
+            .expect("queued")
+            .expect("a job");
+        assert_eq!(job.username, "alice");
     }
 }

@@ -626,6 +626,9 @@ pub fn find_duplicates<T: Clone>(songs: &[T], fields: &dyn IHealthFields<T>) -> 
                 if !lengths_close(fields.seconds(a), fields.seconds(b), SAME_LENGTH_SECONDS) {
                     continue;
                 }
+                if album_versions_differ(a, b, fields) {
+                    continue;
+                }
                 if SongIdentity::same(&ref_a, &ref_of(b, fields), Some(&options)).is_same() {
                     sets.join(bucket[i], bucket[j]);
                 }
@@ -681,6 +684,24 @@ pub fn find_duplicates<T: Clone>(songs: &[T], fields: &dyn IHealthFields<T>) -> 
         .then_with(|| compare_ordinal(fields.id(a.best()), fields.id(b.best())))
     });
     found
+}
+
+/// Whether two songs of the same title sit on albums that name different versions beyond what
+/// their titles say: "Let's Get Lost" on "Let's Get Lost Remixes" is a remix tagged plainly, not
+/// a copy of the one on the studio album, however close their lengths.
+fn album_versions_differ<T>(a: &T, b: &T, fields: &dyn IHealthFields<T>) -> bool {
+    let named = |song: &T| {
+        let artist = fields.artist(song);
+        let in_title = octo_core::common::version_variant::requested(Some(fields.title(song)), None);
+        fields
+            .album(song)
+            .map(|album| octo_core::common::version_variant::in_folder(album, artist))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|version| !in_title.contains(version))
+            .collect::<std::collections::BTreeSet<String>>()
+    };
+    named(a) != named(b)
 }
 
 /// Each song's key for "this song in this version". Reading a title is the slow part of the

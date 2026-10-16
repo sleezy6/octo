@@ -1415,9 +1415,8 @@ async fn asks_from_two_members_at_once_never_pass_either_weekly_limit() {
         for ask in asks {
             let (user, outcome) = ask.await.expect("joins");
             match outcome {
-                // A repeat that comes after the first ask's song already landed is answered
-                // from the member's own copy (AddedFromFamily): a request, but no weekly slot.
-                // Only what takes a slot is counted, however the asks interleave.
+                // A repeat that arrives after the first ask's song is in the member's library
+                // is answered from that copy, which uses no slot; count only what does.
                 Ok(request) if request.counts_toward_quota(chrono::Utc::now()) => {
                     made.insert((user.to_string(), request.id));
                 }

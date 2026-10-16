@@ -205,6 +205,26 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
     } else {
         None
     };
+    // An outside song whose library copy Octo knows (its download landed, or a heart already
+    // made the copy a favorite) is a heart on a song you have: Navidrome favorites the copy now
+    // and nothing is fetched again.
+    let holder = match (&heart, who.as_deref(), favorite_credential(&call)) {
+        (HeartOutcome::Download(AcquisitionTarget::Shared), Some(who), Some(credential)) => {
+            Some(StarOnArrival::holder_name(&credential, Some(who)))
+        }
+        _ => None,
+    };
+    let mut owned: Vec<(String, String)> = Vec::new();
+    if let Some(holder) = &holder {
+        songs.retain(|id| match library_copy_of(&state, id, holder) {
+            Some(copy) => {
+                owned.push((id.clone(), copy));
+                false
+            }
+            None => true,
+        });
+        library.extend(owned.iter().map(|(_, copy)| ("id", copy.clone())));
+    }
     let outside = OutsideHearts {
         heart: &heart,
         sources: &sources,
@@ -244,6 +264,12 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
             // it refused leaves nothing queued or held.
             if accepted {
                 outside.queue(&state, &call).await;
+                if let Some(holder) = &holder {
+                    for (song, copy) in &owned {
+                        info!("{song} is in the library as {copy}; favorited that copy for {holder}");
+                        state.star_on_arrival.remember_landed(song, copy, holder);
+                    }
+                }
             }
             let username = if accepted {
                 listener(&state, &call).await
@@ -282,6 +308,30 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
             .into_response()),
         Err(other) => Err(other.into()),
     }
+}
+
+/// The library copy of the outside song `id` for the person filed as `holder`: the copy a heart
+/// of theirs made the favorite, else the one its download placed while the downloads log keeps
+/// that row.
+fn library_copy_of(state: &AppState, id: &str, holder: &str) -> Option<String> {
+    if let Some(copy) = state.star_on_arrival.landed_copy(id, holder) {
+        return Some(copy);
+    }
+    let (_, provider, external_id) = state.local_library.parse_song_id(id);
+    state
+        .acquisition_tracker
+        .landed_library_id(&provider?, &external_id?)
+}
+
+/// The name the caller's hearts are filed under, when some outside song's library copy is a
+/// favorite through a heart; None otherwise, or when the caller cannot be named.
+async fn landed_holder(state: &AppState, call: &SubsonicCall) -> Option<String> {
+    if !state.star_on_arrival.has_landed() {
+        return None;
+    }
+    let credential = SubsonicCredential::from(&call.parameters)?;
+    let who = signed_in_user(state, call).await.ok()?;
+    Some(StarOnArrival::holder_name(&credential, Some(&who)))
 }
 
 /// The outside songs and albums one star carried, with what a heart does for this person and
@@ -670,8 +720,31 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
             .is_some_and(|user| state.family_saved.is_saved(user, id))
             || state.local_library.parse_song_id(id).0
     };
-    let (outside, library): (Vec<(&str, String)>, Vec<(&str, String)>) =
+    let (sent_outside, mut library): (Vec<(&str, String)>, Vec<(&str, String)>) =
         ids.into_iter().partition(|(_, id)| is_outside(id));
+    // An outside song whose library copy a heart made the favorite: taking the heart back takes
+    // back the copy's favorite. Ids are forgotten once Navidrome takes the unstar.
+    let landed = landed_holder(&state, &call).await;
+    let mut outside: Vec<(&str, String)> = Vec::new();
+    let mut taken_back: Vec<String> = Vec::new();
+    for (key, id) in sent_outside {
+        let copy = landed
+            .as_deref()
+            .filter(|_| key == "id")
+            .and_then(|holder| state.star_on_arrival.landed_copy(&id, holder));
+        match copy {
+            Some(copy) => {
+                library.push(("id", copy));
+                taken_back.push(id);
+            }
+            None => outside.push((key, id)),
+        }
+    }
+    let mapped = !taken_back.is_empty();
+    if landed.is_some() {
+        taken_back.extend(library.iter().map(|(_, id)| id.clone()));
+    }
+    let forget = landed.as_deref().map(|holder| (holder, taken_back.as_slice()));
     // The waiting hearts among the outside ids, by their pipeline key.
     let held: Vec<(String, String)> = outside
         .iter()
@@ -682,13 +755,20 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
         .filter(|(provider, external_id)| state.star_on_arrival.holds_song(provider, external_id))
         .collect();
 
-    if outside.is_empty() || (member.is_none() && library.is_empty() && held.is_empty()) {
+    if !mapped && (outside.is_empty() || (member.is_none() && library.is_empty() && held.is_empty())) {
         return match member {
             None => {
+                if let Some((holder, ids)) = forget
+                    && !ids.is_empty()
+                    && matches!(refuse_unless_signed_in(&state, &call, &format).await, Ok(None))
+                {
+                    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+                    state.star_on_arrival.forget_landed(&ids, holder);
+                }
                 crate::http::catch_all::catch_all(State(state), Request::from_parts(parts, Body::from(body)))
                     .await
             }
-            Some(_) => relay_unstar(&state, &call, &format, None).await,
+            Some(_) => relay_unstar(&state, &call, &format, None, forget).await,
         };
     }
 
@@ -726,16 +806,18 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
             .create_response(&format, "unstar")
             .into_response();
     }
-    relay_unstar(&state, &call, &format, Some(library.as_slice())).await
+    relay_unstar(&state, &call, &format, Some(library.as_slice()), forget).await
 }
 
 /// Relays an unstar to Navidrome: the request as sent, or with only `library` as its ids. Once
-/// Navidrome took it, the listener's lists read their hearts again.
+/// Navidrome took it, the listener's lists read their hearts again, and the ids in `forget` no
+/// longer read as favorites through a heart.
 async fn relay_unstar(
     state: &AppState,
     call: &SubsonicCall,
     format: &str,
     library: Option<&[(&str, String)]>,
+    forget: Option<(&str, &[String])>,
 ) -> axum::response::Response {
     let relayed = match library {
         None => call.proxy.relay("rest/unstar", &call.parameters).await,
@@ -754,8 +836,13 @@ async fn relay_unstar(
     };
     match relayed {
         Ok(result) => {
+            let accepted = is_successful_subsonic_response(&result.body, format);
+            if accepted && let Some((holder, ids)) = forget {
+                let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+                state.star_on_arrival.forget_landed(&ids, holder);
+            }
             if library.is_some()
-                && is_successful_subsonic_response(&result.body, format)
+                && accepted
                 && let Some(username) = listener(state, call).await
             {
                 state.generated_playlists.forget_marks(&username);
@@ -1562,3 +1649,7 @@ mod family_library_tests;
 #[cfg(test)]
 #[path = "stars_album_tests.rs"]
 mod album_tests;
+
+#[cfg(test)]
+#[path = "stars_landing_tests.rs"]
+mod landing_tests;

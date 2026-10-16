@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use octo_core::common::cover_names::{release_artist_fits, release_title_fits};
 use octo_core::common::dotnet;
 use octo_core::json::element::{enumerate_array, get_string, try_get_property};
 use octo_core::metadata::accept_language_header;
@@ -99,7 +100,8 @@ impl LastFmCoverArtLookup {
             dotnet::escape_data_string(title),
             self.api_key
         );
-        self.pick_image_from_response(&url, "track", Some("album")).await
+        self.pick_image_from_response(&url, "track", Some("album"), (title, artist))
+            .await
     }
 
     async fn get_album_image_url(&self, artist: &str, album: &str) -> anyhow::Result<Option<String>> {
@@ -114,7 +116,9 @@ impl LastFmCoverArtLookup {
             self.api_key
         );
         // The album response has the image array directly under <album>.
-        let direct = self.pick_image_from_response(&url, "album", None).await?;
+        let direct = self
+            .pick_image_from_response(&url, "album", None, (album, artist))
+            .await?;
         if direct.as_deref().is_some_and(|d| !d.is_empty()) {
             return Ok(direct);
         }
@@ -134,14 +138,52 @@ impl LastFmCoverArtLookup {
         url: &str,
         outer_key: &str,
         inner_key: Option<&str>,
+        (title, artist): (&str, &str),
     ) -> anyhow::Result<Option<String>> {
         let answer = HttpAnswer::read(self.client.get(url).send().await?).await?;
         if !answer.is_success() {
             return Ok(None);
         }
         let doc: Value = serde_json::from_str(&answer.text())?;
+        if !names_fit(&doc, outer_key, title, artist)? {
+            return Ok(None);
+        }
         pick_image(&doc, outer_key, inner_key)
     }
+}
+
+/// A text field, or an object's `name` or `#text`, as Last.fm writes an artist either way.
+fn text_of(value: Option<&Value>) -> anyhow::Result<Option<&str>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if let Some(text) = value.as_str() {
+        return Ok(Some(text));
+    }
+    for key in ["name", "#text"] {
+        if let Some(inner) = try_get_property(value, key)? {
+            return Ok(get_string(inner)?);
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the answer is the release or the track asked for, by its own artist: Last.fm's
+/// autocorrect answers with whatever it thinks was meant, which can be another artist's record of
+/// a near name.
+fn names_fit(doc: &Value, outer_key: &str, title: &str, artist: &str) -> anyhow::Result<bool> {
+    let Some(outer) = try_get_property(doc, outer_key)? else {
+        return Ok(false);
+    };
+    let (mut titles, mut artists): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    titles.extend(text_of(try_get_property(outer, "name")?)?);
+    artists.extend(text_of(try_get_property(outer, "artist")?)?);
+    if let Some(album) = try_get_property(outer, "album")? {
+        titles.extend(text_of(try_get_property(album, "title")?)?);
+        artists.extend(text_of(try_get_property(album, "artist")?)?);
+    }
+    Ok(titles.iter().any(|name| release_title_fits(title, name))
+        && artists.iter().any(|name| release_artist_fits(&[artist], name)))
 }
 
 fn pick_image(doc: &Value, outer_key: &str, inner_key: Option<&str>) -> anyhow::Result<Option<String>> {
@@ -243,7 +285,7 @@ mod tests {
             .await;
         Mock::given(query_param("method", "track.getInfo"))
             .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-                r##"{{"track":{{"album":{{"image":[
+                r##"{{"track":{{"name":"Sexy Boy","artist":{{"name":"Air"}},"album":{{"image":[
                     {{"size":"small","#text":"{}"}},
                     {{"size":"mega","#text":"https://x/i/u/2a96cbd8b46e442fc41c2b86b821562f.png"}},
                     {{"size":"extralarge","#text":"{}"}},

@@ -106,7 +106,10 @@ impl LyricsChoiceStore {
         let pins = self.pins.lock();
         // The newest by `set_utc`, the first of equals.
         let mut best: Option<&LyricsPin> = None;
-        for pin in pins.values().filter(|pin| match_key(pin) == want) {
+        for pin in pins
+            .values()
+            .filter(|pin| match_key(pin) == want && !other_remix(pin, title))
+        {
             if best.is_none_or(|best| pin.set_utc > best.set_utc) {
                 best = Some(pin);
             }
@@ -136,7 +139,7 @@ impl LyricsChoiceStore {
         let mut pins = self.pins.lock();
         let ids: Vec<String> = pins
             .values()
-            .filter(|pin| match_key(pin) == want)
+            .filter(|pin| match_key(pin) == want && !other_remix(pin, title))
             .map(|pin| pin.song_id.clone())
             .collect();
         if ids.is_empty() {
@@ -174,6 +177,17 @@ impl LyricsChoiceStore {
             warn!("lyrics choices could not be written: {error}");
         }
     }
+}
+
+/// Whether the pin is for a remix credited to someone else than the title's: the name key says
+/// "remix" for both, and their lyrics are timed to two different recordings.
+fn other_remix(pin: &LyricsPin, title: &str) -> bool {
+    octo_core::common::version_gap::version_gap(
+        title,
+        pin.title.as_deref().unwrap_or(""),
+        octo_core::common::version_gap::Against::Title,
+    )
+    .is_some_and(|gap| gap.other_remixer)
 }
 
 fn match_key(pin: &LyricsPin) -> String {
@@ -528,6 +542,43 @@ mod tests {
             text.trim_end_matches('\n')
         );
         assert!(!state_file::temp_path(&path).exists());
+    }
+
+    /// A pin for one remix is never found by name for a remix credited to someone else: the
+    /// name key says "remix" for both, and their lyrics are timed to different recordings.
+    #[test]
+    fn a_pin_for_one_remix_is_not_another_remixers() {
+        let store = LyricsChoiceStore::new(None);
+        let now = at("2026-10-13T11:36:09Z");
+        store.set(pin(
+            "teklife-file",
+            "kugou:1.a",
+            "G-Eazy",
+            "Let's Get Lost (Teklife Remix)",
+            now,
+        ));
+        assert!(
+            store
+                .find_by_name(
+                    "G-Eazy",
+                    "Let's Get Lost (feat. Devon Baldwin) [Bear//Face Remix]"
+                )
+                .is_none()
+        );
+        assert!(!store.remove_by_name(
+            Some("G-Eazy"),
+            Some("Let's Get Lost (feat. Devon Baldwin) [Bear//Face Remix]")
+        ));
+        assert_eq!(
+            store
+                .find_by_name("G-Eazy", "Let's Get Lost [Teklife Remix]")
+                .expect("the same remix")
+                .song_id,
+            "teklife-file"
+        );
+        // A pin that does not say who made the remix still answers for one that does.
+        store.set(pin("plain", "kugou:2.b", "Nero", "Promises (Remix)", now));
+        assert!(store.find_by_name("Nero", "Promises (Skrillex Remix)").is_some());
     }
 
     /// A removed pin's place is taken by the next one added, and the file lists the pins in that

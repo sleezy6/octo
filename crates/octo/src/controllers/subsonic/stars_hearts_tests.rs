@@ -81,13 +81,15 @@ impl HeartApp {
             .mount(&navidrome)
             .await;
         let directory = tempfile::tempdir().expect("a temp dir");
-        let settings = AppSettings {
+        let mut settings = AppSettings {
             soulseek: SoulseekSettings {
                 base_url: Some("http://127.0.0.1:1".into()),
                 ..Default::default()
             },
             ..settings(&navidrome.uri())
         };
+        // A waiting heart is listed only when it becomes a favorite on landing.
+        settings.subsonic.star_downloads_for_requester = true;
         let state = state_with(settings, |_| {});
         state
             .settings
