@@ -2802,6 +2802,9 @@ impl AppState {
             }
         });
         let integrations = Integrations::build(&settings, &settings_writer, &clients.deezer_metadata, None);
+        integrations
+            .last_fm_scrobbles
+            .set_loves_file(config_dir.join("lastfm-loves.json"));
         let soulseek = SoulseekServices::build(&settings, &stores, &clients, &integrations.last_fm, true);
         let metadata_service: Arc<dyn IMusicMetadataService> = soulseek.metadata.clone();
         // The Share my library switch: keeps slskd.yml's share list to it, and checks every 10

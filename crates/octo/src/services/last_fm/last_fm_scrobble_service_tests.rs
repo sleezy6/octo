@@ -121,6 +121,7 @@ async fn respond(State(fake): State<Arc<FakeLastFm>>, body: String) -> Response 
                 r#"{{"scrobbles":{{"@attr":{{"accepted":{accepted},"ignored":0}},"scrobble":[]}}}}"#
             ))
         }
+        Some("track.love" | "track.unlove") => ok("{}".to_string()),
         Some("track.updateNowPlaying") => {
             ok(r##"{"nowplaying":{"ignoredMessage":{"code":"0","#text":""}}}"##.to_string())
         }
@@ -961,4 +962,101 @@ async fn finish_writes_through_the_settings_file_and_says_why_it_cannot() {
     assert!(!f.service.is_enabled_for("carol"));
     assert!(f.service.disconnect("bob").expect("disconnected"));
     assert_eq!(f.saved_session("bob"), None);
+}
+
+/// A favorite in any app is loved on the listener's Last.fm and a favorite taken back unloved;
+/// a listener with no link sends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_favorite_is_loved_and_a_favorite_taken_back_unloved() {
+    let f = Fixture::new().await;
+    f.service.love("Alice", "Burial", "Archangel", true);
+    f.service.love("bob", "Burial", "Archangel", true);
+    let last_fm = Arc::clone(&f.last_fm);
+    until(move || last_fm.calls_to("track.love").len() == 1).await;
+    f.service.love("alice", "Burial", "Archangel", false);
+    let last_fm = Arc::clone(&f.last_fm);
+    until(move || last_fm.calls_to("track.unlove").len() == 1).await;
+
+    let love = &f.last_fm.calls_to("track.love")[0];
+    assert_eq!(field(love, "sk"), Some("sk-alice"));
+    assert_eq!(field(love, "artist"), Some("Burial"));
+    assert_eq!(field(love, "track"), Some("Archangel"));
+    assert_eq!(field(love, "api_sig"), Some(sig_of(love).as_str()));
+    assert_eq!(
+        f.last_fm.calls().len(),
+        2,
+        "bob has no link, so nothing went for him"
+    );
+}
+
+/// The favorites a listener had before linking are loved once; neither a second play nor a
+/// restart loves them again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn favorites_already_there_are_loved_once_per_link() {
+    let f = Fixture::new().await;
+    let file = f._directory.path().join("lastfm-loves.json");
+    f.service.set_loves_file(file.clone());
+    let favorites = || async {
+        Some(vec![
+            ("Burial".to_string(), "Archangel".to_string()),
+            ("Bladee".to_string(), "Be Nice 2 Me".to_string()),
+        ])
+    };
+    assert!(f.service.favorites_unloved("alice"));
+    f.service.love_favorites_once("alice", favorites());
+    let service = Arc::clone(&f.service);
+    until(move || !service.favorites_unloved("alice") && service.loves.syncing.lock().is_empty()).await;
+    f.service.love_favorites_once("alice", favorites());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let loved: Vec<_> = f
+        .last_fm
+        .calls_to("track.love")
+        .iter()
+        .map(|call| field(call, "track").unwrap_or("").to_string())
+        .collect();
+    assert_eq!(loved, ["Archangel", "Be Nice 2 Me"]);
+
+    // After a restart, the same link is known to have been loved already.
+    let restarted = LastFmScrobbleService::with_parts(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9/2.0/",
+        Arc::clone(&f.settings),
+        Arc::clone(&f.file),
+        ScrobbleTuning::default(),
+        ScrobbleTime::system(),
+    );
+    restarted.set_loves_file(file);
+    assert!(!restarted.favorites_unloved("alice"));
+}
+
+/// Favorites that could not be read are tried again on a later play.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unread_favorites_are_tried_again() {
+    let f = Fixture::new().await;
+    f.service.love_favorites_once("alice", async { None });
+    let service = Arc::clone(&f.service);
+    until(move || service.loves.syncing.lock().is_empty()).await;
+    assert!(f.service.favorites_unloved("alice"));
+    assert!(f.last_fm.calls().is_empty());
+}
+
+#[test]
+fn starred_songs_are_read_from_a_get_starred2_answer() {
+    let body = br#"{"subsonic-response":{"status":"ok","starred2":{"song":[
+        {"id":"1","artist":"Burial","title":"Archangel"},
+        {"id":"2","title":"No artist"}
+    ],"album":[{"id":"9","name":"Untrue"}]}}}"#;
+    assert_eq!(
+        super::starred_songs(body),
+        Some(vec![("Burial".to_string(), "Archangel".to_string())])
+    );
+    assert_eq!(
+        super::starred_songs(br#"{"subsonic-response":{"status":"ok","starred2":{}}}"#),
+        Some(vec![])
+    );
+    assert_eq!(
+        super::starred_songs(br#"{"subsonic-response":{"status":"failed"}}"#),
+        None
+    );
 }

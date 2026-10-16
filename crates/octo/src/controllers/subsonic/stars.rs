@@ -1,5 +1,7 @@
 //! `star`, `unstar`, `getStarred`, `getStarred2`, `setRating`, `scrobble` and `reportPlayback`.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
@@ -33,6 +35,7 @@ use crate::services::family::list_rules::{Edit, edit};
 use crate::services::family::{HeartOutcome, SavedAlbum, SavedSong, family_caller};
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::last_fm::LastFmRadioTrackResolver;
+use crate::services::last_fm::last_fm_scrobble_service::starred_songs;
 use crate::services::library::{IgnoredRating, RatingActionRequest, RatingIgnored};
 use crate::services::soulseek::SoulseekMetadataService;
 use crate::services::subsonic::RelayError;
@@ -211,6 +214,9 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
     if split && library.is_empty() {
         // Navidrome has never seen these ids, so relaying the star would just error.
         outside.queue(&state, &call).await;
+        if let Some(username) = listener(&state, &call).await {
+            love_on_last_fm(&state, &call, &username, &songs, true).await;
+        }
         return Ok(builder.create_response(&format, "starred").into_response());
     }
 
@@ -246,13 +252,20 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
             if let Some(username) = username.as_deref() {
                 state.generated_playlists.forget_marks(username);
                 let resolver = resolver(&state, &call);
+                let loves = state.last_fm_scrobbles.loves_for(username);
                 for (_, song_id) in library.iter().filter(|(key, _)| *key == "id") {
                     if let Some(song) = resolver.resolve_scrobble(song_id, &call.parameters).await {
                         state
                             .last_fm_radio_state
                             .mark_heart(username, song_id, &song.artist, &song.title);
+                        if loves {
+                            state
+                                .last_fm_scrobbles
+                                .love(username, &song.artist, &song.title, true);
+                        }
                     }
                 }
+                love_on_last_fm(&state, &call, username, &songs, true).await;
             }
             let content_type = result
                 .content_type
@@ -645,6 +658,7 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
     };
     let call = SubsonicCall::from_parts(&state, &parts, body.clone());
     let format = call.format();
+    unlove_on_last_fm(&state, &call).await;
     let ids: Vec<(&str, String)> = ["id", "albumId", "artistId"]
         .into_iter()
         .flat_map(|key| sent_ids(&call, key).into_iter().map(move |id| (key, id)))
@@ -1085,6 +1099,76 @@ async fn act_on_rating(
 /// The listener a request Navidrome accepted speaks for, named the way every request's identity
 /// is: `u`, or for an API key sign-in its owner as Navidrome names it. None when there is nobody
 /// to name or Navidrome could not be asked.
+/// Loves (or unloves) these songs on the listener's own Last.fm when they linked it there, as
+/// the favorites they are (or no longer are) in every app. Sent in the background.
+async fn love_on_last_fm(
+    state: &AppState,
+    call: &SubsonicCall,
+    username: &str,
+    song_ids: &[String],
+    loved: bool,
+) {
+    if song_ids.is_empty() || !state.last_fm_scrobbles.loves_for(username) {
+        return;
+    }
+    let resolver = resolver(state, call);
+    for song_id in song_ids {
+        if let Some(song) = resolver.resolve_scrobble(song_id, &call.parameters).await {
+            state
+                .last_fm_scrobbles
+                .love(username, &song.artist, &song.title, loved);
+        }
+    }
+}
+
+/// An unstar's songs, unloved on the listener's Last.fm when they linked it there. The songs are
+/// looked up in the background, so the answer does not wait on them.
+async fn unlove_on_last_fm(state: &AppState, call: &SubsonicCall) {
+    let song_ids = sent_ids(call, "id");
+    if song_ids.is_empty() {
+        return;
+    }
+    let Some(username) = listener(state, call).await else {
+        return;
+    };
+    if !state.last_fm_scrobbles.loves_for(&username) {
+        return;
+    }
+    let resolver = resolver(state, call);
+    let parameters = call.parameters.clone();
+    let scrobbles = Arc::clone(&state.last_fm_scrobbles);
+    tokio::spawn(async move {
+        for song_id in song_ids {
+            if let Some(song) = resolver.resolve_scrobble(&song_id, &parameters).await {
+                scrobbles.love(&username, &song.artist, &song.title, false);
+            }
+        }
+    });
+}
+
+/// The keys of a Subsonic sign-in, all a call made on the listener's behalf carries over.
+const SIGN_IN_KEYS: [&str; 7] = ["u", "p", "t", "s", "apiKey", "v", "c"];
+
+/// The first play after a listener links Last.fm loves the favorites they already had, read from
+/// Navidrome as them. Once per link: see `LastFmScrobbleService::love_favorites_once`.
+fn love_favorites_once(state: &AppState, call: &SubsonicCall, username: &str) {
+    if !state.last_fm_scrobbles.favorites_unloved(username) {
+        return;
+    }
+    let proxy = call.proxy.clone();
+    let mut parameters: Vec<(String, String)> = call
+        .parameters
+        .iter()
+        .filter(|(key, _)| SIGN_IN_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    parameters.push(("f".into(), "json".into()));
+    state.last_fm_scrobbles.love_favorites_once(username, async move {
+        let result = proxy.relay_safe("rest/getStarred2", parameters).await?;
+        starred_songs(&result.body)
+    });
+}
+
 async fn listener(state: &AppState, call: &SubsonicCall) -> Option<String> {
     state
         .request_identity
@@ -1275,6 +1359,7 @@ async fn learn_from_scrobbles(
     state
         .radio_outcomes
         .observe(&username, ids, submissions, Utc::now());
+    love_favorites_once(state, call, &username);
     let last_fm_settings = state.settings.current().last_fm.clone();
     let learning = last_fm_settings.enable_radio && last_fm_settings.enable_personalized_stations;
     let submitting = state.listen_brainz.is_enabled_for(&username);

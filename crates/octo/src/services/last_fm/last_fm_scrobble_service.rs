@@ -271,6 +271,8 @@ pub struct LastFmScrobbleService {
     just_saved: Mutex<IgnoreCaseMap<LastFmUserSession>>,
     last_sent: Mutex<IgnoreCaseMap<LastFmSentPlay>>,
     notices: Mutex<IgnoreCaseMap<String>>,
+    /// Favorites as Last.fm loves: see `last_fm_loves.rs`.
+    loves: loves::Loves,
 }
 
 impl LastFmScrobbleService {
@@ -352,6 +354,7 @@ impl LastFmScrobbleService {
             just_saved: Mutex::new(IgnoreCaseMap::default()),
             last_sent: Mutex::new(IgnoreCaseMap::default()),
             notices: Mutex::new(IgnoreCaseMap::default()),
+            loves: loves::Loves::default(),
         }
     }
 
@@ -1291,6 +1294,10 @@ fn number(node: Option<&Value>) -> Option<i32> {
         _ => None,
     }
 }
+
+#[path = "last_fm_loves.rs"]
+mod loves;
+pub use loves::starred_songs;
 
 #[cfg(test)]
 #[path = "last_fm_scrobble_service_tests.rs"]
