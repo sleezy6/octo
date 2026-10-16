@@ -38,6 +38,7 @@ use crate::services::last_fm::LastFmRadioTrackResolver;
 use crate::services::last_fm::last_fm_scrobble_service::starred_songs;
 use crate::services::library::{IgnoredRating, RatingActionRequest, RatingIgnored};
 use crate::services::soulseek::SoulseekMetadataService;
+use crate::services::subsonic::CredentialVerdict;
 use crate::services::subsonic::RelayError;
 use octo_core::family::abilities::RequestQuality;
 use octo_core::family::request::RequestKind;
@@ -1100,7 +1101,9 @@ async fn act_on_rating(
 /// is: `u`, or for an API key sign-in its owner as Navidrome names it. None when there is nobody
 /// to name or Navidrome could not be asked.
 /// Loves (or unloves) these songs on the listener's own Last.fm when they linked it there, as
-/// the favorites they are (or no longer are) in every app. Sent in the background.
+/// the favorites they are (or no longer are) in every app. Sent in the background. Only for a
+/// sign-in already taken: by Navidrome when it took the star, or by the check before the
+/// outside hearts.
 async fn love_on_last_fm(
     state: &AppState,
     call: &SubsonicCall,
@@ -1132,6 +1135,16 @@ async fn unlove_on_last_fm(state: &AppState, call: &SubsonicCall) {
         return;
     };
     if !state.last_fm_scrobbles.loves_for(&username) {
+        return;
+    }
+    // The name is only what the request says: nothing goes to someone's Last.fm until Navidrome
+    // has taken the sign-in (remembered ten minutes, so this rarely asks it).
+    let credential = SubsonicCredential::from(&call.parameters);
+    let verdict = state
+        .credential_check
+        .check(credential.as_ref(), &call.proxy)
+        .await;
+    if !matches!(verdict, Ok(CredentialVerdict::Accepted)) {
         return;
     }
     let resolver = resolver(state, call);
