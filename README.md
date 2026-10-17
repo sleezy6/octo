@@ -516,6 +516,8 @@ alike 0.4), what radio has learned, and "Forget what radio learned". `RADIO_YOUT
 `RADIO_LISTENBRAINZ`, `RADIO_SOUNDS_ALIKE` and `RADIO_LEARN_FROM_LISTENING` switch them in `.env`.
 YouTube Music and ListenBrainz receive the artist and title of the song a radio starts from.
 
+To compare it with another analysis, the dashboard's **Sounds alike from** (Radio sources) can ask Navidrome's own similar songs instead, which a Navidrome plugin such as [AudioMuse-AI](https://github.com/NeptuneHub/AudioMuse-AI) can answer: song radio asks it with the listener's sign-in, station refreshes with Octo's Navidrome admin sign-in, and octo-sonic no longer reorders radio's library picks. It still reads songs for their transition profiles.
+
 Sounds alike runs in the `octo-sonic` service (bliss-rs). The same reading makes each song's
 transition profile, which the Octo apps use to blend one song into the next, so octo-sonic runs
 whether or not Sounds alike is on. It reads each song once, one at a time

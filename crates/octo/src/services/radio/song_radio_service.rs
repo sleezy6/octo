@@ -179,9 +179,15 @@ impl SongRadioService {
             .collect();
         // Sound check: a library pick that sounds far from the seed slips down, one that sounds
         // close moves up. It catches a catalog's wrong-mood pick that the other sources missed.
-        // Only songs Octo has analyzed have a sound, so outside songs keep their score.
+        // Only songs Octo has analyzed have a sound, so outside songs keep their score. Not while
+        // Sounds alike comes from Navidrome, so that test leaves octo-sonic out of radio.
         if let Some(sonic) = &self.sonic
             && self.settings.current().radio_sources.sounds_alike
+            && !self
+                .settings
+                .current()
+                .radio_sources
+                .sounds_alike_from_navidrome()
             && let Some(seed_song) = seed.library_song.as_ref().filter(|song| !song.id.is_empty())
         {
             let fit = sonic.fit_factors(

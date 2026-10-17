@@ -19,6 +19,11 @@ pub struct RadioSourceSettings {
     /// reading how songs sound; their transition profiles are still made. RADIO_SOUNDS_ALIKE.
     pub sounds_alike: bool,
 
+    /// Where Sounds alike asks: `octo-sonic` (its own analysis, the default) or `navidrome`
+    /// (Navidrome's getSimilarSongs, which a plugin such as AudioMuse-AI can answer), to compare
+    /// the two. Either way it answers library songs only. Dashboard only.
+    pub sounds_alike_from: String,
+
     /// The octo-sonic sidecar. RADIO_SONIC_URL.
     pub sonic_url: String,
 
@@ -56,6 +61,7 @@ impl Default for RadioSourceSettings {
             you_tube_music: true,
             listen_brainz: true,
             sounds_alike: true,
+            sounds_alike_from: SOUNDS_ALIKE_FROM_SONIC.to_string(),
             sonic_url: "http://octo-sonic:8080".to_string(),
             sonic_pause_seconds: 2,
             listen_brainz_algorithm:
@@ -70,7 +76,20 @@ impl Default for RadioSourceSettings {
     }
 }
 
+/// [`RadioSourceSettings::sounds_alike_from`]: octo-sonic's analysis.
+pub const SOUNDS_ALIKE_FROM_SONIC: &str = "octo-sonic";
+/// [`RadioSourceSettings::sounds_alike_from`]: Navidrome's getSimilarSongs.
+pub const SOUNDS_ALIKE_FROM_NAVIDROME: &str = "navidrome";
+
 impl RadioSourceSettings {
+    /// True when Sounds alike asks Navidrome's getSimilarSongs rather than octo-sonic; any
+    /// value but `navidrome` is octo-sonic.
+    pub fn sounds_alike_from_navidrome(&self) -> bool {
+        self.sounds_alike_from
+            .trim()
+            .eq_ignore_ascii_case(SOUNDS_ALIKE_FROM_NAVIDROME)
+    }
+
     /// LB Radio's mode as it is asked: easy, medium or hard, any other value easy.
     pub fn effective_listen_brainz_radio_mode(&self) -> &'static str {
         let mode = self.listen_brainz_radio_mode.trim();

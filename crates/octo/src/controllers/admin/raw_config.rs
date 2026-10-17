@@ -249,6 +249,7 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "RadioSources:YouTubeMusic",
     "RadioSources:ListenBrainz",
     "RadioSources:SoundsAlike",
+    "RadioSources:SoundsAlikeFrom",
     "RadioSources:SonicUrl",
     "RadioSources:SonicPauseSeconds",
     "RadioSources:ListenBrainzAlgorithm",

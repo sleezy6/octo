@@ -2019,7 +2019,10 @@ impl Radio {
                 settings.clone(),
             )),
             Arc::new(ListenBrainzRadioSource::new(listen_brainz, settings.clone())),
-            Arc::new(SoundsAlikeRadioSource::new(sonic_store.clone(), settings.clone())),
+            Arc::new(
+                SoundsAlikeRadioSource::new(sonic_store.clone(), settings.clone())
+                    .with_identity(navidrome.navidrome_identity.clone()),
+            ),
         ];
         let sources = Arc::new(RadioSourceSet::new(
             source_list,

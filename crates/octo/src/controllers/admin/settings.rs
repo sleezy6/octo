@@ -346,6 +346,7 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
             ("YouTubeMusic", Node::Bool(radio.you_tube_music)),
             ("ListenBrainz", Node::Bool(radio.listen_brainz)),
             ("SoundsAlike", Node::Bool(radio.sounds_alike)),
+            ("SoundsAlikeFrom", n_str(&radio.sounds_alike_from)),
             ("SonicUrl", n_str(&radio.sonic_url)),
             ("SonicPauseSeconds", n_num(radio.sonic_pause_seconds)),
             ("ListenBrainzAlgorithm", n_str(&radio.listen_brainz_algorithm)),
