@@ -50,8 +50,12 @@ const PARTIAL_TTL: Duration = Duration::from_secs(10 * 60);
 /// another way, then the title alone. Each is one request against Deezer's shared budget,
 /// and only a miss makes the next.
 const TRACK_SEARCHES: usize = 3;
-/// How many artists an artist search reads to find the one named exactly as asked.
-const ARTIST_NAME_CANDIDATES: i32 = 5;
+/// How many artists an artist search reads to find the ones named exactly as asked. Deezer
+/// lists namesakes and acts that merely contain the name ahead of the best-known one: for
+/// "Adele" the Adele people mean is sixth, behind "Adele & Andy" and three smaller Adeles. Every
+/// name lookup asks for this many, so they share one cached search; it costs one request
+/// whatever the count.
+pub const ARTIST_NAME_CANDIDATES: i32 = 25;
 /// How many artists of one name a lookup tries, the best known first.
 const SAME_NAME_ARTISTS: usize = 3;
 

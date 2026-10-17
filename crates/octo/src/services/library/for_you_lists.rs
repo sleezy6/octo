@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::services::metadata::DeezerMetadataService;
+use crate::services::metadata::deezer_metadata_service::ARTIST_NAME_CANDIDATES as ARTIST_CANDIDATES;
 use crate::services::soulseek::ExternalIdRegistry;
 use crate::services::soulseek::soulseek_metadata_service::SoulseekMetadataService;
 
@@ -158,7 +159,6 @@ pub struct NewReleasesBuilder {
 
 const FOUND: TimeDelta = TimeDelta::days(7);
 const MISSED: TimeDelta = TimeDelta::days(1);
-const ARTIST_CANDIDATES: i32 = 5;
 const RELEASES_AT_ONCE: usize = 4;
 const ARTIST_ALBUM_PAGES: i32 = 3;
 

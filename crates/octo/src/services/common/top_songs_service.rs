@@ -45,7 +45,9 @@ use crate::services::framework::{InFlight, MemoryCache};
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::last_fm::last_fm_service::LastFmService;
 use crate::services::library::for_you_lists;
-use crate::services::metadata::deezer_metadata_service::{CHART_LIMIT, DeezerMetadataService};
+use crate::services::metadata::deezer_metadata_service::{
+    ARTIST_NAME_CANDIDATES as ARTIST_CANDIDATES, CHART_LIMIT, DeezerMetadataService,
+};
 use crate::services::soulseek::external_id_registry::ExternalIdRegistry;
 
 /// A whole list keeps for this long once every source answered; one built while a source did
@@ -60,9 +62,6 @@ const MENU_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Apple's gate behind the others, so it gets longer than an artist's list.
 const ARTIST_BUILD_TIMEOUT: Duration = Duration::from_secs(15);
 const CHART_BUILD_TIMEOUT: Duration = Duration::from_secs(45);
-
-/// How many catalog artists of a name are weighed, as an outside artist page does.
-const ARTIST_CANDIDATES: i32 = 5;
 
 /// Library searches running at once for one list. Navidrome is local and quick.
 pub const LIBRARY_SEARCHES_AT_ONCE: usize = 4;

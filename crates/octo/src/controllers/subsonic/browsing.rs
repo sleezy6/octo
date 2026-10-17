@@ -196,7 +196,10 @@ pub async fn get_artist(State(state): State<AppState>, req: Request) -> AppResul
     // The first hit is not reliably this artist: a bigger act whose name contains this one
     // can come first. Of the few asked for, the one with this exact name is.
     let deezer_artists: Vec<_> = metadata
-        .search_artists(&artist_name, 5)
+        .search_artists(
+            &artist_name,
+            crate::services::metadata::deezer_metadata_service::ARTIST_NAME_CANDIDATES,
+        )
         .await
         .into_iter()
         .filter(|found| SongIdentity::same_artist_name(&found.name, &artist_name))

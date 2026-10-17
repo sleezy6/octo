@@ -2307,3 +2307,52 @@ async fn apple_is_not_asked_when_deezer_has_the_length() {
     assert_eq!(fixture.shown(&songs[0]), (Some(234), LengthSource::Deezer));
     assert!(!fixture.requests().iter().any(|r| r.starts_with("apple")));
 }
+
+/// Deezer's search for "Adele" lists "Adele & Andy", "Adèle & Robin" and three smaller Adeles
+/// ahead of the Adele people mean, sixth.
+const ADELES: &str = r#"{"data":[
+    {"id":76152522,"name":"Adele & Andy","nb_fan":326,"nb_album":25},
+    {"id":69171232,"name":"Adèle & Robin","nb_fan":3733,"nb_album":11},
+    {"id":61817012,"name":"Adele","nb_fan":336,"nb_album":1},
+    {"id":5673798,"name":"Adele","nb_fan":12436,"nb_album":1},
+    {"id":5203567,"name":"Adèle & Zalem","nb_fan":1834,"nb_album":2},
+    {"id":75798,"name":"Adele","nb_fan":15496011,"nb_album":15},
+    {"id":7016369,"name":"Adele","nb_fan":639,"nb_album":1}]}"#;
+
+/// A name search reads enough artists to reach the best-known one of the name, and asks for
+/// them in one request.
+#[tokio::test]
+async fn search_artists_reaches_a_best_known_artist_listed_sixth() {
+    let h = build_service(vec![("/search/artist", ADELES)]).await;
+
+    let rows = h.service.search_artists("Adele", 25).await;
+
+    let adele = rows.iter().find(|row| row.name == "Adele").expect("an Adele row");
+    assert_eq!(h.lookup(&adele.id).external_artist_id.as_deref(), Some("75798"));
+    assert_eq!(h.calls("/search/artist"), 1);
+}
+
+/// A namesake settled on before the best-known one was ever listed gives way to it the next
+/// time a search shows it, and only to more fans.
+#[tokio::test]
+async fn search_artists_an_earlier_pick_gives_way_to_a_better_known_namesake() {
+    let h = build_service(vec![("/search/artist", ADELES)]).await;
+    let id = outside_artist(&h, "Adele", Some("61817012"));
+
+    let rows = h.service.search_artists("Adele", 25).await;
+
+    let adele = rows.iter().find(|row| row.name == "Adele").expect("an Adele row");
+    assert_eq!(adele.id, id);
+    assert_eq!(h.lookup(&id).external_artist_id.as_deref(), Some("75798"));
+}
+
+/// The best-known one settled on stays, whatever smaller namesake a search lists first.
+#[tokio::test]
+async fn search_artists_keeps_the_best_known_namesake_settled_on() {
+    let h = build_service(vec![("/search/artist", ADELES)]).await;
+    let id = outside_artist(&h, "Adele", Some("75798"));
+
+    h.service.search_artists("Adele", 25).await;
+
+    assert_eq!(h.lookup(&id).external_artist_id.as_deref(), Some("75798"));
+}

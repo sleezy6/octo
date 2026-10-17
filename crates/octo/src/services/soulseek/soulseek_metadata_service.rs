@@ -30,7 +30,9 @@ use crate::services::cover_art::CoverArtAggregator;
 use crate::services::framework::InFlight;
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::metadata::DeezerMetadataService;
-use crate::services::metadata::deezer_metadata_service::fold_editions;
+use crate::services::metadata::deezer_metadata_service::{
+    ARTIST_NAME_CANDIDATES as ARTIST_CANDIDATES, fold_editions,
+};
 use crate::services::you_tube::{YouTubeHit, YouTubeResolver};
 
 /// The two members of `LastFmService` the length lookup uses: whether it has an API key, and
@@ -238,11 +240,6 @@ const TRACK_COUNT_WAIT: Duration = Duration::from_secs(2);
 const TRACK_COUNTS_PER_VISIT: usize = 20;
 const TRACK_COUNTS_AT_ONCE: usize = 4;
 
-/// How many catalog artists a name search weighs. The first hit is not reliably
-/// the artist asked for: a name another artist shares, or a bigger act that contains it,
-/// can come first.
-const ARTIST_CANDIDATES: i32 = 5;
-
 /// How many artists of one name a library artist's page compares against the
 /// library. Each is one listing call, cached, and only made when a name is shared.
 const ARTISTS_COMPARED: usize = 3;
@@ -282,6 +279,17 @@ fn shared_count(releases: &[AlbumHit], owned: &HashSet<String>) -> usize {
         .iter()
         .filter(|release| owned.contains(&SongIdentity::key(&release.title)))
         .count()
+}
+
+/// The namesake already settled on, unless another of them is followed by more people. A pick
+/// made from a search that did not list the best-known one ("Adele" lists her sixth) gives way
+/// once that one shows, and only ever to more fans, so the choice never swings back.
+fn settled_or_better<'a>(hits: &'a [ArtistHit], settled: Option<&str>) -> Option<&'a ArtistHit> {
+    let best = most_followed(hits)?;
+    match settled.and_then(|id| hits.iter().find(|hit| hit.deezer_id == id)) {
+        Some(kept) if kept.fans >= best.fans => Some(kept),
+        _ => Some(best),
+    }
 }
 
 /// The artist more people follow; the catalog's own order on a tie.
@@ -1821,26 +1829,23 @@ impl IMusicMetadataService for SoulseekMetadataService {
             });
             let routing = inner.lookup(&id);
             let settled = routing.as_ref().and_then(|r| r.lock().external_artist_id.clone());
-            let hit = same
-                .iter()
-                .find(|h| settled.as_deref() == Some(h.deezer_id.as_str()))
-                .or_else(|| most_followed(&same))
+            let hit = settled_or_better(&same, settled.as_deref())
                 .expect("a group is never empty")
                 .clone();
-            // Remembered only when nothing is yet: an earlier search or visit to the artist's
-            // page already settled which artist of the name this is. An album never settles
+            // Remembered when nothing is yet, or when this search shows a namesake more people
+            // follow than the one settled on (see `settled_or_better`). An album never settles
             // it: the name's entry is everyone's, and the first album to show a little-known
             // namesake would have decided the name for all of them.
             if let Some(routing) = routing {
-                let unsettled = {
+                let changed = {
                     let mut r = routing.lock();
-                    let unsettled = r.external_artist_id.is_none();
-                    if unsettled {
+                    let changed = r.external_artist_id.as_deref() != Some(hit.deezer_id.as_str());
+                    if changed {
                         r.external_artist_id = Some(hit.deezer_id.clone());
                     }
-                    unsettled
+                    changed
                 };
-                if unsettled {
+                if changed {
                     inner.id_registry.register(routing);
                 }
             }
