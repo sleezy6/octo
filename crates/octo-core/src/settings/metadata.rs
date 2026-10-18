@@ -80,9 +80,16 @@ pub struct MetadataSettings {
     /// Let "Find lyrics for the library" write lyrics files beside every library song, not only
     /// the ones Octo downloaded. Off by default: a folder of rips or purchases is the owner's,
     /// and Octo does not add files to it unless asked. Existing lyrics files and lyrics embedded
-    /// in a song are never replaced either way.
+    /// in a song are not replaced either way unless [`Self::replace_others_lyrics`] is on.
     /// Environment variable: LYRICS_WRITE_BESIDE_ALL
     pub write_lyrics_beside_all_songs: bool,
+
+    /// Let Octo replace lyrics it did not write (a .lrc or .txt beside the song, or lyrics in its
+    /// tags) where it would replace its own: better lyrics a library walk with upgrade finds, and
+    /// lyrics picked under Better lyrics or Fix a song's lyrics. Off by default: they are the
+    /// owner's. Each replacement is kept in the lyrics undo journal. Lyrics files of other kinds
+    /// (.ttml, .yml and the like) are still left alone. Dashboard only.
+    pub replace_others_lyrics: bool,
 
     /// File a song that arrived without an album under the first release of its recording
     /// (its original album), even when the file's own tags name a compilation or a later
@@ -169,6 +176,7 @@ impl Default for MetadataSettings {
             save_lyrics_to: LyricsSaveTo::BESIDE.to_string(),
             prefer_word_timed_lyrics: true,
             write_lyrics_beside_all_songs: false,
+            replace_others_lyrics: false,
             prefer_original_album: true,
             year_from_original_release: true,
             preferred_countries: String::new(),

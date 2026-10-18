@@ -49,10 +49,22 @@ impl Song {
     }
 
     fn writer(&self, order: &str, save_to: &str, source: Arc<FakeSource>) -> LyricsSidecarWriter {
+        self.writer_with(order, save_to, source, false)
+    }
+
+    /// [`Self::writer`], replacing lyrics Octo did not write when `replace_others`.
+    fn writer_with(
+        &self,
+        order: &str,
+        save_to: &str,
+        source: Arc<FakeSource>,
+        replace_others: bool,
+    ) -> LyricsSidecarWriter {
         let settings = Arc::new(SettingsStore::for_tests(AppSettings {
             metadata: MetadataSettings {
                 lyrics_sources: order.to_string(),
                 save_lyrics_to: save_to.to_string(),
+                replace_others_lyrics: replace_others,
                 ..MetadataSettings::default()
             },
             ..AppSettings::default()
@@ -578,4 +590,77 @@ fn is_octos_reads_the_first_line() {
     assert!(LyricsSidecarWriter::is_octos(&lrc));
     std::fs::write(&lrc, "[00:01.00]x").expect("written");
     assert!(!LyricsSidecarWriter::is_octos(&lrc));
+}
+
+// ---- Replacing lyrics Octo did not write (Metadata:ReplaceOthersLyrics) ----------------------
+
+/// With the switch on, an upgrade replaces the owner's line-timed .lrc with Octo's word-timed
+/// one, and the owner's file is kept in the undo journal; Undo puts it back.
+#[tokio::test]
+async fn replacing_others_an_upgrade_replaces_the_owners_lrc_and_can_be_undone() {
+    let song = Song::new();
+    let theirs = song.mp3("02 Theirs.mp3", None);
+    std::fs::write(beside(&theirs, "lrc"), "[00:01.00]the owner's line\n").expect("written");
+    let words = FakeSource::new("kugou", || found("KuGou", Some(WORDS), None));
+    let writer = song.writer_with("kugou", LyricsSaveTo::BESIDE, words, true);
+    let journal = Arc::new(LyricsUndoJournal::new(None));
+    writer.set_undo_journal(journal.clone());
+
+    let write = writer
+        .write(
+            &LyricsJob::new(&theirs, "Artist", "Theirs", None, Some(1)),
+            true,
+            &none(),
+        )
+        .await
+        .expect("written");
+
+    assert_eq!(write.outcome, LyricsWriteOutcome::Upgraded);
+    assert_eq!(read(&beside(&theirs, "lrc")), format!("{MARK}\n{WORDS}\n"));
+    let entries = journal.read_all().expect("read");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].before.as_deref(), Some("[00:01.00]the owner's line\n"));
+    assert!(writer.restore(&entries[0]));
+    assert_eq!(read(&beside(&theirs, "lrc")), "[00:01.00]the owner's line\n");
+}
+
+/// With the switch on, lyrics in the owner's tags are replaced in place when saving inside.
+#[tokio::test]
+async fn replacing_others_the_owners_tag_lyrics_are_replaced_in_place() {
+    let song = Song::new();
+    let audio = song.mp3("Artist - Song.mp3", Some(LINES));
+    let writer = song.writer_with(
+        "song,kugou",
+        LyricsSaveTo::INSIDE,
+        FakeSource::new("kugou", || found("KuGou", Some(WORDS), None)),
+        true,
+    );
+
+    let write = writer.write(&job(&audio), true, &none()).await.expect("written");
+
+    assert_eq!(write.outcome, LyricsWriteOutcome::Upgraded);
+    assert_eq!(song.tags.get(&audio), Some(format!("{MARK}\n{WORDS}")));
+    assert!(!beside(&audio, "lrc").exists());
+}
+
+/// A chosen replacement goes over the owner's lyrics only with the switch on, and a lyrics file
+/// of another kind still keeps Octo out.
+#[tokio::test]
+async fn replacing_others_a_chosen_replacement_needs_the_switch_and_spares_other_kinds() {
+    let song = Song::new();
+    let mine = song.mp3("01 Mine.mp3", None);
+    std::fs::write(beside(&mine, "txt"), "the owner's words").expect("written");
+    let odd = song.mp3("02 Odd.mp3", None);
+    std::fs::write(beside(&odd, "ttml"), "<tt/>").expect("written");
+    let chosen = LyricsResult::new("KuGou", None, Some("chosen words".into()), false);
+    let source = || FakeSource::new("kugou", || found("KuGou", None, None));
+
+    let off = song.writer_with("kugou", LyricsSaveTo::BESIDE, source(), false);
+    assert!(!off.replace(&mine, &chosen, &none()).await.expect("checked"));
+    assert_eq!(read(&beside(&mine, "txt")), "the owner's words");
+
+    let on = song.writer_with("kugou", LyricsSaveTo::BESIDE, source(), true);
+    assert!(on.replace(&mine, &chosen, &none()).await.expect("written"));
+    assert_eq!(read(&beside(&mine, "txt")), "chosen words\n");
+    assert!(!on.replace(&odd, &chosen, &none()).await.expect("checked"));
 }

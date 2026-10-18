@@ -274,6 +274,11 @@ impl LyricsSidecarWriter {
         LyricsSaveTo::normalize(Some(&self.settings.current().metadata.save_lyrics_to))
     }
 
+    /// Metadata:ReplaceOthersLyrics: lyrics Octo did not write may be replaced too.
+    fn replaces_others(&self) -> bool {
+        self.settings.current().metadata.replace_others_lyrics
+    }
+
     /// Queue a song. False when the queue is full and the job was dropped.
     pub fn try_enqueue(&self, job: LyricsJob) -> bool {
         self.sender.try_send(job).is_ok()
@@ -428,7 +433,14 @@ impl LyricsSidecarWriter {
             else {
                 return Ok(LyricsWrite::new(LyricsWriteOutcome::AlreadyThere, None));
             };
-            if !self.save(&job.audio_path, &better, None).await? {
+            let saved = if has.octos {
+                self.save(&job.audio_path, &better, None).await?
+            } else {
+                // Lyrics Octo did not write, replaced only with Metadata:ReplaceOthersLyrics on
+                // (`save` refuses otherwise): kept in the undo journal so they can come back.
+                self.save_undoable(&job.audio_path, &better).await?
+            };
+            if !saved {
                 return Ok(LyricsWrite::new(LyricsWriteOutcome::AlreadyThere, None));
             }
             info!(
@@ -514,17 +526,22 @@ impl LyricsSidecarWriter {
             None => None,
         };
         let has = self.song_lyrics(audio_path);
-        if has.place != SongLyricsPlace::None && !has.octos {
+        if has.place != SongLyricsPlace::None && !has.octos && !self.replaces_others() {
             return Ok(false);
         }
+        self.save_undoable(audio_path, chosen).await
+    }
+
+    /// [`Self::save`], telling the undo journal (when there is one) what each write replaces.
+    async fn save_undoable(&self, audio_path: &Path, found: &LyricsResult) -> anyhow::Result<bool> {
         let Some(journal) = self.undo.get() else {
-            return self.save(audio_path, chosen, None).await;
+            return self.save(audio_path, found, None).await;
         };
         let run_id = super::lyrics_library_job::new_run_id();
         let record = |path: &Path, kind: &str, before: Option<&str>| -> anyhow::Result<()> {
             Ok(journal.record(&path.to_string_lossy(), kind, before, &run_id)?)
         };
-        self.save(audio_path, chosen, Some(&record)).await
+        self.save(audio_path, found, Some(&record)).await
     }
 
     /// Save lyrics someone picked on the lyrics page, where LYRICS_SAVE_TO says and Octo may
@@ -540,9 +557,10 @@ impl LyricsSidecarWriter {
         self.save(audio_path, found, Some(record)).await
     }
 
-    /// Save lyrics where LYRICS_SAVE_TO says, replacing only Octo's own. Where that is not
-    /// allowed (inside a song whose tags hold someone else's lyrics), they go beside it
-    /// instead, which takes nothing away. False when there was nowhere to put them.
+    /// Save lyrics where LYRICS_SAVE_TO says, replacing only Octo's own (anyone's with
+    /// Metadata:ReplaceOthersLyrics on). Where that is not allowed (inside a song whose tags hold
+    /// someone else's lyrics), they go beside it instead, which takes nothing away. False when
+    /// there was nowhere to put them.
     async fn save(
         &self,
         audio_path: &Path,
@@ -567,7 +585,9 @@ impl LyricsSidecarWriter {
                 self.scan_soon();
             }
         }
-        if beside && song_lyrics::may_write_beside(&stem, found.has_synced()) {
+        if beside
+            && song_lyrics::may_write_beside_replacing(&stem, found.has_synced(), self.replaces_others())
+        {
             let target = with_suffix(&stem, if found.has_synced() { ".lrc" } else { ".txt" });
             if let Some(record) = record {
                 let before = if target.exists() {
@@ -590,7 +610,8 @@ impl LyricsSidecarWriter {
         let path = Path::new(&entry.path);
         let restored = (|| -> anyhow::Result<bool> {
             if entry.kind == LyricsUndoJournal::INSIDE {
-                if !path.exists() || !self.may_write_inside(path) {
+                // Only while the tags still hold what Octo saved, whatever the switch says.
+                if !path.exists() || !self.holds_only_octos_inside(path) {
                     return Ok(false);
                 }
                 self.tags.write_lyrics(path, entry.before.as_deref())?;
@@ -634,8 +655,15 @@ impl LyricsSidecarWriter {
         song_lyrics::of_with_tag_lyrics(audio_path, inside.as_deref())
     }
 
-    /// Whether Octo may write inside the song: the tags hold no lyrics, or Octo's.
+    /// Whether Octo may write inside the song: the tags hold no lyrics, or Octo's (or anyone's,
+    /// with Metadata:ReplaceOthersLyrics on).
     fn may_write_inside(&self, audio_path: &Path) -> bool {
+        self.holds_only_octos_inside(audio_path)
+            || (self.replaces_others() && self.tags.read_lyrics(audio_path).is_ok())
+    }
+
+    /// The tags hold no lyrics, or Octo's.
+    fn holds_only_octos_inside(&self, audio_path: &Path) -> bool {
         match self.tags.read_lyrics(audio_path) {
             Ok(Some(text)) if !is_null_or_white_space(Some(&text)) => SongLyrics::is_octos_text(&text),
             Ok(_) => true,

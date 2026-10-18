@@ -269,6 +269,7 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "Metadata:LyricsSources",
     "Metadata:PreferWordTimedLyrics",
     "Metadata:WriteLyricsBesideAllSongs",
+    "Metadata:ReplaceOthersLyrics",
     "Metadata:SaveLyricsTo",
     "Metadata:PreferOriginalAlbum",
     "Metadata:YearFromOriginalRelease",

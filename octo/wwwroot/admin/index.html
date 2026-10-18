@@ -2198,9 +2198,17 @@
               <div class="set-info">
                 <div class="set-info-t">Write lyrics files beside all library songs</div>
                 <div class="set-info-d">Lets a library walk started through the API save lyrics for your own rips and purchases too.</div>
-                <div class="set-info-more">Songs you pick under Better lyrics are saved either way. Lyrics Octo did not write are never replaced.</div>
+                <div class="set-info-more">Songs you pick under Better lyrics are saved either way. Lyrics Octo did not write are not replaced unless the switch below is on.</div>
               </div>
               <label class="switch"><input type="checkbox" name="Metadata.WriteLyricsBesideAllSongs" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Replace lyrics Octo did not write</div>
+                <div class="set-info-d">Lets better lyrics, or lyrics you pick, replace a song's existing .lrc, .txt or embedded lyrics even when they came from somewhere else.</div>
+                <div class="set-info-more">Off, those are left as they are. Each replacement can be undone like any other lyrics save. Lyrics files of other kinds (.ttml and the like) are never touched.</div>
+              </div>
+              <label class="switch"><input type="checkbox" name="Metadata.ReplaceOthersLyrics" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
           </form>
         </div>

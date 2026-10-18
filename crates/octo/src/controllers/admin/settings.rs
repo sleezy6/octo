@@ -508,6 +508,7 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
                 "WriteLyricsBesideAllSongs",
                 Node::Bool(metadata.write_lyrics_beside_all_songs),
             ),
+            ("ReplaceOthersLyrics", Node::Bool(metadata.replace_others_lyrics)),
             (
                 "SaveLyricsTo",
                 n_str(LyricsSaveTo::normalize(Some(&metadata.save_lyrics_to))),

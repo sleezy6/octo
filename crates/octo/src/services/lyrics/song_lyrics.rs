@@ -102,6 +102,23 @@ pub fn stem(audio_path: &Path) -> PathBuf {
     audio_path.with_extension("")
 }
 
+/// [`may_write_beside`], and with `replace_others` (Metadata:ReplaceOthersLyrics) the owner's
+/// .lrc and .txt may be replaced too: timed lyrics as a .lrc whatever is there, plain ones as a
+/// .txt where no .lrc sits beside it (a .lrc would still be what is shown). Lyrics files of
+/// other kinds still keep Octo out.
+pub fn may_write_beside_replacing(stem: &Path, timed: bool, replace_others: bool) -> bool {
+    if !replace_others {
+        return may_write_beside(stem, timed);
+    }
+    if has_other_lyrics_file(stem) {
+        return false;
+    }
+    if timed {
+        return true;
+    }
+    !with_suffix(stem, ".lrc").exists()
+}
+
 fn with_suffix(stem: &Path, suffix: &str) -> PathBuf {
     let mut path: OsString = stem.as_os_str().to_owned();
     path.push(suffix);
