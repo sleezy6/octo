@@ -302,3 +302,48 @@ async fn lrclib_a_canceled_lookup_is_not_now() {
     assert!(lookup.transient);
     assert!(http.calls().await.is_empty());
 }
+
+/// A busy /api/get with a short Retry-After does not end the lookup: once the wait is over, the
+/// search that answers finds the lyrics (issue #98).
+#[tokio::test]
+async fn lrclib_a_briefly_busy_get_still_tries_the_search() {
+    let http = FakeHttp::start(|url| {
+        if url.contains("/api/get?") {
+            status(503, r#"{"message":"The server is busy, please retry in a moment."}"#)
+                .insert_header("Retry-After", "1")
+        } else {
+            json(
+                r#"[{"trackName":"Yesterday","artistName":"The Beatles","duration":125,"syncedLyrics":"[00:01.00] Yesterday","plainLyrics":"Yesterday"}]"#,
+            )
+        }
+    })
+    .await;
+
+    let lookup = source(&http)
+        .find(
+            &LyricsQuery::new("The Beatles", "Yesterday", None, Some(125)),
+            &none(),
+        )
+        .await;
+
+    assert!(!lookup.transient);
+    assert!(lookup.result.expect("found by the search").has_synced());
+    assert_eq!(http.calls().await.len(), 2);
+}
+
+/// When nothing answers, the lookup is "not now", never "no lyrics", so a later play asks again.
+#[tokio::test]
+async fn lrclib_busy_everywhere_is_not_now_rather_than_no_lyrics() {
+    let http =
+        FakeHttp::start(|_| status(503, r#"{"message":"busy"}"#).insert_header("Retry-After", "1")).await;
+
+    let lookup = source(&http)
+        .find(
+            &LyricsQuery::new("The Beatles", "Yesterday", None, Some(125)),
+            &none(),
+        )
+        .await;
+
+    assert!(lookup.transient);
+    assert!(lookup.result.is_none());
+}

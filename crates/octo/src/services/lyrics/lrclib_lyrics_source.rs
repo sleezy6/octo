@@ -43,6 +43,9 @@ impl LrclibLyricsSource {
     pub const DEFAULT_BASE_URL: &'static str = "https://lrclib.net";
     const MINIMUM_GAP: Duration = Duration::from_millis(250);
     const DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
+    /// The longest "retry in a moment" a lookup waits out before going on to the searches.
+    /// Longer, and LRCLIB is left alone for as long as it asked (issue #98).
+    const SHORT_WAIT: Duration = Duration::from_secs(2);
 
     /// The source over the `lyrics` client ([`super::lyrics_http::lyrics_http_client`]).
     pub fn new(client: reqwest::Client) -> Self {
@@ -75,7 +78,11 @@ impl LrclibLyricsSource {
         ct: &CancellationToken,
     ) -> Result<LyricsLookup, ShapeError> {
         let get = self.send(&self.get_url(query), ct).await;
-        if get.transient {
+        // A busy /api/get does not end the lookup: its search often answers a moment later
+        // (issue #98). A short wait LRCLIB asks for is waited out first; a long one is honored
+        // by asking nothing more.
+        let mut busy = get.transient;
+        if busy && !self.wait_out_a_short_cool_down(ct).await {
             return Ok(LyricsLookup::failed());
         }
         if let Some(found) = &get.json {
@@ -91,7 +98,11 @@ impl LrclibLyricsSource {
         for variant in LyricsIdentity::searches(query, 3) {
             let search = self.send(&self.search_url(&variant), ct).await;
             if search.transient {
-                return Ok(LyricsLookup::failed());
+                busy = true;
+                if !self.wait_out_a_short_cool_down(ct).await {
+                    break;
+                }
+                continue;
             }
             let Some(results) = &search.json else {
                 continue;
@@ -100,7 +111,30 @@ impl LrclibLyricsSource {
                 return Ok(LyricsLookup::new(Some(Self::parse(hit, Some(query))?), false));
             }
         }
-        Ok(LyricsLookup::miss())
+        // Found nowhere: "no lyrics" only when every request answered, else "not now", so a
+        // later play asks again.
+        Ok(if busy {
+            LyricsLookup::failed()
+        } else {
+            LyricsLookup::miss()
+        })
+    }
+
+    /// After a request that did not answer: true to go on, once a cool-down LRCLIB asked for
+    /// is over when it is short ([`Self::SHORT_WAIT`]); false when it asked for longer, or the
+    /// lookup was canceled while waiting.
+    async fn wait_out_a_short_cool_down(&self, ct: &CancellationToken) -> bool {
+        let Some(until) = self.cool_down_until() else {
+            return !ct.is_cancelled();
+        };
+        let left = until.saturating_duration_since(Instant::now());
+        if left > Self::SHORT_WAIT {
+            return false;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(left) => true,
+            () = ct.cancelled() => false,
+        }
     }
 
     fn candidates(results: &[Value]) -> Result<LyricsSearch, ShapeError> {
