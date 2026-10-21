@@ -323,6 +323,27 @@ impl MusicBrainzClient {
         }
     }
 
+    /// The barcodes of an album's official releases, digital ones first (see
+    /// [`pure::barcodes_of_releases`]). On the background lane; remembered six hours.
+    pub async fn album_barcodes(&self, artist: &str, album: &str) -> Result<Vec<String>, MusicBrainzError> {
+        let Some(url) = pure::album_releases_url(artist, album) else {
+            return Ok(Vec::new());
+        };
+        let key = format!("album-barcodes|{}", SongIdentity::match_key(artist, album));
+        let doc = match self.cache.get(&key) {
+            Some(Cached::Json(cached)) => cached,
+            _ => {
+                let Some(doc) = self.get_background(&url, "album releases search").await? else {
+                    return Ok(Vec::new());
+                };
+                self.cache
+                    .set(key, Cached::Json(doc.clone()), 1, Self::SEARCH_TTL);
+                doc
+            }
+        };
+        Ok(pure::barcodes_of_releases(&doc, artist, album)?)
+    }
+
     /// Where the artist with this MusicBrainz id is from: a two-letter country, empty when
     /// MusicBrainz names none, None when it could not be asked. On the background lane;
     /// answers are remembered a day.
@@ -576,6 +597,19 @@ impl crate::services::metadata::deezer_metadata_service::IsrcSource for MusicBra
             Ok(codes) => codes,
             Err(e) => {
                 tracing::debug!("MusicBrainz could not name ISRCs for '{artist} - {title}': {e}");
+                Vec::new()
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::services::cover_art::BarcodeSource for MusicBrainzClient {
+    async fn barcodes_for(&self, artist: &str, album: &str) -> Vec<String> {
+        match self.album_barcodes(artist, album).await {
+            Ok(codes) => codes,
+            Err(e) => {
+                tracing::debug!("MusicBrainz could not name barcodes for '{artist} - {album}': {e}");
                 Vec::new()
             }
         }

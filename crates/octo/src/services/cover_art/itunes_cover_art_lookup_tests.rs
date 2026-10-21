@@ -196,6 +196,55 @@ async fn priming_by_barcode_matches_albums_back_by_name() {
     assert_eq!(lookup.cached_rows().len(), 4);
 }
 
+/// Apple's search leaves out an explicit album with no clean edition and lists its remixes
+/// instead; the album is found by the barcodes another catalog names for it.
+#[tokio::test]
+async fn an_album_the_search_leaves_out_is_found_by_another_catalogs_barcode() {
+    struct Codes;
+    #[async_trait]
+    impl BarcodeSource for Codes {
+        async fn barcodes_for(&self, artist: &str, album: &str) -> Vec<String> {
+            assert_eq!((artist, album), ("Gorgon City", "Olympia"));
+            vec!["00602435761824".into(), "0602435761749".into()]
+        }
+    }
+    set_apple_interval(Duration::ZERO);
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"results":[{"wrapperType":"collection","collectionId":1592495247,"artistName":"Gorgon City","collectionName":"Olympia (Remixes)","collectionExplicitness":"notExplicit","artworkUrl100":"http://x/r/100x100bb.jpg"}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(path("/lookup"))
+        .and(query_param(
+            "upc",
+            "00602435761824,602435761824,0602435761749,602435761749",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"results":[{"wrapperType":"collection","collectionId":1562117946,"artistName":"Gorgon City","collectionName":"Olympia","collectionExplicitness":"explicit","artworkUrl100":"http://x/o/100x100bb.jpg"}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let lookup = ITunesCoverArtLookup::with_base_url(None, &server.uri(), Clock::fixed(at(10, 0, 0)));
+    assert_eq!(
+        lookup
+            .album_collection_id("Gorgon City", "Olympia", None)
+            .await
+            .expect("answered"),
+        None,
+        "without another catalog the search's answer stands"
+    );
+    lookup.set_barcode_source(Arc::new(Codes));
+    assert_eq!(
+        lookup
+            .album_collection_id("Gorgon City", "Olympia", None)
+            .await
+            .expect("answered"),
+        Some(1562117946)
+    );
+}
+
 /// A search ranks its hits by how well the artist is named: the same name in another script
 /// beats a longer name that only starts with the same letters.
 #[tokio::test]

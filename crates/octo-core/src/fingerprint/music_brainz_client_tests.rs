@@ -508,3 +508,24 @@ fn isrcs_of_recordings_without_a_length_takes_one_song_s_codes() {
         vec!["GBLZC0700013".to_string(), "GBLZC1200050".to_string()]
     );
 }
+
+#[test]
+fn an_albums_barcodes_come_from_its_own_releases_digital_first() {
+    let doc = serde_json::json!({"releases": [
+        {"title": "Olympia", "barcode": "0602435761749", "artist-credit": [{"name": "Gorgon City"}],
+         "media": [{"format": "CD"}]},
+        {"title": "Olympia", "barcode": "00602435761824", "artist-credit": [{"name": "Gorgon City"}],
+         "media": [{"format": "Digital Media"}]},
+        {"title": "Olympia (Remixes)", "barcode": "1", "artist-credit": [{"name": "Gorgon City"}]},
+        {"title": "Olympia", "barcode": "2", "artist-credit": [{"name": "Austra"}]},
+        {"title": "Olympia", "barcode": "", "artist-credit": [{"name": "Gorgon City"}]},
+        {"title": "Olympia", "barcode": "00602435761824", "artist-credit": [{"name": "Gorgon City"}]},
+    ]});
+    assert_eq!(
+        barcodes_of_releases(&doc, "Gorgon City", "Olympia").expect("read"),
+        ["00602435761824", "0602435761749"]
+    );
+    assert!(album_releases_url("", "Olympia").is_none());
+    let url = album_releases_url("Gorgon City", "Olympia").expect("asked");
+    assert!(url.starts_with("release/?query=release%3A%22Olympia%22"), "{url}");
+}

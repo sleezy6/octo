@@ -1462,6 +1462,11 @@ impl MetadataClients {
         // The cover sources take their settings once: captured here, at construction.
         let current = settings.current();
         let itunes_cover_art = Arc::new(ITunesCoverArtLookup::new(itunes_cache));
+        // An album Apple's search leaves out (explicit, with no clean edition) is found by the
+        // barcodes MusicBrainz lists for it. Not when the catalog is a test's stand-in.
+        if deezer_base_url.is_none() {
+            itunes_cover_art.set_barcode_source(Arc::clone(&music_brainz) as _);
+        }
         // Cover-art sources, in fallback order. The aggregator queries them sequentially; adding
         // or removing a source is a one-line change here.
         let artwork_hints = Arc::new(ArtworkHints::new());

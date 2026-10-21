@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -61,10 +61,12 @@ const SONG_LENGTH_CAP: usize = 20_000;
 static RELEASE_SUFFIX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\s+-\s+(?:Single|EP)\s*$").expect("the release suffix regex compiles"));
 
-/// Song matching for album titles: no length tolerance.
+/// Song matching for album titles: no length tolerance, and a subtitle only one title carries
+/// ("Olympia" against "Olympia (Remixes)") is another album, not a lower confidence.
 fn album_titles() -> SongMatchOptions {
     SongMatchOptions {
         length_tolerance_seconds: None,
+        extras_must_agree: true,
         ..Default::default()
     }
 }
@@ -152,6 +154,30 @@ pub struct ITunesCoverArtLookup {
     /// Song lengths Apple's catalog gave, and the songs it had none for, by artist, title and
     /// ISRC, with when each was learned. In memory: a found length is kept on the song itself.
     lengths: Mutex<HashMap<String, (Option<i32>, Instant)>>,
+
+    /// Where an album's barcodes come from when the caller knows none: another catalog
+    /// (MusicBrainz), asked only after Apple's search has not named the album.
+    barcodes: std::sync::OnceLock<Arc<dyn BarcodeSource>>,
+}
+
+/// An album's barcodes from another catalog, for an Apple lookup by barcode.
+#[async_trait]
+pub trait BarcodeSource: Send + Sync {
+    /// The barcodes of `album` by `artist`, likeliest first. Empty when none are known or the
+    /// source did not answer.
+    async fn barcodes_for(&self, artist: &str, album: &str) -> Vec<String>;
+}
+
+/// How many of another catalog's barcodes one Apple lookup asks for.
+const BARCODES_ASKED: usize = 6;
+
+/// What one ask for an album's id came to.
+enum Ask {
+    Found(u64),
+    /// Apple answered, and none of the albums it listed is the one.
+    NoMatch,
+    /// Apple did not answer, or the answer could not be read.
+    Unanswered,
 }
 
 impl ITunesCoverArtLookup {
@@ -178,9 +204,15 @@ impl ITunesCoverArtLookup {
             cache_path: cache_path.filter(|p| !dotnet::is_blank(&p.to_string_lossy())),
             dirty: AtomicBool::new(false),
             lengths: Mutex::new(HashMap::new()),
+            barcodes: std::sync::OnceLock::new(),
         };
         lookup.load_cache();
         lookup
+    }
+
+    /// Sets where an album's barcodes come from when a caller knows none. Once.
+    pub fn set_barcode_source(&self, source: Arc<dyn BarcodeSource>) {
+        let _ = self.barcodes.set(source);
     }
 
     /// Writes the matches every 15 seconds, and once more when the token is canceled.
@@ -371,43 +403,86 @@ impl ITunesCoverArtLookup {
         );
         let mut answered = false;
         for url in by_code.into_iter().chain([by_name]) {
-            let answer = match self.apple_get(&url).await {
-                Ok(Some(answer)) if answer.is_success() => answer,
-                Ok(_) => continue,
-                Err(e) => {
-                    debug!("iTunes album id lookup failed for {artist} - {album}: {e}");
-                    continue;
-                }
-            };
-            let Ok(doc) = serde_json::from_str::<Value>(&answer.text()) else {
-                continue;
-            };
-            let Ok(collections) = collections_of(&doc) else {
-                continue;
-            };
-            answered = true;
-            let best = collections
+            match self.album_id_at(&url, artist, album).await {
+                Ask::Found(id) => return Ok(Some(id)),
+                Ask::NoMatch => answered = true,
+                Ask::Unanswered => {}
+            }
+        }
+        // Apple's search leaves out an explicit album with no clean edition. Another catalog's
+        // barcodes for the album find it by its lookup, which leaves nothing out.
+        if codes.is_empty()
+            && let Some(source) = self.barcodes.get()
+        {
+            let codes: Vec<String> = source
+                .barcodes_for(artist, album)
+                .await
                 .iter()
-                .filter(|c| c.id.is_some())
-                .filter(|c| {
-                    SongIdentity::same_text(
-                        album,
-                        artist,
-                        &c.name,
-                        c.by.as_deref().unwrap_or(""),
-                        Some(&album_titles()),
-                    )
-                    .is_same()
-                })
-                .min_by_key(|c| c.clean);
-            if let Some(found) = best {
-                return Ok(found.id);
+                .flat_map(|code| barcode_forms(Some(code)))
+                .take(BARCODES_ASKED)
+                .collect();
+            if !codes.is_empty() {
+                let url = format!(
+                    "{}/lookup?entity=album&upc={}",
+                    self.base,
+                    codes
+                        .iter()
+                        .map(|c| dotnet::escape_data_string(c))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                match self.album_id_at(&url, artist, album).await {
+                    Ask::Found(id) => {
+                        info!(
+                            "Apple's album id for '{artist} - {album}' came from another catalog's barcode"
+                        );
+                        return Ok(Some(id));
+                    }
+                    Ask::NoMatch => answered = true,
+                    Ask::Unanswered => {}
+                }
             }
         }
         if answered {
             Ok(None)
         } else {
             anyhow::bail!("Apple answered none of the album id asks")
+        }
+    }
+
+    /// The id of the album among the collections `url` lists, when one is the very album.
+    async fn album_id_at(&self, url: &str, artist: &str, album: &str) -> Ask {
+        let answer = match self.apple_get(url).await {
+            Ok(Some(answer)) if answer.is_success() => answer,
+            Ok(_) => return Ask::Unanswered,
+            Err(e) => {
+                debug!("iTunes album id lookup failed for {artist} - {album}: {e}");
+                return Ask::Unanswered;
+            }
+        };
+        let Ok(doc) = serde_json::from_str::<Value>(&answer.text()) else {
+            return Ask::Unanswered;
+        };
+        let Ok(collections) = collections_of(&doc) else {
+            return Ask::Unanswered;
+        };
+        let best = collections
+            .iter()
+            .filter(|c| c.id.is_some())
+            .filter(|c| {
+                SongIdentity::same_text(
+                    album,
+                    artist,
+                    &c.name,
+                    c.by.as_deref().unwrap_or(""),
+                    Some(&album_titles()),
+                )
+                .is_same()
+            })
+            .min_by_key(|c| c.clean);
+        match best.and_then(|found| found.id) {
+            Some(id) => Ask::Found(id),
+            None => Ask::NoMatch,
         }
     }
 

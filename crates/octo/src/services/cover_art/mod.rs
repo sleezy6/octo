@@ -31,6 +31,6 @@ pub use cover_upgrade::{
 pub use deezer_cover_art_lookup::DeezerCoverArtLookup;
 pub use download_cover_resolver::{CoverChoice, CoversOnHand, DownloadCoverResolver};
 pub use i_cover_art_source::ICoverArtSource;
-pub use itunes_cover_art_lookup::ITunesCoverArtLookup;
+pub use itunes_cover_art_lookup::{BarcodeSource, ITunesCoverArtLookup};
 pub use last_fm_cover_art_lookup::LastFmCoverArtLookup;
 pub use local_cover_cache::LocalCoverCache;

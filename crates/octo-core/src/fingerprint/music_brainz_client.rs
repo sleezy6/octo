@@ -102,6 +102,79 @@ pub fn studio_album_search(artist: &str, title: &str) -> Option<(String, String)
     ))
 }
 
+/// The relative URL that lists an album's official releases, with their barcodes, or None when
+/// the album cannot be asked for.
+pub fn album_releases_url(artist: &str, album: &str) -> Option<String> {
+    if dotnet::is_blank(artist) || dotnet::is_blank(album) {
+        return None;
+    }
+    let query = format!(
+        "release:\"{}\" AND artist:\"{}\" AND status:official",
+        escape(album.trim()),
+        escape(artist.trim())
+    );
+    Some(format!(
+        "release/?query={}&fmt=json&limit=25",
+        dotnet::escape_data_string(&query)
+    ))
+}
+
+/// The barcodes of the releases in `root` that are `album` by `artist`: the same title and the
+/// same first credited artist, read the way songs are matched. Digital releases first, since a
+/// store carries those; no repeats.
+pub fn barcodes_of_releases(root: &Value, artist: &str, album: &str) -> ElementResult<Vec<String>> {
+    let Some(releases @ Value::Array(_)) = try_get_property(root, "releases")? else {
+        return Ok(Vec::new());
+    };
+    let wanted_album = SongIdentity::key(album);
+    let wanted_artist = SongIdentity::key(artist);
+    let mut digital: Vec<String> = Vec::new();
+    let mut physical: Vec<String> = Vec::new();
+    for release in enumerate_array(releases)? {
+        let Some(title) = try_get_property(release, "title")? else {
+            continue;
+        };
+        if SongIdentity::key(get_string(title)?.unwrap_or("")) != wanted_album {
+            continue;
+        }
+        let credited = match try_get_property(release, "artist-credit")? {
+            Some(Value::Array(credits)) => match credits.first().and_then(|c| c.get("name")) {
+                Some(Value::String(name)) => name.clone(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        };
+        if SongIdentity::key(&credited) != wanted_artist {
+            continue;
+        }
+        let Some(barcode) = try_get_property(release, "barcode")? else {
+            continue;
+        };
+        let Some(code) = get_string(barcode)?.map(str::trim).filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        let is_digital = match try_get_property(release, "media")? {
+            Some(Value::Array(media)) => media.iter().any(|m| {
+                m.get("format")
+                    .and_then(Value::as_str)
+                    .is_some_and(|f| f.eq_ignore_ascii_case("Digital Media"))
+            }),
+            _ => false,
+        };
+        let code = code.to_string();
+        if digital.contains(&code) || physical.contains(&code) {
+            continue;
+        }
+        if is_digital {
+            digital.push(code);
+        } else {
+            physical.push(code);
+        }
+    }
+    digital.extend(physical);
+    Ok(digital)
+}
+
 /// The release group of the oldest official studio album a song appears on, else of a mixtape,
 /// else of a soundtrack. None when the answer names none of them.
 pub fn pick_studio_album(root: &Value, title: &str) -> ElementResult<Option<String>> {
