@@ -574,7 +574,12 @@ fn lists_rule(context: &AnswerContext<'_>, body: Bytes, privacy: &PrivacyCache) 
     }
     let caller = context.caller;
     let endpoint = context.endpoint;
-    let kid = kid_filter::applies(caller, endpoint).then_some(settings.family.kid_unrated_is_explicit);
+    let kid = kid_filter::answer_filter(
+        &state.family_store,
+        caller,
+        endpoint,
+        settings.family.kid_unrated_is_explicit,
+    );
     let owner = owner_privacy::applies(caller, endpoint, &settings.family);
     let personal = personal_marks::personal_library(&state.family_store, caller);
     if kid.is_none() && owner.is_none() && personal.is_none() {
@@ -582,11 +587,15 @@ fn lists_rule(context: &AnswerContext<'_>, body: Bytes, privacy: &PrivacyCache) 
     }
     let index = &state.library_index;
 
-    if let Some(unrated) = kid
+    if let Some(filter) = kid.filter(|f| matches!(f, kid_filter::AnswerFilter::Clean { .. }))
         && eq_ignore_case(endpoint, "getSong")
     {
         match any_song(&body, |facts| {
-            kid_filter::song_is_explicit(index, facts.id, facts.explicit_status, unrated)
+            let indexed = index.song(facts.id);
+            filter.drops(
+                indexed.as_ref().map(|song| song.explicit_status.as_str()),
+                facts.explicit_status,
+            )
         }) {
             Some(true) => return kid_filter::not_found(state, context, &body),
             Some(false) => {}
@@ -622,13 +631,12 @@ fn lists_rule(context: &AnswerContext<'_>, body: Bytes, privacy: &PrivacyCache) 
         match facts.kind {
             NodeKind::Song => {
                 let indexed = index.song(facts.id);
-                if let Some(unrated) = kid
-                    && kid_filter::is_explicit(
+                if kid.is_some_and(|filter| {
+                    filter.drops(
                         indexed.as_ref().map(|s| s.explicit_status.as_str()),
                         facts.explicit_status,
-                        unrated,
                     )
-                {
+                }) {
                     return Verdict::Drop;
                 }
                 let library = indexed.as_ref().and_then(|s| s.library_id);

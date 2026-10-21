@@ -88,21 +88,76 @@ pub(crate) fn not_found(state: &AppState, context: &AnswerContext<'_>, answer: &
 }
 
 /// The explicit filter for lists Octo builds for `user` (radio, stations, mixes, Made for you,
-/// charts): clean only for a kid profile while Family is on, else the server's setting.
+/// charts): clean only for a kid profile while Family is on, else the listener's own choice
+/// when they made one, else the server's setting.
 pub fn explicit_filter_for(
     settings: &AppSettings,
     family: Option<&FamilyStore>,
     user: Option<&str>,
 ) -> ExplicitFilter {
     let global = settings.subsonic.explicit_filter;
-    if !settings.family.enabled {
+    let (Some(store), Some(user)) = (family, user.filter(|u| !u.trim().is_empty())) else {
         return global;
+    };
+    let kid = settings.family.enabled
+        && store
+            .member(user)
+            .is_some_and(|member| member.abilities().clean_only);
+    if kid {
+        return ExplicitFilter::CleanOnly;
     }
-    let clean = family
-        .zip(user.filter(|u| !u.trim().is_empty()))
-        .and_then(|(store, user)| store.member(user))
-        .is_some_and(|member| member.abilities().clean_only);
-    if clean { ExplicitFilter::CleanOnly } else { global }
+    store.explicit_choice(user).unwrap_or(global)
+}
+
+/// What a caller's answers (search, albums, playlists and the rest of [`KID_ENDPOINTS`]) leave
+/// out, while Family is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerFilter {
+    /// Explicit songs: a kid profile, or a listener who chose clean only. An unmarked song
+    /// counts as explicit when `unrated_is_explicit` (kid profiles only, by
+    /// `Family:KidUnratedIsExplicit`).
+    Clean { unrated_is_explicit: bool },
+    /// Clean edits: a listener who chose explicit versions.
+    NoEdits,
+}
+
+impl AnswerFilter {
+    /// Whether a song with these marks leaves the answer.
+    pub fn drops(self, indexed: Option<&str>, answered: Option<&str>) -> bool {
+        match self {
+            AnswerFilter::Clean { unrated_is_explicit } => {
+                is_explicit(indexed, answered, unrated_is_explicit)
+            }
+            AnswerFilter::NoEdits => indexed
+                .or(answered)
+                .is_some_and(|mark| mark.trim().eq_ignore_ascii_case(CLEAN_WORD)),
+        }
+    }
+}
+
+/// The answer filter for this caller's answer from `endpoint`, if any: a kid profile's, else
+/// the listener's own choice.
+pub fn answer_filter(
+    store: &FamilyStore,
+    caller: &FamilyCaller,
+    endpoint: &str,
+    kid_unrated_is_explicit: bool,
+) -> Option<AnswerFilter> {
+    if !listed(KID_ENDPOINTS, endpoint) {
+        return None;
+    }
+    if is_kid(caller) {
+        return Some(AnswerFilter::Clean {
+            unrated_is_explicit: kid_unrated_is_explicit,
+        });
+    }
+    match store.explicit_choice(&caller.user)? {
+        ExplicitFilter::CleanOnly => Some(AnswerFilter::Clean {
+            unrated_is_explicit: false,
+        }),
+        ExplicitFilter::ExplicitOnly => Some(AnswerFilter::NoEdits),
+        ExplicitFilter::All => None,
+    }
 }
 
 /// The explicit filter for lists Octo builds for the caller of a request.
@@ -133,6 +188,63 @@ pub fn unrated_count(index: &LibraryIndex, scope: &ScopeResolver) -> usize {
 mod tests {
     use super::*;
     use octo_core::family::abilities::{Abilities, Preset};
+
+    #[test]
+    fn a_listeners_own_choice_shapes_their_lists_and_answers_but_a_kid_stays_clean() {
+        let store = FamilyStore::in_memory();
+        let mut settings = AppSettings::default();
+        settings.family.enabled = true;
+        settings.subsonic.explicit_filter = ExplicitFilter::All;
+        let mut kid = crate::services::family::member_credentials::tests::member("kid", String::new());
+        kid.preset = Preset::Kid;
+        store.upsert_member(kid);
+        store.set_explicit_choice("sam", Some(ExplicitFilter::CleanOnly));
+        store.set_explicit_choice("KID", Some(ExplicitFilter::ExplicitOnly));
+        store.set_explicit_choice("lee", Some(ExplicitFilter::ExplicitOnly));
+        assert_eq!(
+            explicit_filter_for(&settings, Some(&store), Some("Sam")),
+            ExplicitFilter::CleanOnly
+        );
+        assert_eq!(
+            explicit_filter_for(&settings, Some(&store), Some("kid")),
+            ExplicitFilter::CleanOnly
+        );
+        assert_eq!(
+            explicit_filter_for(&settings, Some(&store), Some("lee")),
+            ExplicitFilter::ExplicitOnly
+        );
+        assert_eq!(
+            explicit_filter_for(&settings, Some(&store), Some("pat")),
+            ExplicitFilter::All
+        );
+        store.set_explicit_choice("sam", None);
+        assert_eq!(
+            explicit_filter_for(&settings, Some(&store), Some("sam")),
+            ExplicitFilter::All
+        );
+
+        let lee = FamilyCaller::unmanaged("lee", false);
+        let filter = answer_filter(&store, &lee, "search3", false).expect("lee chose");
+        assert_eq!(filter, AnswerFilter::NoEdits);
+        assert!(filter.drops(None, Some("clean")));
+        assert!(!filter.drops(None, Some("explicit")));
+        assert!(!filter.drops(None, None));
+        assert_eq!(
+            answer_filter(&store, &lee, "getArtists", false),
+            None,
+            "not a song list"
+        );
+        store.set_explicit_choice("lee", Some(ExplicitFilter::CleanOnly));
+        let clean = answer_filter(&store, &lee, "getAlbum", true).expect("lee chose");
+        assert_eq!(
+            clean,
+            AnswerFilter::Clean {
+                unrated_is_explicit: false
+            },
+            "only kids lose unmarked songs"
+        );
+        assert!(clean.drops(Some("explicit"), None));
+    }
 
     #[test]
     fn the_index_mark_wins_over_the_answer() {

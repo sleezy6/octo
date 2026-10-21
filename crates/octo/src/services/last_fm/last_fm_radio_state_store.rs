@@ -16,8 +16,8 @@ use octo_core::last_fm::last_fm_radio_state_store::{
     MAX_UNAVAILABLE_TRACKS_PER_USER, MAX_USERS, UNAVAILABLE_TRACK_COOLDOWN, user_key,
 };
 use octo_core::models::radio::{
-    LastFmRadioBan, LastFmRadioPlay, LastFmRadioStateDocument, LastFmRadioStation, LastFmRadioTrack,
-    LastFmRadioUnavailableTrack, LastFmRadioUserState, LastFmRadioUserSummary,
+    BannedArtist, LastFmRadioBan, LastFmRadioPlay, LastFmRadioStateDocument, LastFmRadioStation,
+    LastFmRadioTrack, LastFmRadioUnavailableTrack, LastFmRadioUserState, LastFmRadioUserSummary,
 };
 use octo_core::settings::SettingsStore;
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
@@ -329,11 +329,54 @@ impl LastFmRadioStateStore {
                     station.changed_utc = now;
                 }
             }
+            // Enough of the artist's songs rated one star bans the artist too.
+            user.drop_banned_artists_from_stations(self.artist_ban_after(), now);
         } else if !had {
             return false;
         }
         self.save_locked(state);
         true
+    }
+
+    /// `LastFm:ArtistBanAfter`: how many songs rated one star ban their artist (0: never).
+    fn artist_ban_after(&self) -> i32 {
+        self.settings.current().last_fm.artist_ban_after.max(0)
+    }
+
+    /// The artist rated one star (`banned`) leaves this listener's radio, stations and mixes,
+    /// and the stations they have now; any other rating, or Lift on the dashboard, lifts that
+    /// and an automatic ban for their songs. True when anything changed.
+    pub fn set_artist_ban(&self, username: &str, artist: &str, banned: bool) -> bool {
+        if dotnet::is_blank(username) || dotnet::is_blank(artist) {
+            return false;
+        }
+        let mut guard = self.state.lock();
+        let state = self.load_locked(&mut guard);
+        if !banned && state.get(&user_key(username)).is_none() {
+            return false;
+        }
+        let now = self.clock.now();
+        let user = get_or_create(state, username, now);
+        if !user.set_artist_ban(artist, banned, now) {
+            return false;
+        }
+        user.artist_bans.truncate(MAX_RADIO_BANS_PER_USER);
+        if banned {
+            user.drop_banned_artists_from_stations(self.artist_ban_after(), now);
+        }
+        self.save_locked(state);
+        true
+    }
+
+    /// The artists this listener's radio leaves out, for the dashboard.
+    pub fn banned_artists(&self, username: &str) -> Vec<BannedArtist> {
+        let after = self.artist_ban_after();
+        let mut guard = self.state.lock();
+        let state = self.load_locked(&mut guard);
+        state
+            .get(&user_key(username))
+            .map(|user| user.banned_artists(after))
+            .unwrap_or_default()
     }
 
     /// The keys of the songs this user rated one star, without copying the rest of their state.
@@ -382,6 +425,8 @@ impl LastFmRadioStateStore {
         user.last_refresh_error = None;
         user.refreshing = false;
         user.last_seen_utc = now;
+        // A station built before an artist was banned may still hold their songs.
+        user.drop_banned_artists_from_stations(self.artist_ban_after(), now);
         rehydrate_routes(&self.registry, user);
         self.save_locked(state);
     }

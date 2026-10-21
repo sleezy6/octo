@@ -56,6 +56,10 @@ pub struct FamilyPlaylist {
     pub approve_additions: bool,
     #[serde(default)]
     pub entries: Vec<FamilyPlaylistEntry>,
+    /// The members it is shared with, besides its maker and the owner, who always see it.
+    /// Empty: the whole family sees it. Left out of the file while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_with: Vec<String>,
 }
 
 const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -116,6 +120,7 @@ impl FamilyPlaylistStore {
                 created_by: by.to_string(),
                 approve_additions: false,
                 entries: Vec::new(),
+                shared_with: Vec::new(),
             };
             playlists.push(playlist.clone());
             playlist
@@ -134,6 +139,11 @@ impl FamilyPlaylistStore {
 
     pub fn rename(&self, id: &str, name: &str) -> bool {
         self.change(id, |p| p.name = name.trim().to_string())
+    }
+
+    /// Who the playlist is shared with; empty shares it with the whole family.
+    pub fn set_shared_with(&self, id: &str, people: Vec<String>) -> bool {
+        self.change(id, |p| p.shared_with = people)
     }
 
     pub fn set_approve(&self, id: &str, approve: bool) -> bool {

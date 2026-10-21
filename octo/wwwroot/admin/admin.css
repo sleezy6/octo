@@ -2692,3 +2692,7 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .art-tile .cover-art img { transition: opacity 160ms, filter 160ms; }
 .art-more { align-self: center; }
 @media (prefers-reduced-motion: reduce) { .art-tile .cover-art img { transition: none; } }
+
+/* Artists left out of a listener's radio, each with its Lift button. */
+.radio-ban-chip { display: inline-flex; align-items: center; gap: 6px; margin: 2px 8px 2px 0; }
+.radio-ban-chip small { color: var(--text-muted); }

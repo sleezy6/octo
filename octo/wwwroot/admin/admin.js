@@ -3370,8 +3370,28 @@ async function loadRadioStatus() {
     output.innerHTML = `<p class="radio-state-copy">${escapeHtml(stateMessage)}</p>` + ((data.stations || []).length
       ? `<div class="radio-station-grid">${data.stations.map(station => `<article class="radio-station-item"><div><strong>${escapeHtml(station.name)}</strong><span>${escapeHtml(station.kind)} · ${station.trackCount} tracks</span></div><p>${(station.preview || []).map(track => `${escapeHtml(track.title)} by ${escapeHtml(track.artist)}`).join(' · ') || 'Snapshot has no preview yet.'}</p></article>`).join('')}</div>`
       : '<div class="radio-empty">No ready snapshots yet. Stations are offered automatically as listening signals arrive.</div>');
+    renderArtistBans(data.bannedArtists || [], select.value || data.selectedUser || '');
   } catch (error) { output.textContent = `Radio status unavailable: ${error.message}`; }
 }
+function renderArtistBans(banned, user) {
+  const row = document.getElementById('radio-artist-bans-row'); const list = document.getElementById('radio-artist-bans');
+  if (!row || !list) return;
+  row.hidden = banned.length === 0;
+  list.innerHTML = banned.map(item => {
+    const why = item.rated ? 'rated one star' : `${item.songs} song${item.songs === 1 ? '' : 's'} rated one star`;
+    return `<span class="radio-ban-chip">${escapeHtml(item.artist)} <small>(${escapeHtml(why)})</small> <button class="btn btn-ghost btn-sm" type="button" data-lift-artist="${escapeHtml(item.artist)}" data-lift-user="${escapeHtml(user)}">Lift</button></span>`;
+  }).join(' ');
+}
+document.getElementById('radio-artist-bans')?.addEventListener('click', async event => {
+  const button = event.target.closest('[data-lift-artist]'); if (!button) return;
+  const { liftArtist: artist, liftUser: user } = button.dataset;
+  button.disabled = true;
+  try {
+    const response = await api(`/api/admin/lastfm/radio/artist-ban?user=${encodeURIComponent(user)}&artist=${encodeURIComponent(artist)}`, { method: 'DELETE' });
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || data.title || `HTTP ${response.status}`);
+    toast(`${artist} can play on ${user}'s radio again.`); renderArtistBans(data.bannedArtists || [], user);
+  } catch (error) { toast(`Could not lift the ban: ${error.message}`, 'error'); button.disabled = false; }
+});
 document.getElementById('radio-user')?.addEventListener('change', loadRadioStatus);
 document.getElementById('radio-reset')?.addEventListener('click', async event => {
   // Read before the first await: once the click has been handled, event.currentTarget is null.
@@ -9103,6 +9123,46 @@ document.getElementById('deezer-cache-clear')?.addEventListener('click', async e
   } catch (error) { toast(`Could not empty the cache: ${error.message}`, 'error'); }
   await loadDeezerCache();
 });
+// ────────────────────────────────────────────────────────────────
+// Deezer: how many requests Octo made of the catalog, and what for
+// ────────────────────────────────────────────────────────────────
+const DEEZER_USE_WORDS = {
+  search: 'search', lengths: 'song lengths', artistPages: 'artist pages', albumPages: 'album pages',
+  covers: 'covers', playback: 'finding songs to play or keep', songLookups: 'song facts', other: 'other',
+};
+function deezerRequestLine(counts) {
+  if (!counts.total) return 'None.';
+  const parts = counts.uses
+    .filter(u => u.interactive + u.background > 0)
+    .sort((a, b) => (b.interactive + b.background) - (a.interactive + a.background))
+    .map(u => {
+      const n = u.interactive + u.background;
+      const words = DEEZER_USE_WORDS[u.use] || u.use;
+      return u.background ? `${words} ${n.toLocaleString()} (${u.background.toLocaleString()} in the background)` : `${words} ${n.toLocaleString()}`;
+    });
+  let line = `${counts.total.toLocaleString()}: ${parts.join(', ')}.`;
+  if (counts.searchesSkipped) line += ` ${counts.searchesSkipped.toLocaleString()} time${counts.searchesSkipped === 1 ? '' : 's'} a play or heart went straight to a Deezer id Octo already knew, with no search.`;
+  if (counts.turnedAway) line += ` ${counts.turnedAway.toLocaleString()} turned away because too many were waiting.`;
+  return line;
+}
+async function loadDeezerRequests() {
+  const hour = document.getElementById('deezer-requests-hour');
+  const total = document.getElementById('deezer-requests-total');
+  if (!hour || !total) return;
+  try {
+    const response = await api('/api/admin/deezer/requests', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const report = await response.json();
+    hour.textContent = deezerRequestLine(report.lastHour);
+    total.textContent = deezerRequestLine(report.sinceStart);
+  } catch (error) {
+    hour.textContent = `Could not read the counts: ${error.message}`;
+    total.textContent = '';
+  }
+}
+document.getElementById('deezer-requests-refresh')?.addEventListener('click', loadDeezerRequests);
+document.querySelector('.sidebar-nav-item[data-tab="deezer"]')?.addEventListener('click', loadDeezerRequests);
+ready.then(loadDeezerRequests);
 // ────────────────────────────────────────────────────────────────
 // Deezer: whether each account signs in, the plan it is on, and what to do when it does not
 // ────────────────────────────────────────────────────────────────

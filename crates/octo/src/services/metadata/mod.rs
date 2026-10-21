@@ -5,6 +5,7 @@
 pub mod deezer_metadata_service;
 pub mod deezer_rate_limit_handler;
 pub mod deezer_rate_limiter;
+pub mod deezer_requests;
 pub mod genre_backfill_journal;
 pub mod genre_backfill_state;
 pub mod genre_backfill_worker;

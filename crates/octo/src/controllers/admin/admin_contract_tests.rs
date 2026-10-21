@@ -780,12 +780,12 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // GeneratedPlaylists:Years, :MaxYearPlaylists, :Artists and :ArtistCount, the sweep's
     // replacing two: LibraryActions:ReviewSweepAutoReplace and :ReviewSweepAutoReplacePerDay,
     // then LibraryActions:KeepRatedCopies, Subsonic:DownloadAlbumOnSongStar and
-    // Metadata:AnimatedArt, listed last; and this fork's fifteen: Subsonic:StreamSource,
+    // Metadata:AnimatedArt, listed last; and this fork's sixteen: Subsonic:StreamSource,
     // Deezer:Arl, :ArlFallback, :Quality and :StreamQuality, the playback cache's four
     // (Deezer:CacheEnabled, :CachePath, :CacheMaxGiB and :CacheRetentionDays), YouTube:Enabled,
-    // LastFm:EnableStarterRadio, Subsonic:BadgeOutsideCovers, LastFm:LoveFavorites and
-    // RadioSources:SoundsAlikeFrom and Metadata:ReplaceOthersLyrics.
-    assert_eq!(rows.len(), 218);
+    // LastFm:EnableStarterRadio, Subsonic:BadgeOutsideCovers, LastFm:LoveFavorites,
+    // LastFm:ArtistBanAfter, RadioSources:SoundsAlikeFrom and Metadata:ReplaceOthersLyrics.
+    assert_eq!(rows.len(), 219);
     assert!(!rows.iter().any(|r| {
         r["Key"]
             .as_str()
@@ -846,7 +846,8 @@ async fn last_fm_and_listen_brainz_reads_have_the_recorded_shapes() {
     let radio = get(&app, "/api/admin/lastfm/radio").await;
     assert_eq!(
         radio.text(),
-        r#"{"enabled":false,"hasApiKey":false,"personalizedEnabled":false,"discoveryEnabled":false,"playlistsEnabled":false,"streamsEnabled":false,"streamBitrateKbps":192,"icyMetadataEnabled":true,"minimumPlays":10,"selectedUser":null,"users":[],"learning":null,"stations":[]}"#
+        // The fork adds the artist bans (LastFm:ArtistBanAfter) after the recorded keys.
+        r#"{"enabled":false,"hasApiKey":false,"personalizedEnabled":false,"discoveryEnabled":false,"playlistsEnabled":false,"streamsEnabled":false,"streamBitrateKbps":192,"icyMetadataEnabled":true,"minimumPlays":10,"selectedUser":null,"users":[],"learning":null,"stations":[],"artistBanAfter":3,"bannedArtists":[]}"#
     );
     let radio = get(&app, "/api/admin/lastfm/radio?user=admin").await.json();
     assert_eq!(radio["selectedUser"], "admin");
@@ -986,6 +987,37 @@ async fn deezer_account_health_without_an_arl_says_none_is_set() {
             serde_json::json!({"configured": false, "accounts": [], "notes": []}),
             "{path}"
         );
+    }
+}
+
+/// The Deezer request counts come back in the shape the dashboard reads, every purpose listed.
+#[tokio::test]
+async fn deezer_request_counts_list_every_purpose() {
+    let (_, app) = factory();
+    let body = get(&app, "/api/admin/deezer/requests").await.json();
+    for stretch in ["lastHour", "sinceStart"] {
+        let uses: Vec<&str> = body[stretch]["uses"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|u| u["use"].as_str().expect("named"))
+            .collect();
+        assert_eq!(
+            uses,
+            [
+                "search",
+                "lengths",
+                "artistPages",
+                "albumPages",
+                "covers",
+                "playback",
+                "songLookups",
+                "other"
+            ],
+            "{stretch}"
+        );
+        assert!(body[stretch]["total"].is_u64(), "{stretch}");
+        assert!(body[stretch]["searchesSkipped"].is_u64(), "{stretch}");
     }
 }
 

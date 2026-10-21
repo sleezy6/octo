@@ -104,6 +104,7 @@ pub fn routes() -> RouteSet {
             put(change_password).layer(DefaultBodyLimit::max(SIGN_IN_BODY)),
         )
         .route("/api/family/me/quality", put(set_quality))
+        .route("/api/family/me/explicit", put(set_explicit))
         .route("/api/family/me/ntfy", put(set_ntfy))
         .route("/api/family/me/lastfm", get(my_last_fm))
         .route("/api/family/me/imports", get(imports::my_imports))
@@ -128,6 +129,7 @@ pub fn routes() -> RouteSet {
         .route("/api/family/devices", get(devices))
         .route("/api/family/devices/{id}", delete(forget_device))
         .route("/api/family/playlists", get(playlists).post(create_playlist))
+        .route("/api/family/playlists/people", get(playlist_people))
         .route(
             "/api/family/playlists/{id}",
             put(change_playlist).delete(delete_playlist),

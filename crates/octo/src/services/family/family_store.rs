@@ -14,6 +14,7 @@ use octo_core::family::codes::constant_time_eq;
 use octo_core::family::device::{Device, NetworkPlace};
 use octo_core::family::quality::{DeviceQualityMode, QualityPreference};
 use octo_core::json::datetime;
+use octo_core::settings::ExplicitFilter;
 use parking_lot::Mutex;
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
@@ -152,6 +153,11 @@ pub struct FamilyFile {
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub preferences: IndexMap<String, QualityPreference>,
     pub invites: Vec<Invite>,
+    /// Which songs each account chose to hear by their explicit mark, by username; only
+    /// accounts that chose something other than the server's filter are listed. A kid profile
+    /// hears clean songs whatever it says here.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub explicit_choices: IndexMap<String, ExplicitFilter>,
 }
 
 impl Default for FamilyFile {
@@ -164,6 +170,7 @@ impl Default for FamilyFile {
             detected: Vec::new(),
             preferences: IndexMap::new(),
             invites: Vec::new(),
+            explicit_choices: IndexMap::new(),
         }
     }
 }
@@ -580,6 +587,34 @@ impl FamilyStore {
                 .retain(|name, _| !eq_ignore_case(name, username));
             if preference != QualityPreference::default() {
                 state.preferences.insert(username.trim().to_string(), preference);
+            }
+        }
+        self.save();
+    }
+
+    /// Which songs an account chose to hear by their explicit mark (by username, ignoring
+    /// case): None until they choose, which leaves it to the server's filter.
+    pub fn explicit_choice(&self, username: &str) -> Option<ExplicitFilter> {
+        if username.trim().is_empty() {
+            return None;
+        }
+        self.state
+            .lock()
+            .explicit_choices
+            .iter()
+            .find(|(name, _)| eq_ignore_case(name, username))
+            .map(|(_, choice)| *choice)
+    }
+
+    /// Sets an account's explicit choice; None goes back to the server's filter.
+    pub fn set_explicit_choice(&self, username: &str, choice: Option<ExplicitFilter>) {
+        {
+            let mut state = self.state.lock();
+            state
+                .explicit_choices
+                .retain(|name, _| !eq_ignore_case(name, username));
+            if let Some(choice) = choice {
+                state.explicit_choices.insert(username.trim().to_string(), choice);
             }
         }
         self.save();

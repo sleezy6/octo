@@ -133,6 +133,8 @@ pub struct EditMemberBody {
     pub edits: Option<Map<String, Value>>,
     pub shared_libraries: Option<Value>,
     pub suspended: Option<bool>,
+    /// Which songs they hear by their explicit mark: see [`super::account::explicit_choice`].
+    pub explicit: Option<String>,
 }
 
 /// `PUT /api/family/members/{name}`.
@@ -174,6 +176,13 @@ pub async fn edit_member(
             }
         },
     };
+    let explicit = match request.explicit.as_deref() {
+        None => None,
+        Some(text) => match super::account::explicit_choice(text) {
+            Some(choice) => Some(choice),
+            None => return refusal(StatusCode::BAD_REQUEST, super::account::EXPLICIT_CHOICES),
+        },
+    };
     let edit = EditMember {
         display_name: request.display_name,
         preset,
@@ -182,7 +191,12 @@ pub async fn edit_member(
         suspended: request.suspended,
     };
     match state.family.edit_member(&state, &signed.actor, &name, edit).await {
-        Ok(member) => ok(&state.family.member_full_json(&state, &member)),
+        Ok(member) => {
+            if let Some(choice) = explicit {
+                state.family_store.set_explicit_choice(&member.username, choice);
+            }
+            ok(&state.family.member_full_json(&state, &member))
+        }
         Err(e) => family_error(&e),
     }
 }
@@ -405,6 +419,9 @@ pub async fn playlists(State(state): State<AppState>, web: Web) -> Response {
 pub struct PlaylistBody {
     pub name: Option<String>,
     pub approve_additions: Option<bool>,
+    /// Usernames it is shared with besides its maker and the owner; empty shares it with
+    /// everyone.
+    pub shared_with: Option<Vec<String>>,
 }
 
 /// `POST /api/family/playlists`: needs Family playlists editing; only managers set approval.
@@ -432,8 +449,26 @@ pub async fn create_playlist(State(state): State<AppState>, web: Web, body: Byte
     }
 }
 
-/// `PUT /api/family/playlists/{id}`: the creator or a manager renames it; only managers turn
-/// approval of additions on or off.
+/// `GET /api/family/playlists/people`: the family a playlist can be shared with: the owner and
+/// every member, by username and name. Anyone who sees family playlists.
+pub async fn playlist_people(State(state): State<AppState>, web: Web) -> Response {
+    if let Err(res) = web.anyone(&state).await {
+        return res;
+    }
+    let owner = state.family_store.owner();
+    let mut people: Vec<Value> = Vec::new();
+    if !owner.trim().is_empty() {
+        people.push(json!({ "username": owner, "displayName": owner, "owner": true }));
+    }
+    for member in state.family_store.members() {
+        people
+            .push(json!({ "username": member.username, "displayName": member.display_name, "owner": false }));
+    }
+    ok(&Value::Array(people))
+}
+
+/// `PUT /api/family/playlists/{id}`: the creator or a manager renames it and chooses who it is
+/// shared with (`sharedWith`); only managers turn approval of additions on or off.
 pub async fn change_playlist(
     State(state): State<AppState>,
     web: Web,
@@ -456,7 +491,13 @@ pub async fn change_playlist(
         .family
         .hooks(&state)
         .playlists
-        .update(&id, signed.user(), name, request.approve_additions)
+        .update(
+            &id,
+            signed.user(),
+            name,
+            request.approve_additions,
+            request.shared_with.as_deref(),
+        )
         .await
     {
         Ok(playlist) => ok(&json!(playlist)),

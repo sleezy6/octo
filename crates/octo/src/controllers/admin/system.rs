@@ -544,6 +544,12 @@ pub async fn get_deezer_account(State(state): State<AppState>, RawQuery(query): 
     }))
 }
 
+/// `GET /api/admin/deezer/requests`: how many requests Octo made of Deezer's public API in the
+/// last hour and since it started, by what they were for and on which lane.
+pub async fn get_deezer_requests() -> Response {
+    json_ok(&crate::services::metadata::deezer_requests::DeezerRequestCounter::global().report())
+}
+
 /// `GET /api/admin/deezer/cache`: what the Deezer playback cache holds.
 pub async fn get_deezer_cache(State(state): State<AppState>) -> Response {
     json_ok(&state.deezer_cache.status().await)

@@ -84,7 +84,8 @@ impl SongRadioService {
     /// `listener`: who the radio is for, named the way scrobbles name them (RequestIdentity), so
     /// what they play teaches their own weights; None for nobody. `client_order`: the caller
     /// mixes the radio itself (Octo's apps send `octoMix=client`) and wants the order of fit, so
-    /// outside songs are not placed.
+    /// outside songs are not placed. `bans` and `banned_artists`: the songs (track keys) and
+    /// artists (artist keys) the listener banned from their radio.
     pub async fn build(
         &self,
         seed: &RadioSeed,
@@ -92,6 +93,7 @@ impl SongRadioService {
         listener: Option<&str>,
         auth: &IndexMap<String, String>,
         bans: &IgnoreCaseKeys,
+        banned_artists: &IgnoreCaseKeys,
         resolver: &LastFmRadioTrackResolver,
         client_order: bool,
     ) -> Vec<Song> {
@@ -127,6 +129,7 @@ impl SongRadioService {
         let answers: Vec<RadioAnswer> = answers
             .into_iter()
             .map(|answer| radio_blend::without_filler_or_bans(answer, bans))
+            .map(|answer| radio_blend::without_artists(answer, banned_artists))
             .collect();
         let weights = self.sources.weights(listener, library_led);
         let picks = radio_blend::blend(

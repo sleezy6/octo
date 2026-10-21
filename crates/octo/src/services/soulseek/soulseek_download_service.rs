@@ -63,6 +63,7 @@ use crate::services::i_download_service::DirectStreamInfo;
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::library::upgrade_queue::AudioSummary;
 use crate::services::lidarr::{ILidarrTrackFetcher, LidarrImport, LidarrImportHandoff, LidarrTrackRequest};
+use crate::services::metadata::deezer_requests::{DeezerRequestCounter, DeezerUse};
 use crate::services::you_tube::{YouTubeHit, YouTubeResolver};
 use octo_core::common::acquisition_tracker::user_safe;
 use octo_core::lidarr::lidarr_track_fetcher::LidarrStep;
@@ -667,7 +668,10 @@ impl SoulseekDownloadService {
         let Some(deezer) = self.deezer.as_ref().filter(|deezer| deezer.is_configured()) else {
             anyhow::bail!("{DEEZER_NOT_SET_UP}");
         };
-        let Some(track_id) = deezer.track_id_for(artist, title, None, None).await else {
+        let Some(track_id) = DeezerUse::Playback
+            .scope(deezer.track_id_for(artist, title, None, None))
+            .await
+        else {
             return Ok(None);
         };
         let quality = if lossless_only {
@@ -691,16 +695,63 @@ impl SoulseekDownloadService {
         }))
     }
 
-    /// The song's id in Deezer's catalog, or why there is none to ask Deezer for.
-    async fn deezer_track_id(&self, deezer: &DeezerResolver, r: &SoulseekRouting) -> Option<String> {
+    /// The song's id in Deezer's catalog: the one kept on its routing (a length lookup or an
+    /// earlier play found the very recording), else a search's, which is then kept. None when
+    /// the catalog has no such song.
+    async fn deezer_track_id(
+        &self,
+        deezer: &DeezerResolver,
+        external_id: &str,
+        r: &SoulseekRouting,
+    ) -> Option<String> {
+        if let Some(kept) = r.deezer_track_id.as_deref().filter(|id| !id.is_empty()) {
+            DeezerRequestCounter::global().search_skipped();
+            return Some(kept.to_string());
+        }
+        self.searched_deezer_track_id(deezer, external_id, r).await
+    }
+
+    /// The song's id from a catalog search, kept on its routing for the next play or heart.
+    async fn searched_deezer_track_id(
+        &self,
+        deezer: &DeezerResolver,
+        external_id: &str,
+        r: &SoulseekRouting,
+    ) -> Option<String> {
         if !r.has_artist_title() {
             return None;
         }
         let (artist, title) = names(r);
         let seconds = lookup_seconds(r);
-        deezer
-            .track_id_for(&artist, &title, r.isrc.as_deref(), seconds)
-            .await
+        let found = DeezerUse::Playback
+            .scope(deezer.track_id_for(&artist, &title, r.isrc.as_deref(), seconds))
+            .await?;
+        self.id_registry.keep_deezer_track(external_id, &found);
+        Some(found)
+    }
+
+    /// After Deezer gave no audio for `missed`: when that was the id kept on the routing, it
+    /// is forgotten and the id a search finds is the one to try instead (None when the search
+    /// finds the same one, or nothing).
+    async fn deezer_track_id_after_miss(
+        &self,
+        deezer: &DeezerResolver,
+        external_id: &str,
+        r: &SoulseekRouting,
+        missed: &str,
+    ) -> Option<String> {
+        if r.deezer_track_id.as_deref() != Some(missed) {
+            return None;
+        }
+        self.id_registry.forget_deezer_track(external_id, missed);
+        let (artist, title) = names(r);
+        info!("Deezer had no audio for '{artist} - {title}' under the kept track {missed}; searching again");
+        let mut searched = r.clone();
+        searched.deezer_track_id = None;
+        let found = self
+            .searched_deezer_track_id(deezer, external_id, &searched)
+            .await?;
+        (found != missed).then_some(found)
     }
 
     /// An outside song played straight from Deezer, decrypted as it is read. `None` when no
@@ -708,21 +759,34 @@ impl SoulseekDownloadService {
     /// plays it from YouTube then.
     async fn deezer_direct_stream(
         &self,
+        external_id: &str,
         r: &SoulseekRouting,
         range_header: Option<&str>,
     ) -> Option<DirectStreamInfo> {
         let deezer = self.deezer.as_ref().filter(|deezer| deezer.is_configured())?;
         let (artist, title) = names(r);
-        let Some(track_id) = self.deezer_track_id(deezer, r).await else {
+        let Some(mut track_id) = self.deezer_track_id(deezer, external_id, r).await else {
             debug!("play of '{artist} - {title}': Deezer's catalog has no such song");
             return None;
         };
         // Through the playback cache when there is one: a replay or a seek then reads the copy.
         let quality = deezer.stream_quality();
-        let opened = match &self.deezer_cache {
-            Some(cache) => cache.open_stream(&track_id, range_header, &quality).await,
-            None => deezer.open_stream(&track_id, range_header, &quality).await,
-        }?;
+        let quality = quality.as_str();
+        let open = |track_id: String| async move {
+            match &self.deezer_cache {
+                Some(cache) => cache.open_stream(&track_id, range_header, quality).await,
+                None => deezer.open_stream(&track_id, range_header, quality).await,
+            }
+        };
+        let opened = match open(track_id.clone()).await {
+            Some(opened) => opened,
+            None => {
+                track_id = self
+                    .deezer_track_id_after_miss(deezer, external_id, r, &track_id)
+                    .await?;
+                open(track_id.clone()).await?
+            }
+        };
         info!(
             "Deezer stream '{artist} - {title}' (track={track_id}, {}, status={}, {} bytes{})",
             opened.format,
@@ -776,7 +840,10 @@ impl SoulseekDownloadService {
 
         let r = routing.snapshot();
         let (artist, title) = names(&r);
-        let Some(track_id) = or_canceled(ct, async { Ok(self.deezer_track_id(deezer, &r).await) }).await?
+        let Some(mut track_id) = or_canceled(ct, async {
+            Ok(self.deezer_track_id(deezer, &track_key, &r).await)
+        })
+        .await?
         else {
             return Err(file_not_found(format!(
                 "No Deezer match for '{artist} - {title}'"
@@ -828,7 +895,25 @@ impl SoulseekDownloadService {
             }
             None => or_canceled(ct, deezer.download_as(&track_id, &dest_without_ext, &quality)).await?,
         };
-        let Some(path) = path.filter(|p| !p.is_empty() && file_exists(p)) else {
+        let mut path = path.filter(|p| !p.is_empty() && file_exists(p));
+        // No copy at all under an id kept from an earlier lookup: the id has gone stale, so
+        // it is forgotten and a search's id tried. (No lossless copy says nothing about the id.)
+        if path.is_none()
+            && !lossless_only
+            && let Some(searched) = or_canceled(ct, async {
+                Ok(self
+                    .deezer_track_id_after_miss(deezer, &track_key, &r, &track_id)
+                    .await)
+            })
+            .await?
+        {
+            track_id = searched;
+            let dest_without_ext = combine(&incoming, &format!("deezer-{track_id}-{}", new_guid()));
+            path = or_canceled(ct, deezer.download_as(&track_id, &dest_without_ext, &quality))
+                .await?
+                .filter(|p| !p.is_empty() && file_exists(p));
+        }
+        let Some(path) = path else {
             return Err(file_not_found(format!(
                 "Deezer has no {} of '{artist} - {title}' this account can be given",
                 if lossless_only { "lossless copy" } else { "copy" }
@@ -2454,7 +2539,7 @@ impl DownloadBackend for SoulseekDownloadService {
         // which is a different format from the one its row declared; most players read the
         // Content-Type of the answer and play it all the same.
         if self.stream_from_deezer {
-            if let Some(stream) = self.deezer_direct_stream(&r, range_header).await {
+            if let Some(stream) = self.deezer_direct_stream(external_id, &r, range_header).await {
                 return Ok(Some(stream));
             }
             let (artist, title) = (

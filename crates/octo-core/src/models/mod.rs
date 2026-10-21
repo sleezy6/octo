@@ -48,9 +48,9 @@ pub mod radio {
     pub mod last_fm_radio_state;
 
     pub use last_fm_radio_state::{
-        LastFmRadioBan, LastFmRadioPlay, LastFmRadioStateDocument, LastFmRadioStation,
-        LastFmRadioStationKind, LastFmRadioTrack, LastFmRadioUnavailableTrack, LastFmRadioUserState,
-        LastFmRadioUserSummary,
+        BannedArtist, LastFmRadioArtistBan, LastFmRadioBan, LastFmRadioPlay, LastFmRadioStateDocument,
+        LastFmRadioStation, LastFmRadioStationKind, LastFmRadioTrack, LastFmRadioUnavailableTrack,
+        LastFmRadioUserState, LastFmRadioUserSummary,
     };
 }
 

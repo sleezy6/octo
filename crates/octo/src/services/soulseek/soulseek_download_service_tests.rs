@@ -1840,6 +1840,98 @@ async fn a_play_comes_from_deezer_when_outside_songs_play_from_it() {
 }
 
 #[tokio::test]
+async fn a_play_goes_straight_to_the_deezer_track_kept_on_the_song() {
+    let root = Root::new("octo-deezer-");
+    let payload: Vec<u8> = (0..300).map(|i| (i % 251) as u8).collect();
+    let deezer = deezer_with(0, payload.clone()).await;
+    let walk = build_full(
+        &root,
+        false,
+        DownloadSource::Soulseek,
+        true,
+        Some((deezer.resolver.clone(), true, None)),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+    let id = walk.songs[0].external_id.clone().expect("an id");
+    assert!(walk.registry.keep_deezer_track(&id, "42"));
+
+    let stream = walk
+        .service
+        .get_direct_stream("soulseek", &id, None, &CancellationToken::new())
+        .await
+        .expect("no error")
+        .expect("a stream");
+
+    assert_eq!(stream_bytes(stream).await, payload);
+    assert_eq!(deezer.seen.lock().page_ids, ["42"]);
+    // The catalog was not searched.
+    let asked: Vec<String> = deezer
+        ._server
+        .received_requests()
+        .await
+        .expect("recording")
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .filter(|p| p.starts_with("/search") || p.starts_with("/track"))
+        .collect();
+    assert!(asked.is_empty(), "{asked:?}");
+}
+
+#[tokio::test]
+async fn a_kept_deezer_track_with_no_audio_is_forgotten_for_the_one_a_search_finds() {
+    let root = Root::new("octo-deezer-");
+    let deezer = deezer_with(0, vec![1, 2, 3]).await;
+    let walk = build_full(
+        &root,
+        false,
+        DownloadSource::Soulseek,
+        true,
+        Some((deezer.resolver.clone(), true, None)),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+    let id = walk.songs[0].external_id.clone().expect("an id");
+    assert!(walk.registry.keep_deezer_track(&id, "77"));
+    let routing = walk.registry.lookup(&id).expect("known").snapshot();
+
+    let instead = walk
+        .backend
+        .deezer_track_id_after_miss(&deezer.resolver, &id, &routing, "77")
+        .await
+        .expect("a search finds the song");
+
+    assert_ne!(instead, "77");
+    assert_eq!(
+        walk.registry
+            .lookup(&id)
+            .expect("known")
+            .snapshot()
+            .deezer_track_id
+            .as_deref(),
+        Some(instead.as_str()),
+        "the found track is kept in its place"
+    );
+    // A miss under a track that is not the kept one forgets nothing.
+    let routing = walk.registry.lookup(&id).expect("known").snapshot();
+    assert_eq!(
+        walk.backend
+            .deezer_track_id_after_miss(&deezer.resolver, &id, &routing, "78")
+            .await,
+        None
+    );
+    assert_eq!(
+        walk.registry
+            .lookup(&id)
+            .expect("known")
+            .snapshot()
+            .deezer_track_id
+            .as_deref(),
+        Some(instead.as_str())
+    );
+}
+
+#[tokio::test]
 async fn a_play_deezer_cannot_serve_comes_from_you_tube() {
     let root = Root::new("octo-deezer-");
     // The catalog's one song is song 0; song 3 is played.

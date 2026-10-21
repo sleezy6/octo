@@ -1,5 +1,6 @@
 //! Cover art from Deezer's public search.
 
+use crate::services::metadata::deezer_requests::DeezerUse;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -213,8 +214,8 @@ impl DeezerCoverArtLookup {
     /// [`DeezerRateLimitHandler`], so marking a CDN image request is harmless but pointless;
     /// done uniformly for simplicity.
     async fn send(&self, url: &str, background: bool) -> anyhow::Result<HttpAnswer> {
-        self.http
-            .get(url, background, self.accept_language.as_deref())
+        DeezerUse::Covers
+            .scope(self.http.get(url, background, self.accept_language.as_deref()))
             .await
     }
 }

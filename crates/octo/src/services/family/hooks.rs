@@ -481,6 +481,8 @@ impl RulePlaylists {
             approve_additions: playlist.approve_additions,
             created_by: playlist.created_by.clone(),
             created: datetime::format_utc(&playlist.created),
+            shared_with: playlist.shared_with.clone(),
+            may_share: family_playlists::may_share(viewer, playlist),
         }
     }
 }
@@ -518,8 +520,17 @@ impl FamilyPlaylists for RulePlaylists {
         by: &str,
         name: Option<&str>,
         approve_additions: Option<bool>,
+        shared_with: Option<&[String]>,
     ) -> Result<FamilyPlaylistSummary, FamilyError> {
         let caller = caller_for(&self.family, by);
+        if let Some(people) = shared_with
+            && let Some(stranger) = people
+                .iter()
+                .map(|p| p.trim())
+                .find(|p| !p.is_empty() && self.family.member(p).is_none() && !self.family.is_owner(p))
+        {
+            return Err(FamilyError::Invalid(format!("{stranger} is not in the family.")));
+        }
         let mut playlist = family_playlists::find(&self.store, &caller, id)
             .ok_or_else(|| playlist_failure(PlaylistError::NotFound))?;
         if let Some(name) = name {
@@ -528,6 +539,10 @@ impl FamilyPlaylists for RulePlaylists {
         if let Some(approve) = approve_additions {
             playlist =
                 family_playlists::set_approve(&self.store, &caller, id, approve).map_err(playlist_failure)?;
+        }
+        if let Some(people) = shared_with {
+            playlist = family_playlists::set_shared_with(&self.store, &caller, id, people)
+                .map_err(playlist_failure)?;
         }
         Ok(Self::summary(&playlist, &caller))
     }

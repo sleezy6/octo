@@ -18,6 +18,10 @@ pub struct TrackMeta {
     /// Whether the song's words are explicit (1), the clean edit (3) or neither (0), None when
     /// the catalog does not say. See `models::domain::explicit_status`.
     pub explicit_content: Option<i32>,
+    /// The track's catalog id, only when its artist and title name the very recording asked
+    /// for (not merely a search match) and the catalog does not mark it unplayable: what a
+    /// play may ask Deezer for without searching again.
+    pub track_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

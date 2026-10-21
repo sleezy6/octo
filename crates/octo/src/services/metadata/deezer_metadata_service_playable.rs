@@ -47,7 +47,7 @@ pub fn recording_matches(
 
 /// A track record's artist and title, the title with its version when the record names one
 /// apart ("title_version").
-fn identity_of(track: &Value) -> ElementResult<Option<(String, String)>> {
+pub(super) fn identity_of(track: &Value) -> ElementResult<Option<(String, String)>> {
     let artist = match try_get_property(track, "artist")? {
         Some(credit) => str_prop(credit, "name")?,
         None => None,
@@ -62,7 +62,7 @@ fn identity_of(track: &Value) -> ElementResult<Option<(String, String)>> {
 
 /// A track record the catalog marks as not playable (`readable: false`). A record that does
 /// not say is taken as playable.
-fn unreadable(track: &Value) -> bool {
+pub(super) fn unreadable(track: &Value) -> bool {
     matches!(track.get("readable"), Some(Value::Bool(false)))
 }
 

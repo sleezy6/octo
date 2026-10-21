@@ -78,6 +78,10 @@ pub fn admin_controller_routes() -> RouteSet {
             "/api/admin/lastfm/radio/history",
             delete(lastfm::reset_last_fm_radio),
         )
+        .route(
+            "/api/admin/lastfm/radio/artist-ban",
+            delete(lastfm::lift_artist_ban),
+        )
         // Discovery, the library chain, the browse sign-in and the files.
         .route("/api/admin/discover-servers", get(system::discover_servers))
         .route("/api/admin/library-status", get(system::library_status))
@@ -110,6 +114,7 @@ pub fn admin_controller_routes() -> RouteSet {
             "/api/admin/deezer/cache",
             get(system::get_deezer_cache).delete(system::clear_deezer_cache),
         )
+        .route("/api/admin/deezer/requests", get(system::get_deezer_requests))
         .route("/api/admin/restart", post(system::restart))
         .route(
             "/api/admin/soulseek/rejected-peers/clear",

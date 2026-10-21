@@ -88,10 +88,30 @@ const CANNOT_EDIT: &str = "This account cannot change family playlists.";
 const CANNOT_RENAME: &str = "Only the person who made this playlist or a family manager can change it.";
 const CANNOT_DELETE: &str = "Only a family manager can delete a family playlist.";
 const CANNOT_APPROVE: &str = "Only people who manage the family can ask for approval of additions.";
+const CANNOT_SHARE: &str =
+    "Only the person who made this playlist or a family manager can choose who it is shared with.";
 
 /// Whether the caller sees family playlists: the owner and members.
 pub fn may_view(caller: &FamilyCaller) -> bool {
     caller.managed || caller.role == Role::Owner
+}
+
+/// Whether the caller sees this playlist: the owner and its maker always; the rest of the
+/// family when it is shared with everyone (no list) or with them.
+pub fn sees(caller: &FamilyCaller, playlist: &FamilyPlaylist) -> bool {
+    may_view(caller)
+        && (playlist.shared_with.is_empty()
+            || caller.role == Role::Owner
+            || eq_ignore_case(&playlist.created_by, &caller.user)
+            || playlist
+                .shared_with
+                .iter()
+                .any(|person| eq_ignore_case(person, &caller.user)))
+}
+
+/// Whether the caller may choose who the playlist is shared with: its maker or a manager.
+pub fn may_share(caller: &FamilyCaller, playlist: &FamilyPlaylist) -> bool {
+    may_rename(caller, playlist) || (may_view(caller) && caller.role == Role::Owner)
 }
 
 /// Whether the caller adds and removes songs.
@@ -180,7 +200,11 @@ pub fn visible_count(playlist: &FamilyPlaylist, viewer: &FamilyCaller) -> usize 
 /// The family playlists `viewer` sees (none for an account outside the family).
 pub fn visible_playlists(store: &FamilyPlaylistStore, viewer: &FamilyCaller) -> Vec<FamilyPlaylist> {
     if may_view(viewer) {
-        store.list()
+        store
+            .list()
+            .into_iter()
+            .filter(|playlist| sees(viewer, playlist))
+            .collect()
     } else {
         Vec::new()
     }
@@ -188,7 +212,29 @@ pub fn visible_playlists(store: &FamilyPlaylistStore, viewer: &FamilyCaller) -> 
 
 /// One family playlist, when `viewer` sees it.
 pub fn find(store: &FamilyPlaylistStore, viewer: &FamilyCaller, id: &str) -> Option<FamilyPlaylist> {
-    may_view(viewer).then(|| store.get(id)).flatten()
+    store.get(id).filter(|playlist| sees(viewer, playlist))
+}
+
+/// Chooses who a family playlist is shared with: `people` (usernames; the maker and the owner
+/// see it anyway and are left off), or everyone when empty.
+pub fn set_shared_with(
+    store: &FamilyPlaylistStore,
+    caller: &FamilyCaller,
+    id: &str,
+    people: &[String],
+) -> Result<FamilyPlaylist, PlaylistError> {
+    let playlist = find(store, caller, id).ok_or(PlaylistError::NotFound)?;
+    if !may_share(caller, &playlist) {
+        return Err(PlaylistError::NotAllowed(CANNOT_SHARE));
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for person in people.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+        if !eq_ignore_case(person, &playlist.created_by) && !kept.iter().any(|k| eq_ignore_case(k, person)) {
+            kept.push(person.to_string());
+        }
+    }
+    store.set_shared_with(id, kept);
+    store.get(id).ok_or(PlaylistError::NotFound)
 }
 
 /// Makes a new family playlist.
@@ -379,6 +425,56 @@ mod tests {
         fn addition_waits(&self, _: &FamilyPlaylist, index: usize, _: &FamilyPlaylistEntry, by: &str) {
             self.0.lock().push((index, by.to_string()));
         }
+    }
+
+    #[test]
+    fn a_playlist_shared_with_some_is_seen_and_changed_by_them_its_maker_and_the_owner() {
+        let store = FamilyPlaylistStore::in_memory();
+        let alex = caller("alex", Preset::Member);
+        let sam = caller("sam", Preset::Member);
+        let kid = caller("kid", Preset::Kid);
+        let list = create(&store, &alex, "Alex and Kid", false, now()).expect("made");
+        assert_eq!(
+            visible_playlists(&store, &sam).len(),
+            1,
+            "no list: everyone sees it"
+        );
+
+        // Sam may not choose; Alex, who made it, may. Alex is left off their own list.
+        assert_eq!(
+            set_shared_with(&store, &sam, &list.id, &["sam".into()]),
+            Err(PlaylistError::NotAllowed(CANNOT_SHARE))
+        );
+        let shared = set_shared_with(
+            &store,
+            &alex,
+            &list.id,
+            &["Kid".into(), "alex".into(), "kid".into()],
+        )
+        .expect("shared");
+        assert_eq!(shared.shared_with, ["Kid"]);
+
+        assert!(visible_playlists(&store, &sam).is_empty());
+        assert!(find(&store, &sam, &list.id).is_none());
+        assert_eq!(
+            add(
+                &store,
+                &NoPlaylistAddRequests,
+                &sam,
+                &list.id,
+                vec![outside("x")],
+                now()
+            ),
+            Err(PlaylistError::NotFound)
+        );
+        assert_eq!(visible_playlists(&store, &kid).len(), 1);
+        assert_eq!(visible_playlists(&store, &alex).len(), 1);
+        assert_eq!(visible_playlists(&store, &owner()).len(), 1);
+        assert!(may_share(&owner(), &shared));
+
+        // Nobody chosen: back to everyone.
+        set_shared_with(&store, &owner(), &list.id, &[]).expect("shared");
+        assert_eq!(visible_playlists(&store, &sam).len(), 1);
     }
 
     #[test]

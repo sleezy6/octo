@@ -1,5 +1,6 @@
 //! `search3` and `search2`: the search hijack, its later song pages, and the sync walk.
 
+use crate::services::metadata::deezer_requests::DeezerUse;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -150,7 +151,7 @@ pub async fn search3(State(state): State<AppState>, req: Request) -> Result<Resp
             // build has looked its rows up; the album search itself goes at once.
             let rows_looked_up = (external_target > 0).then(|| external_search.rows_looked_up(&query));
             let judging = state.clone();
-            tokio::spawn(async move {
+            tokio::spawn(DeezerUse::Search.scope(async move {
                 let albums = external_search.get_albums(&query, requested_albums.min(20)).await;
                 let found = started.elapsed();
                 if let Some(rows_looked_up) = rows_looked_up {
@@ -158,7 +159,7 @@ pub async fn search3(State(state): State<AppState>, req: Request) -> Result<Resp
                 }
                 let standings = judge_albums(&judging, &albums, scope).await;
                 (albums, standings, found, started.elapsed())
-            })
+            }))
         });
 
     // Artists the same way, and for the same reason: the merge has always known how to
@@ -171,7 +172,7 @@ pub async fn search3(State(state): State<AppState>, req: Request) -> Result<Resp
         .then(|| {
             let metadata = Arc::clone(&state.metadata_service);
             let query = clean_query.clone();
-            tokio::spawn(async move {
+            tokio::spawn(DeezerUse::Search.scope(async move {
                 // The same count every name lookup asks for, so the artist's page a tap opens
                 // reads this search from the cache rather than making its own.
                 let mut artists = metadata
@@ -182,7 +183,7 @@ pub async fn search3(State(state): State<AppState>, req: Request) -> Result<Resp
                     .await;
                 artists.truncate(usize::try_from(requested_artists.min(20)).unwrap_or(0));
                 (artists, started.elapsed())
-            })
+            }))
         });
 
     // One build per query, shared by every caller. Started here rather than awaited, so it
@@ -191,10 +192,10 @@ pub async fn search3(State(state): State<AppState>, req: Request) -> Result<Resp
     let external_task = (external_target > 0).then(|| {
         let external_search = Arc::clone(&state.external_search);
         let query = clean_query.clone();
-        tokio::spawn(async move {
+        tokio::spawn(DeezerUse::Search.scope(async move {
             let songs = external_search.get(&query).await;
             (songs, started.elapsed())
-        })
+        }))
     });
 
     // Local pass-through. Albums/artists always get the full requested counts;
@@ -464,7 +465,7 @@ async fn search_later_song_page(
         let built_task = {
             let external_search = Arc::clone(&state.external_search);
             let query = clean_query.to_string();
-            tokio::spawn(async move { external_search.get(&query).await })
+            tokio::spawn(DeezerUse::Search.scope(async move { external_search.get(&query).await }))
         };
         let mut prefix_params = call.parameters.clone();
         prefix_params.insert("songOffset".into(), "0".into());

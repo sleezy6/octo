@@ -933,6 +933,10 @@
               <input class="set-input" name="LastFm.GenreStationCount" type="number" min="0" max="5" />
             </div>
             <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Leave an artist out after</div><div class="set-info-d">Once a listener rates this many of an artist's songs one star, that artist leaves their radio, stations and mixes, whoever's songs they are. Rating the artist one star does it at once. 0 only bans artists rated one star. Default: 3 songs.</div><div class="set-info-more">Rating the artist anything other than one star lifts it, and so does Lift beside their name below. A lifted artist comes back until another of their songs is rated one star. Radio started from the artist themselves, or from one of their songs, still plays them.</div></div>
+              <input class="set-input" name="LastFm.ArtistBanAfter" type="number" min="0" max="20" />
+            </div>
+            <div class="set-row stack">
               <div class="set-info"><div class="set-info-t">Discovery balance</div><div class="set-info-d">Percentage of Your Radio reserved for less-familiar recommendations. Discovery Radio keeps the same share of songs from your library.</div></div>
               <input class="set-input" name="LastFm.DiscoveryPercent" type="number" min="0" max="100" />
             </div>
@@ -1030,6 +1034,7 @@
               <div class="set-ctrl"><select class="set-input" id="radio-user" aria-label="Radio listener" hidden></select></div>
             </div>
             <div id="radio-status" class="radio-status" aria-live="polite">Loading radio status…</div>
+            <div class="set-row stack" id="radio-artist-bans-row" hidden><div class="set-info"><div class="set-info-t">Artists left out of this listener's radio</div><div class="set-info-d" id="radio-artist-bans"></div></div></div>
             <div class="set-row radio-reset-row"><div class="set-info"><div class="set-info-t">Reset this listener's Radio history</div><div class="set-info-d">Removes what radio learned from this listener's plays and stars, and their station snapshots. Radio starts over from what they play next. Downloaded music is untouched.</div></div><button class="btn btn-ghost" id="radio-reset" type="button" disabled>Reset history</button></div>
           </div>
         </div>
@@ -2999,6 +3004,29 @@
               <button class="btn btn-ghost" type="button" id="deezer-cache-clear">Empty the cache</button>
             </div>
           </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Requests to Deezer</h3>
+            <p class="set-desc">How many times Octo asked Deezer's catalog, and what for. Deezer allows about 50 every 5 seconds; Octo keeps to 40, and work in the background waits behind anything someone is waiting on.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Last hour</div>
+                <div class="set-info-d" id="deezer-requests-hour" role="status" aria-live="polite">Checking…</div>
+              </div>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Since Octo started</div>
+                <div class="set-info-d" id="deezer-requests-total">Checking…</div>
+                <div class="set-info-more">Playing the song itself from your account is not counted: that goes to Deezer's media servers, which this limit does not cover. Octo also writes the last hour's numbers to its log once an hour.</div>
+              </div>
+              <button class="btn btn-ghost" type="button" id="deezer-requests-refresh">Refresh</button>
+            </div>
+          </div>
         </div>
       </section>
 

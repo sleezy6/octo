@@ -1867,6 +1867,123 @@ async fn remove_device_is_for_managers_and_only_members_devices() {
 }
 
 #[tokio::test]
+async fn a_playlist_shared_with_chosen_members_is_seen_by_them_its_maker_and_the_owner() {
+    let f = fam().await;
+    f.state
+        .family_store
+        .upsert_member(member(&f.state, "kim", Preset::Kid, None, None));
+    let made = f
+        .post(
+            "/api/family/playlists",
+            Some(&f.alex()),
+            json!({ "name": "Ours" }),
+        )
+        .await;
+    let id = made.json()["id"].as_str().expect("an id").to_string();
+    assert_eq!(made.json()["sharedWith"], json!([]));
+    assert_eq!(made.json()["mayShare"], true);
+
+    let people = f
+        .get("/api/family/playlists/people", Some(&f.alex()))
+        .await
+        .json();
+    let names: Vec<&str> = people
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|p| p["username"].as_str().expect("named"))
+        .collect();
+    assert!(names.contains(&"winters") && names.contains(&"kim"), "{names:?}");
+
+    let stranger = f
+        .put(
+            &format!("/api/family/playlists/{id}"),
+            Some(&f.alex()),
+            json!({ "sharedWith": ["nobody"] }),
+        )
+        .await;
+    assert_eq!(stranger.status, StatusCode::BAD_REQUEST, "{}", stranger.body);
+    let shared = f
+        .put(
+            &format!("/api/family/playlists/{id}"),
+            Some(&f.alex()),
+            json!({ "sharedWith": ["kim"] }),
+        )
+        .await;
+    assert_eq!(shared.status, StatusCode::OK, "{}", shared.body);
+    assert_eq!(shared.json()["sharedWith"], json!(["kim"]));
+
+    let seen = |cookie: String| {
+        let f = &f;
+        async move {
+            f.get("/api/family/playlists", Some(&cookie))
+                .await
+                .json()
+                .as_array()
+                .expect("a list")
+                .len()
+        }
+    };
+    assert_eq!(seen(f.sam()).await, 0, "not shared with sam");
+    assert_eq!(seen(f.member_cookie("kim")).await, 1);
+    assert_eq!(seen(f.alex()).await, 1);
+    assert_eq!(seen(f.owner_cookie()).await, 1);
+
+    let everyone = f
+        .put(
+            &format!("/api/family/playlists/{id}"),
+            Some(&f.owner_cookie()),
+            json!({ "sharedWith": [] }),
+        )
+        .await;
+    assert_eq!(everyone.json()["sharedWith"], json!([]));
+    assert_eq!(seen(f.sam()).await, 1);
+}
+
+#[tokio::test]
+async fn each_account_chooses_its_explicit_songs() {
+    let f = fam().await;
+    let me = f.get("/api/family/me", Some(&f.alex())).await.json();
+    assert_eq!(
+        me["explicit"],
+        json!({ "choice": "Server", "server": "All", "cleanOnlyByFamily": false })
+    );
+    let r = f
+        .put(
+            "/api/family/me/explicit",
+            Some(&f.alex()),
+            json!({ "choice": "CleanOnly" }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.json()["choice"], "CleanOnly");
+    assert_eq!(
+        f.state.family_store.explicit_choice("ALEX"),
+        Some(octo_core::settings::ExplicitFilter::CleanOnly)
+    );
+    let bad = f
+        .put(
+            "/api/family/me/explicit",
+            Some(&f.alex()),
+            json!({ "choice": "Loud" }),
+        )
+        .await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+
+    // A manager sets it for a member; Server goes back to the server's filter.
+    let edited = f
+        .put(
+            "/api/family/members/alex",
+            Some(&f.sam()),
+            json!({ "explicit": "Server" }),
+        )
+        .await;
+    assert_eq!(edited.status, StatusCode::OK, "{}", edited.body);
+    assert_eq!(edited.json()["explicit"]["choice"], "Server");
+    assert_eq!(f.state.family_store.explicit_choice("alex"), None);
+}
+
+#[tokio::test]
 async fn playlists_are_listed_made_changed_and_deleted() {
     let f = fam().await;
     let made = f

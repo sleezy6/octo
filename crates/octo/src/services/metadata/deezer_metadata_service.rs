@@ -340,6 +340,7 @@ impl DeezerMetadataService {
                     artist_name: art_name.map(str::to_string),
                     artist_image_url: art_img.map(str::to_string),
                     explicit_content: song_explicitness(doc.as_ref(), artist, title, &t)?,
+                    track_id: the_recording_asked_for(&t, artist, title)?,
                 });
             }
             Ok(Flow::Done)
@@ -1733,6 +1734,12 @@ impl DeezerMetadataService {
                         } else {
                             catalog_explicit(hit)?
                         },
+                        // Kept under the hit's own artist and title, so it is the recording.
+                        track_id: if playable::unreadable(hit) {
+                            None
+                        } else {
+                            number_id(hit)?
+                        },
                     };
                     self.put(key, Cached::Track(Some(meta)), POSITIVE_TTL);
                 }
@@ -2235,6 +2242,22 @@ fn scored_matches(
 }
 
 /// An element's numeric `id` as text, when it has one.
+/// The search hit's catalog id when it is the very recording asked for (see
+/// [`playable::recording_matches`]) and the catalog does not mark it unplayable; else None,
+/// and a play searches as before.
+fn the_recording_asked_for(hit: &Value, artist: &str, title: &str) -> ElementResult<Option<String>> {
+    if playable::unreadable(hit) {
+        return Ok(None);
+    }
+    let Some((got_artist, got_title)) = playable::identity_of(hit)? else {
+        return Ok(None);
+    };
+    if !playable::recording_matches(Some(artist), Some(title), Some(&got_artist), Some(&got_title)) {
+        return Ok(None);
+    }
+    number_id(hit)
+}
+
 fn number_id(element: &Value) -> ElementResult<Option<String>> {
     Ok(match try_get_property(element, "id")? {
         Some(id @ Value::Number(_)) => Some(get_int64(id)?.to_string()),

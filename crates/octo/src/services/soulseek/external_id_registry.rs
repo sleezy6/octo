@@ -361,6 +361,47 @@ impl ExternalIdRegistry {
         true
     }
 
+    /// Keeps `track` as the song's id in Deezer's catalog (see
+    /// [`SoulseekRouting::deezer_track_id`]), written down at the next flush. An id already
+    /// kept stays: it came from the same exact match. True when the song now has `track`.
+    pub fn keep_deezer_track(&self, short_id: &str, track: &str) -> bool {
+        if short_id.is_empty() || track.is_empty() {
+            return false;
+        }
+        let Some(routing) = self.lru.lock().by_id.get(short_id).map(|(r, _)| r.clone()) else {
+            return false;
+        };
+        {
+            let mut r = routing.lock();
+            if r.kind != RoutingKind::Song {
+                return false;
+            }
+            match r.deezer_track_id.as_deref() {
+                Some(kept) => return kept == track,
+                None => r.deezer_track_id = Some(track.to_string()),
+            }
+        }
+        self.dirty.store(true, Ordering::SeqCst);
+        true
+    }
+
+    /// Forgets `track` as the song's Deezer id, when it is still the one kept: Deezer had no
+    /// audio under it. True when it was forgotten.
+    pub fn forget_deezer_track(&self, short_id: &str, track: &str) -> bool {
+        let Some(routing) = self.lru.lock().by_id.get(short_id).map(|(r, _)| r.clone()) else {
+            return false;
+        };
+        {
+            let mut r = routing.lock();
+            if r.deezer_track_id.as_deref() != Some(track) {
+                return false;
+            }
+            r.deezer_track_id = None;
+        }
+        self.dirty.store(true, Ordering::SeqCst);
+        true
+    }
+
     /// Pins `video` for playback on the song under `short_id`, written down at the next flush.
     /// `replace` false keeps a different video that is already pinned. Pinning another video
     /// forgets the old one's stream facts. True when the song now plays `video`.

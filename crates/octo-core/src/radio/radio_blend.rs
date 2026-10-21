@@ -11,7 +11,7 @@ use super::radio_provider;
 use super::radio_types::{RadioAnswer, RadioMatch};
 use crate::common::dotnet;
 use crate::last_fm::SimilarTrack;
-use crate::last_fm::last_fm_radio_recommendation_service::IgnoreCaseKeys;
+use crate::last_fm::last_fm_radio_recommendation_service::{IgnoreCaseKeys, artist_key};
 use crate::last_fm::last_fm_radio_seed_normalizer as seed_normalizer;
 use crate::last_fm::radio_filler;
 use crate::models::domain::Song;
@@ -104,6 +104,27 @@ pub fn without_filler_or_bans(answer: RadioAnswer, bans: &IgnoreCaseKeys) -> Rad
             .library_songs
             .into_iter()
             .filter(|song| kept(&song.artist, &song.title, song.duration))
+            .collect(),
+        ..answer
+    }
+}
+
+/// The answer without the songs of `artists` (by [`artist_key`]): the artists the listener
+/// banned from their radio.
+pub fn without_artists(answer: RadioAnswer, artists: &IgnoreCaseKeys) -> RadioAnswer {
+    if artists.is_empty() {
+        return answer;
+    }
+    RadioAnswer {
+        tracks: answer
+            .tracks
+            .into_iter()
+            .filter(|track| !artists.contains(&artist_key(&track.artist)))
+            .collect(),
+        library_songs: answer
+            .library_songs
+            .into_iter()
+            .filter(|song| !artists.contains(&artist_key(&song.artist)))
             .collect(),
         ..answer
     }

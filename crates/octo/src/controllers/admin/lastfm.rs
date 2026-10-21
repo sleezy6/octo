@@ -11,7 +11,7 @@ use octo_core::last_fm::last_fm_scrobble_service::LastFmScrobbleException;
 use octo_core::settings::SettingsWriteError;
 use serde::Deserialize;
 use serde_json::json;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::json_body::bind_body;
 use super::json_body::{FromBody, Kind, Member, Shape, text_record};
@@ -49,6 +49,10 @@ pub async fn get_last_fm_radio(
         _ => summaries.first().map(|summary| summary.username.clone()),
     };
     let user_state = selected.as_deref().map(|user| radio.get_user(user));
+    let banned_artists = selected
+        .as_deref()
+        .map(|user| radio.banned_artists(user))
+        .unwrap_or_default();
     let settings = state.settings.current().last_fm.clone();
 
     let learning = user_state.as_ref().map(|user| {
@@ -109,6 +113,36 @@ pub async fn get_last_fm_radio(
         "users": summaries,
         "learning": learning,
         "stations": stations,
+        "artistBanAfter": settings.artist_ban_after.max(0),
+        "bannedArtists": banned_artists,
+    }))
+}
+
+/// `DELETE /api/admin/lastfm/radio/artist-ban?user=&artist=`: lifts a listener's ban on an
+/// artist, whether they rated the artist one star or enough of the artist's songs. The Octo app
+/// with a listener's own sign-in lifts that listener's own bans only.
+pub async fn lift_artist_ban(
+    State(state): State<AppState>,
+    caller: Caller,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let listener = caller_of(&caller)
+        .filter(|caller| caller.kind == AdminCallerKind::Listener)
+        .and_then(|caller| caller.user.clone());
+    let user = listener.or_else(|| query_value(query.as_deref(), "user"));
+    let artist = query_value(query.as_deref(), "artist");
+    let (Some(user), Some(artist)) = (user.filter(|u| !is_blank(u)), artist.filter(|a| !is_blank(a))) else {
+        return validation_problem(&[("user", &["The user and artist fields are required."])]);
+    };
+    let lifted = state.last_fm_radio_state.set_artist_ban(&user, &artist, false);
+    if lifted {
+        info!("The ban on {artist} was lifted for {user}'s radio");
+    }
+    ok(&json!({
+        "ok": lifted,
+        "user": user,
+        "artist": artist,
+        "bannedArtists": state.last_fm_radio_state.banned_artists(&user),
     }))
 }
 

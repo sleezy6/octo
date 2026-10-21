@@ -245,6 +245,28 @@ impl LastFmRadioTrackResolver {
         None
     }
 
+    /// The name of the artist under `id`: an outside artist Octo listed, or one in this
+    /// listener's library. None for anything else.
+    pub async fn artist_name(
+        &self,
+        id: &str,
+        authenticated_parameters: &IndexMap<String, String>,
+    ) -> Option<String> {
+        if let Some(route) = self.registry.lookup(id) {
+            let route = route.snapshot();
+            return (route.kind == RoutingKind::Artist)
+                .then_some(route.artist)
+                .flatten()
+                .filter(|name| !name.trim().is_empty());
+        }
+        let artist = self
+            .read("rest/getArtist", id, authenticated_parameters, "artist")
+            .await?;
+        string(&artist, "name")
+            .ok()
+            .filter(|name| !name.trim().is_empty())
+    }
+
     /// One library song as this listener's Navidrome describes it; None when they cannot see it.
     pub async fn read_library_song(
         &self,

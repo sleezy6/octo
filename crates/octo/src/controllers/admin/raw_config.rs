@@ -229,6 +229,7 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "LastFm:ScrobbleExternalPlays",
     "LastFm:ScrobbleLibraryPlays",
     "LastFm:LoveFavorites",
+    "LastFm:ArtistBanAfter",
     "LastFm:EnableRadio",
     "LastFm:RadioTrackCount",
     "LastFm:RadioCacheDurationHours",

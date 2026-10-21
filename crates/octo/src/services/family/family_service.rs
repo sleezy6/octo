@@ -266,6 +266,10 @@ pub struct FamilyPlaylistSummary {
     pub approve_additions: bool,
     pub created_by: String,
     pub created: String,
+    /// The members it is shared with besides its maker and the owner; empty: everyone.
+    pub shared_with: Vec<String>,
+    /// Whether the viewer may choose who it is shared with.
+    pub may_share: bool,
 }
 
 /// Playlists every member can add to. Each change is checked for the person making it.
@@ -286,6 +290,7 @@ pub trait FamilyPlaylists: Send + Sync {
         by: &str,
         name: Option<&str>,
         approve_additions: Option<bool>,
+        shared_with: Option<&[String]>,
     ) -> Result<FamilyPlaylistSummary, FamilyError>;
     async fn delete(&self, id: &str, by: &str) -> Result<(), FamilyError>;
 }
@@ -865,6 +870,10 @@ impl FamilyService {
             // Signed up before one login: no password kept the sealed way until a reset.
             map.insert("needsPassword".into(), json!(m.signed_up() && !m.has_password()));
             map.insert("created".into(), json!(datetime::format_utc(&m.created)));
+            map.insert(
+                "explicit".into(),
+                crate::controllers::family::account::explicit_json(state, &m.username),
+            );
         }
         value
     }

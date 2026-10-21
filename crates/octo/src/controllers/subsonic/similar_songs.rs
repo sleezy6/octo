@@ -7,6 +7,7 @@ use std::sync::Arc;
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 use octo_core::common::dotnet;
+use octo_core::last_fm::last_fm_radio_recommendation_service::{IgnoreCaseKeys, artist_key};
 use octo_core::models::domain::Song;
 use octo_core::radio::RadioSeed;
 use octo_core::soulseek::soulseek_metadata_service::RoutingKind;
@@ -166,6 +167,17 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
         .as_deref()
         .map(|listener| state.last_fm_radio_state.radio_ban_keys(listener))
         .unwrap_or_default();
+    // The artists the listener banned, except the one this radio starts from: asking for a
+    // banned artist's own radio, or radio from one of their songs, is asking for them.
+    let seed_artist = artist_key(&artist_name);
+    let banned_artists: IgnoreCaseKeys = listener
+        .as_deref()
+        .map(|listener| state.last_fm_radio_state.banned_artists(listener))
+        .unwrap_or_default()
+        .iter()
+        .map(|banned| artist_key(&banned.artist))
+        .filter(|key| !key.eq_ignore_ascii_case(&seed_artist))
+        .collect();
     let seed = RadioSeed {
         artist: artist_name.clone(),
         title: track_title.clone(),
@@ -181,6 +193,7 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
             listener.as_deref(),
             &call.parameters,
             &bans,
+            &banned_artists,
             &resolver,
             client_order,
         )

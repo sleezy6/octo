@@ -23,6 +23,18 @@ impl Respond for FakeNavidrome {
                 r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong username or password"}}}"#,
             );
         }
+        let query = request.url.query().unwrap_or("");
+        if path.contains("/rest/getArtist") && query.contains("id=ar-1") {
+            return navidrome_json(
+                r#"{"subsonic-response":{"status":"ok","artist":{"id":"ar-1","name":"Massive Attack"}}}"#,
+            );
+        }
+        if (path.contains("/rest/getSong") || path.contains("/rest/getArtist")) && !query.contains("id=nd-1")
+        {
+            return navidrome_json(
+                r#"{"subsonic-response":{"status":"failed","error":{"code":70,"message":"data not found"}}}"#,
+            );
+        }
         if path.contains("/rest/getSong") {
             return navidrome_json(
                 r#"{"subsonic-response":{"status":"ok","song":{"id":"nd-1","artist":"Library Artist","title":"Library Song","duration":200}}}"#,
@@ -89,6 +101,45 @@ async fn one_star_on_a_song_found_online_from_a_caller_navidrome_refuses_changes
     let id = online_song(&state);
     assert!(get(&app(&state), &rate(&id, 1)).await.status.is_success());
     assert!(state.last_fm_radio_state.radio_ban_keys("alice").is_empty());
+}
+
+fn banned_artists(state: &crate::app::AppState) -> Vec<(String, bool)> {
+    state
+        .last_fm_radio_state
+        .banned_artists("alice")
+        .into_iter()
+        .map(|banned| (banned.artist, banned.rated))
+        .collect()
+}
+
+#[tokio::test]
+async fn one_star_on_a_library_artist_bans_them_and_another_rating_lifts_it() {
+    let server = navidrome(true).await;
+    let state = crate::app::AppState::for_tests(settings(&server.uri()));
+    let app = app(&state);
+
+    assert!(get(&app, &rate("ar-1", 1)).await.status.is_success());
+    assert_eq!(banned_artists(&state), [("Massive Attack".to_string(), true)]);
+    assert!(
+        state.last_fm_radio_state.radio_ban_keys("alice").is_empty(),
+        "no song was banned"
+    );
+
+    assert!(get(&app, &rate("ar-1", 0)).await.status.is_success());
+    assert!(banned_artists(&state).is_empty());
+}
+
+#[tokio::test]
+async fn one_star_on_an_artist_found_online_bans_them() {
+    let server = navidrome(true).await;
+    let state = crate::app::AppState::for_tests(settings(&server.uri()));
+    let id = state.external_id_registry.register(SoulseekRouting {
+        kind: RoutingKind::Artist,
+        artist: Some("Online Band".into()),
+        ..Default::default()
+    });
+    assert!(get(&app(&state), &rate(&id, 1)).await.status.is_success());
+    assert_eq!(banned_artists(&state), [("Online Band".to_string(), true)]);
 }
 
 #[test]

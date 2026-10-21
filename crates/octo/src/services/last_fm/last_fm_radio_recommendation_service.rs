@@ -264,7 +264,7 @@ impl LastFmRadioRecommendationService {
             unavailable,
             banned,
             disliked,
-        } = Signals::of(&user);
+        } = Signals::of(&user, settings.artist_ban_after);
         let known = known_artists(&plays);
         let refill_headroom = (unavailable.len() as i32).min(settings.effective_radio_track_count());
         let candidate_target = 100.min(settings.effective_radio_track_count() + refill_headroom + 10);
@@ -818,7 +818,7 @@ impl LastFmRadioRecommendationService {
             mut unavailable,
             banned,
             disliked,
-        } = Signals::of(&user);
+        } = Signals::of(&user, settings.artist_ban_after);
         for track in station
             .tracks
             .iter()
@@ -1318,7 +1318,10 @@ struct Signals {
 }
 
 impl Signals {
-    fn of(user: &LastFmRadioUserState) -> Self {
+    /// `artist_ban_after`: `LastFm:ArtistBanAfter`. A banned artist counts as disliked, so it
+    /// never scores as a similar artist; the store takes any of their songs left off the
+    /// stations.
+    fn of(user: &LastFmRadioUserState, artist_ban_after: i32) -> Self {
         let mut plays = user.plays.clone();
         plays.sort_by_key(|a| std::cmp::Reverse(a.played_at_utc));
         let unavailable: IgnoreCaseKeys = user
@@ -1332,6 +1335,11 @@ impl Signals {
             .radio_bans
             .iter()
             .map(|ban| artist_key(&ban.artist))
+            .chain(
+                user.banned_artists(artist_ban_after.max(0))
+                    .iter()
+                    .map(|banned| artist_key(&banned.artist)),
+            )
             .collect();
         Signals {
             plays,

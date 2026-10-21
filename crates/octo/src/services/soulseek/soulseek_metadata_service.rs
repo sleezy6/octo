@@ -33,6 +33,7 @@ use crate::services::metadata::DeezerMetadataService;
 use crate::services::metadata::deezer_metadata_service::{
     ARTIST_NAME_CANDIDATES as ARTIST_CANDIDATES, fold_editions,
 };
+use crate::services::metadata::deezer_requests::DeezerUse;
 use crate::services::you_tube::{YouTubeHit, YouTubeResolver};
 
 /// The two members of `LastFmService` the length lookup uses: whether it has an API key, and
@@ -443,12 +444,11 @@ impl SoulseekMetadataService {
             }
 
             // Free: a search for the same song may have asked Deezer already.
-            if let Some(d) = inner
-                .deezer
-                .cached_track(&song.artist, &song.title)
-                .and_then(|m| m.duration)
-                .filter(|&d| d > 0)
-            {
+            let cached = inner.deezer.cached_track(&song.artist, &song.title);
+            if let Some(meta) = &cached {
+                inner.keep_deezer_track(&song.id, meta);
+            }
+            if let Some(d) = cached.and_then(|m| m.duration).filter(|&d| d > 0) {
                 song.duration = Some(d);
                 inner
                     .id_registry
@@ -616,6 +616,15 @@ impl Inner {
         }
         self.id_registry
             .remember_length(id, meta.duration, LengthSource::Deezer);
+        self.keep_deezer_track(id, meta);
+    }
+
+    /// Keeps the catalog id of the very recording on the song's routing, so a play or a heart
+    /// asks Deezer for it without searching again.
+    fn keep_deezer_track(&self, id: &str, meta: &TrackMeta) {
+        if let Some(track) = meta.track_id.as_deref() {
+            self.id_registry.keep_deezer_track(id, track);
+        }
     }
 
     fn lengths_from_deezer(&self) -> bool {
@@ -625,7 +634,9 @@ impl Inner {
     /// The song's length from Deezer's catalog, stored on its routing as Deezer's. `None` when
     /// Deezer has no such song or no length for it.
     async fn deezer_length(&self, id: &str, artist: &str, title: &str, background: bool) -> Option<i32> {
-        let meta = self.deezer.enrich_track(artist, title, false, background).await?;
+        let meta = DeezerUse::Lengths
+            .scope(self.deezer.enrich_track(artist, title, false, background))
+            .await?;
         let shown = meta.duration.filter(|&d| d > 0)?;
         if !id.is_empty() {
             self.reflect_on_routing(id, &meta);
@@ -769,7 +780,7 @@ impl Inner {
             return;
         }
         let this = Arc::clone(self);
-        let task = tokio::spawn(async move {
+        let task = tokio::spawn(DeezerUse::Search.scope(async move {
             let mut still_missing = Vec::new();
             for row in rows {
                 match row {
@@ -798,7 +809,7 @@ impl Inner {
                 }
             }
             this.warm_lengths(still_missing);
-        });
+        }));
         *self.last_rows_finish.lock() = Some(task.map(|_| ()).boxed().shared());
     }
 
@@ -934,7 +945,12 @@ impl Inner {
     /// interactive lane (`false`), the fire-and-forget warm pass on the background lane. The
     /// video guess at the end stays background work either way.
     async fn look_up_length(&self, id: &str, artist: &str, title: &str, background: bool) {
-        let meta = self.deezer.enrich_track(artist, title, false, background).await;
+        let meta = DeezerUse::Lengths
+            .scope(self.deezer.enrich_track(artist, title, false, background))
+            .await;
+        if let Some(meta) = &meta {
+            self.keep_deezer_track(id, meta);
+        }
         if self
             .id_registry
             .remember_length(id, meta.and_then(|m| m.duration), LengthSource::Deezer)

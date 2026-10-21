@@ -871,7 +871,8 @@ impl Respond for DeezerTable {
             Some((key, duration)) if request.url.path() == "/search" => {
                 let split = key.rfind(' ').expect("an artist and a title");
                 let mut row = serde_json::json!({
-                    "title": &key[split + 1..], "duration": duration, "artist": {"name": &key[..split]},
+                    "id": 9000 + duration, "title": &key[split + 1..], "duration": duration,
+                    "artist": {"name": &key[..split]},
                 });
                 if let Some(album) = self.0.albums.lock().get(&key) {
                     row["album"] = serde_json::json!({ "title": album });
@@ -1167,6 +1168,17 @@ async fn complete_song_lengths_deezer_is_tried_first() {
 
     assert_eq!(fixture.shown(&song), (Some(234), LengthSource::Deezer));
     assert!(!fixture.requests().iter().any(|url| url.contains("track.getInfo")));
+}
+
+/// The length lookup found the very song on Deezer, so its track is kept for plays and hearts.
+#[tokio::test]
+async fn a_deezer_length_keeps_the_track_it_came_from() {
+    let fixture = LengthFixture::new().await;
+    fixture.deezer("Justice Genesis", 234);
+    let song = fixture.station_row("Justice", "Genesis").await;
+
+    let routing = fixture.registry.lookup(&song.id).expect("registered").snapshot();
+    assert_eq!(routing.deezer_track_id.as_deref(), Some("9234"));
 }
 
 #[tokio::test]

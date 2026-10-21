@@ -1295,17 +1295,30 @@ async fn listener(state: &AppState, call: &SubsonicCall) -> Option<String> {
         .filter(|u| !u.is_empty())
 }
 
-/// One star keeps a song off this listener's radio; any other rating lifts that. Never fails the
-/// rating itself: the radio is a side effect of it.
+/// One star keeps a song off this listener's radio; any other rating lifts that. On an artist,
+/// one star keeps all of the artist's songs off it (`LastFm:ArtistBanAfter` songs rated one star
+/// do too), and any other rating lifts that. Never fails the rating itself: the radio is a side
+/// effect of it.
 async fn record_radio_ban(state: &AppState, call: &SubsonicCall, username: &str, item_id: &str, stars: i32) {
     let resolver = resolver(state, call);
     if let Some(rated) = resolver.resolve_scrobble(item_id, &call.parameters).await {
         state
             .last_fm_radio_state
             .set_radio_ban(username, item_id, &rated.artist, &rated.title, stars == 1);
+        if stars == 1 {
+            state.radio_outcomes.disliked(username, item_id, Utc::now());
+        }
+        return;
     }
-    if stars == 1 {
-        state.radio_outcomes.disliked(username, item_id, Utc::now());
+    if let Some(artist) = resolver.artist_name(item_id, &call.parameters).await
+        && state
+            .last_fm_radio_state
+            .set_artist_ban(username, &artist, stars == 1)
+    {
+        info!(
+            "{username} {} {artist} on their radio",
+            if stars == 1 { "banned" } else { "lifted the ban on" }
+        );
     }
 }
 

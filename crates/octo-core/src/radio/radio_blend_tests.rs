@@ -305,3 +305,23 @@ fn stations_keep_guesses_at_a_discount_and_a_pick_names_its_strongest_source() {
     assert_eq!(picks[0].provider, YOU_TUBE_MUSIC);
     assert!((picks[0].score - 1.5).abs() < 1e-9);
 }
+
+#[test]
+fn a_banned_artist_leaves_by_name_whatever_the_song() {
+    let answer = RadioAnswer::new(
+        LAST_FM,
+        RadioMatch::Song,
+        vec![
+            track("Nickelback", "Photograph", Some(200)),
+            track("Keane", "Somewhere Only We Know", Some(200)),
+        ],
+        Vec::new(),
+    );
+    let artists: IgnoreCaseKeys = ["nickelback"].into_iter().collect();
+    let kept: Vec<String> = without_artists(answer, &artists)
+        .tracks
+        .into_iter()
+        .map(|track| track.artist)
+        .collect();
+    assert_eq!(kept, ["Keane"]);
+}

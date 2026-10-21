@@ -11,6 +11,7 @@ use reqwest::header::ACCEPT_LANGUAGE;
 use tracing::warn;
 
 use super::deezer_rate_limiter::DeezerRateLimiter;
+use super::deezer_requests::{DeezerRequestCounter, DeezerUse};
 use crate::services::framework::HttpAnswer;
 use crate::services::framework::http::client_builder;
 
@@ -66,8 +67,10 @@ impl DeezerRateLimitHandler {
             return self.client.execute(request).await;
         }
 
+        let purpose = DeezerUse::current().unwrap_or_else(|| DeezerUse::of_path(request.url().path()));
         let lease = self.limiter.acquire(background).await;
         if !lease.is_acquired() {
+            DeezerRequestCounter::global().turned_away();
             // The queue is full. Answering 429 rather than throwing means callers take
             // their existing "Deezer refused this" path, which never caches the result:
             // so back-pressure can slow us down but can never poison the cache.
@@ -79,6 +82,7 @@ impl DeezerRateLimitHandler {
             return Ok(too_many_requests());
         }
 
+        DeezerRequestCounter::global().count(purpose, background);
         self.client.execute(request).await
     }
 

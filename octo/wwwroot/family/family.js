@@ -95,6 +95,26 @@
     ['Standard', 'Standard'],
     ['DataSaver', 'Data saver']
   ];
+  // Which songs an account hears by their explicit mark. Server follows the server's filter.
+  var EXPLICIT_CHOICES = [
+    ['Server', 'Server default'],
+    ['All', 'Everything'],
+    ['CleanOnly', 'Clean only'],
+    ['ExplicitOnly', 'Explicit versions']
+  ];
+  var EXPLICIT_HELP = {
+    Server: 'What the server is set to show.',
+    All: 'Every song, explicit or clean.',
+    CleanOnly: 'Songs marked explicit are left out.',
+    ExplicitOnly: 'Clean edits are left out, so the originals play.'
+  };
+  var SERVER_EXPLICIT = { All: 'everything', CleanOnly: 'clean only', ExplicitOnly: 'explicit versions' };
+  function explicitHelp(x) {
+    if (x.cleanOnlyByFamily) return 'Your family plan keeps your songs clean, whatever you choose here.';
+    var line = EXPLICIT_HELP[x.choice] || '';
+    if (x.choice === 'Server') line = 'The server shows ' + (SERVER_EXPLICIT[x.server] || 'everything') + '.';
+    return line + ' Applies to radio, mixes and charts Octo makes for you, and to search, albums and playlists.';
+  }
   var QUALITY_HELP = {
     Original: 'the file as it is.',
     High: 'about 256 kbps.',
@@ -1004,6 +1024,15 @@
       help.textContent = lines.join(' ');
     };
     describe();
+    var x = reply.data.explicit || { choice: 'Server', server: 'All', cleanOnlyByFamily: false };
+    var explicitNote = el('p', { class: 'fam-help' }, explicitHelp(x));
+    var saveExplicit = async function (value) {
+      var r = await api('PUT', '/me/explicit', { choice: value });
+      if (!r.ok) return F.toast(F.errorOf(r), true);
+      x = r.data;
+      explicitNote.textContent = explicitHelp(x);
+      F.toast('Explicit songs: ' + EXPLICIT_CHOICES.filter(function (c) { return c[0] === value; })[0][1]);
+    };
     F.clear(main);
     F.append(main, [
       pageHeader('sliders', 'Audio quality', 'What Octo sends your devices, at home and away. Each device can follow this or let its app decide, under Devices.'),
@@ -1011,6 +1040,10 @@
         setRow('At home', 'On your home network.', segmented(QUALITIES, q.home, function (v) { save('home', v); }, 'Quality at home')),
         setRow('Away from home', 'Everywhere else, often on mobile data.', segmented(QUALITIES, q.away, function (v) { save('away', v); }, 'Quality away from home')),
         el('div', { class: 'set-row' }, help)
+      ]),
+      rowsCard([
+        setRow('Explicit songs', 'Which songs you hear by their explicit mark.', segmented(EXPLICIT_CHOICES, x.choice, saveExplicit, 'Explicit songs')),
+        el('div', { class: 'set-row' }, explicitNote)
       ]),
       el('p', { class: 'fam-help fam-gap' }, 'Songs from outside the library already stream at about 128 to 160 kbps, so these choices leave them as they are.')
     ]);
@@ -1398,6 +1431,10 @@
     var preset = m.preset;
     var values = Object.assign({}, m.abilities);
     var display = el('input', { class: 'set-input', id: 'edit-name', value: m.displayName });
+    var explicitNow = (m.explicit && m.explicit.choice) || 'Server';
+    var explicitSelect = el('select', { class: 'set-input fam-select', 'aria-label': 'Explicit songs' },
+      EXPLICIT_CHOICES.map(function (c) { return el('option', { value: c[0] }, c[1]); }));
+    explicitSelect.value = explicitNow;
     var fields = el('div', { class: 'fam-stack' });
     var libraries = await librariesPicker(m.sharedLibraries);
     var presetHelp = el('p', { class: 'fam-help' }, PRESETS[preset]);
@@ -1435,12 +1472,14 @@
         if (values[f.key] !== base[f.key]) edits[f.key] = values[f.key];
       });
       save.disabled = true;
-      var r = await api('PUT', '/members/' + encodeURIComponent(m.username), {
+      var body = {
         displayName: display.value.trim(),
         preset: preset,
         edits: edits,
         sharedLibraries: libraries.value()
-      });
+      };
+      if (explicitSelect.value !== explicitNow) body.explicit = explicitSelect.value;
+      var r = await api('PUT', '/members/' + encodeURIComponent(m.username), body);
       save.disabled = false;
       if (!r.ok) { error.textContent = F.errorOf(r); return; }
       F.closeSheet();
@@ -1456,6 +1495,8 @@
     }, 'Plan'), presetHelp),
     fields,
     el('div', { class: 'fam-group' }, el('h3', { class: 'fam-group-title' }, 'Shared music they see'), libraries),
+    el('div', { class: 'fam-group' }, el('h3', { class: 'fam-group-title' }, 'Explicit songs'),
+      rowsCard([setRow('Which songs they hear', 'Their own choice, which they can change on their Audio quality page. Clean songs only, above, keeps them clean whatever this says.', explicitSelect)])),
     el('p', { class: 'fam-help' }, 'Outside songs stream at about 128 to 160 kbps whatever the limits say.'),
     error);
     F.openSheet('Edit ' + m.displayName, form, { side: true, sub: 'Choose a plan, then change any ability. Each one says what it does.', foot: [el('button', { class: 'btn btn-ghost', type: 'button', onclick: F.closeSheet }, 'Cancel'), save] });
@@ -1549,6 +1590,40 @@
     ]);
   }
 
+  // Who a family playlist is shared with. Nobody ticked: the whole family. Its maker and the
+  // owner always see it.
+  async function shareSheet(p, after) {
+    var reply = await api('GET', '/playlists/people');
+    if (!reply.ok) return F.toast(F.errorOf(reply), true);
+    var chosen = (p.sharedWith || []).map(function (u) { return u.toLowerCase(); });
+    var maker = (p.createdBy || '').toLowerCase();
+    var boxes = [];
+    var rows = reply.data.filter(function (person) {
+      return !person.owner && person.username.toLowerCase() !== maker;
+    }).map(function (person) {
+      var sw = switchControl(chosen.indexOf(person.username.toLowerCase()) >= 0, 'Share with ' + person.displayName, function () {});
+      boxes.push({ username: person.username, input: sw.input });
+      return setRow(person.displayName, person.displayName === person.username ? null : person.username, sw.node);
+    });
+    var error = el('p', { class: 'field-error', role: 'alert' });
+    var save = el('button', { class: 'btn btn-primary', type: 'submit', form: 'share-playlist' }, 'Save');
+    var form = el('form', { class: 'fam-form', id: 'share-playlist', onsubmit: async function (e) {
+      e.preventDefault();
+      var people = boxes.filter(function (b) { return b.input.checked; }).map(function (b) { return b.username; });
+      save.disabled = true;
+      var r = await api('PUT', '/playlists/' + encodeURIComponent(p.id), { sharedWith: people });
+      save.disabled = false;
+      if (!r.ok) { error.textContent = F.errorOf(r); return; }
+      F.closeSheet();
+      F.toast(people.length ? 'Shared with ' + people.length + (people.length === 1 ? ' person' : ' people') : 'Everyone in the family sees it');
+      after();
+    } },
+    rows.length ? rowsCard(rows) : el('p', { class: 'fam-help' }, 'There is nobody else in the family yet.'),
+    el('p', { class: 'fam-help' }, 'Tick nobody and the whole family sees it. ' + p.createdBy + ', who made it, and the owner always see it. Only the people who see it can add to it.'),
+    error);
+    F.openSheet('Share ' + p.name, form, { side: true, sub: 'Choose who sees this playlist in their apps.', foot: [el('button', { class: 'btn btn-ghost', type: 'button', onclick: F.closeSheet }, 'Cancel'), save] });
+  }
+
   async function viewPlaylists(main) {
     var reply = await api('GET', '/playlists');
     if (!reply.ok) return failed(main, reply);
@@ -1573,6 +1648,11 @@
           viewPlaylists(main);
         } }, 'Rename'));
       }
+      if (p.mayShare) {
+        side.appendChild(el('button', { class: 'btn btn-sm btn-ghost', type: 'button', onclick: function () {
+          shareSheet(p, function () { viewPlaylists(main); });
+        } }, 'Shared with'));
+      }
       if (session.manager) {
         side.appendChild(el('button', { class: 'btn btn-sm btn-ghost btn-danger', type: 'button', onclick: async function () {
           if (!confirmIn('Delete the family playlist ' + p.name + '? The songs stay in the library.')) return;
@@ -1585,7 +1665,8 @@
         el('span', { class: 'fam-row-ico', 'aria-hidden': 'true' }, F.icon('playlist')),
         el('div', { class: 'fam-row-main' },
           el('div', { class: 'fam-row-title' }, p.name),
-          el('div', { class: 'fam-row-meta' }, p.songCount + (p.songCount === 1 ? ' song' : ' songs') + ' · made by ' + p.createdBy)),
+          el('div', { class: 'fam-row-meta' }, p.songCount + (p.songCount === 1 ? ' song' : ' songs') + ' · made by ' + p.createdBy +
+            ' · ' + (p.sharedWith && p.sharedWith.length ? 'shared with ' + p.sharedWith.join(', ') : 'everyone sees it'))),
         side));
     });
     var name = el('input', { class: 'set-input', placeholder: 'Road trip', 'aria-label': 'Playlist name' });
@@ -1600,7 +1681,7 @@
     } }, name, el('button', { class: 'btn btn-primary', type: 'submit' }, F.icon('plus'), 'Make a playlist')) : null;
     F.clear(main);
     F.append(main, [
-      pageHeader('playlist', 'Family playlists', 'Playlists everyone in the family sees and can add to from any app.'),
+      pageHeader('playlist', 'Family playlists', 'Playlists the family sees and can add to from any app. Each can be shared with everyone, or only with the people you choose.'),
       card(null, null, null, create,
         reply.data.length ? list : empty('playlist', canEdit ? 'No family playlists yet. Name one above, then add songs to it from any app.' : 'No family playlists yet.'))
     ]);

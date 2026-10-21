@@ -108,6 +108,12 @@ pub struct SoulseekRouting {
 
     /// ReplayGain track peak (linear) of the pinned video's audio, measured with the gain.
     pub track_peak: Option<f64>,
+
+    /// The song's id in Deezer's catalog, once a length lookup or a play found the very same
+    /// recording there, so a play or a heart asks Deezer for it without searching again. A
+    /// play that finds no audio under it forgets it. Written only when known, and not part of
+    /// the id.
+    pub deezer_track_id: Option<String>,
 }
 
 /// The gain and peak are plain measured numbers, never NaN, so equality is total.
@@ -207,6 +213,7 @@ impl Serialize for SoulseekRouting {
             self.stream_bit_rate.is_some(),
             self.track_gain.is_some(),
             self.track_peak.is_some(),
+            self.deezer_track_id.is_some(),
         ]
         .into_iter()
         .filter(|known| *known)
@@ -263,6 +270,9 @@ impl Serialize for SoulseekRouting {
         if let Some(peak) = &self.track_peak {
             s.serialize_field("TrackPeak", peak)?;
         }
+        if let Some(track) = &self.deezer_track_id {
+            s.serialize_field("DeezerTrackId", track)?;
+        }
         if from_file {
             s.serialize_field(SHOWN_FROM_FILE, &true)?;
         }
@@ -296,6 +306,24 @@ mod tests {
         );
         let back: SoulseekRouting = serde_json::from_str(&json).expect("reads back");
         assert_eq!(back, routing);
+    }
+
+    #[test]
+    fn a_kept_deezer_track_is_written_only_when_known() {
+        let plain = SoulseekRouting {
+            artist: Some("Drake".into()),
+            title: Some("Started".into()),
+            ..Default::default()
+        };
+        assert!(!crate::json::to_string(&plain).contains("DeezerTrackId"));
+        let kept = SoulseekRouting {
+            deezer_track_id: Some("3135556".into()),
+            ..plain
+        };
+        let json = crate::json::to_string(&kept);
+        assert!(json.contains(r#""DeezerTrackId":"3135556""#), "{json}");
+        let back: SoulseekRouting = serde_json::from_str(&json).expect("reads back");
+        assert_eq!(back, kept);
     }
 
     #[test]

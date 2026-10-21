@@ -36,6 +36,12 @@ pub struct LastFmSettings {
     /// are loved once after connecting. On by default. Works whether scrobbling is on or not.
     pub love_favorites: bool,
 
+    /// A listener's radio, stations and mixes leave out an artist once this many of the
+    /// artist's songs are rated one star by that listener (or at once, when they rate the
+    /// artist one star). 0 turns the automatic ban off. A rating other than one star on the
+    /// artist, or Lift on the dashboard, lifts it.
+    pub artist_ban_after: i32,
+
     /// Navidrome username to that listener's Last.fm session, written by Connect on the
     /// dashboard. A session key is a password for scrobbling as that person, so the admin
     /// API only ever shows it masked.
@@ -126,6 +132,7 @@ impl Default for LastFmSettings {
             scrobble_external_plays: true,
             scrobble_library_plays: true,
             love_favorites: true,
+            artist_ban_after: 3,
             user_sessions: IndexMap::new(),
             enable_radio: true,
             radio_track_count: 50,

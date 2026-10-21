@@ -9,6 +9,7 @@ use axum::response::Response;
 use octo_core::common::dotnet::{eq_ignore_case, is_blank};
 use octo_core::family::abilities::{RequestQuality, Role};
 use octo_core::family::quality::{DeviceQualityMode, QualityPreference, StreamQuality};
+use octo_core::settings::ExplicitFilter;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -334,6 +335,9 @@ pub async fn me(State(state): State<AppState>, web: Web) -> Response {
     let mut me = state
         .family
         .me_json(&state, signed.user(), signed.device_id.as_deref(), web.place);
+    if let Value::Object(map) = &mut me {
+        map.insert("explicit".into(), explicit_json(&state, signed.user()));
+    }
     if let (Value::Object(map), Some(member)) = (&mut me, state.family_store.member(signed.user())) {
         map.insert("ntfyTopic".into(), json!(member.ntfy_topic));
     }
@@ -666,6 +670,68 @@ pub async fn set_quality(State(state): State<AppState>, web: Web, body: Bytes) -
         &preference,
         &FamilyService::abilities_of(&state, signed.user()),
     ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ExplicitBody {
+    pub choice: Option<String>,
+}
+
+/// An explicit choice as the API writes it: `Server` (the server's filter, the default),
+/// `All`, `CleanOnly` or `ExplicitOnly`. Outer None when the text is none of them.
+pub fn explicit_choice(text: &str) -> Option<Option<ExplicitFilter>> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "" | "server" | "default" => Some(None),
+        "all" | "everything" => Some(Some(ExplicitFilter::All)),
+        "cleanonly" | "clean" => Some(Some(ExplicitFilter::CleanOnly)),
+        "explicitonly" | "explicit" => Some(Some(ExplicitFilter::ExplicitOnly)),
+        _ => None,
+    }
+}
+
+pub const EXPLICIT_CHOICES: &str = "Choose Server, All, CleanOnly or ExplicitOnly.";
+
+/// The `explicit` object: the account's choice, the server's filter, and whether a kid
+/// profile's plan makes it clean whatever the choice.
+pub fn explicit_json(state: &AppState, user: &str) -> Value {
+    let settings = state.settings.current();
+    let kid = settings.family.enabled
+        && state
+            .family_store
+            .member(user)
+            .is_some_and(|member| member.abilities().clean_only);
+    json!({
+        "choice": state.family_store.explicit_choice(user).map_or("Server", explicit_word),
+        "server": explicit_word(settings.subsonic.explicit_filter),
+        "cleanOnlyByFamily": kid,
+    })
+}
+
+fn explicit_word(filter: ExplicitFilter) -> &'static str {
+    match filter {
+        ExplicitFilter::All => "All",
+        ExplicitFilter::CleanOnly => "CleanOnly",
+        ExplicitFilter::ExplicitOnly => "ExplicitOnly",
+    }
+}
+
+/// `PUT /api/family/me/explicit`: which songs the account hears by their explicit mark, in
+/// lists Octo builds for them and (while Family is on) every answer. Anyone signed in.
+pub async fn set_explicit(State(state): State<AppState>, web: Web, body: Bytes) -> Response {
+    let signed = match web.anyone(&state).await {
+        Ok(signed) => signed,
+        Err(res) => return res,
+    };
+    let request: ExplicitBody = match body_as(&body) {
+        Ok(request) => request,
+        Err(res) => return res,
+    };
+    let Some(choice) = explicit_choice(request.choice.as_deref().unwrap_or("")) else {
+        return refusal(StatusCode::BAD_REQUEST, EXPLICIT_CHOICES);
+    };
+    state.family_store.set_explicit_choice(signed.user(), choice);
+    ok(&explicit_json(&state, signed.user()))
 }
 
 #[derive(Debug, Default, Deserialize)]

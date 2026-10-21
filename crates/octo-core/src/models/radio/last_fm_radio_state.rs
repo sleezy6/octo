@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::json::datetime;
+use crate::last_fm::last_fm_radio_recommendation_service::{IgnoreCaseKeys, artist_key};
 use crate::models::null_as_default;
 
 /// The whole file: a version and the listeners, keyed by trimmed lower-cased username.
@@ -49,6 +50,10 @@ pub struct LastFmRadioUserState {
     /// Songs the listener rated one star: they never play on their radio.
     #[serde(deserialize_with = "null_as_default")]
     pub radio_bans: Vec<LastFmRadioBan>,
+    /// Artists the listener rated one star, and automatic artist bans they lifted. See
+    /// [`LastFmRadioUserState::banned_artists`]. Absent from the file until there is one.
+    #[serde(deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
+    pub artist_bans: Vec<LastFmRadioArtistBan>,
     #[serde(with = "datetime::utc_option")]
     pub last_refresh_attempt_utc: Option<DateTime<Utc>>,
     #[serde(with = "datetime::utc_option")]
@@ -71,6 +76,7 @@ impl Default for LastFmRadioUserState {
             stations: Vec::new(),
             unavailable_tracks: Vec::new(),
             radio_bans: Vec::new(),
+            artist_bans: Vec::new(),
             last_refresh_attempt_utc: None,
             last_refresh_success_utc: None,
             last_refresh_error: None,
@@ -106,6 +112,158 @@ impl Default for LastFmRadioUnavailableTrack {
             failed_at_utc: now,
             retry_after_utc: now + TimeDelta::hours(24),
         }
+    }
+}
+
+/// The listener's own word on an artist for their radio: rated one star (`banned`), or a ban
+/// lifted (`banned` false): a rating other than one star, or Lift on the dashboard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct LastFmRadioArtistBan {
+    /// [`artist_key`] of the name.
+    #[serde(deserialize_with = "null_as_default")]
+    pub key: String,
+    #[serde(deserialize_with = "null_as_default")]
+    pub artist: String,
+    pub banned: bool,
+    /// For a lifted ban: how many of the artist's songs were rated one star when it was lifted.
+    /// The automatic ban stays lifted until another of their songs is.
+    pub song_bans_then: i32,
+    #[serde(with = "datetime::utc")]
+    pub at_utc: DateTime<Utc>,
+}
+
+impl Default for LastFmRadioArtistBan {
+    fn default() -> Self {
+        LastFmRadioArtistBan {
+            key: String::new(),
+            artist: String::new(),
+            banned: false,
+            song_bans_then: 0,
+            at_utc: Utc::now(),
+        }
+    }
+}
+
+/// An artist the listener's radio leaves out, as the dashboard lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BannedArtist {
+    pub artist: String,
+    /// Rated one star themselves, rather than banned for their songs' one stars.
+    pub rated: bool,
+    /// How many of their songs the listener rated one star.
+    pub songs: i32,
+}
+
+impl LastFmRadioUserState {
+    /// How many of each artist's songs (by [`artist_key`]) the listener rated one star, with
+    /// the name of the latest.
+    fn song_bans_by_artist(&self) -> IndexMap<String, (String, i32)> {
+        let mut counts: IndexMap<String, (String, i32)> = IndexMap::new();
+        for ban in &self.radio_bans {
+            let key = artist_key(&ban.artist);
+            if key.is_empty() {
+                continue;
+            }
+            counts.entry(key).or_insert_with(|| (ban.artist.clone(), 0)).1 += 1;
+        }
+        counts
+    }
+
+    /// The artists this listener's radio, stations and mixes leave out: each they rated one
+    /// star, and each with `after` or more songs rated one star (none for `after` 0) unless
+    /// they lifted that ban and no further song of theirs was rated one star since.
+    pub fn banned_artists(&self, after: i32) -> Vec<BannedArtist> {
+        let counts = self.song_bans_by_artist();
+        let mut out: Vec<BannedArtist> = Vec::new();
+        for rule in self.artist_bans.iter().filter(|rule| rule.banned) {
+            out.push(BannedArtist {
+                artist: rule.artist.clone(),
+                rated: true,
+                songs: counts.get(&rule.key).map_or(0, |(_, n)| *n),
+            });
+        }
+        if after > 0 {
+            for (key, (artist, songs)) in &counts {
+                if *songs < after {
+                    continue;
+                }
+                let ruled = self.artist_bans.iter().find(|rule| &rule.key == key);
+                match ruled {
+                    Some(rule) if rule.banned => continue,
+                    Some(rule) if *songs <= rule.song_bans_then => continue,
+                    _ => {}
+                }
+                out.push(BannedArtist {
+                    artist: artist.clone(),
+                    rated: false,
+                    songs: *songs,
+                });
+            }
+        }
+        out
+    }
+
+    /// [`Self::banned_artists`] as [`artist_key`]s.
+    pub fn banned_artist_keys(&self, after: i32) -> IgnoreCaseKeys {
+        self.banned_artists(after)
+            .iter()
+            .map(|banned| artist_key(&banned.artist))
+            .collect()
+    }
+
+    /// Bans the artist from this listener's radio (`banned`), or lifts a ban on them, whether
+    /// they were rated one star or banned for their songs. True when anything changed.
+    pub fn set_artist_ban(&mut self, artist: &str, banned: bool, now: DateTime<Utc>) -> bool {
+        let key = artist_key(artist);
+        if key.is_empty() {
+            return false;
+        }
+        let songs = self.song_bans_by_artist().get(&key).map_or(0, |(_, n)| *n);
+        let rule = LastFmRadioArtistBan {
+            key: key.clone(),
+            artist: artist.trim().to_string(),
+            banned,
+            song_bans_then: if banned { 0 } else { songs },
+            at_utc: now,
+        };
+        match self.artist_bans.iter_mut().find(|r| r.key == key) {
+            Some(existing)
+                if existing.banned == rule.banned && existing.song_bans_then == rule.song_bans_then =>
+            {
+                false
+            }
+            Some(existing) => {
+                *existing = rule;
+                true
+            }
+            None if !banned && songs == 0 => false,
+            None => {
+                self.artist_bans.insert(0, rule);
+                true
+            }
+        }
+    }
+
+    /// Takes the banned artists' songs off the stations the listener has now. How many went.
+    pub fn drop_banned_artists_from_stations(&mut self, after: i32, now: DateTime<Utc>) -> usize {
+        let banned = self.banned_artist_keys(after);
+        if banned.is_empty() {
+            return 0;
+        }
+        let mut removed = 0;
+        for station in &mut self.stations {
+            let before = station.tracks.len();
+            station
+                .tracks
+                .retain(|track| !banned.contains(&artist_key(&track.artist)));
+            if before != station.tracks.len() {
+                removed += before - station.tracks.len();
+                station.changed_utc = now;
+            }
+        }
+        removed
     }
 }
 
@@ -287,6 +445,105 @@ mod tests {
             "/../../docs/rust-migration/fixtures/state/lastfm-radio-state.json"
         ))
         .expect("the fixture is in the repo")
+    }
+
+    fn song_ban(artist: &str, title: &str) -> LastFmRadioBan {
+        LastFmRadioBan {
+            key: format!("{artist}|{title}"),
+            artist: artist.into(),
+            title: title.into(),
+            ..LastFmRadioBan::default()
+        }
+    }
+
+    fn names(user: &LastFmRadioUserState, after: i32) -> Vec<(String, bool, i32)> {
+        user.banned_artists(after)
+            .into_iter()
+            .map(|b| (b.artist, b.rated, b.songs))
+            .collect()
+    }
+
+    #[test]
+    fn enough_songs_rated_one_star_ban_their_artist_by_name() {
+        let mut user = LastFmRadioUserState {
+            radio_bans: vec![
+                song_ban("Nickelback", "Photograph"),
+                song_ban("NICKELBACK", "Rockstar"),
+            ],
+            ..LastFmRadioUserState::default()
+        };
+        assert!(names(&user, 3).is_empty());
+        user.radio_bans
+            .push(song_ban("Nickelback feat. Someone", "How You Remind Me"));
+        assert_eq!(names(&user, 3), [("Nickelback".to_string(), false, 3)]);
+        assert!(user.banned_artist_keys(3).contains("nickelback"));
+        // 0 turns the automatic ban off.
+        assert!(names(&user, 0).is_empty());
+    }
+
+    #[test]
+    fn a_lifted_automatic_ban_holds_until_another_song_is_rated_one_star() {
+        let now = Utc::now();
+        let mut user = LastFmRadioUserState {
+            radio_bans: vec![song_ban("Creed", "One"), song_ban("Creed", "Higher")],
+            ..LastFmRadioUserState::default()
+        };
+        assert_eq!(names(&user, 2).len(), 1);
+        assert!(user.set_artist_ban("Creed", false, now));
+        assert!(names(&user, 2).is_empty());
+        assert!(!user.set_artist_ban("Creed", false, now), "already lifted");
+        user.radio_bans.push(song_ban("Creed", "Arms Wide Open"));
+        assert_eq!(names(&user, 2), [("Creed".to_string(), false, 3)]);
+    }
+
+    #[test]
+    fn an_artist_rated_one_star_is_banned_at_once_and_another_rating_lifts_it() {
+        let now = Utc::now();
+        let mut user = LastFmRadioUserState::default();
+        assert!(!user.set_artist_ban("Muse", false, now), "nothing to lift");
+        assert!(user.set_artist_ban("Muse", true, now));
+        assert_eq!(names(&user, 3), [("Muse".to_string(), true, 0)]);
+        assert!(
+            !user.set_artist_ban("muse", true, now),
+            "the same name in other case"
+        );
+        user.stations = vec![LastFmRadioStation {
+            tracks: vec![
+                LastFmRadioTrack {
+                    artist: "Muse".into(),
+                    title: "Uprising".into(),
+                    ..LastFmRadioTrack::default()
+                },
+                LastFmRadioTrack {
+                    artist: "Radiohead".into(),
+                    title: "Reckoner".into(),
+                    ..LastFmRadioTrack::default()
+                },
+            ],
+            ..LastFmRadioStation::default()
+        }];
+        assert_eq!(user.drop_banned_artists_from_stations(3, now), 1);
+        assert_eq!(user.stations[0].tracks[0].artist, "Radiohead");
+        assert!(user.set_artist_ban("Muse", false, now));
+        assert!(names(&user, 3).is_empty());
+    }
+
+    #[test]
+    fn artist_bans_are_left_out_of_the_file_until_there_is_one() {
+        let user = LastFmRadioUserState::default();
+        assert!(!crate::json::to_string(&user).contains("ArtistBans"));
+        let mut banned = user.clone();
+        banned.set_artist_ban("Muse", true, Utc::now());
+        let json = crate::json::to_string(&banned);
+        assert!(
+            json.contains(r#""ArtistBans":[{"Key":"muse","Artist":"Muse","Banned":true"#),
+            "{json}"
+        );
+        let back: LastFmRadioUserState = serde_json::from_str(&json).expect("reads");
+        // The time is written to the tick, so it is compared without its last digits.
+        assert_eq!(back.artist_bans[0].key, "muse");
+        assert!(back.artist_bans[0].banned);
+        assert_eq!(back.banned_artists(3), banned.banned_artists(3));
     }
 
     /// The file reads and writes back byte for byte, indented.
