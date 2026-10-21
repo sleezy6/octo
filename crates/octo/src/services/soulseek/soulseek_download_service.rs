@@ -63,7 +63,7 @@ use crate::services::i_download_service::DirectStreamInfo;
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::library::upgrade_queue::AudioSummary;
 use crate::services::lidarr::{ILidarrTrackFetcher, LidarrImport, LidarrImportHandoff, LidarrTrackRequest};
-use crate::services::you_tube::YouTubeResolver;
+use crate::services::you_tube::{YouTubeHit, YouTubeResolver};
 use octo_core::common::acquisition_tracker::user_safe;
 use octo_core::lidarr::lidarr_track_fetcher::LidarrStep;
 
@@ -244,6 +244,25 @@ pub struct SoulseekDownloadService {
 /// song was listed with, else the one shown for it from a catalog. Never a video's length: that
 /// may be the very clip that played in the song's place (a 59 s preview of a four-minute song),
 /// and would keep the right recording from matching.
+/// Whether yt-dlp's best video is the song and not a clip of it: within
+/// [`VIDEO_LENGTH_TOLERANCE`] of the song's known length, and never one that calls itself a
+/// preview, snippet, teaser or sample. yt-dlp ranks the top results by length but refuses none,
+/// so a 59 s sample of a four-minute song used to play when it came first.
+pub(crate) fn is_the_song(hit: &YouTubeHit, seconds: Option<i32>) -> bool {
+    if let (Some(want), Some(got)) = (seconds.filter(|s| *s > 0), hit.duration.filter(|d| *d > 0))
+        && (want - got).abs() > VIDEO_LENGTH_TOLERANCE
+    {
+        return false;
+    }
+    let title = hit.title.as_deref().unwrap_or("").to_lowercase();
+    !PREVIEW_WORDS.iter().any(|word| title.contains(word))
+}
+
+/// How far a video's length may be from the song's for the video to be the song.
+const VIDEO_LENGTH_TOLERANCE: i32 = 10;
+/// Words in a video's title that say it is a piece of the song, not the song.
+const PREVIEW_WORDS: [&str; 4] = ["preview", "snippet", "teaser", "sample"];
+
 pub(crate) fn lookup_seconds(r: &SoulseekRouting) -> Option<i32> {
     let shown = r
         .shown_duration
@@ -2453,7 +2472,10 @@ impl DownloadBackend for SoulseekDownloadService {
             let (artist, title) = names(&r);
             // YouTube Music's row for the song first: one quick search, and the stream is
             // resolved as it opens. Else the shim's yt-dlp search, which resolves both at once.
-            let hit = match self.youtube.music_song(&artist, &title, r.duration).await {
+            // The song's known length (never a video's: `lookup_seconds`) tells both searches
+            // which video is the song, and keeps a preview clip from playing in its place.
+            let seconds = lookup_seconds(&r);
+            let hit = match self.youtube.music_song(&artist, &title, seconds).await {
                 Some(hit) => {
                     debug!(
                         "play of '{artist} - {title}': video {} from YouTube Music",
@@ -2464,13 +2486,23 @@ impl DownloadBackend for SoulseekDownloadService {
                 None => {
                     let hit = self
                         .youtube
-                        .search(&format!("{artist} {title}"), r.duration, false)
+                        .search(&format!("{artist} {title}"), seconds, false)
                         .await
                         .filter(|h| !h.video_id.is_empty());
-                    if let Some(hit) = &hit {
-                        debug!("play of '{artist} - {title}': video {} from yt-dlp", hit.video_id);
+                    match hit {
+                        Some(hit) if is_the_song(&hit, seconds) => {
+                            debug!("play of '{artist} - {title}': video {} from yt-dlp", hit.video_id);
+                            Some(hit)
+                        }
+                        Some(hit) => {
+                            warn!(
+                                "play of '{artist} - {title}': video {} ({:?}, {:?} s) is not the song; nothing plays",
+                                hit.video_id, hit.title, hit.duration
+                            );
+                            None
+                        }
+                        None => None,
                     }
-                    hit
                 }
             };
             // Pin it on the song so a second click on the same placeholder skips the

@@ -172,7 +172,15 @@ pub async fn search3(State(state): State<AppState>, req: Request) -> Result<Resp
             let metadata = Arc::clone(&state.metadata_service);
             let query = clean_query.clone();
             tokio::spawn(async move {
-                let artists = metadata.search_artists(&query, requested_artists.min(20)).await;
+                // The same count every name lookup asks for, so the artist's page a tap opens
+                // reads this search from the cache rather than making its own.
+                let mut artists = metadata
+                    .search_artists(
+                        &query,
+                        crate::services::metadata::deezer_metadata_service::ARTIST_NAME_CANDIDATES,
+                    )
+                    .await;
+                artists.truncate(usize::try_from(requested_artists.min(20)).unwrap_or(0));
                 (artists, started.elapsed())
             })
         });

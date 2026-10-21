@@ -236,7 +236,7 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
         // Navidrome has never seen these ids, so relaying the star would just error.
         outside.queue(&state, &call).await;
         if let Some(username) = listener(&state, &call).await {
-            love_on_last_fm(&state, &call, &username, &songs, true).await;
+            love_on_last_fm(&state, &call, &username, &favorites_among(&call, &songs), true).await;
         }
         return Ok(builder.create_response(&format, "starred").into_response());
     }
@@ -292,7 +292,7 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
                         }
                     }
                 }
-                love_on_last_fm(&state, &call, username, &songs, true).await;
+                love_on_last_fm(&state, &call, username, &favorites_among(&call, &songs), true).await;
             }
             let content_type = result
                 .content_type
@@ -1187,6 +1187,17 @@ async fn act_on_rating(
 /// The listener a request Navidrome accepted speaks for, named the way every request's identity
 /// is: `u`, or for an API key sign-in its owner as Navidrome names it. None when there is nobody
 /// to name or Navidrome could not be asked.
+/// The outside songs of a star that are favorites: all of them from another app, none from
+/// the Octo apps, whose star on an outside song is Add to library, a copy and not a favorite
+/// (see [`favorite_credential`]), so it is not loved on Last.fm either.
+fn favorites_among(call: &SubsonicCall, outside_songs: &[String]) -> Vec<String> {
+    if StarOnArrival::is_octo_app(call.param_opt("c")) {
+        Vec::new()
+    } else {
+        outside_songs.to_vec()
+    }
+}
+
 /// Loves (or unloves) these songs on the listener's own Last.fm when they linked it there, as
 /// the favorites they are (or no longer are) in every app. Sent in the background. Only for a
 /// sign-in already taken: by Navidrome when it took the star, or by the check before the
@@ -1214,7 +1225,12 @@ async fn love_on_last_fm(
 /// An unstar's songs, unloved on the listener's Last.fm when they linked it there. The songs are
 /// looked up in the background, so the answer does not wait on them.
 async fn unlove_on_last_fm(state: &AppState, call: &SubsonicCall) {
-    let song_ids = sent_ids(call, "id");
+    // From the Octo apps an outside song's star was Add, not a favorite: nothing to unlove.
+    let octo_app = StarOnArrival::is_octo_app(call.param_opt("c"));
+    let song_ids: Vec<String> = sent_ids(call, "id")
+        .into_iter()
+        .filter(|id| !(octo_app && state.local_library.parse_song_id(id).0))
+        .collect();
     if song_ids.is_empty() {
         return;
     }

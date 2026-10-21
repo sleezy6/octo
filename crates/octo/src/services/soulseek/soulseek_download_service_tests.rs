@@ -1389,7 +1389,8 @@ fn the_played_size_is_the_whole_body_or_the_total_after_the_slash() {
 async fn a_play_pins_the_found_video_and_learns_its_true_size_from_the_stream() {
     let root = Root::new("octo-stream-");
     let walk = build(&root, false, |_| Arc::new(|_: &str| Vec::new())).await;
-    let id = walk.songs[0].external_id.clone().expect("an id");
+    // "Started", 180 s, the length of the video yt-dlp answers.
+    let id = walk.songs[3].external_id.clone().expect("an id");
 
     let stream = walk
         .service
@@ -1454,7 +1455,8 @@ async fn a_play_takes_youtube_musics_video_for_the_song_before_the_yt_dlp_search
 async fn a_play_falls_back_to_the_yt_dlp_search_when_youtube_music_has_no_such_song() {
     let root = Root::new("octo-stream-");
     let walk = build(&root, false, |_| Arc::new(|_: &str| Vec::new())).await;
-    let id = walk.songs[0].external_id.clone().expect("an id");
+    // "Started", 180 s: the video yt-dlp answers runs 180 s, so it is the song.
+    let id = walk.songs[3].external_id.clone().expect("an id");
     walk.slskd.state.lock().ytm_tracks = Some(json!([{
         "videoId": "other", "title": "Another Song", "artists": ["Someone Else"],
         "durationSeconds": 200, "videoType": "MUSIC_VIDEO_TYPE_ATV",
@@ -1840,8 +1842,8 @@ async fn a_play_comes_from_deezer_when_outside_songs_play_from_it() {
 #[tokio::test]
 async fn a_play_deezer_cannot_serve_comes_from_you_tube() {
     let root = Root::new("octo-deezer-");
-    // The catalog's one song is song 3; song 0 is played.
-    let deezer = deezer_with(3, vec![1, 2, 3]).await;
+    // The catalog's one song is song 0; song 3 is played.
+    let deezer = deezer_with(0, vec![1, 2, 3]).await;
     let walk = build_full(
         &root,
         false,
@@ -1851,7 +1853,8 @@ async fn a_play_deezer_cannot_serve_comes_from_you_tube() {
         |_| Arc::new(|_: &str| Vec::new()),
     )
     .await;
-    let id = walk.songs[0].external_id.clone().expect("an id");
+    // "Started", 180 s, the length of the video yt-dlp answers.
+    let id = walk.songs[3].external_id.clone().expect("an id");
 
     let stream = walk
         .service
@@ -1885,7 +1888,8 @@ async fn a_play_stays_on_you_tube_while_outside_songs_do_not_play_from_deezer() 
         |_| Arc::new(|_: &str| Vec::new()),
     )
     .await;
-    let id = walk.songs[0].external_id.clone().expect("an id");
+    // "Started", 180 s, the length of the video yt-dlp answers.
+    let id = walk.songs[3].external_id.clone().expect("an id");
 
     let stream = walk
         .service
@@ -2019,4 +2023,25 @@ fn a_catalog_lookup_is_never_told_a_videos_length() {
         lookup_seconds(&routing(Some(0), Some(238), LengthSource::Apple)),
         Some(238)
     );
+}
+
+/// yt-dlp's best video plays only when it is the song: within ten seconds of the song's known
+/// length, and never a preview or sample. The 59 s sample yt-dlp listed first for Burial's
+/// four-minute "Archangel" used to play in its place.
+#[test]
+fn a_video_too_short_or_called_a_sample_is_not_the_song() {
+    use crate::services::you_tube::YouTubeHit;
+    use octo_core::soulseek::StreamFacts;
+    let video = |title: &str, duration| YouTubeHit {
+        video_id: "v".into(),
+        title: Some(title.into()),
+        duration: Some(duration),
+        channel: None,
+        stream: StreamFacts::default(),
+    };
+    assert!(!is_the_song(&video("Burial - Archangel", 59), Some(238)));
+    assert!(is_the_song(&video("Burial - Archangel", 240), Some(238)));
+    assert!(is_the_song(&video("Burial - Archangel", 59), None));
+    assert!(!is_the_song(&video("Burial - Archangel (Preview)", 59), None));
+    assert!(!is_the_song(&video("Archangel sample", 238), Some(238)));
 }
