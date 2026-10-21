@@ -1,0 +1,46 @@
+# Weekly update pull requests for the Rust crates, the GitHub Actions the workflows use, the
+# shim's Python test dependencies and the base images of the three Dockerfiles. Each opens
+# against main, where CI checks it before anything is merged. Minor and patch updates of each
+# ecosystem come as one grouped pull request a week; a major version comes on its own, since
+# that is the one that can need code changes.
+#
+# yt-dlp itself is not here: the shim's Dockerfile downloads the newest release at every image
+# build (YTDLP_VERSION pins it when needed), so it is already as current as an image can be.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories: ["/", "/sonic"]
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      rust-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directory: "/yt-dlp-shim"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      shim-python:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directories: ["/", "/yt-dlp-shim", "/sonic"]
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      base-images:
+        update-types: [minor, patch]

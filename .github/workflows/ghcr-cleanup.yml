@@ -1,0 +1,48 @@
+name: Clean up old images
+
+# Every push to main publishes all three images (octo, octo-yt-dlp-shim, octo-sonic) tagged
+# with its commit, so ghcr.io fills up with images nobody will pull again. Once a week this
+# keeps the newest 10 commit-tagged images of each and deletes the older ones.
+#
+# Never deleted: anything tagged main, latest or feat-…, release tags (any tag with a dot, like 2026.07.29, or
+# v-prefixed), and the per-platform parts and signatures of every image it keeps. That last
+# point is why this uses ghcr-cleanup-action rather than deleting untagged versions directly:
+# an image's platform manifests are untagged versions too, and deleting them breaks the image.
+#
+# Run it by hand with "dry run" to see what it would delete without deleting anything.
+on:
+  schedule:
+    - cron: "17 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only list what would be deleted.
+        type: boolean
+        default: true
+
+permissions:
+  packages: write
+
+concurrency:
+  group: ghcr-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ["", "-yt-dlp-shim", "-sonic"]
+    steps:
+      - name: Delete all but the newest 10 commit images
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          package: ${{ github.event.repository.name }}${{ matrix.package }}
+          keep-n-tagged: 10
+          exclude-tags: "main,latest,feat-*,v*,*.*"
+          delete-untagged: true
+          delete-ghost-images: true
+          delete-partial-images: true
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          token: ${{ secrets.GITHUB_TOKEN }}
