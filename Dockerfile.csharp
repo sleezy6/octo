@@ -22,7 +22,7 @@ COPY octo.Tests/ octo.Tests/
 RUN dotnet publish octo/octo.csproj -c Release -o /app/publish
 
 # Runtime stage
-FROM mcr.microsoft.com/dotnet/aspnet:9.0
+FROM mcr.microsoft.com/dotnet/aspnet:10.0
 WORKDIR /app
 
 # Continuous Subsonic Radio normalizes mixed FLAC/M4A sources into one stable
