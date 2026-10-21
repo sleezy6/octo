@@ -3,4 +3,4 @@
 pytest
 flask
 requests
-ytmusicapi>=1.12,<2
+ytmusicapi>=1.12.3,<2
