@@ -3014,15 +3014,14 @@
           <div class="set-card">
             <div class="set-row stack">
               <div class="set-info">
-                <div class="set-info-t">Last hour</div>
-                <div class="set-info-d" id="deezer-requests-hour" role="status" aria-live="polite">Checking…</div>
+                <div class="set-info-t">By what they were for</div>
+                <div class="set-info-d" id="deezer-requests-summary" role="status" aria-live="polite">Checking…</div>
               </div>
+              <div class="config-table deezer-requests" id="deezer-requests-table"></div>
             </div>
-            <div class="set-row stack">
+            <div class="set-row">
               <div class="set-info">
-                <div class="set-info-t">Since Octo started</div>
-                <div class="set-info-d" id="deezer-requests-total">Checking…</div>
-                <div class="set-info-more">Playing the song itself from your account is not counted: that goes to Deezer's media servers, which this limit does not cover. Octo also writes the last hour's numbers to its log once an hour.</div>
+                <div class="set-info-d">Grey numbers are requests made in the background, which wait behind anything someone is waiting on. Playing a song from your account is not counted: that goes to Deezer's media servers, which this limit does not cover. The same numbers go to Octo's log once an hour.</div>
               </div>
               <button class="btn btn-ghost" type="button" id="deezer-requests-refresh">Refresh</button>
             </div>

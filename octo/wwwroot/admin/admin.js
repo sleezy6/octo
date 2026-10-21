@@ -9127,37 +9127,48 @@ document.getElementById('deezer-cache-clear')?.addEventListener('click', async e
 // Deezer: how many requests Octo made of the catalog, and what for
 // ────────────────────────────────────────────────────────────────
 const DEEZER_USE_WORDS = {
-  search: 'search', lengths: 'song lengths', artistPages: 'artist pages', albumPages: 'album pages',
-  covers: 'covers', playback: 'finding songs to play or keep', songLookups: 'song facts', other: 'other',
+  search: 'Search', lengths: 'Song lengths', artistPages: 'Artist pages', albumPages: 'Album pages',
+  covers: 'Covers and artist pictures', playback: 'Finding songs to play or keep', songLookups: 'Song facts', other: 'Other',
 };
-function deezerRequestLine(counts) {
-  if (!counts.total) return 'None.';
-  const parts = counts.uses
-    .filter(u => u.interactive + u.background > 0)
-    .sort((a, b) => (b.interactive + b.background) - (a.interactive + a.background))
-    .map(u => {
-      const n = u.interactive + u.background;
-      const words = DEEZER_USE_WORDS[u.use] || u.use;
-      return u.background ? `${words} ${n.toLocaleString()} (${u.background.toLocaleString()} in the background)` : `${words} ${n.toLocaleString()}`;
-    });
-  let line = `${counts.total.toLocaleString()}: ${parts.join(', ')}.`;
-  if (counts.searchesSkipped) line += ` ${counts.searchesSkipped.toLocaleString()} time${counts.searchesSkipped === 1 ? '' : 's'} a play or heart went straight to a Deezer id Octo already knew, with no search.`;
-  if (counts.turnedAway) line += ` ${counts.turnedAway.toLocaleString()} turned away because too many were waiting.`;
-  return line;
+const deezerCell = u => {
+  const n = u.interactive + u.background;
+  if (!n) return '<span class="value empty">0</span>';
+  const background = u.background ? ` <span class="background" title="${u.background.toLocaleString()} in the background">(${u.background.toLocaleString()})</span>` : '';
+  return `<span class="value">${n.toLocaleString()}${background}</span>`;
+};
+function deezerRequestSummary(report) {
+  const hour = report.lastHour; const total = report.sinceStart;
+  const minutes = Math.max(1, Math.min(60, report.minutesSinceStart || 1));
+  const parts = [`${hour.total.toLocaleString()} in the last hour, about ${Math.round(hour.total / minutes).toLocaleString()} a minute; ${total.total.toLocaleString()} since Octo started.`];
+  if (total.searchesSkipped) parts.push(`${total.searchesSkipped.toLocaleString()} play${total.searchesSkipped === 1 ? '' : 's'} and hearts needed no search, because Octo already knew the song's Deezer id.`);
+  if (hour.turnedAway) parts.push(`${hour.turnedAway.toLocaleString()} turned away in the last hour because too many were waiting.`);
+  else if (total.turnedAway) parts.push(`${total.turnedAway.toLocaleString()} turned away since Octo started because too many were waiting.`);
+  return parts.join(' ');
+}
+function renderDeezerRequests(report) {
+  const summary = document.getElementById('deezer-requests-summary');
+  const table = document.getElementById('deezer-requests-table');
+  if (!summary || !table) return;
+  summary.textContent = deezerRequestSummary(report);
+  const byUse = new Map(report.sinceStart.uses.map(u => [u.use, u]));
+  const rows = report.lastHour.uses
+    .map(u => ({ use: u.use, hour: u, total: byUse.get(u.use) || u }))
+    .filter(r => r.total.interactive + r.total.background > 0)
+    .sort((a, b) => (b.total.interactive + b.total.background) - (a.total.interactive + a.total.background));
+  table.innerHTML = `<div class="config-row config-row-head"><span>For</span><span>Last hour</span><span>Since start</span></div>` +
+    (rows.length
+      ? rows.map(r => `<div class="config-row"><span class="use">${escapeHtml(DEEZER_USE_WORDS[r.use] || r.use)}</span>${deezerCell(r.hour)}${deezerCell(r.total)}</div>`).join('')
+      : '<div class="config-row"><span class="value empty">No requests yet.</span></div>');
 }
 async function loadDeezerRequests() {
-  const hour = document.getElementById('deezer-requests-hour');
-  const total = document.getElementById('deezer-requests-total');
-  if (!hour || !total) return;
+  const summary = document.getElementById('deezer-requests-summary');
+  if (!summary) return;
   try {
     const response = await api('/api/admin/deezer/requests', { cache: 'no-store' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const report = await response.json();
-    hour.textContent = deezerRequestLine(report.lastHour);
-    total.textContent = deezerRequestLine(report.sinceStart);
+    renderDeezerRequests(await response.json());
   } catch (error) {
-    hour.textContent = `Could not read the counts: ${error.message}`;
-    total.textContent = '';
+    summary.textContent = `Could not read the counts: ${error.message}`;
   }
 }
 document.getElementById('deezer-requests-refresh')?.addEventListener('click', loadDeezerRequests);

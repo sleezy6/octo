@@ -2696,3 +2696,10 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 /* Artists left out of a listener's radio, each with its Lift button. */
 .radio-ban-chip { display: inline-flex; align-items: center; gap: 6px; margin: 2px 8px 2px 0; }
 .radio-ban-chip small { color: var(--text-muted); }
+
+/* Requests to Deezer: purpose, last hour, since start; the background share in grey. */
+.deezer-requests { margin-top: var(--s-m); }
+.deezer-requests .config-row { grid-template-columns: 2fr 1fr 1fr; gap: var(--s-l); }
+.deezer-requests .use { color: var(--ink-1); }
+.deezer-requests .value { font-family: inherit; word-break: normal; }
+.deezer-requests .background { color: var(--text-muted); font-weight: 400; }
