@@ -746,12 +746,18 @@ impl SoulseekDownloadService {
         self.id_registry.forget_deezer_track(external_id, missed);
         let (artist, title) = names(r);
         info!("Deezer had no audio for '{artist} - {title}' under the kept track {missed}; searching again");
-        let mut searched = r.clone();
-        searched.deezer_track_id = None;
-        let found = self
-            .searched_deezer_track_id(deezer, external_id, &searched)
+        if !r.has_artist_title() {
+            return None;
+        }
+        let found = DeezerUse::Playback
+            .scope(deezer.track_id_for(&artist, &title, r.isrc.as_deref(), lookup_seconds(r)))
             .await?;
-        (found != missed).then_some(found)
+        if found == missed {
+            // The search finds the same track: it stays forgotten, and the play goes elsewhere.
+            return None;
+        }
+        self.id_registry.keep_deezer_track(external_id, &found);
+        Some(found)
     }
 
     /// An outside song played straight from Deezer, decrypted as it is read. `None` when no

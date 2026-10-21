@@ -425,6 +425,7 @@ pub struct PlaylistBody {
 }
 
 /// `POST /api/family/playlists`: needs Family playlists editing; only managers set approval.
+/// `sharedWith` limits it to those members from the start.
 pub async fn create_playlist(State(state): State<AppState>, web: Web, body: Bytes) -> Response {
     let signed = match web.anyone(&state).await {
         Ok(signed) => signed,
@@ -444,7 +445,21 @@ pub async fn create_playlist(State(state): State<AppState>, web: Web, body: Byte
         .create(name, signed.user(), request.approve_additions.unwrap_or(false))
         .await
     {
-        Ok(playlist) => ok(&json!(playlist)),
+        Ok(playlist) => match request.shared_with.as_deref() {
+            Some(people) if !people.is_empty() => {
+                match state
+                    .family
+                    .hooks(&state)
+                    .playlists
+                    .update(&playlist.id, signed.user(), None, None, Some(people))
+                    .await
+                {
+                    Ok(playlist) => ok(&json!(playlist)),
+                    Err(e) => family_error(&e),
+                }
+            }
+            _ => ok(&json!(playlist)),
+        },
         Err(e) => family_error(&e),
     }
 }
@@ -452,8 +467,13 @@ pub async fn create_playlist(State(state): State<AppState>, web: Web, body: Byte
 /// `GET /api/family/playlists/people`: the family a playlist can be shared with: the owner and
 /// every member, by username and name. Anyone who sees family playlists.
 pub async fn playlist_people(State(state): State<AppState>, web: Web) -> Response {
-    if let Err(res) = web.anyone(&state).await {
-        return res;
+    let signed = match web.anyone(&state).await {
+        Ok(signed) => signed,
+        Err(res) => return res,
+    };
+    let caller = crate::services::family::hooks::caller_for(&state.family_store, signed.user());
+    if !crate::services::family::family_playlists::may_view(&caller) {
+        return refusal(StatusCode::FORBIDDEN, "Only the family sees family playlists.");
     }
     let owner = state.family_store.owner();
     let mut people: Vec<Value> = Vec::new();

@@ -1,6 +1,7 @@
 //! The Deezer metadata service. The records it answers with are in
 //! `octo_core::metadata::deezer_metadata_service`.
 
+use super::deezer_requests::DeezerUse;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -1546,11 +1547,13 @@ impl DeezerMetadataService {
     async fn get_json(&self, url: &str, background: bool) -> DeezerResponse {
         let this = self.clone();
         let address = url.to_string();
+        // The fetch runs in a task of its own, which does not inherit the mark of what asked.
         self.inner
             .in_flight_calls
-            .run(&format!("{background}|{url}"), async move {
-                this.fetch_json(&address, background).await
-            })
+            .run(
+                &format!("{background}|{url}"),
+                DeezerUse::carry(async move { this.fetch_json(&address, background).await }),
+            )
             .await
     }
 

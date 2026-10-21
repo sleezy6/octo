@@ -440,6 +440,36 @@ fn registry_a_search_row_minted_again_keeps_what_the_catalog_said() {
     );
 }
 
+/// The Deezer track a length lookup found stays through the next search's re-mint, and a play
+/// forgets it only while it is still the one kept.
+#[test]
+fn registry_re_minting_a_song_keeps_the_deezer_track_a_lookup_found() {
+    let registry = ExternalIdRegistry::in_memory();
+    let id = registry.register(song("Tame Impala", "Dracula"));
+    assert!(registry.keep_deezer_track(&id, "3135556"));
+    assert!(
+        registry.keep_deezer_track(&id, "3135556"),
+        "the same track again is fine"
+    );
+    assert!(
+        !registry.keep_deezer_track(&id, "999"),
+        "a different track does not replace it"
+    );
+    registry.register(song("Tame Impala", "Dracula"));
+    let kept = || {
+        registry
+            .lookup(&id)
+            .expect("registered")
+            .snapshot()
+            .deezer_track_id
+    };
+    assert_eq!(kept().as_deref(), Some("3135556"));
+    assert!(!registry.forget_deezer_track(&id, "999"));
+    assert_eq!(kept().as_deref(), Some("3135556"));
+    assert!(registry.forget_deezer_track(&id, "3135556"));
+    assert_eq!(kept(), None);
+}
+
 /// A song's id leaves out its album, so radio registering a song Last.fm named without one must
 /// not undo the album a search filed it under. A registration with an album of its own still
 /// replaces it.

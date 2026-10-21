@@ -88,7 +88,7 @@ const CANNOT_EDIT: &str = "This account cannot change family playlists.";
 const CANNOT_RENAME: &str = "Only the person who made this playlist or a family manager can change it.";
 const CANNOT_DELETE: &str = "Only a family manager can delete a family playlist.";
 const CANNOT_APPROVE: &str = "Only people who manage the family can ask for approval of additions.";
-const CANNOT_SHARE: &str =
+pub const CANNOT_SHARE: &str =
     "Only the person who made this playlist or a family manager can choose who it is shared with.";
 
 /// Whether the caller sees family playlists: the owner and members.
@@ -96,12 +96,13 @@ pub fn may_view(caller: &FamilyCaller) -> bool {
     caller.managed || caller.role == Role::Owner
 }
 
-/// Whether the caller sees this playlist: the owner and its maker always; the rest of the
-/// family when it is shared with everyone (no list) or with them.
+/// Whether the caller sees this playlist: the owner, family managers and its maker always;
+/// the rest of the family when it is shared with everyone (no list) or with them.
 pub fn sees(caller: &FamilyCaller, playlist: &FamilyPlaylist) -> bool {
     may_view(caller)
         && (playlist.shared_with.is_empty()
             || caller.role == Role::Owner
+            || caller.abilities.manage_family
             || eq_ignore_case(&playlist.created_by, &caller.user)
             || playlist
                 .shared_with
@@ -471,6 +472,13 @@ mod tests {
         assert_eq!(visible_playlists(&store, &alex).len(), 1);
         assert_eq!(visible_playlists(&store, &owner()).len(), 1);
         assert!(may_share(&owner(), &shared));
+        let manager = caller("pat", Preset::CoAdmin);
+        assert_eq!(
+            visible_playlists(&store, &manager).len(),
+            1,
+            "managers see every playlist"
+        );
+        assert!(may_share(&manager, &shared));
 
         // Nobody chosen: back to everyone.
         set_shared_with(&store, &owner(), &list.id, &[]).expect("shared");

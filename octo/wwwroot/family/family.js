@@ -1619,7 +1619,7 @@
       after();
     } },
     rows.length ? rowsCard(rows) : el('p', { class: 'fam-help' }, 'There is nobody else in the family yet.'),
-    el('p', { class: 'fam-help' }, 'Tick nobody and the whole family sees it. ' + p.createdBy + ', who made it, and the owner always see it. Only the people who see it can add to it.'),
+    el('p', { class: 'fam-help' }, 'Tick nobody and the whole family sees it. ' + p.createdBy + ', who made it, the owner and anyone who manages the family always see it. Only the people who see it can add to it.'),
     error);
     F.openSheet('Share ' + p.name, form, { side: true, sub: 'Choose who sees this playlist in their apps.', foot: [el('button', { class: 'btn btn-ghost', type: 'button', onclick: F.closeSheet }, 'Cancel'), save] });
   }

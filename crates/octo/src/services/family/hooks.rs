@@ -533,6 +533,12 @@ impl FamilyPlaylists for RulePlaylists {
         }
         let mut playlist = family_playlists::find(&self.store, &caller, id)
             .ok_or_else(|| playlist_failure(PlaylistError::NotFound))?;
+        // Checked before anything is written, so a refused share leaves the rest unapplied too.
+        if shared_with.is_some() && !family_playlists::may_share(&caller, &playlist) {
+            return Err(playlist_failure(PlaylistError::NotAllowed(
+                family_playlists::CANNOT_SHARE,
+            )));
+        }
         if let Some(name) = name {
             playlist = family_playlists::rename(&self.store, &caller, id, name).map_err(playlist_failure)?;
         }

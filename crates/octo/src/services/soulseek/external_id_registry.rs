@@ -190,9 +190,13 @@ impl ExternalIdRegistry {
                     p.album.clone(),
                 )
             };
-            let (prev_video, prev_stream) = {
+            let (prev_video, prev_stream, prev_deezer) = {
                 let p = previous.lock();
-                (p.you_tube_id.clone().filter(|v| !v.is_empty()), p.stream_facts())
+                (
+                    p.you_tube_id.clone().filter(|v| !v.is_empty()),
+                    p.stream_facts(),
+                    p.deezer_track_id.clone(),
+                )
             };
             let mut r = routing.lock();
             // A song row mints an album routing with no Deezer id (`convert_song_to_json`), and
@@ -218,6 +222,11 @@ impl ExternalIdRegistry {
             // mints its artist again by name alone, and must not undo that choice.
             if r.external_artist_id.is_none() {
                 r.external_artist_id = prev_artist_id;
+            }
+            // And the Deezer track a length lookup or a play found: the next search mints the
+            // song again without it, and a play would search for it once more.
+            if r.deezer_track_id.is_none() {
+                r.deezer_track_id = prev_deezer;
             }
             // And what the catalog said of its words: a search row mints the song again before
             // the catalog is asked.

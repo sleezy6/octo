@@ -1872,6 +1872,20 @@ async fn a_playlist_shared_with_chosen_members_is_seen_by_them_its_maker_and_the
     f.state
         .family_store
         .upsert_member(member(&f.state, "kim", Preset::Kid, None, None));
+    f.state
+        .family_store
+        .upsert_member(member(&f.state, "lee", Preset::Listener, None, None));
+    // Someone outside the family is not told who is in it.
+    let bob = format!(
+        "octo_family={}",
+        f.state
+            .browse_sessions
+            .create_family("bob", SessionKind::FamilyNavidrome)
+    );
+    assert_eq!(
+        f.get("/api/family/playlists/people", Some(&bob)).await.status,
+        StatusCode::FORBIDDEN
+    );
     let made = f
         .post(
             "/api/family/playlists",
@@ -1924,10 +1938,33 @@ async fn a_playlist_shared_with_chosen_members_is_seen_by_them_its_maker_and_the
                 .len()
         }
     };
-    assert_eq!(seen(f.sam()).await, 0, "not shared with sam");
+    assert_eq!(seen(f.member_cookie("lee")).await, 0, "not shared with lee");
     assert_eq!(seen(f.member_cookie("kim")).await, 1);
     assert_eq!(seen(f.alex()).await, 1);
     assert_eq!(seen(f.owner_cookie()).await, 1);
+    assert_eq!(seen(f.sam()).await, 1, "a family manager sees every playlist");
+    // Lee may not choose, and a refused share applies none of the request.
+    let refused = f
+        .put(
+            &format!("/api/family/playlists/{id}"),
+            Some(&f.member_cookie("lee")),
+            json!({ "name": "Lee's", "sharedWith": [] }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::NOT_FOUND, "{}", refused.body);
+    assert_eq!(seen(f.member_cookie("lee")).await, 0);
+    // Shared from the start.
+    let shared_at_once = f
+        .post(
+            "/api/family/playlists",
+            Some(&f.alex()),
+            json!({ "name": "Just Lee", "sharedWith": ["lee"] }),
+        )
+        .await;
+    assert_eq!(shared_at_once.status, StatusCode::OK, "{}", shared_at_once.body);
+    assert_eq!(shared_at_once.json()["sharedWith"], json!(["lee"]));
+    assert_eq!(seen(f.member_cookie("lee")).await, 1);
+    assert_eq!(seen(f.member_cookie("kim")).await, 1, "Ours only");
 
     let everyone = f
         .put(
@@ -1937,7 +1974,7 @@ async fn a_playlist_shared_with_chosen_members_is_seen_by_them_its_maker_and_the
         )
         .await;
     assert_eq!(everyone.json()["sharedWith"], json!([]));
-    assert_eq!(seen(f.sam()).await, 1);
+    assert_eq!(seen(f.member_cookie("lee")).await, 2, "Ours is everyone's again");
 }
 
 #[tokio::test]
