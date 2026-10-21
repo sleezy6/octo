@@ -7,7 +7,7 @@
 # The released C# image is ghcr.io/winters27/octo:2026.10.05 (and earlier dated tags).
 
 # Build stage
-FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
 COPY octo.sln .
