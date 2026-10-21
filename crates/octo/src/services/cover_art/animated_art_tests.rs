@@ -290,6 +290,23 @@ fn clip(video: &str) -> Clip {
     }
 }
 
+/// Look again forgets the albums Apple had no animated art for, and nothing else.
+#[tokio::test]
+async fn look_again_forgets_the_misses_and_keeps_what_was_found() {
+    let apple = Apple::new().await;
+    let covers = apple.covers("direct", None);
+    covers.keep("Lorde", "Melodrama", Some(clip(SQUARE)), None);
+    covers.keep("Lorde", "Pure Heroine", None, None);
+    covers.keep("Lorde", "Solar Power", None, None);
+    assert_eq!(covers.summary()["known"], 3);
+
+    assert_eq!(covers.forget_misses(), 2);
+
+    assert_eq!(covers.summary()["known"], 1);
+    assert!(covers.peek("Lorde", "Melodrama", None).is_some());
+    assert_eq!(covers.forget_misses(), 0, "nothing left to forget");
+}
+
 #[tokio::test]
 async fn the_field_is_apples_addresses_direct_and_this_servers_relayed() {
     let apple = Apple::new().await;

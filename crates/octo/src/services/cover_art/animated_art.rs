@@ -599,6 +599,22 @@ impl AnimatedArt {
         self.kick.notify_one();
     }
 
+    /// Forgets every "no animated art" answer, so the next sweep asks Apple about those albums
+    /// again without waiting the week out. Found artwork, hidden or not, is kept. How many were
+    /// forgotten.
+    pub fn forget_misses(&self) -> usize {
+        let forgotten = {
+            let mut kept = self.kept.write();
+            let before = kept.len();
+            kept.retain(|_, k| k.found());
+            before - kept.len()
+        };
+        if forgotten > 0 {
+            self.dirty.store(true, Ordering::Release);
+        }
+        forgotten
+    }
+
     pub fn sweep_progress(&self) -> SweepProgress {
         self.sweep.lock().clone()
     }

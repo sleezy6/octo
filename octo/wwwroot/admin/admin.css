@@ -2703,3 +2703,6 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .deezer-requests .use { color: var(--ink-1); }
 .deezer-requests .value { font-family: inherit; word-break: normal; }
 .deezer-requests .background { color: var(--text-muted); font-weight: 400; }
+
+/* Animated art: the two look-up buttons side by side. */
+.art-actions { display: flex; gap: var(--s-s); flex-wrap: wrap; margin-top: -7px; }

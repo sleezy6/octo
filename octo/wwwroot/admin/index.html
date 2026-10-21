@@ -2075,8 +2075,12 @@
                 <span class="set-info-t" id="art-count"></span>
                 <span class="set-info-d" id="art-sweep"></span>
               </div>
-              <button class="btn btn-ghost" type="button" id="art-look-up"><svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg><span>Look up my library now</span></button>
+              <div class="art-actions">
+                <button class="btn btn-ghost" type="button" id="art-look-up"><svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg><span>Look up my library now</span></button>
+                <button class="btn btn-ghost" type="button" id="art-look-again" title="Albums Apple had no animated art for are not asked about again for a week. This asks about all of them now.">Look again</button>
+              </div>
             </div>
+            <p class="set-info-d art-hint">Look up my library now asks about new albums. Look again also asks about every album Apple had no animated art for, instead of waiting the week out.</p>
             <div class="cover-progress" id="art-progress" hidden><span id="art-progress-fill"></span></div>
             <p class="set-info-d art-hint" id="art-hint" hidden>Pick a cover to hide it in every app; pick it again to bring it back.</p>
             <div class="cover-wall" id="art-wall" role="list"></div>

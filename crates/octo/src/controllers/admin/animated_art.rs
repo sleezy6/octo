@@ -6,6 +6,8 @@
 //!   art (key, artist, album, the still, whether a tall loop is there, whether hidden), by
 //!   artist then album, and `total`.
 //! - `POST /api/admin/animated-art/sweep`: look the library up now.
+//! - `POST /api/admin/animated-art/look-again`: forget every album Apple had no animated art
+//!   for and look the library up now, instead of waiting the week out.
 //! - `POST /api/admin/animated-art/hide` with `{"key": ..., "hidden": true|false}`: hide or
 //!   show one album's animated art in every app.
 
@@ -29,6 +31,10 @@ pub fn routes() -> RouteSet {
         .route("/api/admin/animated-art", get(get_animated_art_summary))
         .route("/api/admin/animated-art/albums", get(get_animated_art_albums))
         .route("/api/admin/animated-art/sweep", post(sweep_animated_art))
+        .route(
+            "/api/admin/animated-art/look-again",
+            post(look_again_animated_art),
+        )
         .route("/api/admin/animated-art/hide", post(hide_animated_art))
 }
 
@@ -53,6 +59,15 @@ pub async fn sweep_animated_art(State(state): State<AppState>) -> Response {
     }
     state.animated_art.sweep_now();
     accepted(&json!({ "ok": true }))
+}
+
+pub async fn look_again_animated_art(State(state): State<AppState>) -> Response {
+    if !state.animated_art.offered() {
+        return error_json(StatusCode::CONFLICT, "Animated art is off.");
+    }
+    let forgotten = state.animated_art.forget_misses();
+    state.animated_art.sweep_now();
+    accepted(&json!({ "ok": true, "forgotten": forgotten }))
 }
 
 #[derive(Deserialize)]

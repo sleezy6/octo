@@ -9271,6 +9271,7 @@ async function loadAnimatedArt() {
   progress.hidden = !sweep.running;
   if (sweep.running && sweep.total) document.getElementById('art-progress-fill').style.width = `${Math.round(100 * sweep.checked / sweep.total)}%`;
   document.getElementById('art-look-up').disabled = !!sweep.running;
+  document.getElementById('art-look-again').disabled = !!sweep.running;
   await loadArtWall(true);
   if (sweep.running) {
     if (!artPoll) artPoll = setInterval(loadAnimatedArt, 4000);
@@ -9296,6 +9297,18 @@ async function loadArtWall(fromStart) {
 document.getElementById('art-look-up')?.addEventListener('click', async event => {
   event.currentTarget.disabled = true;
   await api('/api/admin/animated-art/sweep', { method: 'POST' }).catch(() => null);
+  setTimeout(loadAnimatedArt, 800);
+});
+document.getElementById('art-look-again')?.addEventListener('click', async event => {
+  const button = event.currentTarget;
+  if (!(await askConfirm('Look again for animated art?', 'Every album Apple had no animated art for is asked about again now, a page a second or so. Albums with animated art are left as they are.', 'Look again'))) return;
+  button.disabled = true;
+  try {
+    const response = await api('/api/admin/animated-art/look-again', { method: 'POST' });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    toast(`Looking again at ${Number(data.forgotten).toLocaleString()} album${data.forgotten === 1 ? '' : 's'}.`);
+  } catch (error) { toast(`Could not start: ${error.message}`, 'error'); button.disabled = false; }
   setTimeout(loadAnimatedArt, 800);
 });
 document.getElementById('art-more')?.addEventListener('click', () => loadArtWall(false));
