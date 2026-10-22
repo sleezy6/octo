@@ -303,7 +303,8 @@ fn stations_keep_guesses_at_a_discount_and_a_pick_names_its_strongest_source() {
         1,
     );
     assert_eq!(picks[0].provider, YOU_TUBE_MUSIC);
-    assert!((picks[0].score - 1.5).abs() < 1e-9);
+    // The strongest source in full, the other at a quarter of its 0.5.
+    assert!((picks[0].score - 1.125).abs() < 1e-9);
 }
 
 #[test]
@@ -324,4 +325,152 @@ fn a_banned_artist_leaves_by_name_whatever_the_song() {
         .map(|track| track.artist)
         .collect();
     assert_eq!(kept, ["Keane"]);
+}
+
+fn pick(artist: &str, title: &str, score: f64) -> RadioPick {
+    RadioPick {
+        track: Some(SimilarTrack::new(artist, title, 1.0)),
+        library_song: None,
+        provider: "lastfm".into(),
+        score,
+        needs_reading: false,
+    }
+}
+
+/// A song several sources suggest scores its best term and a quarter of each other's, so two
+/// sources agreeing no longer doubles a hit.
+#[test]
+fn agreement_counts_a_quarter_not_in_full() {
+    let answer = |provider: &str| {
+        RadioAnswer::new(
+            provider,
+            RadioMatch::Song,
+            vec![track("A", "Hit", Some(200))],
+            Vec::new(),
+        )
+    };
+    let weights: RadioWeights = [("lastfm".to_string(), 1.0), ("youtube-music".to_string(), 1.0)]
+        .into_iter()
+        .collect();
+    let picks = blend(
+        &[answer("lastfm"), answer("youtube-music")],
+        &weights,
+        10,
+        "",
+        None,
+        1,
+    );
+    assert_eq!(picks.len(), 1);
+    let one = blend(&[answer("lastfm")], &weights, 10, "", None, 1);
+    assert!(
+        (picks[0].score / one[0].score - 1.25).abs() < 1e-9,
+        "{} {}",
+        picks[0].score,
+        one[0].score
+    );
+}
+
+/// The best match leads every draw; the rest come in an order the draw picks, and a seeded draw
+/// repeats.
+#[test]
+fn the_draw_keeps_the_best_first_and_varies_the_rest() {
+    let pool: Vec<RadioPick> = (0..30)
+        .map(|i| pick("A", &format!("Song {i}"), 30.0 - f64::from(i)))
+        .collect();
+    let order = |seed: i32| -> Vec<String> {
+        let mut random = crate::common::dotnet_random::DotnetRandom::new(seed);
+        draw_order(pool.clone(), &IgnoreCaseKeys::new(), &mut random)
+            .into_iter()
+            .map(|p| p.track.expect("a track").title)
+            .collect()
+    };
+    let (one, two) = (order(1), order(2));
+    assert_eq!(one[0], "Song 0");
+    assert_eq!(two[0], "Song 0");
+    assert_eq!(one.len(), 30);
+    assert_ne!(one, two, "two draws differ");
+    assert_eq!(one, order(1), "the same seed draws the same");
+}
+
+/// A song any radio gave the listener lately comes up later on the whole.
+#[test]
+fn songs_served_lately_weigh_less() {
+    let pool: Vec<RadioPick> = (0..2).map(|i| pick("A", &format!("Song {i}"), 1.0)).collect();
+    let pool = [vec![pick("A", "Best", 9.0)], pool].concat();
+    let served: IgnoreCaseKeys = [seed_normalizer::track_key("A", "Song 1")].into_iter().collect();
+    let mut later = 0;
+    for seed in 0..200 {
+        let mut random = crate::common::dotnet_random::DotnetRandom::new(seed);
+        let order = draw_order(pool.clone(), &served, &mut random);
+        if order[2].track.as_ref().expect("a track").title == "Song 1" {
+            later += 1;
+        }
+    }
+    assert!(later > 120, "{later} of 200");
+}
+
+/// One artist holds a tenth of the radio at most (the seed's artist a quarter), songs heard
+/// lately wait, and what the caps held back fills a radio left short.
+#[test]
+fn fit_count_caps_artists_and_lets_heard_songs_wait() {
+    let songs: Vec<(String, String)> = (0..6)
+        .map(|i| ("Busy".to_string(), format!("B{i}")))
+        .chain((0..6).map(|i| (format!("Artist {i}"), format!("S{i}"))))
+        .chain([
+            ("Seed".to_string(), "Own 1".to_string()),
+            ("Seed".to_string(), "Own 2".to_string()),
+        ])
+        .collect();
+    let heard: IgnoreCaseKeys = [seed_normalizer::track_key("Artist 0", "S0")]
+        .into_iter()
+        .collect();
+    let fit = fit_count(
+        songs.clone(),
+        10,
+        "Seed",
+        &heard,
+        |(artist, _)| artist.clone(),
+        |(artist, title)| seed_normalizer::track_key(artist, title),
+    );
+    let titles: Vec<&str> = fit.iter().map(|(_, t)| t.as_str()).collect();
+    // One of Busy's six within the cap of one; the seed's two within its cap of three; the song
+    // heard lately after every fresh one; then what the caps held back.
+    assert_eq!(
+        titles,
+        ["B0", "S1", "S2", "S3", "S4", "S5", "Own 1", "Own 2", "S0", "B1"]
+    );
+    // A short pool: the held-back songs fill it.
+    let all = fit_count(
+        songs,
+        14,
+        "Seed",
+        &IgnoreCaseKeys::new(),
+        |(artist, _)| artist.clone(),
+        |(artist, title)| seed_normalizer::track_key(artist, title),
+    );
+    assert_eq!(all.len(), 14);
+}
+
+/// Deezer names the recording's id in its catalog; the same song from another source that
+/// answered first takes it over, so a play or heart needs no search.
+#[test]
+fn the_same_song_from_deezer_keeps_its_deezer_id() {
+    let last_fm = RadioAnswer::new(
+        LAST_FM,
+        RadioMatch::Song,
+        vec![SimilarTrack::new("Portishead", "Roads", 1.0)],
+        Vec::new(),
+    );
+    let deezer = RadioAnswer::new(
+        crate::radio::radio_provider::DEEZER,
+        RadioMatch::Song,
+        vec![SimilarTrack::new("Portishead", "Roads", 1.0).with_deezer_track_id(Some("3135556".into()))],
+        Vec::new(),
+    );
+    let picks = blend(&[last_fm, deezer], &even(), 10, "seed", None, FULL_ANSWER);
+    assert_eq!(picks.len(), 1);
+    assert_eq!(
+        picks[0].track.as_ref().and_then(|t| t.deezer_track_id.as_deref()),
+        Some("3135556")
+    );
 }

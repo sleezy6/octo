@@ -11,7 +11,9 @@ use crate::services::soulseek::soulseek_link::SoulseekLinkState;
 /// Where Better quality looks for a lossless copy, decided in one place so the dashboard, the
 /// apps, the queue and the weekly worker never disagree. Only lossless sources count: YouTube can
 /// only produce an MP3, which a Better quality check refuses anyway. Deezer counts, asked for
-/// FLAC and nothing lesser.
+/// FLAC and nothing lesser. The Soulseek step is the lossless step: Soulseek, and SpotiFLAC
+/// when it is on (in the order its placement gives), so with SpotiFLAC on the step is there
+/// even while Soulseek is off or not logged in.
 pub struct UpgradeSources {
     /// The library action, Soulseek and Lidarr settings, read at every use.
     settings: Arc<SettingsStore>,
@@ -75,10 +77,31 @@ impl UpgradeSources {
     }
 
     /// The sources in words, for "Looking for a higher quality copy on X": the ones that are set
-    /// up, or, when none is, the ones the setting asks for.
+    /// up, or, when none is, the ones the setting asks for. The Soulseek step is named for what
+    /// it asks: Soulseek, SpotiFLAC, or both.
     pub fn name(&self) -> String {
         let plan = self.plan();
-        Self::words(if plan.is_empty() { self.wanted() } else { plan })
+        let sources = if plan.is_empty() { self.wanted() } else { plan };
+        let settings = self.settings.current();
+        let spotiflac = settings.spotiflac.is_on();
+        let soulseek = Self::soulseek_set_up(&settings.soulseek);
+        let mut words: Vec<&str> = Vec::new();
+        for source in sources {
+            let word = match source {
+                DownloadSource::Soulseek if spotiflac && soulseek => "Soulseek or SpotiFLAC",
+                DownloadSource::Soulseek if spotiflac => "SpotiFLAC",
+                other => Self::word(other),
+            };
+            if !words.contains(&word) {
+                words.push(word);
+            }
+        }
+        words.join(" or ")
+    }
+
+    /// SpotiFLAC is on, so the lossless step can ask it whatever Soulseek is doing.
+    fn spotiflac_on(&self) -> bool {
+        self.settings.current().spotiflac.is_on()
     }
 
     /// The sources that can take a search right now. Soulseek drops out while slskd is not
@@ -88,7 +111,7 @@ impl UpgradeSources {
         let Some(link) = self.soulseek_link.as_ref() else {
             return plan;
         };
-        if !plan.contains(&DownloadSource::Soulseek) {
+        if !plan.contains(&DownloadSource::Soulseek) || self.spotiflac_on() {
             return plan;
         }
         let state = link.read(false).await.map(|reading| reading.link);
@@ -129,7 +152,9 @@ impl UpgradeSources {
     fn set_up(&self, source: DownloadSource) -> bool {
         let settings = self.settings.current();
         match source {
-            DownloadSource::Soulseek => Self::soulseek_set_up(&settings.soulseek),
+            DownloadSource::Soulseek => {
+                Self::soulseek_set_up(&settings.soulseek) || settings.spotiflac.is_on()
+            }
             DownloadSource::Lidarr => Self::lidarr_set_up(&settings.lidarr),
             DownloadSource::Deezer => Self::deezer_set_up(&settings.deezer),
             _ => false,
@@ -381,5 +406,35 @@ mod tests {
 
         assert_eq!(sources.available().await, [DownloadSource::Lidarr]);
         assert!(!sources.waiting_for_soulseek().await);
+    }
+
+    /// SpotiFLAC rides on the Soulseek step: with it on, the step is planned and searchable
+    /// while Soulseek is off or not logged in, and it is named for what it asks.
+    #[tokio::test]
+    async fn spotiflac_keeps_the_lossless_step_without_soulseek() {
+        let settings = |soulseek: Option<SoulseekSettings>| {
+            Arc::new(SettingsStore::for_tests(AppSettings {
+                library_actions: LibraryActionSettings {
+                    upgrade_source: UpgradeSourceChoice::Soulseek,
+                    ..Default::default()
+                },
+                soulseek: soulseek.unwrap_or_default(),
+                spotiflac: octo_core::settings::SpotiflacSettings {
+                    enabled: true,
+                    url: "http://spotiflac:8000".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+        };
+        let alone = UpgradeSources::new(
+            settings(None),
+            Some(Arc::new(FixedLink(SoulseekLinkState::NotLoggedIn))),
+        );
+        assert_eq!(alone.plan(), [DownloadSource::Soulseek]);
+        assert_eq!(alone.available().await, [DownloadSource::Soulseek]);
+        assert_eq!(alone.name(), "SpotiFLAC");
+        let both = UpgradeSources::new(settings(Some(slskd())), None);
+        assert_eq!(both.name(), "Soulseek or SpotiFLAC");
     }
 }

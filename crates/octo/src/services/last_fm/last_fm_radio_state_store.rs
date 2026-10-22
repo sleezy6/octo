@@ -616,6 +616,7 @@ pub fn route_track(registry: &ExternalIdRegistry, track: &mut LastFmRadioTrack) 
         album: track.album.clone(),
         duration: track.duration,
         you_tube_id: track.you_tube_id.clone(),
+        deezer_track_id: track.deezer_track_id.clone(),
         ..Default::default()
     }));
     if track.external_provider.is_none() {

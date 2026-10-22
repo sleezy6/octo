@@ -1587,3 +1587,101 @@ async fn another_catalogs_isrc_for_a_different_song_is_not_taken() {
         None
     );
 }
+
+/// Deezer's gateway keeps a song's version apart from its title and writes numbers as text;
+/// the public API's radio writes them as numbers.
+#[test]
+fn deezer_radios_are_read_from_both_shapes() {
+    use super::radio::{RadioTrack, gateway_tracks, public_tracks};
+    let gateway = serde_json::json!({ "results": { "data": [
+        { "SNG_ID": "3135556", "SNG_TITLE": "Harder, Better, Faster, Stronger", "ART_NAME": "Daft Punk", "DURATION": "224" },
+        { "SNG_ID": "1109731", "SNG_TITLE": "Lose Yourself", "VERSION": "(Radio Edit)", "ART_NAME": "Eminem", "DURATION": "0" },
+        { "SNG_ID": "1", "SNG_TITLE": " ", "ART_NAME": "Nobody" },
+    ] } });
+    assert_eq!(
+        gateway_tracks(&gateway),
+        [
+            RadioTrack {
+                track_id: "3135556".into(),
+                artist: "Daft Punk".into(),
+                title: "Harder, Better, Faster, Stronger".into(),
+                seconds: Some(224),
+            },
+            RadioTrack {
+                track_id: "1109731".into(),
+                artist: "Eminem".into(),
+                title: "Lose Yourself (Radio Edit)".into(),
+                seconds: None,
+            },
+        ]
+    );
+    let public = serde_json::json!({ "data": [
+        { "id": 3135556, "title": "Around the World", "duration": 429, "artist": { "name": "Daft Punk" } },
+        { "id": 2, "title": "No Artist" },
+    ] });
+    assert_eq!(
+        public_tracks(&public),
+        [RadioTrack {
+            track_id: "3135556".into(),
+            artist: "Daft Punk".into(),
+            title: "Around the World".into(),
+            seconds: Some(429),
+        }]
+    );
+}
+
+/// The track mix asks the gateway as Deezer's web player does: an anonymous session first
+/// (its cookie and token go with the call), in a desktop Chrome's name, and leaves the seed out.
+#[tokio::test]
+async fn the_track_mix_asks_with_an_anonymous_session_as_a_browser() {
+    use wiremock::matchers::{header, method, path, query_param};
+
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // The whole header: wiremock's `header` would split Chrome's "(KHTML, like Gecko)" at its
+    // comma.
+    let as_a_browser = |request: &wiremock::Request| {
+        request
+            .headers
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            == Some(crate::services::deezer::DeezerResolver::USER_AGENT)
+    };
+    Mock::given(method("GET"))
+        .and(path("/ajax/gw-light.php"))
+        .and(query_param("method", "deezer.getUserData"))
+        .and(as_a_browser)
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("set-cookie", "sid=fr123; path=/; secure")
+                .set_body_json(serde_json::json!({ "results": { "checkForm": "tok-1" } })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/ajax/gw-light.php"))
+        .and(query_param("method", "song.getSearchTrackMix"))
+        .and(query_param("api_token", "tok-1"))
+        .and(header("cookie", "sid=fr123"))
+        .and(as_a_browser)
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "error": {},
+            "results": { "data": [
+                { "SNG_ID": "1", "SNG_TITLE": "Seed", "ART_NAME": "A", "DURATION": "200" },
+                { "SNG_ID": "2", "SNG_TITLE": "Next", "ART_NAME": "B", "DURATION": "180" },
+            ] },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let settings = SettingsStore::for_tests(AppSettings::default());
+    let http = Arc::new(DeezerRateLimitHandler::new(Arc::new(DeezerRateLimiter::new())));
+    let service = DeezerMetadataService::with_base_url(http, Arc::new(settings), server.uri());
+    let mix = service.track_mix("1").await.expect("an answer");
+    assert_eq!(mix.iter().map(|t| t.track_id.as_str()).collect::<Vec<_>>(), ["2"]);
+    // Kept for the day: asking again goes nowhere.
+    assert_eq!(service.track_mix("1").await.expect("kept").len(), 1);
+}

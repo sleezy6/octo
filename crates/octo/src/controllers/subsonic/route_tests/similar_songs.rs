@@ -377,6 +377,7 @@ async fn fixture(change: impl FnOnce(&mut AppSettings)) -> Fixture {
         radio_sources: RadioSourceSettings {
             you_tube_music: false,
             listen_brainz: false,
+            deezer: false,
             sounds_alike: false,
             learn_from_listening: false,
             ..Default::default()
@@ -527,10 +528,12 @@ async fn known_song_is_last_fms_radio_as_before() {
     let f = fixture(|_| {}).await;
     let songs = radio_ids(&f, "teardrop").await;
 
-    // A full answer for the song itself: Last.fm's order, and the library is not asked.
-    assert_eq!(
-        songs[..2],
-        ["ext-Portishead-Glory Box", "ext-Morcheeba-Trigger Hippie"]
+    // A full answer for the song itself: Last.fm's best match first (the rest is drawn), and
+    // the library is not asked.
+    assert_eq!(songs[0], "ext-Portishead-Glory Box");
+    assert!(
+        songs.iter().any(|id| id == "ext-Morcheeba-Trigger Hippie"),
+        "{songs:?}"
     );
     assert_eq!(songs.len(), 20);
     assert!(!f.calls().iter().any(|call| call.contains("rest/getAlbum")));
@@ -588,13 +591,13 @@ async fn a_song_last_fm_and_you_tube_music_both_suggest_comes_first_and_uploads_
     let songs = radio(&f, "alice", "teardrop", 50).await;
 
     assert_eq!(songs[0].0, "ext-Portishead-Glory Box");
-    // YouTube Music's two songs are a thin answer next to Last.fm's 25: its own pick plays, but
-    // after Last.fm's.
+    // YouTube Music's two songs are a thin answer next to Last.fm's 25: its own pick still
+    // plays, drawn among the rest after the best match.
     let sour_times = songs
         .iter()
         .position(|(id, by)| id == "ext-Portishead-Sour Times" && by.as_deref() == Some("YouTube Music"))
         .expect("Sour Times plays");
-    assert!(sour_times > 20, "Sour Times at {sour_times}");
+    assert!(sour_times > 0, "Sour Times at {sour_times}");
     assert!(
         !songs
             .iter()
@@ -822,9 +825,10 @@ async fn new_song_by_a_known_artist_still_gets_artists_like_them() {
 async fn album_id_is_a_radio_from_its_first_song() {
     let f = fixture(|_| {}).await;
     let songs = radio_ids(&f, "album-trip").await;
-    assert_eq!(
-        songs[..2],
-        ["ext-Portishead-Glory Box", "ext-Morcheeba-Trigger Hippie"]
+    assert_eq!(songs[0], "ext-Portishead-Glory Box");
+    assert!(
+        songs.iter().any(|id| id == "ext-Morcheeba-Trigger Hippie"),
+        "{songs:?}"
     );
 }
 
@@ -849,7 +853,7 @@ fn kinds(ids: &[String]) -> String {
 
 // Radio placement: Octo's own apps (octoMix=client) get the order of fit; every other app gets
 // the same songs with the outside ones placed at random at the radio's own mix (here 20 of 30),
-// each kind still in its own order. The Discovery balance, set to 90 here, plays no part. The draw is seeded, so the placed
+// each kind in the order it was drawn. The Discovery balance, set to 90 here, plays no part. The draw is seeded, so the placed
 // order repeats exactly.
 #[tokio::test]
 async fn other_apps_get_outside_songs_placed_and_octos_apps_get_the_order_of_fit() {
@@ -888,8 +892,17 @@ async fn other_apps_get_outside_songs_placed_and_octos_apps_get_the_order_of_fit
     let mut sorted = placed.clone();
     sorted.sort();
     assert_eq!(sorted, sorted_fit, "the same songs: {placed:?}");
-    assert_eq!(of_kind(&placed, true), of_kind(&fit, true), "{placed:?}");
-    assert_eq!(of_kind(&placed, false), of_kind(&fit, false), "{placed:?}");
+    let sorted_kind = |ids: &[String], library: bool| {
+        let mut kind = of_kind(ids, library);
+        kind.sort();
+        kind
+    };
+    assert_eq!(sorted_kind(&placed, true), sorted_kind(&fit, true), "{placed:?}");
+    assert_eq!(
+        sorted_kind(&placed, false),
+        sorted_kind(&fit, false),
+        "{placed:?}"
+    );
     // Placed, not the order of fit: the kinds land elsewhere.
     let pattern = kinds(&placed);
     assert_ne!(pattern, kinds(&fit), "placed as the order of fit");
@@ -907,10 +920,10 @@ async fn other_apps_get_outside_songs_placed_and_octos_apps_get_the_order_of_fit
 /// A seed with 120 songs like it on Last.fm, none of them in the library.
 const WIDE_SONGS: usize = 120;
 
-// "Ask for more songs": Octo's own apps (octoMix=client) may ask for up to 100 songs, whatever
-// RadioTrackCount is (50 here, the default). Every other app is still cut to RadioTrackCount.
+// Every app may ask for up to 100 songs, whatever RadioTrackCount is (50 here, the default):
+// song radio is drawn from every source's whole list, so a long radio is worth having.
 #[tokio::test]
-async fn octos_apps_may_ask_for_100_songs_and_other_apps_get_the_configured_count() {
+async fn every_app_may_ask_for_100_songs() {
     let f = fixture(|_| {}).await;
     async fn wide(f: &Fixture, extra: &str) -> usize {
         let body = get_string(
@@ -921,7 +934,7 @@ async fn octos_apps_may_ask_for_100_songs_and_other_apps_get_the_configured_coun
         songs(&body).len()
     }
     assert_eq!(wide(&f, "&octoMix=client").await, 100);
-    assert_eq!(wide(&f, "").await, 50);
+    assert_eq!(wide(&f, "").await, 100);
 }
 
 #[tokio::test]

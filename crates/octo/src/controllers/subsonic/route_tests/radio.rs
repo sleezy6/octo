@@ -1676,6 +1676,7 @@ async fn station_songs_fixture(played: i64) -> RadioFixture {
     let mut settings = fixture.state.settings.current().as_ref().clone();
     settings.radio_sources.you_tube_music = false;
     settings.radio_sources.listen_brainz = false;
+    settings.radio_sources.deezer = false;
     settings.radio_sources.sounds_alike = false;
     fixture.state.settings.set(settings);
     fixture.install_station("");

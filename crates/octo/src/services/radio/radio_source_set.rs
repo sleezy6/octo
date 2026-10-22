@@ -9,7 +9,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use indexmap::IndexMap;
 use octo_core::json::datetime;
 use octo_core::radio::radio_blend::{RadioWeights, SOUNDS_ALIKE_WHEN_UNKNOWN};
-use octo_core::radio::radio_provider::{LAST_FM, LIBRARY, LISTEN_BRAINZ, SOUNDS_ALIKE, YOU_TUBE_MUSIC};
+use octo_core::radio::radio_provider::{
+    DEEZER, LAST_FM, LIBRARY, LISTEN_BRAINZ, SOUNDS_ALIKE, YOU_TUBE_MUSIC,
+};
 use octo_core::radio::{RadioAnswer, RadioSeed};
 use octo_core::settings::{RadioSourceSettings, SettingsStore};
 use parking_lot::Mutex;
@@ -121,6 +123,13 @@ impl RadioSourceSet {
                 weigh(
                     LISTEN_BRAINZ,
                     RadioSourceSettings::effective_weight(current.listen_brainz_weight),
+                ),
+            ),
+            (
+                DEEZER.to_string(),
+                weigh(
+                    DEEZER,
+                    RadioSourceSettings::effective_weight(current.deezer_weight),
                 ),
             ),
             (SOUNDS_ALIKE.to_string(), weigh(SOUNDS_ALIKE, sound)),

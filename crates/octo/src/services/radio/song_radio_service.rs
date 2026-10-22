@@ -27,6 +27,14 @@ use crate::services::family::{FamilyStore, kid_filter};
 use crate::services::last_fm::LastFmRadioTrackResolver;
 use crate::services::sonic::SonicStore;
 
+/// How many songs each source is asked for, whatever the radio's length: the draw is over the
+/// whole of every list.
+pub const SOURCE_DEPTH: i32 = 100;
+/// How long a song a song radio gave a listener counts as served lately.
+const SERVED_FOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+/// The most songs remembered as served, per listener.
+const SERVED_KEPT: usize = 3000;
+
 /// Picks resolved beyond the count asked for, so the sound check has some to drop.
 pub const PICK_HEADROOM: f64 = 1.5;
 
@@ -43,6 +51,9 @@ pub struct SongRadioService {
     randomizer: Mutex<Randomizer>,
     /// The family, whose kid profiles get clean radio.
     family: Option<Arc<FamilyStore>>,
+    /// The songs each listener's song radios gave them lately (track keys, when), so the next
+    /// radio leads with others. In memory: a restart starts the week over.
+    served: Mutex<std::collections::HashMap<String, IndexMap<String, std::time::Instant>>>,
 }
 
 impl SongRadioService {
@@ -59,6 +70,7 @@ impl SongRadioService {
             outcomes,
             randomizer: Mutex::new(default_randomizer()),
             family: None,
+            served: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -85,7 +97,14 @@ impl SongRadioService {
     /// what they play teaches their own weights; None for nobody. `client_order`: the caller
     /// mixes the radio itself (Octo's apps send `octoMix=client`) and wants the order of fit, so
     /// outside songs are not placed. `bans` and `banned_artists`: the songs (track keys) and
-    /// artists (artist keys) the listener banned from their radio.
+    /// artists (artist keys) the listener banned from their radio. `heard`: the songs (track
+    /// keys) the listener played in the last days, which wait until nothing else fits.
+    ///
+    /// Every source is asked for [`SOURCE_DEPTH`] songs. Unless the library leads, the radio is a
+    /// draw over the whole pool ([`radio_blend::draw_order`]): the best match first, a song any
+    /// song radio gave the listener lately weighing less, one artist holding a tenth of it at
+    /// most ([`radio_blend::fit_count`]).
+    #[allow(clippy::too_many_arguments)]
     pub async fn build(
         &self,
         seed: &RadioSeed,
@@ -94,6 +113,7 @@ impl SongRadioService {
         auth: &IndexMap<String, String>,
         bans: &IgnoreCaseKeys,
         banned_artists: &IgnoreCaseKeys,
+        heard: &IgnoreCaseKeys,
         resolver: &LastFmRadioTrackResolver,
         client_order: bool,
     ) -> Vec<Song> {
@@ -103,11 +123,7 @@ impl SongRadioService {
             title: seed_normalizer::title(&seed.title),
             ..seed.clone()
         };
-        // A few more than asked for: filler and the listener's one-star songs are left out.
-        let mut answers = self
-            .sources
-            .ask_all(&lookup, (count + 10).min(100), auth, None)
-            .await;
+        let mut answers = self.sources.ask_all(&lookup, SOURCE_DEPTH, auth, None).await;
 
         // When no catalog has songs like this very song, the seed's own tags know its style
         // better than a guess from its artist's name, which for a YouTube upload is only the
@@ -132,16 +148,26 @@ impl SongRadioService {
             .map(|answer| radio_blend::without_artists(answer, banned_artists))
             .collect();
         let weights = self.sources.weights(listener, library_led);
-        let picks = radio_blend::blend(
+        let pool = radio_blend::blend(
             &answers,
             &weights,
-            (f64::from(count) * PICK_HEADROOM).ceil() as usize,
+            usize::MAX,
             &seed_normalizer::track_key(&seed.artist, &seed.title),
             seed.library_song.as_ref().map(|song| song.id.as_str()),
             count,
         );
+        let randomizer = self.randomizer.lock().clone();
+        let mut random = randomizer();
+        let pool_size = pool.len();
+        // A library-led radio keeps its order of fit; every other is a draw over the pool.
+        let mut picks = if library_led {
+            pool
+        } else {
+            radio_blend::draw_order(pool, &self.served_lately(listener), &mut *random)
+        };
+        picks.truncate((f64::from(count) * PICK_HEADROOM).ceil() as usize);
         info!(
-            "Radio for '{} - {}': {}; weights {}; {} picked{}",
+            "Radio for '{} - {}': {}; weights {}; {} picked of {pool_size}{}",
             seed.artist,
             seed.title,
             answers
@@ -204,8 +230,11 @@ impl SongRadioService {
                 for (song, score) in &mut scored {
                     *score *= fit.get(&song.id).copied().unwrap_or(1.0);
                 }
-                // A stable sort, highest score first.
-                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                // A stable sort, highest score first. A drawn radio keeps its draw, and the
+                // sound check's scores only order what Octo's apps get (client order).
+                if library_led {
+                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                }
             }
         }
         // The admin's explicit filter, as stations apply it: with outside songs from every
@@ -214,17 +243,34 @@ impl SongRadioService {
         let settings = self.settings.current();
         let filter = kid_filter::explicit_filter_for(&settings, self.family.as_deref(), listener);
         let skip_covers_and_instrumentals = settings.soulseek.skip_covers_and_instrumentals;
-        let songs: Vec<Song> = scored
+        let kept: Vec<(Song, f64)> = scored
             .into_iter()
-            .map(|(song, _)| song)
-            .filter(|song| match filter {
+            .filter(|(song, _)| match filter {
                 ExplicitFilter::CleanOnly => song.explicit_content_lyrics != Some(1),
                 ExplicitFilter::ExplicitOnly => song.explicit_content_lyrics != Some(3),
                 ExplicitFilter::All => true,
             })
-            .filter(|song| !skipped_takes::hides_song(song, skip_covers_and_instrumentals))
-            .take(count.max(0) as usize)
+            .filter(|(song, _)| !skipped_takes::hides_song(song, skip_covers_and_instrumentals))
             .collect();
+        let wanted = count.max(0) as usize;
+        let mut kept: Vec<(Song, f64)> = if library_led {
+            kept.into_iter().take(wanted).collect()
+        } else {
+            radio_blend::fit_count(
+                kept,
+                wanted,
+                &seed.artist,
+                heard,
+                |(song, _)| song.artist.clone(),
+                |(song, _)| seed_normalizer::track_key(&song.artist, &song.title),
+            )
+        };
+        // Octo's apps mix the radio themselves from the order of fit.
+        if client_order && !library_led {
+            kept.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        let songs: Vec<Song> = kept.into_iter().map(|(song, _)| song).collect();
+        self.remember_served(listener, &songs);
         if let Some(outcomes) = &self.outcomes {
             outcomes.served(
                 listener,
@@ -269,8 +315,6 @@ impl SongRadioService {
                 "Radio for '{} - {}': placed at share {share:.2}",
                 seed.artist, seed.title
             );
-            let randomizer = self.randomizer.lock().clone();
-            let mut random = randomizer();
             last_fm_radio_placement::place(
                 &songs,
                 |song: &Song| !song.is_local,
@@ -280,6 +324,49 @@ impl SongRadioService {
                 share,
                 &mut *random,
             )
+        }
+    }
+}
+
+impl SongRadioService {
+    /// The songs (track keys) any song radio gave this listener in the last week.
+    fn served_lately(&self, listener: Option<&str>) -> IgnoreCaseKeys {
+        let Some(listener) = listener.filter(|l| !l.trim().is_empty()) else {
+            return IgnoreCaseKeys::new();
+        };
+        let now = std::time::Instant::now();
+        self.served
+            .lock()
+            .get(&listener.trim().to_lowercase())
+            .map(|served| {
+                served
+                    .iter()
+                    .filter(|(_, at)| now.duration_since(**at) < SERVED_FOR)
+                    .map(|(key, _)| key.as_str())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Remembers what a radio gave the listener, forgetting what is older than a week and the
+    /// oldest past [`SERVED_KEPT`].
+    fn remember_served(&self, listener: Option<&str>, songs: &[Song]) {
+        let Some(listener) = listener.filter(|l| !l.trim().is_empty()) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let mut all = self.served.lock();
+        let served = all.entry(listener.trim().to_lowercase()).or_default();
+        served.retain(|_, at| now.duration_since(*at) < SERVED_FOR);
+        for song in songs {
+            let key = seed_normalizer::track_key(&song.artist, &song.title);
+            if !key.is_empty() {
+                served.shift_remove(&key);
+                served.insert(key, now);
+            }
+        }
+        while served.len() > SERVED_KEPT {
+            served.shift_remove_index(0);
         }
     }
 }
@@ -301,6 +388,7 @@ async fn resolve(
                     track.duration,
                     auth,
                     track.you_tube_id.as_deref(),
+                    track.deezer_track_id.as_deref(),
                 )
                 .await
         }

@@ -11,6 +11,12 @@ pub struct RadioSourceSettings {
     #[serde(rename = "YouTubeMusic")]
     pub you_tube_music: bool,
 
+    /// Deezer's track mix for the song (the list behind the radio button in Deezer's player), or
+    /// Deezer's radio for its artist when Deezer lacks the song. Needs no Deezer account. Every
+    /// song it suggests is one Deezer has, so it plays where outside songs play from Deezer.
+    /// RADIO_DEEZER.
+    pub deezer: bool,
+
     /// ListenBrainz's similar recordings, and LB Radio when Octo has a ListenBrainz token.
     /// RADIO_LISTENBRAINZ.
     pub listen_brainz: bool,
@@ -49,6 +55,7 @@ pub struct RadioSourceSettings {
     pub you_tube_music_weight: f64,
     pub listen_brainz_weight: f64,
     pub sounds_alike_weight: f64,
+    pub deezer_weight: f64,
 
     /// Let each listener's plays and skips move these weights (0.3 to 1.5).
     /// RADIO_LEARN_FROM_LISTENING.
@@ -59,6 +66,7 @@ impl Default for RadioSourceSettings {
     fn default() -> Self {
         Self {
             you_tube_music: true,
+            deezer: true,
             listen_brainz: true,
             sounds_alike: true,
             sounds_alike_from: SOUNDS_ALIKE_FROM_SONIC.to_string(),
@@ -71,6 +79,7 @@ impl Default for RadioSourceSettings {
             you_tube_music_weight: 1.0,
             listen_brainz_weight: 0.7,
             sounds_alike_weight: 0.4,
+            deezer_weight: 1.0,
             learn_from_listening: true,
         }
     }

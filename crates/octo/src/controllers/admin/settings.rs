@@ -345,6 +345,7 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
         "RadioSources".into(),
         n_obj([
             ("YouTubeMusic", Node::Bool(radio.you_tube_music)),
+            ("Deezer", Node::Bool(radio.deezer)),
             ("ListenBrainz", Node::Bool(radio.listen_brainz)),
             ("SoundsAlike", Node::Bool(radio.sounds_alike)),
             ("SoundsAlikeFrom", n_str(&radio.sounds_alike_from)),
@@ -356,6 +357,7 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
             ("YouTubeMusicWeight", n_num(radio.you_tube_music_weight)),
             ("ListenBrainzWeight", n_num(radio.listen_brainz_weight)),
             ("SoundsAlikeWeight", n_num(radio.sounds_alike_weight)),
+            ("DeezerWeight", n_num(radio.deezer_weight)),
             ("LearnFromListening", Node::Bool(radio.learn_from_listening)),
         ]),
     );

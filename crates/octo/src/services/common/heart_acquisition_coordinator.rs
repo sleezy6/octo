@@ -964,8 +964,8 @@ impl HeartAcquisitionCoordinator {
     fn enabled_steps(&self, album_heart: bool) -> Vec<HeartDownloadSource> {
         let snapshot = self.settings.current();
         // SpotiFLAC rides on the Soulseek step, so with SpotiFLAC on the step stays.
-        let soulseek_off = self.extras.soulseek.as_ref().is_some_and(|link| link.is_off())
-            && !snapshot.spotiflac.is_on();
+        let soulseek_off =
+            self.extras.soulseek.as_ref().is_some_and(|link| link.is_off()) && !snapshot.spotiflac.is_on();
         let you_tube_off = !self.settings.you_tube_enabled();
         let deezer_unset = !snapshot.deezer.is_configured();
         snapshot

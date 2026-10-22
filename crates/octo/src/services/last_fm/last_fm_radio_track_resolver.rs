@@ -145,6 +145,7 @@ impl LastFmRadioTrackResolver {
     /// The library's copy when it has the recording, else the first external placeholder.
     ///
     /// `you_tube_id`: a video a source already named for this song (YouTube Music).
+    /// `deezer_track_id`: the recording a source already named in Deezer's catalog (Deezer).
     pub async fn resolve(
         &self,
         artist: &str,
@@ -152,6 +153,7 @@ impl LastFmRadioTrackResolver {
         duration: Option<i32>,
         authenticated_parameters: &IndexMap<String, String>,
         you_tube_id: Option<&str>,
+        deezer_track_id: Option<&str>,
     ) -> Option<Song> {
         if let Some(local) = self
             .try_find_local_match(artist, title, authenticated_parameters)
@@ -169,6 +171,11 @@ impl LastFmRadioTrackResolver {
         // it suggested.
         if let Some(video) = you_tube_id.filter(|video| !video.is_empty()) {
             self.registry.pin_video(&hit.id, video, false);
+        }
+        // The placeholder is registered under the very artist and title the source gave, so
+        // its Deezer id is this song's: kept, a play or a heart skips Deezer's search.
+        if let Some(track) = deezer_track_id.filter(|track| !track.is_empty()) {
+            self.registry.keep_deezer_track(&hit.id, track);
         }
         Some(hit)
     }
@@ -568,6 +575,7 @@ mod tests {
                 Some(200),
                 &auth(&[("u", "alice"), ("t", "token"), ("s", "salt")]),
                 None,
+                None,
             )
             .await
             .expect("a song");
@@ -600,13 +608,13 @@ mod tests {
         )
         .await;
         let song = resolver
-            .resolve("A", "T", Some(180), &auth(&[("u", "alice")]), None)
+            .resolve("A", "T", Some(180), &auth(&[("u", "alice")]), None, None)
             .await;
         assert_eq!(song.map(|song| song.id), Some(expected.id));
     }
 
     #[tokio::test]
-    async fn resolver_keeps_the_video_a_source_named_without_replacing_one_already_found() {
+    async fn resolver_keeps_the_video_and_deezer_id_a_source_named_without_replacing_one_already_found() {
         let metadata = Arc::new(FakeMetadata::default());
         let (resolver, _server) = resolver(
             r#"{"subsonic-response":{"status":"ok","searchResult3":{"song":[]}}}"#,
@@ -643,14 +651,37 @@ mod tests {
         };
 
         resolver
-            .resolve("A", "T", Some(180), &IndexMap::new(), Some("video-1"))
+            .resolve(
+                "A",
+                "T",
+                Some(180),
+                &IndexMap::new(),
+                Some("video-1"),
+                Some("3135556"),
+            )
             .await;
         assert_eq!(video(&resolver).as_deref(), Some("video-1"));
 
         resolver
-            .resolve("A", "T", Some(180), &IndexMap::new(), Some("video-2"))
+            .resolve(
+                "A",
+                "T",
+                Some(180),
+                &IndexMap::new(),
+                Some("video-2"),
+                Some("999"),
+            )
             .await;
         assert_eq!(video(&resolver).as_deref(), Some("video-1"));
+        // The Deezer id the source named is kept the same way: the first one stays.
+        let kept = resolver
+            .registry
+            .lookup(&id)
+            .expect("known")
+            .lock()
+            .deezer_track_id
+            .clone();
+        assert_eq!(kept.as_deref(), Some("3135556"));
     }
 
     /// The library is searched with the main artist and the core title, a seed is a song, an

@@ -419,6 +419,9 @@ pub struct LastFmRadioTrack {
     pub is_local: bool,
     pub external_provider: Option<String>,
     pub you_tube_id: Option<String>,
+    /// The recording's id in Deezer's catalog, when Deezer's radio suggested it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deezer_track_id: Option<String>,
 }
 
 /// The dashboard's line for one listener.

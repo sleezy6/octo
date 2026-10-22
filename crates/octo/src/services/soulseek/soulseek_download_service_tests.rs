@@ -776,7 +776,17 @@ async fn build_verified(
     soulseek_on: bool,
     answers: impl FnOnce(Vec<Song>) -> Answers,
 ) -> Walk {
-    build_served(root, album_folders, source, soulseek_on, None, true, answers, |_| {}).await
+    build_served(
+        root,
+        album_folders,
+        source,
+        soulseek_on,
+        None,
+        true,
+        answers,
+        |_| {},
+    )
+    .await
 }
 
 /// `deezer`: Deezer as a source of audio, whether outside songs play from it, and its
@@ -789,7 +799,17 @@ async fn build_full(
     deezer: Option<(Arc<DeezerResolver>, bool, Option<Arc<DeezerAudioCache>>)>,
     answers: impl FnOnce(Vec<Song>) -> Answers,
 ) -> Walk {
-    build_served(root, album_folders, source, soulseek_on, deezer, false, answers, |_| {}).await
+    build_served(
+        root,
+        album_folders,
+        source,
+        soulseek_on,
+        deezer,
+        false,
+        answers,
+        |_| {},
+    )
+    .await
 }
 
 /// [`build_full`], with the download services changed by `extra` (a tracker, a write gate).

@@ -943,6 +943,7 @@ async fn resolve_station_tracks(
                     track.duration,
                     parameters,
                     track.you_tube_id.as_deref(),
+                    track.deezer_track_id.as_deref(),
                 )
                 .await
             {

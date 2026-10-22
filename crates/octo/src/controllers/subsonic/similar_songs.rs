@@ -33,20 +33,13 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
     let format = call.format.as_str();
     let builder = &state.subsonic_response_builder;
     let id = call.param_or("id", "").to_string();
-    let settings = state.settings.current();
     // Octo's own apps mix the radio themselves and ask for the order of fit (octoMix=client);
     // for every other app this order is the radio, so outside songs are placed at random at the
     // radio's own mix (last_fm_radio_placement).
     let client_order = dotnet::eq_ignore_case(call.param_or("octoMix", ""), "client");
-    // Octo's apps may ask for up to 100 songs, whatever RadioTrackCount is: at Lots and Mostly
-    // new they need more outside songs than a 50-song answer holds. Every other app gets the
-    // dashboard's count at most, as before.
-    let most = if client_order {
-        MOST_FOR_OCTO_APPS
-    } else {
-        settings.last_fm.effective_radio_track_count().max(1)
-    };
-    let count = int_param(&call.parameters, "count", 50).clamp(1, most);
+    // A song radio is as long as the app asks, up to 100, whatever RadioTrackCount is: its songs
+    // are a draw from every source's whole list, not the stations' length.
+    let count = int_param(&call.parameters, "count", 50).clamp(1, MOST_FOR_OCTO_APPS);
 
     // Subsonic spec: getSimilarSongs.view → key "similarSongs"; getSimilarSongs2.view →
     // "similarSongs2". Clients (Arpeggi) parse the v2 key strictly and ignore v1-shaped
@@ -178,6 +171,23 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
         .map(|banned| artist_key(&banned.artist))
         .filter(|key| !key.eq_ignore_ascii_case(&seed_artist))
         .collect();
+    // What the listener played in the last eight days waits until nothing else fits.
+    let heard: IgnoreCaseKeys = listener
+        .as_deref()
+        .map(|listener| {
+            let since = chrono::Utc::now() - chrono::TimeDelta::days(8);
+            state
+                .last_fm_radio_state
+                .get_user(listener)
+                .plays
+                .iter()
+                .filter(|play| play.played_at_utc > since)
+                .map(|play| {
+                    octo_core::last_fm::last_fm_radio_seed_normalizer::track_key(&play.artist, &play.title)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let seed = RadioSeed {
         artist: artist_name.clone(),
         title: track_title.clone(),
@@ -194,6 +204,7 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
             &call.parameters,
             &bans,
             &banned_artists,
+            &heard,
             &resolver,
             client_order,
         )

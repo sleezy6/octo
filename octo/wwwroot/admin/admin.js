@@ -9336,7 +9336,7 @@ document.getElementById('deezer-cache-clear')?.addEventListener('click', async e
 // ────────────────────────────────────────────────────────────────
 const DEEZER_USE_WORDS = {
   search: 'Search', lengths: 'Song lengths', artistPages: 'Artist pages', albumPages: 'Album pages',
-  covers: 'Covers and artist pictures', playback: 'Finding songs to play or keep', songLookups: 'Song facts', other: 'Other',
+  covers: 'Covers and artist pictures', playback: 'Finding songs to play or keep', songLookups: 'Song facts', radio: 'Song radio', other: 'Other',
 };
 const deezerCell = u => {
   const n = u.interactive + u.background;

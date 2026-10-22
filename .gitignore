@@ -103,8 +103,9 @@ parity/
 /octo-cache/
 
 # Markdown notes, plans and reports stay local. Published: the READMEs, the Family
-# guide the README links to and the icon attribution.
+# guide the README links to, the list of this fork's changes and the icon attribution.
 *.md
 !README.md
 !docs/family.md
+!docs/fork-changes.md
 !scripts/admin-icons/SOURCES.md

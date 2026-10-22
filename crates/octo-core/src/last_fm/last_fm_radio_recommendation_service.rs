@@ -602,6 +602,7 @@ impl Walk<'_> {
             duration: track.duration,
             score: track.r#match,
             you_tube_id: track.you_tube_id.clone(),
+            deezer_track_id: track.deezer_track_id.clone(),
             // Which source suggested it, shown in the apps; a familiar song was the listener's
             // own pick.
             source: track.provider.clone().unwrap_or_else(|| {

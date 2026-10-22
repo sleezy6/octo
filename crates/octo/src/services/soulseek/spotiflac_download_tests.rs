@@ -325,6 +325,9 @@ impl Setup {
             lidarr_imports: None,
             lidarr_fetcher: None,
             spotiflac: Some(spotiflac),
+            deezer: None,
+            deezer_cache: None,
+            stream_from_deezer: false,
         };
         let (service, _) = SoulseekDownloadService::build(core, services, parts);
         Fetch {

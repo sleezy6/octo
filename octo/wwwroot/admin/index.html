@@ -1117,6 +1117,10 @@
               <label class="switch"><input type="checkbox" name="RadioSources.YouTubeMusic" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Deezer</div><div class="set-info-d">Deezer's mix for the song, the list behind the radio button in Deezer's own player, or its radio for the artist when Deezer does not have the song. Needs no Deezer account.</div><div class="set-info-more">Every song it suggests is one Deezer has, so it plays when songs you don't own play from Deezer. Deezer receives the song's id in its catalog, as its own player sends it.</div></div>
+              <label class="switch"><input type="checkbox" name="RadioSources.Deezer" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
               <div class="set-info"><div class="set-info-t">ListenBrainz</div><div class="set-info-d">Songs people play alongside it, from ListenBrainz's open listening data. With a ListenBrainz token, its radio also fills artist and genre stations.</div></div>
               <label class="switch"><input type="checkbox" name="RadioSources.ListenBrainz" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
@@ -1147,6 +1151,7 @@
             <details class="radio-advanced">
               <summary>How much each source counts</summary>
               <div class="set-row stack"><div class="set-info"><div class="set-info-t">YouTube Music</div><div class="set-info-d">0 to 3. 0 leaves the source out. Default: 1.0.</div></div><input class="set-input" name="RadioSources.YouTubeMusicWeight" type="number" min="0" max="3" step="0.1" /></div>
+              <div class="set-row stack"><div class="set-info"><div class="set-info-t">Deezer</div><div class="set-info-d">Default: 1.0.</div></div><input class="set-input" name="RadioSources.DeezerWeight" type="number" min="0" max="3" step="0.1" /></div>
               <div class="set-row stack"><div class="set-info"><div class="set-info-t">Last.fm</div><div class="set-info-d">Default: 0.9.</div></div><input class="set-input" name="RadioSources.LastFmWeight" type="number" min="0" max="3" step="0.1" /></div>
               <div class="set-row stack"><div class="set-info"><div class="set-info-t">ListenBrainz</div><div class="set-info-d">Default: 0.7.</div></div><input class="set-input" name="RadioSources.ListenBrainzWeight" type="number" min="0" max="3" step="0.1" /></div>
               <div class="set-row stack"><div class="set-info"><div class="set-info-t">Sounds alike</div><div class="set-info-d">How a song sounds says tempo and timbre, not genre or mood, so alone it counts least. When no catalog knows the song, it counts at least 0.8. Default: 0.4.</div></div><input class="set-input" name="RadioSources.SoundsAlikeWeight" type="number" min="0" max="3" step="0.1" /></div>
@@ -2611,7 +2616,7 @@
             </div>
             <details class="cover-how">
               <summary>How it works</summary>
-              <p>Each song goes through Better quality, exactly as the action playlist does it: a lossless copy is looked for, checked to be the same recording and really lossless, and put in the original's place, so the song keeps its plays, favorites and playlist places. The original waits in quarantine until its replacement passes. A song with no lossless copy on any of them stays as it is and is not looked for again by the weekly upgrade for 4 weeks. Copies come from the sources named above, Deezer first, then Soulseek, then Lidarr; while every one of them is out, songs wait.</p>
+              <p>Each song goes through Better quality, exactly as the action playlist does it: a lossless copy is looked for, checked to be the same recording and really lossless, and put in the original's place, so the song keeps its plays, favorites and playlist places. The original waits in quarantine until its replacement passes. A song with no lossless copy on any of them stays as it is and is not looked for again by the weekly upgrade for 4 weeks. Copies come from the sources named above, Deezer first, then Soulseek (and SpotiFLAC, when it is on), then Lidarr; while every one of them is out, songs wait.</p>
               <p>Narrow the list with the filters, then Select picks the first songs it shows, up to 2,000 a press; Find higher quality queues them and they run as many at a time as Parallel downloads allows. Press Select again for the next ones. An unsure AcoustID match is a song whose download Octo could not confirm as the recording asked for, or one the library tag check could not pin down. From any other app, add songs to the Better quality action playlist or give them its rating (4 stars unless you changed it).</p>
             </details>
           </div>
@@ -2855,7 +2860,7 @@
               <input class="set-input" name="LibraryActions.UpgradePerWeek" type="number" min="0" max="500" data-number="true" aria-label="Songs to upgrade a week" />
             </div>
             <div class="set-row stack">
-              <div class="set-info"><div class="set-info-t">Where to look for a higher quality copy</div><div class="set-info-d"><strong>Automatic</strong> asks Deezer first, then Soulseek, then Lidarr, each for what the one before cannot find, using whichever of them is set up. Deezer is asked for a FLAC and nothing less, so an account whose plan gives no FLAC is passed over.</div><div class="set-info-more">Lidarr fetches whole albums, so Octo borrows the album: it copies out the one song, deletes the other files that search brought in, and puts the album's monitoring back as it was. A song Lidarr already manages is left to Lidarr. While Soulseek is offline, Lidarr is asked alone.</div></div>
+              <div class="set-info"><div class="set-info-t">Where to look for a higher quality copy</div><div class="set-info-d"><strong>Automatic</strong> asks Deezer first, then Soulseek, then Lidarr, each for what the one before cannot find, using whichever of them is set up. With SpotiFLAC on, Soulseek's turn asks SpotiFLAC too, in the order the SpotiFLAC page gives, and is there even while Soulseek is off. Deezer is asked for a FLAC and nothing less, so an account whose plan gives no FLAC is passed over.</div><div class="set-info-more">Lidarr fetches whole albums, so Octo borrows the album: it copies out the one song, deletes the other files that search brought in, and puts the album's monitoring back as it was. A song Lidarr already manages is left to Lidarr. While Soulseek is offline, Lidarr is asked alone.</div></div>
               <select class="set-input" name="LibraryActions.UpgradeSource">
                 <option value="Auto">Automatic</option>
                 <option value="Soulseek">Soulseek only</option>

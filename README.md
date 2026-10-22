@@ -34,7 +34,6 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 - **Every song has a length.** A song from outside your library gets its length from Deezer, then Apple's catalog, then Last.fm. Radio stations, instant mixes and song lookups wait a moment for it, so players that read a length only once (iPhone apps such as NaviBeat) show it.
 - **Songs Deezer's search misses are still found.** When a song is on Deezer but its search cannot find it (a copy not sold where Octo runs, or an artist who shares a name), Octo asks MusicBrainz for the recording's ISRC and looks it up by that. Where several artists share a name, the one most people follow is taken, however far down Deezer's search lists it.
 - **Deezer kept within its limits.** Octo paces its Deezer requests, ahead for what an app is waiting on and behind for background work, and keeps each account's sign-in until Deezer says it expires, signing in again only when Deezer says it is no longer good. An ARL Deezer refuses is not used again until you change it, and a song Deezer has no audio for is not asked about again for six hours. Once a length lookup has found a song on Deezer (the very recording, not a near match), playing or hearting it goes straight to that track with no second search; a track that turns out to have no audio is forgotten and searched for again. The dashboard's Deezer page counts the requests of the last hour and since Octo started, by what they were for, and the log has the same once an hour.
-- **Plain covers for outside music.** Octo no longer stamps its octopus on the covers of songs and albums from outside your library; switch **Octopus on outside covers** on in the dashboard's cover settings (or `BADGE_OUTSIDE_COVERS=true`) to have it back.
 - **One entry for an album you hold a little of.** When your library has only a song or two of an album (from hearting them), search and artist pages list the whole album once, with how many songs you have, instead of your partial copy beside it.
 - **Favorites become Last.fm loves.** A listener connected to Last.fm on the dashboard has every song they favorite, in any app, loved on their Last.fm, and unloved when they take the favorite back. The favorites they already had are loved once, after their next play. + Add to library from the Octo apps is a copy, not a favorite, so it is not loved. The dashboard's Last.fm page shows where each listener stands and the last song loved; switch **Love favorites on Last.fm** off there to stop it. See [Playback and acquisition](#playback-and-acquisition).
 - **Leave an artist out of your radio.** Rate an artist one star in any app and their songs leave your radio, stations and mixes, whoever else's records they turn up on. The same happens on its own once you have rated three of their songs one star (**Leave an artist out after** under Radio, 0 for never). Rating the artist anything else lifts it, and so does **Lift** beside their name on the dashboard's Radio page; radio you start from the artist themselves still plays them.
@@ -42,9 +41,13 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 - **Family playlists for chosen people.** A family playlist can be shared with the members you pick (**Shared with** on the Family page, or `sharedWith` in the family API) instead of the whole family. Its maker, the owner and family managers always see it, and only those who see it can add to it.
 - **Animated covers for albums Apple's search hides.** Apple's search leaves out an explicit album that has no clean edition, so the animated-art sweep never found one. Octo now asks MusicBrainz for the album's barcodes and looks it up on Apple by those. An album whose title differs only by a subtitle, like a remixes edition, is no longer taken for the album itself. **Look again** on the dashboard's animated-art card asks about every album Apple had none for, instead of waiting the week out.
 - **Sounds alike from Navidrome.** Radio's sound-based picks can come from Navidrome's own similar songs (which a plugin such as [AudioMuse-AI](https://github.com/NeptuneHub/AudioMuse-AI) can answer) instead of octo-sonic, to compare the two: **Sounds alike from** under Radio sources.
-- **Lyrics Octo did not write can be replaced.** Off by default; switch **Replace lyrics Octo did not write** on under the lyrics settings and better lyrics, or lyrics you pick, replace a song's own `.lrc`, `.txt` or embedded lyrics, each kept in the undo journal. A busy LRCLIB no longer ends a lyrics lookup before its search ([winters27/octo#98](https://github.com/winters27/octo/issues/98)).
+- **Lyrics Octo did not write can be replaced.** Off by default; switch **Replace lyrics Octo did not write** on under the lyrics settings and better lyrics, or lyrics you pick, replace a song's own `.lrc`, `.txt` or embedded lyrics, each kept in the undo journal.
 - **Starter Radio can be turned off.** `LASTFM_ENABLE_STARTER_RADIO=false` gives a new listener no mix of their own until enough plays were learned from.
+- **Deezer radio and more varied song radio.** Deezer's own song and artist radios join radio's sources (no account needed; **Deezer** under Radio sources, `RADIO_DEEZER`), and song radio is drawn from every source's list rather than cut from the top, with fewer repeats of what a listener heard lately. Both ported from [am-yy/octo](https://github.com/am-yy/octo).
+- **SpotiFLAC for Better quality too.** Upstream's SpotiFLAC source rides on Soulseek's turn for hearts; here it also does for Better quality, and that turn stays available while Soulseek is off or not logged in, so a server without Soulseek can still upgrade songs through SpotiFLAC.
 - **Bring your own Navidrome.** The built-in installer and bundled Navidrome are gone; Octo runs beside the Navidrome you already have.
+
+Every change, with the settings and endpoints involved, is listed in [docs/fork-changes.md](docs/fork-changes.md).
 
 It also runs a little differently:
 
@@ -497,17 +500,19 @@ library. **Start radio from this song** remains a one-time `getSimilarSongs[2]` 
 
 #### Radio sources
 
-That queue, and every station, draws on four sources and blends their answers:
+That queue, and every station, draws on five sources and blends their answers:
 
 | Source | What it gives |
 | --- | --- |
 | Last.fm | songs like the seed, by its artist and title; similar artists; tag charts |
 | YouTube Music | YouTube Music's radio for the song, which knows uploads Last.fm never heard of (nightcore and phonk channels included); for an artist, the artist's radio |
 | ListenBrainz | recordings people play alongside it, from ListenBrainz's open listening data; with a ListenBrainz token, LB Radio for artist and genre stations |
+| Deezer | Deezer's own radio for the song (the list behind the radio button in Deezer's player), or else for its artist; needs no Deezer account, and its songs play and download from Deezer with no search |
 | Sounds alike | library songs that sound like it (tempo, timbre, loudness, harmony), from Octo's own analysis of every file |
 
 Each song scores its source's weight, times how closely that source matched the seed itself,
-times its place in the source's list; a song more than one source suggests adds up. A source
+times its place in the source's list; a song more than one source suggests counts its strongest
+source in full and each other at a quarter, so agreement helps without crowding out the rest. A source
 with only a few songs counts less. When the catalogs have fewer than 20 songs like the seed
 itself, as with a YouTube upload tagged with its uploader for the artist, the seed's own tags
 lead: the rest of its album (for a library downloaded from playlists, the playlist), library
@@ -515,17 +520,24 @@ songs with its genre, and the top songs for that genre. Similar artists to the s
 join only when the source knows the artist, so an uploader's name never picks the music. A
 nightcore, sped up or remixed seed whose original is known gets songs like the original too,
 behind its album and genre. A title written "Artist - Title" is also looked up under the artist
-it names. An album id starts from its first song, an artist id from artists like them. In song
-radio a library song that sounds far from the seed slips down and one that sounds close moves
-up.
+it names. An album id starts from its first song, an artist id from artists like them.
+
+Song radio (up to 100 songs, in every app) is drawn rather than cut from the top: each source
+is asked for 100 songs, the best match comes first, and the rest are drawn by score, so two
+radios from the same song differ and a source's whole list gets a chance. A listener's songs
+from radio in the last week weigh about a third as much in the draw, songs they played in the
+last 8 days wait behind the rest, and no artist takes more than a tenth of the radio (the seed's
+artist a quarter). The Octo apps get the drawn songs best first. When the seed's own tags lead,
+song radio keeps its old order, where a library song that sounds far from the seed slips down
+and one that sounds close moves up. What was served is kept in memory, so a restart forgets it.
 
 Every radio song carries `octoSuggestedBy`, the source that counted most for it, and the Octo
 apps show it in the song's info. Radio also learns from listening: a radio song played through
 counts for its source and one skipped counts against it, per listener, and each listener's
 weights lean on the sources they keep (never below 0.3 or above 1.5). The dashboard's Radio page
-has the switches, the base weights (YouTube Music 1.0, Last.fm 0.9, ListenBrainz 0.7, Sounds
-alike 0.4), what radio has learned, and "Forget what radio learned". `RADIO_YOUTUBE_MUSIC`,
-`RADIO_LISTENBRAINZ`, `RADIO_SOUNDS_ALIKE` and `RADIO_LEARN_FROM_LISTENING` switch them in `.env`.
+has the switches, the base weights (YouTube Music 1.0, Deezer 1.0, Last.fm 0.9, ListenBrainz 0.7,
+Sounds alike 0.4), what radio has learned, and "Forget what radio learned". `RADIO_YOUTUBE_MUSIC`,
+`RADIO_DEEZER`, `RADIO_LISTENBRAINZ`, `RADIO_SOUNDS_ALIKE` and `RADIO_LEARN_FROM_LISTENING` switch them in `.env`.
 YouTube Music and ListenBrainz receive the artist and title of the song a radio starts from.
 
 To compare it with another analysis, the dashboard's **Sounds alike from** (Radio sources) can ask Navidrome's own similar songs instead, which a Navidrome plugin such as [AudioMuse-AI](https://github.com/NeptuneHub/AudioMuse-AI) can answer: song radio asks it with the listener's sign-in, station refreshes with Octo's Navidrome admin sign-in, and octo-sonic no longer reorders radio's library picks. It still reads songs for their transition profiles.

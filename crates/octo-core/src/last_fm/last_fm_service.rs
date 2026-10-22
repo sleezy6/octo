@@ -4,7 +4,8 @@
 /// One song Last.fm suggested or found.
 ///
 /// `listeners`: how many people Last.fm counts for the row, where the call says.
-/// `you_tube_id`: the video a source already knows plays this song. `provider`: the
+/// `you_tube_id`: the video a source already knows plays this song. `deezer_track_id`: the
+/// recording's id in Deezer's catalog, when the source that named it is Deezer. `provider`: the
 /// `services::radio::radio_provider` key of the source that suggested it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimilarTrack {
@@ -14,6 +15,7 @@ pub struct SimilarTrack {
     pub duration: Option<i32>,
     pub listeners: Option<i64>,
     pub you_tube_id: Option<String>,
+    pub deezer_track_id: Option<String>,
     pub provider: Option<String>,
 }
 
@@ -27,6 +29,7 @@ impl SimilarTrack {
             duration: None,
             listeners: None,
             you_tube_id: None,
+            deezer_track_id: None,
             provider: None,
         }
     }
@@ -46,6 +49,12 @@ impl SimilarTrack {
     /// The same track with its YouTube id set.
     pub fn with_you_tube_id(mut self, you_tube_id: Option<String>) -> Self {
         self.you_tube_id = you_tube_id;
+        self
+    }
+
+    /// The same track with its Deezer catalog id set.
+    pub fn with_deezer_track_id(mut self, deezer_track_id: Option<String>) -> Self {
+        self.deezer_track_id = deezer_track_id;
         self
     }
 

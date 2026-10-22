@@ -33,12 +33,14 @@ pub enum DeezerUse {
     Playback,
     /// A song's facts looked up by artist and title, outside any of the above.
     SongLookups,
+    /// Song radio's Deezer source: the song's or its artist's Deezer radio.
+    Radio,
     /// Charts, genres and anything else.
     Other,
 }
 
 impl DeezerUse {
-    pub const ALL: [DeezerUse; 8] = [
+    pub const ALL: [DeezerUse; 9] = [
         DeezerUse::Search,
         DeezerUse::Lengths,
         DeezerUse::ArtistPages,
@@ -46,6 +48,7 @@ impl DeezerUse {
         DeezerUse::Covers,
         DeezerUse::Playback,
         DeezerUse::SongLookups,
+        DeezerUse::Radio,
         DeezerUse::Other,
     ];
 
@@ -59,6 +62,7 @@ impl DeezerUse {
             DeezerUse::Covers => "covers",
             DeezerUse::Playback => "playback",
             DeezerUse::SongLookups => "song lookups",
+            DeezerUse::Radio => "radio",
             DeezerUse::Other => "other",
         }
     }

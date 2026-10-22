@@ -93,6 +93,8 @@ enum Cached {
     Album(AlbumLookup),
     Chart(Arc<Vec<octo_core::charts::top_songs::CatalogTrack>>),
     Tempo(Option<f64>),
+    /// A Deezer radio: a track mix or an artist's radio.
+    Mix(Arc<Vec<radio::RadioTrack>>),
 }
 
 /// Result of one Deezer call. Deezer answers HTTP 200 even when it is refusing the
@@ -174,6 +176,12 @@ struct Inner {
     in_flight_calls: InFlight<DeezerResponse>,
     /// The chart and artist top lists on their way (`deezer_charts.rs`).
     in_flight_charts: InFlight<Option<Arc<Vec<octo_core::charts::top_songs::CatalogTrack>>>>,
+
+    /// The web player's gateway (www.deezer.com), for the radios the public API lacks
+    /// (`deezer_metadata_service_radio.rs`), its client and the anonymous session it hands out.
+    gateway: String,
+    gateway_client: reqwest::Client,
+    gateway_session: tokio::sync::Mutex<Option<radio::GatewaySession>>,
 }
 
 /// Flow out of a block that can return early.
@@ -184,6 +192,8 @@ enum Flow<T> {
 
 impl DeezerMetadataService {
     pub const BASE: &'static str = "https://api.deezer.com";
+    /// The web player's gateway host.
+    pub const GATEWAY: &'static str = "https://www.deezer.com";
 
     pub fn new(http: Arc<DeezerRateLimitHandler>, settings: Arc<SettingsStore>) -> Self {
         Self::with_base_url(http, settings, Self::BASE)
@@ -195,11 +205,18 @@ impl DeezerMetadataService {
         settings: Arc<SettingsStore>,
         base: impl Into<String>,
     ) -> Self {
+        let base: String = base.into().trim_end_matches('/').to_string();
+        // A test's mock server stands in for the gateway too.
+        let gateway = if base == Self::BASE {
+            Self::GATEWAY.to_string()
+        } else {
+            base.clone()
+        };
         Self {
             inner: Arc::new(Inner {
                 http,
                 settings,
-                base: base.into().trim_end_matches('/').to_string(),
+                base,
                 cache: MemoryCache::new(MAX_CACHE),
                 album_year_tasks: InFlight::new(),
                 in_flight_artists: InFlight::new(),
@@ -208,6 +225,15 @@ impl DeezerMetadataService {
                 in_flight_albums: InFlight::new(),
                 in_flight_calls: InFlight::new(),
                 in_flight_charts: InFlight::new(),
+                gateway,
+                // The web player's own calls, so they say what the web player's browser does:
+                // the desktop Chrome Deezer playback already calls itself.
+                gateway_client: crate::services::framework::http::client_builder()
+                    .user_agent(crate::services::deezer::DeezerResolver::USER_AGENT)
+                    .timeout(Duration::from_secs(8))
+                    .build()
+                    .expect("the Deezer gateway client builds"),
+                gateway_session: tokio::sync::Mutex::new(None),
             }),
         }
     }
@@ -2425,6 +2451,10 @@ mod tempo;
 // The catalog's id for a song, for playing and keeping it from Deezer.
 #[path = "deezer_metadata_service_playable.rs"]
 mod playable;
+
+// Deezer's own radios, for song radio's Deezer source.
+#[path = "deezer_metadata_service_radio.rs"]
+pub mod radio;
 pub use playable::recording_matches;
 
 pub use tempo::DeezerPublishedTempo;

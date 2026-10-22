@@ -233,6 +233,7 @@ services:
       LastFm__MinimumPlays: ${LASTFM_MINIMUM_PLAYS:-10}
       # Radio's other sources (multi-source radio). Weights live on the dashboard's Radio page.
       RadioSources__YouTubeMusic: ${RADIO_YOUTUBE_MUSIC:-true}
+      RadioSources__Deezer: ${RADIO_DEEZER:-true}
       RadioSources__ListenBrainz: ${RADIO_LISTENBRAINZ:-true}
       RadioSources__ListenBrainzAlgorithm: ${RADIO_LISTENBRAINZ_ALGORITHM:-session_based_days_9000_session_300_contribution_5_threshold_15_limit_50_skip_30}
       RadioSources__ListenBrainzRadioMode: ${RADIO_LISTENBRAINZ_RADIO_MODE:-easy}

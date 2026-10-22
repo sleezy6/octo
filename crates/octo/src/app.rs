@@ -135,8 +135,8 @@ use crate::services::metadata::{GenreBackfillJournal, GenreBackfillStore, GenreB
 use crate::services::notifications::{DiscordSink, INotificationSink, NotificationService, NtfySink};
 use crate::services::prefetch::{PrefetchParts, PrefetchService, PrefetchStore, PrefetchedFiles};
 use crate::services::radio::{
-    IRadioSource, LastFmRadioSource, ListenBrainzRadioSource, RadioOutcomeStore, RadioSourceSet,
-    SongRadioService, SoundsAlikeRadioSource, YouTubeMusicRadioSource,
+    DeezerRadioSource, IRadioSource, LastFmRadioSource, ListenBrainzRadioSource, RadioOutcomeStore,
+    RadioSourceSet, SongRadioService, SoundsAlikeRadioSource, YouTubeMusicRadioSource,
 };
 use crate::services::sonic::{
     ISonicClient, NavidromeSonicLibrary, SonicAnalysisWorker, SonicClient, SonicStore, TransitionStore,
@@ -2088,6 +2088,7 @@ impl Radio {
                 settings.clone(),
             )),
             Arc::new(ListenBrainzRadioSource::new(listen_brainz, settings.clone())),
+            Arc::new(DeezerRadioSource::new(Arc::clone(deezer), settings.clone())),
             Arc::new(
                 SoundsAlikeRadioSource::new(sonic_store.clone(), settings.clone())
                     .with_identity(navidrome.navidrome_identity.clone()),
@@ -3952,7 +3953,7 @@ mod tests {
         assert!(state.radio_outcomes.path().ends_with("radio-outcomes.json"));
         assert!(state.sonic_store.path().ends_with("sonic-features.json"));
         assert_eq!(state.sonic_worker.status().state, "Waiting");
-        assert_eq!(state.radio_sources.weights(None, false).len(), 5);
+        assert_eq!(state.radio_sources.weights(None, false).len(), 6);
         let token = state
             .last_fm_radio_stream_sessions
             .issue("alice", "or1", [("u", "alice")], None);

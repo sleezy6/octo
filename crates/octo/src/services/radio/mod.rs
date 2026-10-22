@@ -2,6 +2,7 @@
 //! that asks them together, song radio (getSimilarSongs) and what radio learns from listening
 //! (`radio-outcomes.json`). The records and the blend are `octo_core::radio`.
 
+pub mod deezer_radio_source;
 pub mod last_fm_radio_source;
 pub mod listen_brainz_radio_source;
 pub mod radio_outcome_store;
@@ -11,6 +12,7 @@ pub mod song_radio_service;
 pub mod sounds_alike_radio_source;
 pub mod you_tube_music_radio_source;
 
+pub use deezer_radio_source::DeezerRadioSource;
 pub use last_fm_radio_source::LastFmRadioSource;
 pub use listen_brainz_radio_source::ListenBrainzRadioSource;
 pub use radio_outcome_store::{OutcomeCounts, OutcomeState, ProviderOutcome, RadioOutcomeStore};

@@ -6,19 +6,21 @@ pub const YOU_TUBE_MUSIC: &str = "youtube-music";
 pub const LISTEN_BRAINZ: &str = "listenbrainz";
 pub const SOUNDS_ALIKE: &str = "sounds-alike";
 pub const LIBRARY: &str = "library";
+/// Deezer's track mix, or its artist radio.
+pub const DEEZER: &str = "deezer";
 /// A song from the listener's own plays, which no source suggested.
 pub const HISTORY: &str = "history";
 
 /// The sources that know songs beyond the library.
 pub fn is_catalog(provider: &str) -> bool {
-    matches!(provider, LAST_FM | YOU_TUBE_MUSIC | LISTEN_BRAINZ)
+    matches!(provider, LAST_FM | YOU_TUBE_MUSIC | LISTEN_BRAINZ | DEEZER)
 }
 
 /// A provider's own key, as a station's source lists are prefixed with.
 pub fn is_known(key: &str) -> bool {
     matches!(
         key,
-        LAST_FM | YOU_TUBE_MUSIC | LISTEN_BRAINZ | SOUNDS_ALIKE | LIBRARY | HISTORY
+        LAST_FM | YOU_TUBE_MUSIC | LISTEN_BRAINZ | DEEZER | SOUNDS_ALIKE | LIBRARY | HISTORY
     )
 }
 
@@ -28,6 +30,7 @@ pub fn display_name(provider: Option<&str>) -> Option<&'static str> {
         LAST_FM => Some("Last.fm"),
         YOU_TUBE_MUSIC => Some("YouTube Music"),
         LISTEN_BRAINZ => Some("ListenBrainz"),
+        DEEZER => Some("Deezer"),
         SOUNDS_ALIKE => Some("Sounds alike"),
         LIBRARY => Some("Your library"),
         _ => None,
@@ -36,9 +39,16 @@ pub fn display_name(provider: Option<&str>) -> Option<&'static str> {
 
 /// The key behind a display name, for a song that carries only the name.
 pub fn from_display_name(name: Option<&str>) -> Option<&'static str> {
-    [LAST_FM, YOU_TUBE_MUSIC, LISTEN_BRAINZ, SOUNDS_ALIKE, LIBRARY]
-        .into_iter()
-        .find(|key| display_name(Some(key)) == name)
+    [
+        LAST_FM,
+        YOU_TUBE_MUSIC,
+        LISTEN_BRAINZ,
+        DEEZER,
+        SOUNDS_ALIKE,
+        LIBRARY,
+    ]
+    .into_iter()
+    .find(|key| display_name(Some(key)) == name)
 }
 
 #[cfg(test)]
@@ -47,7 +57,14 @@ mod tests {
 
     #[test]
     fn names_and_keys_go_both_ways() {
-        for key in [LAST_FM, YOU_TUBE_MUSIC, LISTEN_BRAINZ, SOUNDS_ALIKE, LIBRARY] {
+        for key in [
+            LAST_FM,
+            YOU_TUBE_MUSIC,
+            LISTEN_BRAINZ,
+            DEEZER,
+            SOUNDS_ALIKE,
+            LIBRARY,
+        ] {
             assert_eq!(from_display_name(display_name(Some(key))), Some(key), "{key}");
             assert!(is_known(key));
         }

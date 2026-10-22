@@ -1654,6 +1654,10 @@ impl LibraryActionExecutor {
     }
 
     async fn soulseek_out(&self) -> bool {
+        // SpotiFLAC rides on the Soulseek step, so with it on the step is never out.
+        if self.settings.current().spotiflac.is_on() {
+            return false;
+        }
         match &self.soulseek_link {
             Some(link) => link
                 .read(false)
