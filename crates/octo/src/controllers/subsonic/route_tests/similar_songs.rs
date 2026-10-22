@@ -424,6 +424,14 @@ async fn fixture(change: impl FnOnce(&mut AppSettings)) -> Fixture {
     }
 }
 
+/// One of the 25 songs Last.fm names as like Teardrop. Radio draws 20 of them by weight, so
+/// which ones it keeps after the best match varies from one radio to the next.
+fn teardrop_like(id: &str) -> bool {
+    id == "ext-Portishead-Glory Box"
+        || id == "ext-Morcheeba-Trigger Hippie"
+        || (1..=23).any(|i| id == format!("ext-Artist {i}-Song {i}"))
+}
+
 async fn radio_ids(f: &Fixture, id: &str) -> Vec<String> {
     let body = get_string(
         &f.app,
@@ -531,10 +539,7 @@ async fn known_song_is_last_fms_radio_as_before() {
     // A full answer for the song itself: Last.fm's best match first (the rest is drawn), and
     // the library is not asked.
     assert_eq!(songs[0], "ext-Portishead-Glory Box");
-    assert!(
-        songs.iter().any(|id| id == "ext-Morcheeba-Trigger Hippie"),
-        "{songs:?}"
-    );
+    assert!(songs.iter().all(|id| teardrop_like(id)), "{songs:?}");
     assert_eq!(songs.len(), 20);
     assert!(!f.calls().iter().any(|call| call.contains("rest/getAlbum")));
 }
@@ -777,7 +782,8 @@ async fn a_song_the_listener_rated_one_star_stays_off_their_radio() {
         .set_radio_ban("alice", "glory-box", "Portishead", "Glory Box", true);
     let songs = radio_ids(&f, "teardrop").await;
     assert!(!songs.contains(&"ext-Portishead-Glory Box".to_string()));
-    assert!(songs.contains(&"ext-Morcheeba-Trigger Hippie".to_string()));
+    // The next best match leads in its place.
+    assert_eq!(songs[0], "ext-Morcheeba-Trigger Hippie", "{songs:?}");
 }
 
 #[tokio::test]
@@ -826,10 +832,7 @@ async fn album_id_is_a_radio_from_its_first_song() {
     let f = fixture(|_| {}).await;
     let songs = radio_ids(&f, "album-trip").await;
     assert_eq!(songs[0], "ext-Portishead-Glory Box");
-    assert!(
-        songs.iter().any(|id| id == "ext-Morcheeba-Trigger Hippie"),
-        "{songs:?}"
-    );
+    assert!(songs.iter().all(|id| teardrop_like(id)), "{songs:?}");
 }
 
 #[tokio::test]
