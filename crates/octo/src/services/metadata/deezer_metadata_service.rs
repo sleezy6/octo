@@ -1183,7 +1183,7 @@ impl DeezerMetadataService {
     /// The catalog artists named exactly `artist`, the best known first (most fans, then most
     /// albums), at most [`SAME_NAME_ARTISTS`]. Deezer has three called "Burial", and the one
     /// most people mean is the third its search lists; the others are still tried after it.
-    pub(crate) async fn artists_named(&self, artist: &str, background: bool) -> Vec<ArtistHit> {
+    async fn artists_named(&self, artist: &str, background: bool) -> Vec<ArtistHit> {
         if is_blank(artist) {
             return Vec::new();
         }
