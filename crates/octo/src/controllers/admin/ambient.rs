@@ -131,9 +131,9 @@ mod tests {
         let server = MockServer::builder().start().await;
         let cover = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../parity/stubs/bodies/cover.jpg"
+            "/../../docs/rust-migration/fixtures/covers/sample-cover.jpg"
         ))
-        .expect("the parity cover");
+        .expect("the sample cover");
         Mock::given(method("GET"))
             .and(path("/glass.jpg"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(cover))

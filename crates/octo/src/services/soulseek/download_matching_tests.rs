@@ -1126,6 +1126,7 @@ pub(crate) async fn star(answer: Answer, services: DownloadServices) -> Star {
         soulseek_link: None,
         lidarr_imports: None,
         lidarr_fetcher: None,
+        spotiflac: None,
     };
     let (service, _) = SoulseekDownloadService::build(core, services, parts);
     Star {

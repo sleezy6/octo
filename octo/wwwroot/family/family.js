@@ -268,6 +268,7 @@
   // ── Navigation ───────────────────────────────────────────────────────────────────────
   var VIEWS_INFO = {
     overview: ['Overview', 'pulse'],
+    listening: ['Listening', 'headphones'],
     devices: ['Devices', 'phone'],
     requests: ['Requests', 'tray'],
     saved: ['Saved', 'heart'],
@@ -279,15 +280,17 @@
     inbox: ['Requests to approve', 'checkCircle'],
     'all-devices': ['All devices', 'plugs'],
     playlists: ['Family playlists', 'playlist'],
-    activity: ['Activity', 'drives']
+    activity: ['Activity', 'drives'],
+    'everyone-listening': ['Everyone\u2019s listening', 'headphones']
   };
 
   function navFor(s) {
-    var you = s.managed ? ['overview', 'devices', 'requests', 'saved', 'library', 'quality', 'account'] : ['overview', 'devices', 'quality'];
+    var you = s.managed ? ['overview', 'listening', 'devices', 'requests', 'saved', 'library', 'quality', 'account'] : ['overview', 'devices', 'quality'];
+    if (s.managed && !s.familyEnabled) you.splice(you.indexOf('listening'), 1);
     if (s.managed && s.familyEnabled && s.importPlaylists) you.splice(you.indexOf('library') + 1, 0, 'import');
     var family = [];
     if (s.familyEnabled) {
-      if (s.manager) family = ['members', 'inbox', 'all-devices', 'playlists', 'activity'];
+      if (s.manager) family = ['members', 'inbox', 'all-devices', 'playlists', 'activity', 'everyone-listening'];
       else if (s.approver) family = ['inbox', 'playlists'];
       else if (s.role !== 'Unmanaged') family = ['playlists'];
     } else if (s.owner) {
@@ -1941,6 +1944,42 @@
     done.focus();
   }
 
+  // ── Listening ────────────────────────────────────────────────────────────────────────
+  // Drawn by /admin/listening.js, the dashboard's own Listening page: a member's plays, or
+  // everyone's for the people who manage the family.
+  var listeningPage = null;
+
+  function mountListening(main, everyone) {
+    var holder = el('div', { class: 'fam-listening' });
+    F.clear(main).appendChild(holder);
+    if (!window.OctoListening) {
+      holder.appendChild(el('p', { class: 'notice notice-error', role: 'alert' }, 'Listening could not load. Reload the page to try again.'));
+      return;
+    }
+    listeningPage = window.OctoListening.mount(holder, {
+      title: everyone ? 'Everyone\u2019s listening' : 'Listening',
+      canSeeEveryone: everyone,
+      cover: function (item) {
+        var id = item.coverId || item.songId;
+        return id ? '/api/family/cover/' + encodeURIComponent(id) + '?size=160' : '';
+      },
+      fetch: async function (days, user) {
+        var path = (everyone ? '/listening' : '/me/listening') + '?range=' + days;
+        if (everyone && user) path += '&user=' + encodeURIComponent(user);
+        var reply = await api('GET', path);
+        return { ok: reply.ok, status: reply.status, data: reply.data, error: F.errorOf(reply) };
+      }
+    });
+  }
+
+  function viewListening(main) {
+    mountListening(main, false);
+  }
+
+  function viewEveryoneListening(main) {
+    mountListening(main, true);
+  }
+
   // ── Routing ──────────────────────────────────────────────────────────────────────────
   var VIEWS = {
     overview: viewOverview,
@@ -1955,7 +1994,9 @@
     inbox: viewInbox,
     'all-devices': viewAllDevices,
     playlists: viewPlaylists,
-    activity: viewActivity
+    activity: viewActivity,
+    listening: viewListening,
+    'everyone-listening': viewEveryoneListening
   };
 
   function allowed(view) {
@@ -1967,6 +2008,10 @@
     if (!session) return;
     var view = currentView();
     if (!VIEWS[view] || !allowed(view)) view = defaultView(session);
+    if (listeningPage) {
+      listeningPage.destroy();
+      listeningPage = null;
+    }
     var main = frame(view);
     document.title = (VIEWS_INFO[view] ? VIEWS_INFO[view][0] + ' · ' : '') + 'Octo Family';
     await VIEWS[view](main);

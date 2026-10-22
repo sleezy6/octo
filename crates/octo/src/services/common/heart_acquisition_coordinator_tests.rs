@@ -845,3 +845,63 @@ async fn a_hearted_song_lidarr_took_on_brings_no_album_walk() {
     assert!(direct.album_calls.lock().is_empty());
     assert!(next_queued(&queue).await.is_none());
 }
+
+/// Songs downloaded ahead: every song asked about is ready.
+struct AllReady;
+
+impl crate::services::prefetch::PrefetchedFiles for AllReady {
+    fn has(&self, _: &str, _: &str) -> bool {
+        true
+    }
+
+    fn take(&self, _: &str, _: &str, _: &std::path::Path) -> Option<crate::services::prefetch::Taken> {
+        None
+    }
+
+    fn kept(
+        &self,
+        _: &str,
+        _: &str,
+        _: &std::path::Path,
+        _: Option<Box<octo_core::fingerprint::VerificationResult>>,
+    ) {
+    }
+}
+
+#[tokio::test]
+async fn a_heart_on_a_song_downloaded_ahead_is_kept_at_once_without_the_source_chain() {
+    let lidarr = Arc::new(FakeLidarr::default().tracks(|_, _, _| Ok(true)));
+    let queue = new_queue();
+    // Lidarr first, and Soulseek out of its login: neither may hold this heart up.
+    let settings = store(steps(&[
+        (HeartDownloadSource::Lidarr, true),
+        (HeartDownloadSource::Soulseek, true),
+    ]));
+    let coordinator = HeartAcquisitionCoordinator::new(
+        settings,
+        queue.clone(),
+        Arc::new(FakeDownloads::default()),
+        lidarr.clone(),
+        HeartCoordinatorExtras {
+            soulseek: Some(Arc::new(crate::services::common::test_fakes::OfflineLink)),
+            ahead: Some(Arc::new(AllReady)),
+            ..Default::default()
+        },
+    );
+    let running = coordinator.clone();
+    let acquisition = tokio::spawn(async move {
+        running
+            .acquire_track_outcome("soulseek", "track-id", None, None, &AcquisitionTarget::Shared)
+            .await
+    });
+    let request = tokio::time::timeout(Duration::from_secs(5), queue.dequeue(&CancellationToken::new()))
+        .await
+        .expect("queued at once, with no wait for Soulseek")
+        .expect("a request");
+    assert_eq!(request.source_override, Some(DownloadSource::Soulseek));
+    queue.release(&request);
+    request.completion.try_set_result("/music/kept.flac");
+    let outcome = acquisition.await.expect("joined").expect("ran");
+    assert_eq!(outcome, TrackOutcome::Landed("/music/kept.flac".into()));
+    assert!(lidarr.track_calls.lock().is_empty(), "never handed to Lidarr");
+}

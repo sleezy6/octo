@@ -52,6 +52,7 @@ rand = "0.10"
 rapidfuzz = "0.5"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "gzip", "deflate", "rustls", "multipart", "form", "query", "charset", "http2"] }
+rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "raw_value"] }
 serde_repr = "0.1"
@@ -69,7 +70,7 @@ unicode-script = "0.5"
 unicode-segmentation = "1"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Media
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }

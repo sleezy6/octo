@@ -45,6 +45,15 @@ impl FingerprintResult {
     }
 }
 
+/// A chromaprint as chromaprint's own numbers: one 32-bit item for every 1365 samples at
+/// 11025 Hz, about eight a second.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawFingerprint {
+    pub items: Vec<u32>,
+    /// The whole file's length as fpcalc read it, however much of it was fingerprinted.
+    pub seconds: f64,
+}
+
 /// Chromaprint fingerprints, via the fpcalc binary.
 ///
 /// Modelled on LastFmRadioAudioTranscoder's ffmpeg shell-out, with one deliberate
@@ -74,44 +83,8 @@ impl AudioFingerprinter {
         length_seconds: i32,
         timeout_seconds: i32,
     ) -> FingerprintResult {
-        if self.binary_missing.load(Ordering::Relaxed) {
+        let Some(run) = self.run_fpcalc(&[], path, length_seconds, timeout_seconds).await else {
             return FingerprintResult::missing();
-        }
-
-        let length = length_seconds.to_string();
-        let path_text = path.to_string_lossy();
-        let mut child = match tool::spawn("fpcalc", &["-json", "-length", &length, &path_text]) {
-            Ok(child) => child,
-            Err(error) => {
-                self.binary_missing.store(true, Ordering::Relaxed);
-                warn!(
-                    "fpcalc is not in this image, so download verification can only ever accept: {error}. \
-                     Rebuild with libchromaprint-tools installed."
-                );
-                return FingerprintResult::missing();
-            }
-        };
-
-        // Deliberately not linked to any caller token. Verification runs between a finished
-        // transfer and the file joining the library, and a caller who has already left must
-        // not be able to wave an unchecked file through. (A negative timeout times out at
-        // once.)
-        let timeout = Duration::from_secs(timeout_seconds.max(0).unsigned_abs() as u64);
-        let run = match tokio::time::timeout(timeout, tool::collect(&mut child, true)).await {
-            Ok(Ok(run)) => run,
-            Ok(Err(error)) => {
-                tool::kill(&mut child);
-                warn!("fpcalc did not finish for {}: {error}", path.display());
-                return FingerprintResult::missing();
-            }
-            Err(_) => {
-                tool::kill(&mut child);
-                warn!(
-                    "fpcalc did not finish for {}: The operation was canceled.",
-                    path.display()
-                );
-                return FingerprintResult::missing();
-            }
         };
 
         let stdout = String::from_utf8_lossy(&run.stdout);
@@ -134,6 +107,100 @@ impl AudioFingerprinter {
             run.stderr.trim()
         );
         FingerprintResult::new(FingerprintOutcome::Undecodable, None, 0)
+    }
+
+    /// The first `length_seconds` of the file as chromaprint's own numbers (`fpcalc -raw`), the
+    /// form two fingerprints are lined up and compared in. None for every failure: fpcalc
+    /// missing or slow, or a file it could not read.
+    pub async fn raw_fingerprint(
+        &self,
+        path: &Path,
+        length_seconds: i32,
+        timeout_seconds: i32,
+    ) -> Option<RawFingerprint> {
+        let run = self
+            .run_fpcalc(&["-raw"], path, length_seconds, timeout_seconds)
+            .await?;
+        let parsed = Self::parse_fpcalc_raw_json(Some(&String::from_utf8_lossy(&run.stdout)));
+        if parsed.is_none() {
+            warn!(
+                "fpcalc gave no raw fingerprint for {} (exit {}): {}",
+                path.display(),
+                run.exit_code,
+                run.stderr.trim()
+            );
+        }
+        parsed
+    }
+
+    /// fpcalc -json over `length_seconds` of the file, with `extra` arguments in front. None when
+    /// fpcalc is missing (latched), fails to run or does not finish within the timeout.
+    async fn run_fpcalc(
+        &self,
+        extra: &[&str],
+        path: &Path,
+        length_seconds: i32,
+        timeout_seconds: i32,
+    ) -> Option<tool::ToolRun> {
+        if self.binary_missing.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let length = length_seconds.to_string();
+        let path_text = path.to_string_lossy();
+        let mut arguments = extra.to_vec();
+        arguments.extend(["-json", "-length", &length, &path_text]);
+        let mut child = match tool::spawn("fpcalc", &arguments) {
+            Ok(child) => child,
+            Err(error) => {
+                self.binary_missing.store(true, Ordering::Relaxed);
+                warn!(
+                    "fpcalc is not in this image, so download verification can only ever accept: {error}. \
+                     Rebuild with libchromaprint-tools installed."
+                );
+                return None;
+            }
+        };
+
+        // Deliberately not linked to any caller token. Verification runs between a finished
+        // transfer and the file joining the library, and a caller who has already left must
+        // not be able to wave an unchecked file through. (A negative timeout times out at
+        // once.)
+        let timeout = Duration::from_secs(timeout_seconds.max(0).unsigned_abs() as u64);
+        match tokio::time::timeout(timeout, tool::collect(&mut child, true)).await {
+            Ok(Ok(run)) => Some(run),
+            Ok(Err(error)) => {
+                tool::kill(&mut child);
+                warn!("fpcalc did not finish for {}: {error}", path.display());
+                None
+            }
+            Err(_) => {
+                tool::kill(&mut child);
+                warn!(
+                    "fpcalc did not finish for {}: The operation was canceled.",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
+    /// fpcalc -raw -json writes {"duration": 253.14, "fingerprint": [2741973374, ...]}. None
+    /// unless that is the shape, there is at least one number and every number fits 32 bits.
+    pub(crate) fn parse_fpcalc_raw_json(stdout: Option<&str>) -> Option<RawFingerprint> {
+        let root: serde_json::Value = serde_json::from_str(stdout?.trim()).ok()?;
+        let items = root
+            .get("fingerprint")?
+            .as_array()?
+            .iter()
+            .map(|item| item.as_u64().and_then(|n| u32::try_from(n).ok()))
+            .collect::<Option<Vec<u32>>>()
+            .filter(|items| !items.is_empty())?;
+        let seconds = root
+            .get("duration")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|s| s.is_finite() && *s > 0.0)?;
+        Some(RawFingerprint { items, seconds })
     }
 
     /// The fingerprint of the file played back at `speed` times its speed, pitch and all, as a
@@ -285,6 +352,60 @@ mod tests {
             );
         }
         assert_eq!(AudioFingerprinter::parse_fpcalc_json(None), None);
+    }
+
+    #[test]
+    fn parse_fpcalc_raw_json_reads_the_numbers_and_the_length() {
+        let raw = AudioFingerprinter::parse_fpcalc_raw_json(Some(
+            r#"{"duration": 294.99, "fingerprint": [2741973374, 3782160638, 0]}"#,
+        ))
+        .expect("fpcalc's raw shape");
+        assert_eq!(raw.items, vec![2_741_973_374, 3_782_160_638, 0]);
+        assert_eq!(raw.seconds, 294.99);
+    }
+
+    /// Anything else is no fingerprint: a compare must never run on half-read numbers.
+    #[test]
+    fn parse_fpcalc_raw_json_refuses_any_other_shape() {
+        let cases = [
+            "",
+            "not json",
+            r#"{"duration": 12.0, "fingerprint": "AQADtEmk"}"#,
+            r#"{"duration": 12.0, "fingerprint": []}"#,
+            r#"{"duration": 12.0, "fingerprint": [1, -2]}"#,
+            r#"{"duration": 12.0, "fingerprint": [4294967296]}"#,
+            r#"{"duration": 0, "fingerprint": [1, 2]}"#,
+            r#"{"fingerprint": [1, 2]}"#,
+        ];
+        for stdout in cases {
+            assert_eq!(
+                AudioFingerprinter::parse_fpcalc_raw_json(Some(stdout)),
+                None,
+                "stdout {stdout:?}"
+            );
+        }
+    }
+
+    /// Real fpcalc gives about eight items a second, less the first two seconds or so its filters
+    /// need. Skips cleanly where fpcalc is not installed.
+    #[tokio::test]
+    async fn fpcalc_gives_a_raw_fingerprint_of_a_tone() {
+        if !which("fpcalc") {
+            eprintln!("skipped: fpcalc is not on the PATH");
+            return;
+        }
+        crate::audio::test_support::require_ffmpeg!();
+        let dir = tempfile::tempdir().expect("a temp dir");
+        crate::audio::test_support::run_ffmpeg(
+            dir.path(),
+            "-f lavfi -i anoisesrc=color=pink:duration=12:sample_rate=44100:amplitude=0.3 -c:a flac noise.flac",
+        );
+        let raw = AudioFingerprinter::new()
+            .raw_fingerprint(&dir.path().join("noise.flac"), 120, 30)
+            .await
+            .expect("a raw fingerprint");
+        assert!((60..=100).contains(&raw.items.len()), "{} items", raw.items.len());
+        assert!((raw.seconds - 12.0).abs() < 0.5, "{}", raw.seconds);
     }
 
     /// The contract under test is "verification never fails a download", not which flavor of

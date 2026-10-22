@@ -12,6 +12,7 @@ use octo_core::json::element::{
     try_get_property,
 };
 use octo_core::metadata::accept_language_header;
+use octo_core::metadata::deezer_image::deezer_image;
 use octo_core::metadata::deezer_metadata_service::normalized_record_type;
 pub use octo_core::metadata::deezer_metadata_service::{
     AlbumAnswer, AlbumDetail, AlbumHit, AlbumLookup, AlbumTrack, ArtistHit, ArtistMeta, CatalogCandidates,
@@ -310,14 +311,14 @@ impl DeezerMetadataService {
                 let mut alb_id = 0;
                 if let Some(alb) = try_get_property(&t, "album")? {
                     alb_title = str_prop(alb, "title")?;
-                    cover = str_prop(alb, "cover_xl")?.or(str_prop(alb, "cover_medium")?);
+                    cover = deezer_image(alb, &["cover_xl", "cover_medium"])?;
                     if let Some(aid @ Value::Number(_)) = try_get_property(alb, "id")? {
                         alb_id = get_int64(aid)?;
                     }
                 }
                 if let Some(art) = try_get_property(&t, "artist")? {
                     art_name = str_prop(art, "name")?;
-                    art_img = str_prop(art, "picture_xl")?.or(str_prop(art, "picture_medium")?);
+                    art_img = deezer_image(art, &["picture_xl", "picture_medium"])?;
                 }
                 let duration = match try_get_property(&t, "duration")? {
                     Some(du @ Value::Number(_)) => Some(get_int32(du)?),
@@ -481,10 +482,7 @@ impl DeezerMetadataService {
         let mut alb_id = 0;
         if let Some(alb) = try_get_property(t, "album")? {
             alb_title = str_prop(alb, "title")?.map(str::to_string);
-            cover = str_prop(alb, "cover_xl")?
-                .or(str_prop(alb, "cover_big")?)
-                .or(str_prop(alb, "cover_medium")?)
-                .map(str::to_string);
+            cover = deezer_image(alb, &["cover_xl", "cover_big", "cover_medium"])?.map(str::to_string);
             if let Some(aid @ Value::Number(_)) = try_get_property(alb, "id")? {
                 alb_id = get_int64(aid)?;
             }
@@ -625,9 +623,7 @@ impl DeezerMetadataService {
             if let Some(a) = first_data(r.doc.as_ref())? {
                 meta = Some(ArtistMeta {
                     name: str_prop(a, "name")?.map(str::to_string),
-                    image_url: str_prop(a, "picture_xl")?
-                        .or(str_prop(a, "picture_medium")?)
-                        .map(str::to_string),
+                    image_url: deezer_image(a, &["picture_xl", "picture_medium"])?.map(str::to_string),
                 });
             }
             Ok(Flow::Done)
@@ -811,9 +807,7 @@ impl DeezerMetadataService {
                         deezer_id: id,
                         title: title.to_string(),
                         artist: artist.unwrap_or("").to_string(),
-                        cover_url: str_prop(a, "cover_xl")?
-                            .or(str_prop(a, "cover_medium")?)
-                            .map(str::to_string),
+                        cover_url: deezer_image(a, &["cover_xl", "cover_medium"])?.map(str::to_string),
                         year: None,
                         track_count,
                         record_type: record_type.map(str::to_string),
@@ -950,9 +944,7 @@ impl DeezerMetadataService {
                         deezer_id: album_id,
                         title: title.to_string(),
                         artist: artist_name.to_string(),
-                        cover_url: str_prop(a, "cover_xl")?
-                            .or(str_prop(a, "cover_medium")?)
-                            .map(str::to_string),
+                        cover_url: deezer_image(a, &["cover_xl", "cover_medium"])?.map(str::to_string),
                         year,
                         track_count: int(a, "nb_tracks")?.unwrap_or(0),
                         record_type,
@@ -1283,8 +1275,7 @@ impl DeezerMetadataService {
                 if let Some(root) = &r.doc {
                     nb_tracks = int(root, "nb_tracks")?;
                     title = str_prop(root, "title")?.unwrap_or("").to_string();
-                    cover = str_prop(root, "cover_xl")?
-                        .or(str_prop(root, "cover_medium")?)
+                    cover = deezer_image(root, &["cover_xl", "cover_medium"])?
                         .unwrap_or("")
                         .to_string();
                     label = str_prop(root, "label")?.unwrap_or("").to_string();
@@ -1709,13 +1700,13 @@ impl DeezerMetadataService {
                 let (mut alb_title, mut cover, mut alb_id) = (None, None, 0);
                 if let Some(alb) = try_get_property(hit, "album")? {
                     alb_title = str_prop(alb, "title")?;
-                    cover = str_prop(alb, "cover_xl")?.or(str_prop(alb, "cover_medium")?);
+                    cover = deezer_image(alb, &["cover_xl", "cover_medium"])?;
                     if let Some(aid @ Value::Number(_)) = try_get_property(alb, "id")? {
                         alb_id = get_int64(aid)?;
                     }
                 }
                 let art_img = match try_get_property(hit, "artist")? {
-                    Some(a) => str_prop(a, "picture_xl")?.or(str_prop(a, "picture_medium")?),
+                    Some(a) => deezer_image(a, &["picture_xl", "picture_medium"])?,
                     None => None,
                 };
                 let duration = match try_get_property(hit, "duration")? {
@@ -2309,9 +2300,7 @@ fn artist_hits(doc: Option<&Value>) -> ElementResult<Vec<ArtistHit>> {
             hits.push(ArtistHit {
                 deezer_id: id,
                 name: name.to_string(),
-                picture_url: str_prop(a, "picture_xl")?
-                    .or(str_prop(a, "picture_medium")?)
-                    .map(str::to_string),
+                picture_url: deezer_image(a, &["picture_xl", "picture_medium"])?.map(str::to_string),
                 album_count: int(a, "nb_album")?.unwrap_or(0),
                 fans: int(a, "nb_fan")?.unwrap_or(0),
             });

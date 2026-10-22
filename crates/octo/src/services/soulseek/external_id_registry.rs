@@ -91,7 +91,11 @@ pub struct ExternalIdRegistry {
     lru: Mutex<Lru>,
     dirty: AtomicBool,
     flush_lock: Mutex<()>,
+    recovery: Mutex<Option<RoutingRecovery>>,
 }
+
+/// A durable source of song routings that outlives the registry's bounded cache.
+pub type RoutingRecovery = Arc<dyn Fn(&str) -> Option<SoulseekRouting> + Send + Sync>;
 
 /// The entries and their recency: a stamp per entry and a map from stamp to id keep the
 /// most-recently-used order without a linear removal from a list on every touch.
@@ -164,6 +168,7 @@ impl ExternalIdRegistry {
             lru: Mutex::new(Lru::default()),
             dirty: AtomicBool::new(false),
             flush_lock: Mutex::new(()),
+            recovery: Mutex::new(None),
         };
         if registry.path.is_some() {
             registry.load();
@@ -275,10 +280,27 @@ impl ExternalIdRegistry {
     }
 
     pub fn lookup(&self, short_id: &str) -> Option<SharedRouting> {
-        let mut lru = self.lru.lock();
-        let routing = lru.by_id.get(short_id).map(|(r, _)| r.clone())?;
-        lru.touch(short_id);
+        {
+            let mut lru = self.lru.lock();
+            if let Some(routing) = lru.by_id.get(short_id).map(|(r, _)| r.clone()) {
+                lru.touch(short_id);
+                return Some(routing);
+            }
+        }
+        // Never call a source with the LRU locked. Registering checks only the LRU, so
+        // recovery cannot recurse, and unknown Navidrome ids still pass through unchanged.
+        let recover = self.recovery.lock().clone()?;
+        let routing = recover(short_id)?;
+        if Self::make_short_id(&routing) != short_id {
+            return None;
+        }
+        let routing = SharedRouting::new(routing);
+        self.register(routing.clone());
         Some(routing)
+    }
+
+    pub fn set_recovery(&self, recover: RoutingRecovery) {
+        *self.recovery.lock() = Some(recover);
     }
 
     /// How many ids the registry holds.

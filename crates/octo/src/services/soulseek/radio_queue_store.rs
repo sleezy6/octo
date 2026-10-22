@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use indexmap::IndexSet;
 use parking_lot::Mutex;
 
 /// Tracks the most recent search/radio responses as ordered queues so we can
@@ -14,10 +15,14 @@ use parking_lot::Mutex;
 pub struct RadioQueueStore {
     /// Most recent first.
     queues: Mutex<VecDeque<Vec<String>>>,
+    /// The ids a radio offered (song radio, the stations, the mixes), oldest first.
+    radio: Mutex<IndexSet<String>>,
 }
 
 impl RadioQueueStore {
     pub const MAX_QUEUES: usize = 32;
+    /// How many radio ids are remembered.
+    pub const MAX_RADIO_IDS: usize = 5_000;
 
     pub fn new() -> Self {
         Self::default()
@@ -61,6 +66,33 @@ impl RadioQueueStore {
         }
         Vec::new()
     }
+
+    /// Every queue, most recent first.
+    pub fn snapshot(&self) -> Vec<Vec<String>> {
+        self.queues.lock().iter().cloned().collect()
+    }
+
+    /// Remembers these ids as offered by a radio. The oldest are forgotten past
+    /// [`Self::MAX_RADIO_IDS`]; one offered again counts as new.
+    pub fn note_radio<I, S>(&self, song_ids: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut radio = self.radio.lock();
+        for id in song_ids.into_iter().map(Into::into).filter(|id| !id.is_empty()) {
+            radio.shift_remove(&id);
+            radio.insert(id);
+        }
+        while radio.len() > Self::MAX_RADIO_IDS {
+            radio.shift_remove_index(0);
+        }
+    }
+
+    /// Whether a radio offered this id lately.
+    pub fn is_radio(&self, song_id: &str) -> bool {
+        self.radio.lock().contains(song_id)
+    }
 }
 
 #[cfg(test)]
@@ -92,5 +124,19 @@ mod tests {
         }
         assert!(store.get_upcoming_from("first", 1).is_empty());
         assert_eq!(store.queues.lock().len(), RadioQueueStore::MAX_QUEUES);
+    }
+
+    #[test]
+    fn radio_ids_are_remembered_up_to_the_cap_newest_kept() {
+        let store = RadioQueueStore::new();
+        store.note_radio(["a", "", "b"]);
+        assert!(store.is_radio("a") && store.is_radio("b") && !store.is_radio(""));
+        store.note_radio((0..RadioQueueStore::MAX_RADIO_IDS).map(|i| format!("r{i}")));
+        assert!(!store.is_radio("a"));
+        assert!(store.is_radio("r0"));
+        store.note_radio(["r0"]);
+        store.note_radio(["late"]);
+        assert!(store.is_radio("r0"), "noted again, so newest");
+        assert!(!store.is_radio("r1"));
     }
 }

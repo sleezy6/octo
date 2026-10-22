@@ -23,7 +23,7 @@ use super::error::problem;
 use crate::app::AppState;
 use crate::controllers::subsonic::action_helpers::is_successful_subsonic_response;
 use crate::controllers::subsonic::native::{self, NativeRequest};
-use crate::services::subsonic::{IncomingRequest, RawRelayResult};
+use crate::services::subsonic::{CredentialVerdict, IncomingRequest, RawRelayResult, SubsonicProxyService};
 use octo_subsonic::SubsonicResponseBuilder;
 
 /// The largest request body read for a relay: 30 MB.
@@ -54,6 +54,10 @@ pub async fn catch_all(State(state): State<AppState>, req: Request) -> Response 
     if endpoint.eq_ignore_ascii_case("api/events") {
         return relay.relay_events(&endpoint, &parameters).await;
     }
+    // A saved play queue is the order the player plays next, for the songs fetched ahead. Read
+    // here, before the native answers (one of which swallows a queue that holds an outside id),
+    // and the request goes on exactly as it came.
+    observe_saved_queue(&state, &endpoint, &incoming, &parameters, &relay);
     let native_request = NativeRequest {
         endpoint: &endpoint,
         method: &parts.method,
@@ -101,6 +105,55 @@ pub async fn catch_all(State(state): State<AppState>, req: Request) -> Response 
             )
             .into_response(),
     }
+}
+
+/// `savePlayQueue` or `savePlayQueueByIndex`, with or without `.view`, in any case.
+fn saves_play_queue(endpoint: &str) -> bool {
+    let lower = octo_core::common::dotnet::to_lower_invariant(endpoint);
+    let name = lower.strip_suffix(".view").unwrap_or(&lower);
+    name == "rest/saveplayqueue" || name == "rest/saveplayqueuebyindex"
+}
+
+/// Records a saved play queue for the songs fetched ahead, in the background, once Navidrome
+/// accepts the sign-in it came with. Nothing about the request or its answer changes.
+fn observe_saved_queue(
+    state: &AppState,
+    endpoint: &str,
+    incoming: &IncomingRequest,
+    parameters: &octo_subsonic::Parameters,
+    relay: &SubsonicProxyService,
+) {
+    if !saves_play_queue(endpoint) || !state.settings.current().prefetch.enabled {
+        return;
+    }
+    let ids: Vec<String> = incoming
+        .parameter_values("id")
+        .into_iter()
+        .filter(|id| !id.is_empty())
+        .collect();
+    let current_index = parameters
+        .get("currentIndex")
+        .and_then(|index| index.trim().parse::<usize>().ok());
+    let current = parameters
+        .get("current")
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .or_else(|| current_index.and_then(|at| ids.get(at).cloned()));
+    let (state, parameters, relay) = (state.clone(), parameters.clone(), relay.clone());
+    tokio::spawn(async move {
+        let credential = octo_subsonic::SubsonicCredential::from(&parameters);
+        if !matches!(
+            state.credential_check.check(credential.as_ref(), &relay).await,
+            Ok(CredentialVerdict::Accepted)
+        ) {
+            return;
+        }
+        if let Ok(Some(user)) = state.request_identity.username(&parameters, &relay).await
+            && !user.is_empty()
+        {
+            state.prefetch.saved_queue(&user, ids, current, current_index);
+        }
+    });
 }
 
 fn is_unstar(endpoint: &str) -> bool {

@@ -59,6 +59,9 @@ url.workspace = true
 uuid.workspace = true
 zip.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 image.workspace = true
 insta.workspace = true

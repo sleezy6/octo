@@ -258,3 +258,108 @@ async fn a_post_to_the_bare_address_is_relayed() {
     assert_eq!(r.body, "nope");
     assert_eq!(server.received_requests().await.expect("recording").len(), 1);
 }
+
+// ---- savePlayQueue, read for the songs fetched ahead ------------------------------------------
+
+/// A state with the songs fetched ahead on or off, and one outside song in its registry.
+fn prefetch_state(url: &str, on: bool) -> (AppState, String) {
+    let state = AppState::for_tests(AppSettings {
+        subsonic: SubsonicSettings {
+            url: Some(url.to_string()),
+            ..Default::default()
+        },
+        prefetch: octo_core::settings::PrefetchSettings {
+            enabled: on,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let outside = state.external_id_registry.register(
+        octo_core::soulseek::soulseek_metadata_service::SoulseekRouting {
+            kind: octo_core::soulseek::soulseek_metadata_service::RoutingKind::Song,
+            artist: Some("Artist".into()),
+            title: Some("Outside".into()),
+            ..Default::default()
+        },
+    );
+    (state, outside)
+}
+
+fn ok_json(body: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_raw(body.to_string(), "application/json")
+}
+
+#[tokio::test]
+async fn a_saved_play_queue_is_relayed_as_it_came_and_read_for_the_songs_fetched_ahead() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/rest/savePlayQueue"))
+        .respond_with(ok_json(r#"{"subsonic-response":{"status":"ok","saved":1}}"#))
+        .mount(&server)
+        .await;
+    Mock::given(path("/rest/ping"))
+        .respond_with(ok_json(r#"{"subsonic-response":{"status":"ok"}}"#))
+        .mount(&server)
+        .await;
+    let uri = "/rest/savePlayQueue?id=lib-1&id=lib-2&id=lib-3&current=lib-2&u=alice&t=tok&s=salt&v=1.16.1&c=Octo&f=json";
+
+    let (off, _) = prefetch_state(&server.uri(), false);
+    let before = send(&app(off), Method::GET, uri, &[], "").await;
+    let (on, _) = prefetch_state(&server.uri(), true);
+    let after = send(&app(on.clone()), Method::GET, uri, &[], "").await;
+
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.body, before.body);
+    assert_eq!(
+        after.headers.get("content-type"),
+        before.headers.get("content-type")
+    );
+    crate::services::common::test_fakes::until(|| on.prefetch.saved_queue_of("alice").is_some()).await;
+    let saved = on.prefetch.saved_queue_of("alice").expect("saved");
+    assert_eq!(saved.ids, ["lib-1", "lib-2", "lib-3"]);
+    assert_eq!(saved.current.as_deref(), Some("lib-2"));
+}
+
+#[tokio::test]
+async fn a_saved_queue_that_starts_with_an_outside_song_is_answered_as_before_and_read() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/rest/ping"))
+        .respond_with(ok_json(r#"{"subsonic-response":{"status":"ok"}}"#))
+        .mount(&server)
+        .await;
+    Mock::given(path("/rest/savePlayQueueByIndex"))
+        .respond_with(ok_json(r#"{"subsonic-response":{"status":"ok"}}"#))
+        .mount(&server)
+        .await;
+
+    let (off, outside) = prefetch_state(&server.uri(), false);
+    let (on, outside_on) = prefetch_state(&server.uri(), true);
+    assert_eq!(outside, outside_on, "the registry's ids are the routing's");
+    let uri = format!(
+        "/rest/savePlayQueueByIndex?id={outside}&currentIndex=0&u=alice&t=tok&s=salt&v=1.16.1&c=Octo&f=json"
+    );
+    let before = send(&app(off), Method::GET, &uri, &[], "").await;
+    let after = send(&app(on.clone()), Method::GET, &uri, &[], "").await;
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.body, before.body);
+    crate::services::common::test_fakes::until(|| on.prefetch.saved_queue_of("alice").is_some()).await;
+    let saved = on.prefetch.saved_queue_of("alice").expect("saved");
+    assert_eq!(saved.ids, std::slice::from_ref(&outside));
+    assert_eq!(saved.current.as_deref(), Some(outside.as_str()));
+    assert_eq!(saved.current_index, Some(0));
+}
+
+#[tokio::test]
+async fn a_saved_queue_with_a_refused_sign_in_is_not_read() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/rest/ping"))
+        .respond_with(ok_json(
+            r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"Wrong username or password"}}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let (on, outside) = prefetch_state(&server.uri(), true);
+    let uri = format!("/rest/savePlayQueue?id={outside}&u=mallory&t=bad&s=salt&v=1.16.1&c=x&f=json");
+    send(&app(on.clone()), Method::GET, &uri, &[], "").await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(on.prefetch.saved_queue_of("mallory").is_none());
+}

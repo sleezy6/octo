@@ -20,6 +20,15 @@ use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::soulseek::{ExternalIdRegistry, SoulseekMetadataService};
 use crate::services::subsonic::SubsonicProxyService;
 
+/// What a scrobbled library song's entry says beside the song itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrobbleDetails {
+    pub genres: Vec<String>,
+    pub album_id: Option<String>,
+    pub album_artist: Option<String>,
+    pub cover_art: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct LastFmRadioTrackResolver {
     proxy: SubsonicProxyService,
@@ -47,21 +56,40 @@ impl LastFmRadioTrackResolver {
         id: &str,
         authenticated_parameters: &IndexMap<String, String>,
     ) -> Option<Song> {
+        self.resolve_scrobble_with_details(id, authenticated_parameters)
+            .await
+            .map(|(song, _)| song)
+    }
+
+    /// [`Self::resolve_scrobble`], with what the listening log keeps beside the song: a library
+    /// song's genres, album id, album artist and cover id. An outside song's cover id is its own.
+    pub async fn resolve_scrobble_with_details(
+        &self,
+        id: &str,
+        authenticated_parameters: &IndexMap<String, String>,
+    ) -> Option<(Song, ScrobbleDetails)> {
         if let Some(route) = self.registry.lookup(id)
             && route.snapshot().kind == RoutingKind::Song
         {
             let route = route.snapshot();
-            return Some(Song {
-                id: id.to_string(),
-                artist: route.artist.unwrap_or_default(),
-                title: route.title.unwrap_or_default(),
-                album: route.album.unwrap_or_default(),
-                duration: route.duration,
-                is_local: false,
-                external_provider: Some(SoulseekMetadataService::PROVIDER_NAME.to_string()),
-                external_id: Some(id.to_string()),
+            let details = ScrobbleDetails {
+                cover_art: Some(id.to_string()),
                 ..Default::default()
-            });
+            };
+            return Some((
+                Song {
+                    id: id.to_string(),
+                    artist: route.artist.unwrap_or_default(),
+                    title: route.title.unwrap_or_default(),
+                    album: route.album.unwrap_or_default(),
+                    duration: route.duration,
+                    is_local: false,
+                    external_provider: Some(SoulseekMetadataService::PROVIDER_NAME.to_string()),
+                    external_id: Some(id.to_string()),
+                    ..Default::default()
+                },
+                details,
+            ));
         }
         let mut parameters = authenticated_parameters.clone();
         parameters.insert("id".into(), id.to_string());
@@ -70,7 +98,7 @@ impl LastFmRadioTrackResolver {
         if result.body.is_empty() {
             return None;
         }
-        let read = || -> anyhow::Result<Option<Song>> {
+        let read = || -> anyhow::Result<Option<(Song, ScrobbleDetails)>> {
             let document: Value = serde_json::from_slice(&result.body)?;
             let Some(response) = try_get_property(&document, "subsonic-response")? else {
                 return Ok(None);
@@ -78,16 +106,32 @@ impl LastFmRadioTrackResolver {
             let Some(song) = try_get_property(response, "song")? else {
                 return Ok(None);
             };
-            Ok(Some(Song {
-                id: id.to_string(),
-                artist: string(song, "artist")?,
-                title: string(song, "title")?,
-                album: string(song, "album")?,
-                genre: nullable_string(song, "genre")?,
-                duration: integer(song, "duration")?,
-                is_local: true,
-                ..Default::default()
-            }))
+            let text = |key: &str| {
+                song.get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            };
+            let details = ScrobbleDetails {
+                genres: crate::services::listening::genres::song_genres(song),
+                album_id: text("albumId"),
+                album_artist: text("displayAlbumArtist").or_else(|| text("albumArtist")),
+                cover_art: text("coverArt"),
+            };
+            Ok(Some((
+                Song {
+                    id: id.to_string(),
+                    artist: string(song, "artist")?,
+                    title: string(song, "title")?,
+                    album: string(song, "album")?,
+                    genre: nullable_string(song, "genre")?,
+                    duration: integer(song, "duration")?,
+                    is_local: true,
+                    ..Default::default()
+                },
+                details,
+            )))
         };
         match read() {
             Ok(song) => song,

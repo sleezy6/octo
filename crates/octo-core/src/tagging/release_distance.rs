@@ -89,6 +89,10 @@ impl ReleaseDistance {
     /// How many years of later first release count as "a whole generation later".
     pub const ORIGINAL_SPAN_YEARS: f64 = 25.0;
 
+    /// The most an album title may cost and still name the same album: the same name, or the
+    /// same once stylized characters are letters. Another edition costs more.
+    pub const SAME_ALBUM_PENALTY: f64 = 0.1;
+
     /// The shortest title key allowed to match as a prefix or substring of a longer one.
     const MIN_PREFIX_CORE: usize = 6;
 
@@ -391,6 +395,13 @@ impl ReleaseDistance {
         } else {
             core
         }
+    }
+
+    /// Whether a candidate's album is the requested album by name, not another edition of it:
+    /// read both ways, so the plain album is not the requested edition either.
+    pub fn names_same_album(requested: &str, candidate: &str) -> bool {
+        Self::album_penalty(requested, candidate) <= Self::SAME_ALBUM_PENALTY
+            && Self::album_penalty(candidate, requested) <= Self::SAME_ALBUM_PENALTY
     }
 
     /// What kind of release a song without a requested album should be filed under. A plain

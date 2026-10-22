@@ -53,6 +53,7 @@ pub const APP_CALL_ENDPOINTS: &[(Method, &str, bool)] = &[
     (Method::GET, "/api/admin/downloads", true),
     (Method::GET, "/api/admin/lastfm/radio", false),
     (Method::POST, "/api/admin/lastfm/radio/refresh", false),
+    (Method::GET, "/api/admin/listening", false),
     (Method::GET, "/api/admin/library-status", true),
     (Method::GET, "/api/admin/status", true),
     (Method::GET, "/api/admin/update", true),

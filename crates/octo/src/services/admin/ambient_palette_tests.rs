@@ -214,12 +214,15 @@ fn palette_from_a_picture() {
     assert!(cover_colors::hue_distance(lead.h, cover_colors::to_lch(hex("#d9552b")).h) < 4.0);
 }
 
-/// The stub cover (`parity/stubs/bodies/cover.jpg`) lights the page as the reference recording
+/// The sample cover (`docs/rust-migration/fixtures/covers/sample-cover.jpg`) lights the page as the reference recording
 /// shows it (`18-dashboard/ambient-seeded`).
 #[test]
 fn palette_of_the_stub_cover_matches_the_reference() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../parity/stubs/bodies/cover.jpg");
-    let bytes = std::fs::read(path).expect("the parity cover");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/rust-migration/fixtures/covers/sample-cover.jpg"
+    );
+    let bytes = std::fs::read(path).expect("the sample cover");
     let swatches = CoverArtService::swatches_of(&bytes);
     let palette = from_swatches(swatches.as_deref()).expect("a palette");
     assert_eq!(palette.colors, ["#a967be", "#c85c87", "#727bdb"]);

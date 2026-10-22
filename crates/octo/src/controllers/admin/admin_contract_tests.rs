@@ -81,6 +81,18 @@ fn missing_from(document: &Value) -> Vec<String> {
         if section == "Family" && document.get("Family").is_none() {
             continue;
         }
+        // So is SpotiFLAC (effective_document_keeps_spotiflac).
+        if section == "Spotiflac" && document.get("Spotiflac").is_none() {
+            continue;
+        }
+        // And getting upcoming songs ahead (effective_document_keeps_prefetch).
+        if section == "Prefetch" && document.get("Prefetch").is_none() {
+            continue;
+        }
+        // And Listening, once changed from its defaults or saved.
+        if section == "Listening" && document.get("Listening").is_none() {
+            continue;
+        }
         for name in names {
             // The family notices are listed with the Family section.
             if name.starts_with("NotifyFamily") && document.get("Family").is_none() {
@@ -139,6 +151,83 @@ async fn effective_document_keeps_family() {
     state.settings_writer.replace(&file).expect("writes");
     let document = get(&saved, "/api/admin/raw-config").await.json();
     assert_eq!(document["Family"]["Enabled"], Value::Bool(false));
+    assert_eq!(missing_from(&document), Vec::<String>::new());
+}
+
+/// With SpotiFLAC at its defaults neither document lists it; once it is on (or saved in
+/// settings.json) both list every SpotiFLAC property, the token as the placeholder.
+#[tokio::test]
+async fn effective_document_keeps_spotiflac() {
+    let (_, off) = factory();
+    for path in ["/api/admin/settings", "/api/admin/raw-config"] {
+        let document = get(&off, path).await.json();
+        assert!(document.get("Spotiflac").is_none(), "{path}");
+    }
+
+    let mut settings = factory_settings();
+    settings.spotiflac.enabled = true;
+    settings.spotiflac.url = "http://spotiflac:8000".into();
+    settings.spotiflac.token = "s3cret".into();
+    let on = app(AppState::for_tests(settings));
+    for path in ["/api/admin/settings", "/api/admin/raw-config"] {
+        let document = get(&on, path).await.json();
+        assert_eq!(document["Spotiflac"]["Enabled"], Value::Bool(true), "{path}");
+        assert_eq!(document["Spotiflac"]["Placement"], "AfterSoulseek", "{path}");
+        assert_eq!(
+            document["Spotiflac"]["Token"],
+            super::plumbing::SECRET_PLACEHOLDER,
+            "{path}"
+        );
+        assert_eq!(missing_from(&document), Vec::<String>::new(), "{path}");
+    }
+
+    let (state, saved) = factory();
+    let mut file = octo_core::settings::JsonObject::new();
+    file.insert(
+        "Spotiflac".into(),
+        super::plumbing::n_obj([("Enabled", octo_core::json::dom::Node::Bool(false))]),
+    );
+    state.settings_writer.replace(&file).expect("writes");
+    let document = get(&saved, "/api/admin/raw-config").await.json();
+    assert_eq!(document["Spotiflac"]["Enabled"], Value::Bool(false));
+    assert_eq!(missing_from(&document), Vec::<String>::new());
+}
+
+/// With Prefetch at its defaults neither document lists it, so the settings answers stay as they
+/// were; once it is on (or saved in settings.json) both list every Prefetch property.
+#[tokio::test]
+async fn effective_document_keeps_prefetch() {
+    let (_, off) = factory();
+    for path in ["/api/admin/settings", "/api/admin/raw-config"] {
+        let document = get(&off, path).await.json();
+        assert!(document.get("Prefetch").is_none(), "{path}");
+    }
+
+    let mut settings = factory_settings();
+    settings.prefetch.enabled = true;
+    let on = app(AppState::for_tests(settings));
+    for path in ["/api/admin/settings", "/api/admin/raw-config"] {
+        let document = get(&on, path).await.json();
+        assert_eq!(document["Prefetch"]["Enabled"], Value::Bool(true), "{path}");
+        assert_eq!(document["Prefetch"]["Scope"], "RadioOnly", "{path}");
+        assert_eq!(document["Prefetch"]["Count"], 3, "{path}");
+        assert_eq!(
+            document["Prefetch"]["PauseWhenStopped"],
+            Value::Bool(true),
+            "{path}"
+        );
+        assert_eq!(missing_from(&document), Vec::<String>::new(), "{path}");
+    }
+
+    let (state, saved) = factory();
+    let mut file = octo_core::settings::JsonObject::new();
+    file.insert(
+        "Prefetch".into(),
+        super::plumbing::n_obj([("Enabled", octo_core::json::dom::Node::Bool(false))]),
+    );
+    state.settings_writer.replace(&file).expect("writes");
+    let document = get(&saved, "/api/admin/raw-config").await.json();
+    assert_eq!(document["Prefetch"]["Enabled"], Value::Bool(false));
     assert_eq!(missing_from(&document), Vec::<String>::new());
 }
 
@@ -779,12 +868,12 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // LibraryActions:TagCheckPerHour (in their sections), the year and artist mixes' four:
     // GeneratedPlaylists:Years, :MaxYearPlaylists, :Artists and :ArtistCount, the sweep's
     // replacing two: LibraryActions:ReviewSweepAutoReplace and :ReviewSweepAutoReplacePerDay,
-    // then LibraryActions:KeepRatedCopies, Subsonic:DownloadAlbumOnSongStar and
-    // Metadata:AnimatedArt, listed last; and this fork's sixteen: Subsonic:StreamSource,
-    // Deezer:Arl, :ArlFallback, :Quality and :StreamQuality, the playback cache's four
-    // (Deezer:CacheEnabled, :CachePath, :CacheMaxGiB and :CacheRetentionDays), YouTube:Enabled,
-    // LastFm:EnableStarterRadio, Subsonic:BadgeOutsideCovers, LastFm:LoveFavorites,
-    // LastFm:ArtistBanAfter, RadioSources:SoundsAlikeFrom and Metadata:ReplaceOthersLyrics.
+    // then LibraryActions:KeepRatedCopies, Subsonic:DownloadAlbumOnSongStar,
+    // Metadata:AnimatedArt and Subsonic:CoverBadge, listed last; and this fork's fifteen:
+    // Subsonic:StreamSource, Deezer:Arl, :ArlFallback, :Quality and :StreamQuality, the playback
+    // cache's four (Deezer:CacheEnabled, :CachePath, :CacheMaxGiB and :CacheRetentionDays),
+    // YouTube:Enabled, LastFm:EnableStarterRadio, LastFm:LoveFavorites, LastFm:ArtistBanAfter,
+    // RadioSources:SoundsAlikeFrom and Metadata:ReplaceOthersLyrics.
     assert_eq!(rows.len(), 219);
     assert!(!rows.iter().any(|r| {
         r["Key"]
@@ -805,7 +894,9 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     );
     assert_eq!(rows[years + 6]["Key"], "LibraryActions:KeepRatedCopies");
     assert_eq!(rows[years + 7]["Key"], "Subsonic:DownloadAlbumOnSongStar");
-    assert_eq!(rows[years + 9]["Key"], "Metadata:AnimatedArt");
+    assert_eq!(rows[years + 8]["Key"], "Metadata:AnimatedArt");
+    assert_eq!(rows[years + 9]["Key"], "Subsonic:CoverBadge");
+    assert_eq!(row("Subsonic:CoverBadge")["IsSecret"], false);
     assert_eq!(row("Subsonic:DownloadAlbumOnSongStar")["IsSecret"], false);
     assert_eq!(
         row("LibraryActions:ReviewSweepAutoReplacePerDay")["IsSecret"],
@@ -1049,4 +1140,26 @@ async fn status_reports_each_service() {
     assert_eq!(body["services"]["lastfm"]["configured"], false);
     let time = body["time"].as_str().expect("a time");
     assert!(time.ends_with("+00:00") && time.len() == 33, "{time}");
+}
+
+/// With Listening at its defaults neither document lists it, so their answers stay as they
+/// were; once it is changed both list it.
+#[tokio::test]
+async fn effective_document_keeps_listening() {
+    let (_, defaults) = factory();
+    for path in ["/api/admin/settings", "/api/admin/raw-config"] {
+        let document = get(&defaults, path).await.json();
+        assert!(document.get("Listening").is_none(), "{path}");
+    }
+
+    let mut settings = factory_settings();
+    settings.listening.enabled = false;
+    settings.listening.keep_days = 400;
+    let off = app(AppState::for_tests(settings));
+    for path in ["/api/admin/settings", "/api/admin/raw-config"] {
+        let document = get(&off, path).await.json();
+        assert_eq!(document["Listening"]["Enabled"], Value::Bool(false), "{path}");
+        assert_eq!(document["Listening"]["KeepDays"], 365, "{path}");
+        assert_eq!(missing_from(&document), Vec::<String>::new(), "{path}");
+    }
 }

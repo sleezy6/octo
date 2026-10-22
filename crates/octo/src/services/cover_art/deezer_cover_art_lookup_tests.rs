@@ -220,6 +220,58 @@ async fn an_artists_picture_is_the_best_named_hit_and_the_language_is_sent() {
     }
 }
 
+/// Deezer's stand-in for an artist with no picture (an empty hash in its address) is no picture:
+/// a real picture of another hit of the same name wins.
+#[tokio::test]
+async fn deezers_stand_in_is_no_picture() {
+    let (_server, lookup) = catalog(|cdn| {
+        HashMap::from([(
+            "/search/artist",
+            format!(
+                r#"{{"data":[{{"name":"Linkin Park","picture_xl":"{cdn}/images/artist//1000x1000-000000-80-0-0.jpg"}},{{"name":"Linkin Park","picture_xl":"{cdn}/images/artist/4886905210739af3438990897bad3a98/1000x1000-000000-80-0-0.jpg"}}]}}"#
+            ),
+        )])
+    })
+    .await;
+    let ask = |artist: &str| SoulseekRouting {
+        kind: RoutingKind::Artist,
+        artist: Some(artist.into()),
+        ..Default::default()
+    };
+
+    let bytes = lookup.try_fetch(&ask("Linkin Park"), false).await;
+    assert_eq!(
+        bytes.as_deref(),
+        Some(&b"/cdn/images/artist/4886905210739af3438990897bad3a98/1000x1000-000000-80-0-0.jpg"[..])
+    );
+}
+
+/// With only Deezer's stand-in to offer, an artist gets no picture at all.
+#[tokio::test]
+async fn only_the_stand_in_finds_nothing() {
+    let (_server, lookup) = catalog(|cdn| {
+        HashMap::from([(
+            "/search/artist",
+            format!(
+                r#"{{"data":[{{"name":"LINKIN PARK x STEVE AOKI","picture_xl":"{cdn}/images/artist//1000x1000-000000-80-0-0.jpg","picture":"{cdn}/artist/5181383/image"}}]}}"#
+            ),
+        )])
+    })
+    .await;
+
+    let bytes = lookup
+        .try_fetch(
+            &SoulseekRouting {
+                kind: RoutingKind::Artist,
+                artist: Some("LINKIN PARK x STEVE AOKI".into()),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+    assert!(bytes.is_none());
+}
+
 /// An artist's picture goes to the hit that names the artist, in any script, never to a longer
 /// name that only starts with the same letters.
 #[tokio::test]

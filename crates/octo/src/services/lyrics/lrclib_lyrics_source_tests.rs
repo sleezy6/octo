@@ -303,47 +303,92 @@ async fn lrclib_a_canceled_lookup_is_not_now() {
     assert!(http.calls().await.is_empty());
 }
 
-/// A busy /api/get with a short Retry-After does not end the lookup: once the wait is over, the
-/// search that answers finds the lyrics (issue #98).
+/// A busy /api/get with a short Retry-After is waited out, and the search still finds the song.
 #[tokio::test]
-async fn lrclib_a_briefly_busy_get_still_tries_the_search() {
+async fn lrclib_busy_get_with_a_short_wait_goes_on_to_the_search() {
     let http = FakeHttp::start(|url| {
         if url.contains("/api/get?") {
-            status(503, r#"{"message":"The server is busy, please retry in a moment."}"#)
+            status(503, r#"{"message":"The server is busy, please retry in a moment"}"#)
                 .insert_header("Retry-After", "1")
         } else {
             json(
-                r#"[{"trackName":"Yesterday","artistName":"The Beatles","duration":125,"syncedLyrics":"[00:01.00] Yesterday","plainLyrics":"Yesterday"}]"#,
+                r#"[{"trackName":"Yesterday","artistName":"The Beatles","duration":126,"syncedLyrics":"[00:01.00] Yesterday","plainLyrics":"Yesterday"}]"#,
             )
         }
     })
     .await;
 
+    let started = std::time::Instant::now();
     let lookup = source(&http)
         .find(
-            &LyricsQuery::new("The Beatles", "Yesterday", None, Some(125)),
+            &LyricsQuery::new(
+                "The Beatles",
+                "Yesterday",
+                Some("1 (Remastered 2015)".into()),
+                Some(126),
+            ),
             &none(),
         )
         .await;
 
     assert!(!lookup.transient);
-    assert!(lookup.result.expect("found by the search").has_synced());
-    assert_eq!(http.calls().await.len(), 2);
+    assert!(lookup.result.expect("found").has_synced());
+    let calls = http.calls().await;
+    assert!(
+        calls.iter().any(|call| call.contains("/api/search?")),
+        "{calls:?}"
+    );
+    // The search went out only after the second LRCLIB asked for.
+    assert!(started.elapsed() >= std::time::Duration::from_millis(900));
 }
 
-/// When nothing answers, the lookup is "not now", never "no lyrics", so a later play asks again.
+/// When every request is busy, the lookup is "not now", never "no lyrics", so it is asked again.
 #[tokio::test]
-async fn lrclib_busy_everywhere_is_not_now_rather_than_no_lyrics() {
-    let http =
-        FakeHttp::start(|_| status(503, r#"{"message":"busy"}"#).insert_header("Retry-After", "1")).await;
+async fn lrclib_busy_everywhere_is_not_now() {
+    let http = FakeHttp::start(|_| {
+        status(503, r#"{"message":"The server is busy"}"#).insert_header("Retry-After", "1")
+    })
+    .await;
 
     let lookup = source(&http)
         .find(
-            &LyricsQuery::new("The Beatles", "Yesterday", None, Some(125)),
+            &LyricsQuery::new("The Beatles", "Yesterday", None, Some(126)),
             &none(),
         )
         .await;
 
     assert!(lookup.transient);
     assert!(lookup.result.is_none());
+    let calls = http.calls().await;
+    assert!(
+        calls.iter().any(|call| call.contains("/api/search?")),
+        "{calls:?}"
+    );
+}
+
+/// A search that is busy once is asked again after the short wait, not skipped.
+#[tokio::test]
+async fn lrclib_busy_search_is_asked_again_after_the_wait() {
+    let searches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = searches.clone();
+    let http = FakeHttp::start(move |url| {
+        if url.contains("/api/get?") {
+            return status(404, r#"{"code":404}"#);
+        }
+        if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            status(429, "{}").insert_header("Retry-After", "1")
+        } else {
+            json(r#"[{"trackName":"Song","artistName":"Someone","duration":200,"plainLyrics":"words"}]"#)
+        }
+    })
+    .await;
+
+    let lookup = source(&http)
+        .find(&LyricsQuery::new("Someone", "Song", None, Some(200)), &none())
+        .await;
+
+    assert_eq!(lookup.result.and_then(|r| r.plain).as_deref(), Some("words"));
+    let calls = http.calls().await;
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert_eq!(calls[1], calls[2]);
 }

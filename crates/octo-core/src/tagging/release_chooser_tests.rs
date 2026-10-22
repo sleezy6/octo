@@ -34,6 +34,7 @@ fn request(
         catalog_album_id: None,
         catalog_track_id: None,
         version_markers: SongIdentity::distinct_versions(&SongIdentity::parse_title(title, None), None),
+        whole_album: false,
     }
 }
 
@@ -1046,4 +1047,60 @@ fn with_details_fills_what_the_candidate_left_unsaid() {
     let mut empty = TagPlan::empty(None, MatchingSettings::default());
     empty.with(ReleaseDetails::default());
     assert!(empty.details().is_none());
+}
+
+// ---- a track of a whole album takes facts only from that album ----------------------------
+
+#[test]
+fn a_track_of_a_whole_album_takes_no_facts_from_a_larger_edition_of_it() {
+    for whole_album in [false, true] {
+        let request = TagRequest {
+            whole_album,
+            ..request(
+                "Dua Lipa",
+                "Levitating",
+                Some("Future Nostalgia"),
+                Some(5),
+                None,
+                Some(203),
+            )
+        };
+        let evidence = evidence(request.clone(), peer(203, "Levitating", "Dua Lipa"), &["rec-lev"]);
+        let candidates = vec![ReleaseCandidate {
+            label: Some("Warner Moon".into()),
+            ..Fp::new(
+                "rec-lev",
+                "Levitating",
+                "Dua Lipa",
+                "Future Nostalgia (The Moonlight Edition)",
+                "g-moon",
+                "Album",
+                "2021-02-11",
+            )
+            .length(203)
+            .build()
+        }];
+
+        let mut plan =
+            ReleaseChooser::choose(&evidence, &candidates, &MatchingSettings::default(), THIS_YEAR);
+        let mut song = song_for(&request);
+        plan.apply_to(&mut song);
+
+        assert!(plan.album_from_candidate(), "{whole_album}");
+        assert_eq!(song.album, "Future Nostalgia", "{whole_album}");
+        assert_eq!(song.track, Some(5), "{whole_album}");
+        assert_eq!(song.music_brainz_recording_id.as_deref(), Some("rec-lev"));
+        // Any other request lends the larger edition its facts, as before.
+        assert_eq!(
+            song.label.as_deref(),
+            (!whole_album).then_some("Warner Moon"),
+            "{whole_album}"
+        );
+        assert_eq!(song.year, (!whole_album).then_some(2021), "{whole_album}");
+        assert_eq!(
+            song.music_brainz_release_group_id.as_deref(),
+            (!whole_album).then_some("g-moon"),
+            "{whole_album}"
+        );
+    }
 }

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use octo_core::charts::top_songs::{CatalogTrack, explicit_from_catalog};
 use octo_core::common::dotnet::{escape_data_string, is_blank};
+use octo_core::metadata::deezer_image::deezer_image;
 use serde_json::Value;
 
 use super::{Cached, DeezerMetadataService, NEGATIVE_TTL};
@@ -95,9 +96,10 @@ pub(super) fn read_chart_track(t: &Value) -> Option<CatalogTrack> {
         .and_then(Value::as_i64)
         .map(|n| n.to_string());
     let cover = album_node.and_then(|a| {
-        text(a, "cover_xl")
-            .or_else(|| text(a, "cover_big"))
-            .or_else(|| text(a, "cover_medium"))
+        deezer_image(a, &["cover_xl", "cover_big", "cover_medium"])
+            .ok()
+            .flatten()
+            .map(str::to_string)
     });
     let explicit = t.get("explicit_lyrics").and_then(Value::as_bool);
     let content = t

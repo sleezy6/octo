@@ -916,7 +916,7 @@ impl crate::services::cover_art::ICoverArtSource for OnePicture {
 #[tokio::test]
 async fn a_badged_outside_cover_is_kept_and_served_again_from_memory() {
     let navidrome = MockServer::start().await;
-    let state = state_with(badging(settings(&navidrome.uri())), |inner| {
+    let state = state_with(settings(&navidrome.uri()), |inner| {
         inner.cover_art_aggregator = Arc::new(crate::services::cover_art::CoverArtAggregator::new(vec![
             Arc::new(OnePicture),
         ]));
@@ -953,39 +953,6 @@ async fn a_badged_outside_cover_is_kept_and_served_again_from_memory() {
     assert_ne!(plain.body.as_ref(), b"kept");
 }
 
-/// The settings with the octopus on outside covers turned on (it is off by default).
-fn badging(mut settings: AppSettings) -> AppSettings {
-    settings.subsonic.badge_outside_covers = true;
-    settings
-}
-
-/// With the octopus off, as it is by default, an outside cover goes out as the catalog drew it
-/// to every app, and nothing badged is kept.
-#[tokio::test]
-async fn an_outside_cover_is_plain_while_the_octopus_is_off() {
-    let navidrome = MockServer::start().await;
-    let state = state_with(settings(&navidrome.uri()), |inner| {
-        inner.cover_art_aggregator = Arc::new(crate::services::cover_art::CoverArtAggregator::new(vec![
-            Arc::new(NotAPicture),
-        ]));
-    });
-    let id = state.external_id_registry.register(SoulseekRouting {
-        kind: RoutingKind::Song,
-        artist: Some("Artist".into()),
-        title: Some("Plain".into()),
-        ..Default::default()
-    });
-    let reply = get(&app(&state), &format!("/rest/getCoverArt?id={id}&size=300")).await;
-    assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(reply.body.as_ref(), b"not a picture", "as the source gave it");
-    assert_eq!(
-        state
-            .cover_art_service
-            .kept_badged(&state.cover_art_service.badged_key(&id)),
-        None
-    );
-}
-
 #[test]
 fn a_badged_cover_is_kept_by_design_version_and_id() {
     let service = octo_media::cover::CoverArtService::new(None);
@@ -1013,7 +980,7 @@ impl crate::services::cover_art::ICoverArtSource for NotAPicture {
 #[tokio::test]
 async fn a_cover_the_badge_failed_on_is_not_kept() {
     let navidrome = MockServer::start().await;
-    let state = state_with(badging(settings(&navidrome.uri())), |inner| {
+    let state = state_with(settings(&navidrome.uri()), |inner| {
         inner.cover_art_aggregator = Arc::new(crate::services::cover_art::CoverArtAggregator::new(vec![
             Arc::new(NotAPicture),
         ]));
@@ -1036,6 +1003,118 @@ async fn a_cover_the_badge_failed_on_is_not_kept() {
             .kept_badged(&state.cover_art_service.badged_key(&id)),
         None
     );
+}
+
+/// The badged-cover state: the shipped logo and one picture for every outside cover.
+fn badging_state(settings: AppSettings) -> crate::app::AppState {
+    state_with(settings, |inner| {
+        inner.cover_art_aggregator = Arc::new(crate::services::cover_art::CoverArtAggregator::new(vec![
+            Arc::new(OnePicture),
+        ]));
+        let logo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../octo/Assets/octo_logo.png");
+        inner.cover_art_service =
+            Arc::new(octo_media::cover::CoverArtService::new(None).with_logo_paths(vec![logo]));
+    })
+}
+
+/// OnePicture's bytes, as an outside cover with no badge goes out.
+async fn one_picture() -> Vec<u8> {
+    use crate::services::cover_art::ICoverArtSource;
+    OnePicture
+        .try_fetch(&SoulseekRouting::default(), false)
+        .await
+        .expect("picture")
+        .to_vec()
+}
+
+/// With the badge turned off, every app gets the plain picture and nothing badged is kept.
+#[tokio::test]
+async fn with_the_badge_off_outside_covers_go_out_plain() {
+    let navidrome = MockServer::start().await;
+    let mut off = settings(&navidrome.uri());
+    off.subsonic.cover_badge = false;
+    let state = badging_state(off);
+    let id = state.external_id_registry.register(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("Artist".into()),
+        title: Some("Title".into()),
+        ..Default::default()
+    });
+    let app = app(&state);
+    let key = state.cover_art_service.badged_key(&id);
+    // A copy badged while the badge was on is not served once it is off.
+    state
+        .cover_art_service
+        .keep_badged(key.clone(), b"badged earlier");
+
+    let reply = get(&app, &format!("/rest/getCoverArt?id={id}&size=300&c=Symfonium")).await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body.as_ref(), one_picture().await.as_slice());
+    // A missing outside cover is still the drawn placeholder for an app that needs a picture.
+    let missing = get(&app, "/rest/getCoverArt?id=ext-album-unknown&c=Symfonium").await;
+    assert_eq!(missing.status, StatusCode::OK);
+    assert!(image::load_from_memory(&missing.body).is_ok());
+
+    // Turned back on, the badged copy is served again.
+    let mut on = settings(&navidrome.uri());
+    on.subsonic.cover_badge = true;
+    state.settings.set(on);
+    let badged = get(&app, &format!("/rest/getCoverArt?id={id}&size=300&c=Symfonium")).await;
+    assert_eq!(badged.body.as_ref(), b"badged earlier");
+}
+
+/// Navidrome's own web UI asks for `mf-<id>`, `al-<id>` and `ar-<id>` whatever id it was given.
+/// An outside id under one of them is Octo's cover; a library id under one is still Navidrome's.
+#[tokio::test]
+async fn navidromes_web_ui_ids_of_outside_items_get_their_covers() {
+    let navidrome = MockServer::start().await;
+    Mock::given(wiremock::matchers::path("/rest/getCoverArt"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(vec![1, 2, 3], "image/png"))
+        .mount(&navidrome)
+        .await;
+    let mut plain = settings(&navidrome.uri());
+    plain.subsonic.cover_badge = false;
+    let state = badging_state(plain);
+    let register = |kind| {
+        state.external_id_registry.register(SoulseekRouting {
+            kind,
+            artist: Some("Dua Lipa".into()),
+            title: Some("Future Nostalgia".into()),
+            album: Some("Future Nostalgia".into()),
+            ..Default::default()
+        })
+    };
+    let song = register(RoutingKind::Song);
+    let album = register(RoutingKind::Album);
+    let artist = register(RoutingKind::Artist);
+    let app = app(&state);
+
+    for id in [
+        format!("mf-{song}"),
+        format!("al-{album}"),
+        format!("ar-{artist}"),
+    ] {
+        let reply = get(
+            &app,
+            &format!("/rest/getCoverArt?id={id}&size=300&_=2026-10-16T09:00:00Z&c=NavidromeUI"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{id}");
+        assert_eq!(reply.header("content-type"), Some("image/jpeg"), "{id}");
+        assert_eq!(reply.body.as_ref(), one_picture().await.as_slice(), "{id}");
+    }
+
+    // A library id keeps its prefix and is Navidrome's to answer.
+    let library = get(&app, "/rest/getCoverArt?id=al-1&u=a&t=good&s=s&c=NavidromeUI").await;
+    assert_eq!(library.body.as_ref(), [1, 2, 3]);
+    // So is a prefix before an id Octo does not know.
+    let unknown = get(
+        &app,
+        "/rest/getCoverArt?id=mf-0123456789abcdefghijkl&u=a&t=good&s=s",
+    )
+    .await;
+    assert_eq!(unknown.body.as_ref(), [1, 2, 3]);
 }
 
 // ---- An outside stream that cannot play, or a range past its end ---------------------------

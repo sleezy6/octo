@@ -426,8 +426,8 @@ impl TrackAcquisitionQueue {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn waiting_plays(&self) -> i32 {
+    /// Plays in the plays lane that the worker has not taken yet.
+    pub fn waiting_plays(&self) -> i32 {
         self.waiting_plays.load(Ordering::SeqCst)
     }
 

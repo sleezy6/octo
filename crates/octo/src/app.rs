@@ -133,6 +133,7 @@ use crate::services::metadata::{
 };
 use crate::services::metadata::{GenreBackfillJournal, GenreBackfillStore, GenreBackfillWorker};
 use crate::services::notifications::{DiscordSink, INotificationSink, NotificationService, NtfySink};
+use crate::services::prefetch::{PrefetchParts, PrefetchService, PrefetchStore, PrefetchedFiles};
 use crate::services::radio::{
     IRadioSource, LastFmRadioSource, ListenBrainzRadioSource, RadioOutcomeStore, RadioSourceSet,
     SongRadioService, SoundsAlikeRadioSource, YouTubeMusicRadioSource,
@@ -147,6 +148,7 @@ use crate::services::soulseek::{
     SoulseekLink, SoulseekMetadataService, SoulseekPortCheck, SoulseekShareSwitch, SoulseekSharing,
     SoulseekStartupValidator,
 };
+use crate::services::spotiflac::SpotiflacClient;
 use crate::services::subsonic::{
     CredentialCheck, NavidromeIdentityService, RecentScrobbles, RequestIdentity, SearchSongOrderCache,
     SubsonicDiscoveryService, SubsonicProxyService, SyncCatalogService,
@@ -310,6 +312,9 @@ pub struct AppInner {
     pub local_cover_cache: Arc<LocalCoverCache>,
     /// `RadioQueueStore`: recent search and radio queues for prewarming, in memory.
     pub radio_queues: Arc<RadioQueueStore>,
+    /// `PrefetchService`: upcoming songs fetched ahead into the prefetch folder
+    /// (`Prefetch:Folder`, or `<config>/prefetch`); its loop is the "PrefetchService" worker.
+    pub prefetch: Arc<PrefetchService>,
     /// `DirectoryBrowser`: the dashboard's folder picker.
     pub directory_browser: Arc<DirectoryBrowser>,
     /// `BrowseSessionStore`: dashboard sign-ins, `browse-sessions.json`.
@@ -372,6 +377,8 @@ pub struct AppInner {
     pub download_service: Arc<dyn IDownloadService>,
     /// `LidarrClient`: the Lidarr v1 client, its address and key read live.
     pub lidarr_client: Arc<LidarrClient>,
+    /// The person's own SpotiFLAC server, its address and token read live.
+    pub spotiflac: Arc<SpotiflacClient>,
     /// `LidarrAlbumClaims`: which Lidarr albums a heart or an upgrade is working on.
     pub lidarr_album_claims: Arc<LidarrAlbumClaims>,
     /// `LidarrImportHandoff`: the files a Lidarr heart brought in, waiting for the pipeline.
@@ -530,6 +537,8 @@ pub struct AppInner {
     pub family_playlist_requests: crate::services::family::family_playlists::PlaylistAddHook,
     /// `family-pool.json`: the one copy of each member download and who links it.
     pub family_pool: Arc<FamilyPoolStore>,
+    /// `listening/`: each person's completed plays, for their Listening page.
+    pub listening: Arc<crate::services::listening::ListeningLog>,
     /// Octo's admin calls to Navidrome for the family (accounts, libraries, players, scans).
     pub navidrome_admin: Arc<NavidromeAdmin>,
     /// Which library every song is in, read from Navidrome while Family is on.
@@ -684,6 +693,31 @@ fn library_edits(
     (rescan, edits)
 }
 
+/// Getting upcoming songs ahead, over the acquisition pipeline: the download service fetches them,
+/// the heart queue goes first, and the coordinator starts them as plays with DownloadOnPlay on.
+fn prefetch_service(
+    settings: &Arc<SettingsStore>,
+    stores: &Stores,
+    navidrome: &NavidromeServices,
+    acquisition: &Acquisition,
+    soulseek_link: Arc<dyn ISoulseekLink>,
+) -> Arc<PrefetchService> {
+    PrefetchService::new(PrefetchParts {
+        settings: settings.clone(),
+        store: stores.prefetch_store.clone(),
+        downloads: acquisition.download_service.clone(),
+        queue: acquisition.track_acquisition_queue.clone(),
+        coordinator: acquisition.heart_acquisition_coordinator.clone(),
+        radio_queues: stores.radio_queues.clone(),
+        write_gate: navidrome.family_write_gate.clone(),
+        library: navidrome.local_library.clone(),
+        concurrency: Some(stores.download_concurrency.clone()),
+        names: Some(stores.external_id_registry.clone()),
+        soulseek: Some(soulseek_link),
+        clock: Clock::system(),
+    })
+}
+
 /// The tagging and verification services, which the download base
 /// (`services::common::BaseDownloadService`) and the tag preview are built over.
 struct Tagging {
@@ -757,6 +791,7 @@ struct DownloadDeps<'a> {
 struct Acquisition {
     download_service: Arc<dyn IDownloadService>,
     lidarr_client: Arc<LidarrClient>,
+    spotiflac: Arc<SpotiflacClient>,
     lidarr_album_claims: Arc<LidarrAlbumClaims>,
     lidarr_import_handoff: Arc<LidarrImportHandoff>,
     lidarr_track_fetcher: Arc<dyn ILidarrTrackFetcher>,
@@ -843,6 +878,7 @@ impl Acquisition {
             Some(clients.music_brainz.clone()),
         ));
         let lidarr_track_fetcher: Arc<dyn ILidarrTrackFetcher> = lidarr_fetcher.clone();
+        let spotiflac = Arc::new(SpotiflacClient::new(settings.clone()));
 
         // The download service: the base is built over the services above, and the Soulseek
         // backend's optional ones are the link and Lidarr's two. A handler test may swap in its
@@ -880,6 +916,7 @@ impl Acquisition {
                         write_gate: Some(stores.library_write_gate.clone()),
                         family: Some(navidrome.family_pool_service.clone() as Arc<dyn FamilyPlacement>),
                         arrivals: Some(stores.download_arrivals.clone()),
+                        prefetched: Some(stores.prefetch_store.clone() as Arc<dyn PrefetchedFiles>),
                     },
                     SoulseekDownloadParts {
                         slskd: downloads.soulseek_client.clone(),
@@ -898,6 +935,7 @@ impl Acquisition {
                         soulseek_link: Some(soulseek_link.clone()),
                         lidarr_imports: Some(lidarr_import_handoff.clone()),
                         lidarr_fetcher: Some(lidarr_track_fetcher.clone()),
+                        spotiflac: Some(spotiflac.clone()),
                     },
                 );
                 (download_base as Arc<dyn IDownloadService>, Some(backend))
@@ -945,6 +983,7 @@ impl Acquisition {
                 holds: Some(stores.soulseek_holds.clone()),
                 owned: Some(heart_ownership.clone()),
                 stars: Some(star_on_arrival.clone()),
+                ahead: Some(stores.prefetch_store.clone() as Arc<dyn PrefetchedFiles>),
             },
         );
         heart_acquisition_coordinator.use_family(FamilyHooks {
@@ -978,6 +1017,7 @@ impl Acquisition {
         Acquisition {
             download_service,
             lidarr_client,
+            spotiflac,
             lidarr_album_claims,
             lidarr_import_handoff,
             lidarr_track_fetcher,
@@ -1238,6 +1278,7 @@ struct Stores {
     local_cover_cache: Arc<LocalCoverCache>,
     external_id_registry: Arc<ExternalIdRegistry>,
     radio_queues: Arc<RadioQueueStore>,
+    prefetch_store: Arc<PrefetchStore>,
     directory_browser: Arc<DirectoryBrowser>,
     browse_sessions: Arc<BrowseSessionStore>,
     rejected_peers: Arc<RejectedPeerRegistry>,
@@ -1258,6 +1299,7 @@ struct Stores {
     family_saved: Arc<SavedStore>,
     family_playlists: Arc<FamilyPlaylistStore>,
     family_pool: Arc<FamilyPoolStore>,
+    listening: Arc<crate::services::listening::ListeningLog>,
 }
 
 impl Stores {
@@ -1302,6 +1344,19 @@ impl Stores {
                 }),
             ),
         );
+        // The songs fetched ahead: the Prefetch folder, or `prefetch` beside settings.json.
+        let prefetch_settings = settings.clone();
+        let default_prefetch = config_dir.join("prefetch");
+        let prefetch_store = Arc::new(PrefetchStore::new(
+            Arc::new(move || {
+                prefetch_settings
+                    .current()
+                    .prefetch
+                    .effective_folder()
+                    .map_or_else(|| default_prefetch.clone(), PathBuf::from)
+            }),
+            Clock::system(),
+        ));
         let cover_settings = settings.clone();
         let local_cover_cache = Arc::new(LocalCoverCache::new(
             config_dir.join("cover-cache"),
@@ -1326,6 +1381,7 @@ impl Stores {
             local_cover_cache,
             external_id_registry,
             radio_queues: Arc::new(RadioQueueStore::new()),
+            prefetch_store,
             directory_browser: Arc::new(DirectoryBrowser::new()),
             browse_sessions: Arc::new(BrowseSessionStore::new(Some(
                 config_dir.join("browse-sessions.json"),
@@ -1366,6 +1422,10 @@ impl Stores {
                 config_dir.join("family-playlists.json"),
             ))),
             family_pool: Arc::new(FamilyPoolStore::new(Some(config_dir.join("family-pool.json")))),
+            listening: Arc::new(crate::services::listening::ListeningLog::new(
+                config_dir.join("listening"),
+                settings.clone(),
+            )),
         }
     }
 
@@ -1862,6 +1922,10 @@ impl Imports {
             settings: settings.clone(),
             tracker: Some(acquisition.acquisition_tracker.clone()),
         });
+        let weak = Arc::downgrade(&service);
+        stores
+            .external_id_registry
+            .set_recovery(Arc::new(move |id| weak.upgrade()?.preview_routing(id)));
         Imports { service, trickle }
     }
 
@@ -2085,6 +2149,7 @@ impl Radio {
             last_fm_scrobbles: Some(integrations.last_fm_scrobbles.clone()),
             recommendations: Some(recommendations.clone()),
         });
+        streams.use_listening(stores.listening.clone());
         let warmup = Arc::new(LastFmRadioWarmupService::new(streams.clone(), state.clone()));
         let refresh_worker = Arc::new(LastFmRadioRefreshWorker::new(
             refresh_queue.clone(),
@@ -2922,6 +2987,27 @@ impl AppState {
             &clients.music_brainz,
         );
         radio.register_workers(&workers);
+        let prefetch = prefetch_service(
+            &settings,
+            &stores,
+            &navidrome,
+            &acquisition,
+            soulseek.link.clone(),
+        );
+        prefetch.use_mixes(radio.generated_playlists.clone());
+        {
+            let prefetch = prefetch.clone();
+            workers.register("PrefetchService", move |stopping| prefetch.clone().run(stopping));
+        }
+        // Listening: the radio history copied in once, then old plays pruned once a day.
+        let listening = stores.listening.clone();
+        let history = radio.state.clone();
+        let listening_last_fm = integrations.last_fm.clone();
+        workers.register("ListeningLog", move |stopping| {
+            listening
+                .clone()
+                .run(history.clone(), listening_last_fm.clone(), stopping)
+        });
         let charts = Charts::build(
             &settings,
             &stores,
@@ -3102,6 +3188,7 @@ impl AppState {
             stream_size_warmer: stores.stream_size_warmer,
             local_cover_cache: stores.local_cover_cache,
             radio_queues: stores.radio_queues,
+            prefetch,
             directory_browser: stores.directory_browser,
             browse_sessions: stores.browse_sessions,
             sign_in_throttle: admin_sign_in.throttle,
@@ -3152,6 +3239,7 @@ impl AppState {
             metadata_service,
             download_service: acquisition.download_service,
             lidarr_client: acquisition.lidarr_client,
+            spotiflac: acquisition.spotiflac,
             lidarr_album_claims: acquisition.lidarr_album_claims,
             lidarr_import_handoff: acquisition.lidarr_import_handoff,
             lidarr_track_fetcher: acquisition.lidarr_track_fetcher,
@@ -3219,6 +3307,7 @@ impl AppState {
             family_playlists: stores.family_playlists,
             family_playlist_requests: Default::default(),
             family_pool: stores.family_pool,
+            listening: stores.listening,
             navidrome_admin: family_navidrome.0,
             library_index: family_navidrome.1,
             library_scope: family_navidrome.2,
@@ -3376,6 +3465,14 @@ impl AppState {
             &acquisition,
             &clients.music_brainz,
         );
+        let prefetch = prefetch_service(
+            &settings,
+            &stores,
+            &navidrome,
+            &acquisition,
+            soulseek.link.clone(),
+        );
+        prefetch.use_mixes(radio.generated_playlists.clone());
         // Apple's pages from the test's mock server, else an address that refuses at once (a
         // port the system handed out and let go: never port 1, which WSL's mirrored networking
         // lets time out). The warm worker is not run.
@@ -3515,6 +3612,7 @@ impl AppState {
             stream_size_warmer: stores.stream_size_warmer,
             local_cover_cache: stores.local_cover_cache,
             radio_queues: stores.radio_queues,
+            prefetch,
             directory_browser: stores.directory_browser,
             browse_sessions: stores.browse_sessions,
             sign_in_throttle: admin_sign_in.throttle,
@@ -3565,6 +3663,7 @@ impl AppState {
             metadata_service,
             download_service: acquisition.download_service,
             lidarr_client: acquisition.lidarr_client,
+            spotiflac: acquisition.spotiflac,
             lidarr_album_claims: acquisition.lidarr_album_claims,
             lidarr_import_handoff: acquisition.lidarr_import_handoff,
             lidarr_track_fetcher: acquisition.lidarr_track_fetcher,
@@ -3632,6 +3731,7 @@ impl AppState {
             family_playlists: stores.family_playlists,
             family_playlist_requests: Default::default(),
             family_pool: stores.family_pool,
+            listening: stores.listening,
             navidrome_admin: family_navidrome.0,
             library_index: family_navidrome.1,
             library_scope: family_navidrome.2,
@@ -3747,7 +3847,12 @@ mod tests {
     async fn the_acquisition_pipeline_is_wired_with_its_workers() {
         let state = AppState::build(SettingsStore::from_env(Vec::new(), None));
         let names: Vec<String> = state.workers.status().into_iter().map(|s| s.name).collect();
-        for name in ["AcquisitionWorker", "SoulseekHoldResumer", "CacheCleanupService"] {
+        for name in [
+            "AcquisitionWorker",
+            "SoulseekHoldResumer",
+            "CacheCleanupService",
+            "PrefetchService",
+        ] {
             assert!(names.iter().any(|n| n == name), "{name} in {names:?}");
         }
 

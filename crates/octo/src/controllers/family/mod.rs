@@ -15,6 +15,7 @@ pub mod address;
 pub mod admin_entry;
 pub mod handover;
 pub mod imports;
+pub mod listening;
 pub mod manage;
 
 #[cfg(test)]
@@ -107,6 +108,7 @@ pub fn routes() -> RouteSet {
         .route("/api/family/me/explicit", put(set_explicit))
         .route("/api/family/me/ntfy", put(set_ntfy))
         .route("/api/family/me/lastfm", get(my_last_fm))
+        .route("/api/family/me/listening", get(listening::my_listening))
         .route("/api/family/me/imports", get(imports::my_imports))
         .route("/api/family/me/imports/text", post(imports::import_text))
         .route(
@@ -127,6 +129,7 @@ pub fn routes() -> RouteSet {
         .route("/api/family/requests/{id}/approve", post(approve))
         .route("/api/family/requests/{id}/decline", post(decline))
         .route("/api/family/devices", get(devices))
+        .route("/api/family/listening", get(listening::family_listening))
         .route("/api/family/devices/{id}", delete(forget_device))
         .route("/api/family/playlists", get(playlists).post(create_playlist))
         .route("/api/family/playlists/people", get(playlist_people))

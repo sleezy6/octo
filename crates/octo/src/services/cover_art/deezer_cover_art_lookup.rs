@@ -11,6 +11,7 @@ use octo_core::common::cover_names::{
 use octo_core::common::{SongIdentity, dotnet};
 use octo_core::json::element::{array_length, enumerate_array, get_string, str_prop, try_get_property};
 use octo_core::metadata::accept_language_header;
+use octo_core::metadata::deezer_image::deezer_image;
 use octo_core::settings::MetadataSettings;
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
 use serde_json::Value;
@@ -157,10 +158,7 @@ impl DeezerCoverArtLookup {
         let Some(doc) = self.get_json(&url, background).await? else {
             return Ok(None);
         };
-        Ok(str_prop(&doc, "cover_xl")?
-            .or(str_prop(&doc, "cover_big")?)
-            .or(str_prop(&doc, "cover_medium")?)
-            .map(str::to_string))
+        Ok(deezer_image(&doc, &["cover_xl", "cover_big", "cover_medium"])?.map(str::to_string))
     }
 
     async fn resolve_artist_cover(&self, artist: &str, background: bool) -> anyhow::Result<Option<String>> {
@@ -186,9 +184,7 @@ impl DeezerCoverArtLookup {
                 Some(n) => get_string(n)?.unwrap_or(""),
                 None => "",
             };
-            let pic = str_prop(item, "picture_xl")?
-                .or(str_prop(item, "picture_big")?)
-                .or(str_prop(item, "picture")?);
+            let pic = deezer_image(item, &["picture_xl", "picture_big", "picture"])?;
             let Some(pic) = pic.filter(|p| !p.is_empty()) else {
                 continue;
             };
@@ -274,9 +270,7 @@ fn pick_best_album_cover(
         let artist = artist_name(item)?;
         let album = try_get_property(item, "album")?;
         let cover = match album {
-            Some(album) => str_prop(album, "cover_xl")?
-                .or(str_prop(album, "cover_big")?)
-                .or(str_prop(album, "cover_medium")?),
+            Some(album) => deezer_image(album, &["cover_xl", "cover_big", "cover_medium"])?,
             None => None,
         };
         let Some(cover) = cover.filter(|c| !c.is_empty()) else {
@@ -316,9 +310,7 @@ fn pick_best_direct_cover(
     let mut best_score = i32::MIN;
     for item in enumerate_array(data)? {
         let artist = artist_name(item)?;
-        let cover = str_prop(item, "cover_xl")?
-            .or(str_prop(item, "cover_big")?)
-            .or(str_prop(item, "cover_medium")?);
+        let cover = deezer_image(item, &["cover_xl", "cover_big", "cover_medium"])?;
         let Some(cover) = cover.filter(|c| !c.is_empty()) else {
             continue;
         };

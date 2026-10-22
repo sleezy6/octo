@@ -221,12 +221,15 @@ pub fn int_param(parameters: &Parameters, name: &str, fallback: i32) -> i32 {
     }
 }
 
-/// Octo's own playlist ids: radio stations start "or", mixes "og", and while Family is on,
+/// Octo's own playlist ids: radio stations start "or", mixes "og", imports "oi", and while Family is on,
 /// family playlists "of". Navidrome's ids are 22 characters of base62 that start with 0 to 7,
 /// so none can ever be one of them.
 pub fn is_octo_playlist_id(id: &str, family_on: bool) -> bool {
     dotnet::utf16_len(id) == 22
-        && (id.starts_with("or") || id.starts_with("og") || (family_on && id.starts_with("of")))
+        && (id.starts_with("or")
+            || id.starts_with("og")
+            || id.starts_with("oi")
+            || (family_on && id.starts_with("of")))
 }
 
 /// Whether a relayed body says `status="ok"`, read in the format the client asked for
@@ -859,6 +862,11 @@ pub async fn serve_station_songs(
     state
         .radio_queues
         .register(songs.iter().map(|song| song.id.clone()));
+    // A station's songs (the radio stations and the mixes on them) are radio songs for the ones
+    // fetched ahead.
+    state
+        .prefetch
+        .note_radio(&songs.iter().map(|song| song.id.clone()).collect::<Vec<_>>());
     state
         .last_fm_radio_recommendations
         .remember_served(username, &songs);

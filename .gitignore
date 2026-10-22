@@ -98,15 +98,13 @@ __pycache__/
 # GeoNames' files for the image build, when downloaded beforehand (docker.yml does).
 /places-data/
 
-# Parity harness runs: the writable library copies and the box reports.
-parity/.run/
+# The parity harness and its runs stay local.
+parity/
 /octo-cache/
 
 # Markdown notes, plans and reports stay local. Published: the READMEs, the Family
-# guide the README links to, the icon attribution, and known-diffs.md, which
-# parity.py reads.
+# guide the README links to and the icon attribution.
 *.md
 !README.md
 !docs/family.md
-!docs/rust-migration/known-diffs.md
 !scripts/admin-icons/SOURCES.md

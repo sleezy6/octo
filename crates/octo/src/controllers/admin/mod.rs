@@ -27,14 +27,17 @@ pub mod imports;
 pub mod json_body;
 pub mod lastfm;
 pub mod library_actions;
+pub mod listening;
 pub mod lyrics_admin;
 pub mod plumbing;
+pub mod prefetch;
 pub mod radio_admin;
 pub mod raw_config;
 pub mod request_binding;
 pub mod secrets;
 pub mod settings;
 pub mod soulseek_sharing;
+pub mod spotiflac;
 pub mod system;
 pub mod tidy;
 pub mod trash;
@@ -56,6 +59,9 @@ pub fn admin_controller_routes() -> RouteSet {
             get(lastfm::validate_listen_brainz_get).post(lastfm::validate_listen_brainz_post),
         )
         .route("/api/admin/lastfm/scrobble", get(lastfm::get_last_fm_scrobbling))
+        // Listening.
+        .route("/api/admin/listening", get(listening::get_listening))
+        .route("/api/admin/listening/clear", post(listening::clear_listening))
         .route("/api/admin/lastfm/check", post(lastfm::check_last_fm_credentials))
         .route(
             "/api/admin/lastfm/scrobble/cancel",
@@ -115,6 +121,7 @@ pub fn admin_controller_routes() -> RouteSet {
             get(system::get_deezer_cache).delete(system::clear_deezer_cache),
         )
         .route("/api/admin/deezer/requests", get(system::get_deezer_requests))
+        .route("/api/admin/spotiflac/test", post(spotiflac::test_spotiflac))
         .route("/api/admin/restart", post(system::restart))
         .route(
             "/api/admin/soulseek/rejected-peers/clear",
@@ -154,6 +161,7 @@ pub fn library_and_job_routes() -> RouteSet {
         .merge(downloads::routes())
         .merge(soulseek_sharing::routes())
         .merge(radio_admin::routes())
+        .merge(prefetch::routes())
 }
 
 /// The activity view behind the progress toasts, and the Afterglow light.

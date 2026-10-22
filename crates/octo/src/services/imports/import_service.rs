@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -58,6 +59,11 @@ pub struct ImportService {
     gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// People whose lists need matching again: the trickle brought them something.
     rematch: Mutex<Vec<String>>,
+    /// A song a streaming list misses landed: the next open or pass reads the library again.
+    reread_library: AtomicBool,
+    /// Library songs as Navidrome described them to each listener for a streaming list, by
+    /// lowercased listener and song id, with when they were read.
+    songs: Mutex<HashMap<(String, String), (serde_json::Value, DateTime<Utc>)>>,
     /// Lists whose playlist needs writing, as "owner\nid".
     dirty_playlists: Mutex<Vec<String>>,
     /// The back-off for a playlist that would not write: failures so far and when to try
@@ -124,6 +130,8 @@ impl ImportService {
             tracker: parts.tracker,
             gates: Mutex::new(HashMap::new()),
             rematch: Mutex::new(Vec::new()),
+            reread_library: AtomicBool::new(false),
+            songs: Mutex::new(HashMap::new()),
             dirty_playlists: Mutex::new(Vec::new()),
             playlist_retries: Mutex::new(HashMap::new()),
             clock: Mutex::new(Clock::system()),
@@ -135,6 +143,34 @@ impl ImportService {
                 service.on_fetched(job);
             }
         }));
+        // A heart can bring a song a streaming list is missing. Once Navidrome shows it, the
+        // owners of the lists that miss it are matched again on the next pass, which reads the
+        // library once however many songs landed in between.
+        if let Some(tracker) = &service.tracker {
+            let weak = Arc::downgrade(&service);
+            tracker.subscribe_ended(Arc::new(move |end| {
+                if !end.done || end.library_id.is_none() {
+                    return;
+                }
+                let Some(service) = weak.upgrade() else {
+                    return;
+                };
+                let owners = service
+                    .store
+                    .streaming_owners_missing(end.artist.as_deref(), end.title.as_deref());
+                if owners.is_empty() {
+                    return;
+                }
+                service.matcher.forget();
+                service.reread_library.store(true, Ordering::Relaxed);
+                let mut rematch = service.rematch.lock();
+                for owner in owners {
+                    if !rematch.iter().any(|user| eq_ignore_case(user, &owner)) {
+                        rematch.push(owner);
+                    }
+                }
+            }));
+        }
         service
     }
 
@@ -160,6 +196,110 @@ impl ImportService {
 
     pub fn matcher(&self) -> &Arc<ImportMatcher> {
         &self.matcher
+    }
+
+    /// How long a library song read for a streaming list is used again.
+    const KEEP_SONG_FOR: TimeDelta = TimeDelta::minutes(10);
+    /// The most library songs kept for streaming lists across everyone.
+    const MOST_SONGS_KEPT: usize = 20_000;
+
+    /// A library song read for this listener's streaming list in the last ten minutes.
+    pub fn cached_song(&self, user: &str, id: &str) -> Option<serde_json::Value> {
+        let now = self.now();
+        self.songs
+            .lock()
+            .get(&(to_lower_invariant(user), id.to_string()))
+            .filter(|(_, at)| now - *at < Self::KEEP_SONG_FOR)
+            .map(|(song, _)| song.clone())
+    }
+
+    pub fn cache_song(&self, user: &str, id: &str, song: serde_json::Value) {
+        let now = self.now();
+        let mut songs = self.songs.lock();
+        if songs.len() >= Self::MOST_SONGS_KEPT {
+            songs.retain(|_, (_, at)| now - *at < Self::KEEP_SONG_FOR);
+            if songs.len() >= Self::MOST_SONGS_KEPT {
+                songs.clear();
+            }
+        }
+        songs.insert((to_lower_invariant(user), id.to_string()), (song, now));
+    }
+
+    /// A heart or rating changed these songs: everyone's kept copy of them is read again.
+    pub fn forget_cached_songs(&self, ids: &[String]) {
+        let mut songs = self.songs.lock();
+        if songs.is_empty() {
+            return;
+        }
+        songs.retain(|(_, id), _| !ids.iter().any(|changed| changed == id));
+    }
+
+    pub fn preview_routing(&self, id: &str) -> Option<octo_core::soulseek::SoulseekRouting> {
+        self.store.preview_routing(id)
+    }
+
+    /// Toggle only the virtual playlist: never starts the trickle or writes to Navidrome.
+    pub fn set_streaming(&self, user: &str, id: &str, on: bool) -> ImportActionResult {
+        if !self
+            .store
+            .update(user, id, |list| list.stream_without_downloading = on)
+        {
+            return ImportActionResult::failed("There is no such list.");
+        }
+        ImportActionResult::ok(if on {
+            "This snapshot is now a playlist in Octo. Missing songs stream as previews; heart a song to keep it. Get missing songs remains a separate choice."
+        } else {
+            "The streaming playlist is no longer shown in Octo."
+        })
+    }
+
+    pub fn streaming_lists(&self, user: &str) -> Vec<ImportList> {
+        if user.trim().is_empty() {
+            return Vec::new();
+        }
+        self.store
+            .lists_of(user)
+            .into_iter()
+            .filter(|list| list.stream_without_downloading)
+            .collect()
+    }
+
+    /// Resolve only this authenticated listener's snapshot, including after a restart.
+    pub fn streaming_list(&self, user: &str, playlist_id: &str) -> Option<ImportList> {
+        self.streaming_lists(user)
+            .into_iter()
+            .find(|list| super::import_streaming::playlist_id(list) == playlist_id)
+    }
+
+    /// Re-match local copies on read without refreshing the source. Persist only an actual
+    /// change, so the playlist's changed time is stable and an app can notice a landed copy.
+    pub async fn matched_streaming_list(&self, user: &str, playlist_id: &str) -> Option<ImportList> {
+        let mut list = self.streaming_list(user, playlist_id)?;
+        let before = list.tracks.clone();
+        let landed = self.reread_library.load(Ordering::Relaxed);
+        if !self
+            .matcher
+            .match_streaming_tracks_for(user, &mut list.tracks, landed)
+            .await
+        {
+            // The stored matches answer now; the next pass reads the library and matches again.
+            let mut rematch = self.rematch.lock();
+            if !rematch.iter().any(|u| eq_ignore_case(u, user)) {
+                rematch.push(user.to_string());
+            }
+            return Some(list);
+        }
+        if list.tracks != before {
+            list.matched_utc = Some(self.now());
+            self.store.update(user, &list.id, |saved| {
+                // A simultaneous explicit reimport must keep its new snapshot.
+                if saved.tracks == before {
+                    saved.tracks.clone_from(&list.tracks);
+                    saved.matched_utc = list.matched_utc;
+                }
+            });
+        }
+        Some(list)
     }
 
     // =========================================================================================
@@ -881,6 +1021,9 @@ impl ImportService {
     /// One pass of the loop: matches people the trickle brought songs, writes playlists, and
     /// reads stale links again.
     pub async fn loop_once(self: &Arc<Self>) -> anyhow::Result<()> {
+        if self.reread_library.swap(false, Ordering::Relaxed) {
+            self.matcher.forget();
+        }
         let users: Vec<String> = std::mem::take(&mut *self.rematch.lock());
         for user in users {
             let gate = self.gate(&user);
@@ -974,6 +1117,10 @@ fn summary(list: &ImportList, jobs: &IndexMap<String, TrickleJob>) -> ListSummar
         not_found: count(import_track_states::NOT_FOUND),
         skipped: count(import_track_states::SKIPPED),
         keep_playlist: list.keep_playlist,
+        stream_without_downloading: list.stream_without_downloading,
+        streaming_playlist_id: list
+            .stream_without_downloading
+            .then(|| super::import_streaming::playlist_id(list)),
         playlist_id: list.playlist_id.clone(),
         playlist_note: list.playlist_note.clone(),
         get_missing: list.get_missing,

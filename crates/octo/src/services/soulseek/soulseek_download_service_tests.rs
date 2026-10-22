@@ -488,6 +488,10 @@ struct SlskdState {
     /// Files written with some audio after the STREAMINFO. TagLib# (and the tag reader after it)
     /// gives a FLAC with no audio no length at all, so only these have one to check.
     with_audio: HashSet<String>,
+    /// Files written as these exact bytes: real audio, for the checks that listen to it.
+    sound: HashMap<String, Vec<u8>>,
+    /// The audio the shim's /stream sends whole; none answers the two-byte partial reply.
+    preview: Option<Vec<u8>>,
 }
 
 /// slskd as far as one walk needs: logged in, searches answered from a script, and every batch
@@ -621,6 +625,15 @@ impl Respond for FakeSlskd {
                 200,
             );
         }
+        if path == "/v2/lookup" {
+            // An AcoustID that has never heard any of it.
+            return json_answer(&json!({"status": "ok", "results": []}), 200);
+        }
+        if path == "/stream"
+            && let Some(preview) = self.state.lock().preview.clone()
+        {
+            return ResponseTemplate::new(200).set_body_raw(preview, "audio/flac");
+        }
         if path == "/stream" {
             return ResponseTemplate::new(206)
                 .insert_header("content-range", "bytes 0-1/12345")
@@ -668,7 +681,11 @@ impl Respond for FakeSlskd {
                     .to_string();
                 let local = std::path::Path::new(&self.root).join(&destination).join(&leaf);
                 std::fs::create_dir_all(local.parent().expect("a parent")).expect("made");
-                let mut bytes = flac(state.lengths.get(file).copied().unwrap_or(200));
+                let mut bytes = state
+                    .sound
+                    .get(file)
+                    .cloned()
+                    .unwrap_or_else(|| flac(state.lengths.get(file).copied().unwrap_or(200)));
                 if state.with_audio.contains(file) {
                     // Enough for a bitrate of at least 1 kbps, within the 64 KB size drift of the advertised size.
                     bytes.extend_from_slice(&[0u8; 48_000]);
@@ -717,6 +734,7 @@ struct Walk {
     slskd: FakeSlskd,
     songs: Vec<Song>,
     album_id: String,
+    rejected: Arc<RejectedPeerRegistry>,
     _server: MockServer,
 }
 
@@ -750,6 +768,17 @@ async fn build_with_soulseek(
     build_full(root, album_folders, source, soulseek_on, None, answers).await
 }
 
+/// Downloads checked, with an AcoustID key, against the fake's AcoustID.
+async fn build_verified(
+    root: &Root,
+    album_folders: bool,
+    source: DownloadSource,
+    soulseek_on: bool,
+    answers: impl FnOnce(Vec<Song>) -> Answers,
+) -> Walk {
+    build_served(root, album_folders, source, soulseek_on, None, true, answers, |_| {}).await
+}
+
 /// `deezer`: Deezer as a source of audio, whether outside songs play from it, and its
 /// playback cache.
 async fn build_full(
@@ -760,16 +789,19 @@ async fn build_full(
     deezer: Option<(Arc<DeezerResolver>, bool, Option<Arc<DeezerAudioCache>>)>,
     answers: impl FnOnce(Vec<Song>) -> Answers,
 ) -> Walk {
-    build_served(root, album_folders, source, soulseek_on, deezer, answers, |_| {}).await
+    build_served(root, album_folders, source, soulseek_on, deezer, false, answers, |_| {}).await
 }
 
 /// [`build_full`], with the download services changed by `extra` (a tracker, a write gate).
+/// `verified`: downloads are checked, with an AcoustID key, against the fake's AcoustID.
+#[allow(clippy::too_many_arguments)]
 async fn build_served(
     root: &Root,
     album_folders: bool,
     source: DownloadSource,
     soulseek_on: bool,
     deezer: Option<(Arc<DeezerResolver>, bool, Option<Arc<DeezerAudioCache>>)>,
+    verified: bool,
     answers: impl FnOnce(Vec<Song>) -> Answers,
     extra: impl FnOnce(&mut DownloadServices),
 ) -> Walk {
@@ -822,7 +854,12 @@ async fn build_served(
         album_folders,
         parallel_downloads: 3,
         detect_transcodes: false,
-        verify_downloads: false,
+        verify_downloads: verified,
+        acoust_id_api_key: if verified {
+            "key".into()
+        } else {
+            Default::default()
+        },
         download_timeout_seconds: 30,
         ..Default::default()
     };
@@ -889,18 +926,20 @@ async fn build_served(
         ..Default::default()
     };
     extra(&mut services);
+    let acoust_id = url::Url::parse(&format!("{}/", server.uri())).expect("parses");
     let verification = Arc::new(DownloadVerificationService::new(
         Arc::new(AudioFingerprinter::new()),
-        Arc::new(AcoustIdClient::new(Arc::new(AcoustIdRateLimitHandler::new(
-            Arc::new(AcoustIdRateLimiter::new()),
-        )))),
+        Arc::new(AcoustIdClient::new(Arc::new(
+            AcoustIdRateLimitHandler::with_base_url(Arc::new(AcoustIdRateLimiter::new()), acoust_id),
+        ))),
         Arc::clone(&settings),
         None,
         None,
     ));
+    let rejected = Arc::new(RejectedPeerRegistry::in_memory());
     let parts = SoulseekDownloadParts {
         slskd: client,
-        rejected_peers: Arc::new(RejectedPeerRegistry::in_memory()),
+        rejected_peers: Arc::clone(&rejected),
         verification,
         youtube: Arc::new(YouTubeResolver::with_base_url(Some(&server.uri()))),
         stream_from_deezer: deezer.as_ref().is_some_and(|(_, stream, _)| *stream),
@@ -910,6 +949,7 @@ async fn build_served(
         soulseek_link: None,
         lidarr_imports: None,
         lidarr_fetcher: None,
+        spotiflac: None,
     };
     let (service, backend) = SoulseekDownloadService::build(core, services, parts);
     Walk {
@@ -919,6 +959,7 @@ async fn build_served(
         slskd,
         songs,
         album_id: "album-1".into(),
+        rejected,
         _server: server,
     }
 }
@@ -1281,6 +1322,139 @@ async fn a_peer_that_delivers_the_wrong_length_is_passed_over_for_the_next() {
     );
 }
 
+// ---- The preview check ------------------------------------------------------------------
+
+/// 180 s of audio ffmpeg makes from a lavfi source, encoded as `format`; None where ffmpeg or
+/// fpcalc is missing.
+fn made_sound(source: &str, format: &[&str]) -> Option<Vec<u8>> {
+    let on_path = |program: &str| {
+        std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+    };
+    if !on_path("ffmpeg") || !on_path("fpcalc") {
+        return None;
+    }
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let out = dir.path().join("sound");
+    let made = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", source])
+        .args(format)
+        .arg(&out)
+        .status()
+        .is_ok_and(|status| status.success());
+    made.then(|| std::fs::read(&out).expect("made"))
+}
+
+/// The song "Started", a peer whose file is noise, and a peer whose file is the song; AcoustID
+/// has never heard either, and YouTube Music's row for the song is Drake's own.
+fn song_and_noise(walk: &Walk) -> Option<Vec<u8>> {
+    let melody = "aevalsrc=exprs=0.4*sin(2*PI*t*220*pow(2\\,floor(mod(t*2\\,8))*2/12))\
+                  +0.3*sin(2*PI*t*330*pow(2\\,floor(mod(t*3\\,5))*3/12)):s=44100:d=180";
+    let song = made_sound(melody, &["-c:a", "flac", "-f", "flac"])?;
+    let noise = made_sound(
+        "anoisesrc=color=pink:duration=180:amplitude=0.3:seed=7",
+        &["-c:a", "flac", "-f", "flac"],
+    )?;
+    let preview = made_sound(melody, &["-c:a", "aac", "-b:a", "128k", "-f", "mp4"])?;
+    let mut state = walk.slskd.state.lock();
+    state.sound.insert(r"A\Drake\04 - Started.flac".into(), noise);
+    state.sound.insert(r"B\Drake\04 - Started.flac".into(), song);
+    state.ytm_tracks = Some(json!([{
+        "videoId": "ytm-atv", "title": "Started", "artists": ["Drake"],
+        "durationSeconds": 180, "videoType": "MUSIC_VIDEO_TYPE_ATV",
+    }]));
+    Some(preview)
+}
+
+/// The two peers of [`song_and_noise`], each listing its file at its real size, the noise's
+/// peer the faster so it is tried first.
+fn noise_then_song(sizes: HashMap<String, usize>) -> Answers {
+    Arc::new(move |text: &str| {
+        if !text.contains("Started") {
+            return Vec::new();
+        }
+        [
+            ("wrongpeer", r"A\Drake\04 - Started.flac", 2_000_000),
+            ("rightpeer", r"B\Drake\04 - Started.flac", 1_000_000),
+        ]
+        .iter()
+        .map(|(user, file, speed)| {
+                json!({
+                    "username": user, "uploadSpeed": speed, "queueLength": 0, "hasFreeUploadSlot": true,
+                    "files": [{"filename": file, "size": sizes[*file] as i64, "length": 180, "extension": "flac"}],
+                })
+            })
+            .collect()
+    })
+}
+
+async fn verified_walk(root: &Root) -> Option<(Walk, Vec<u8>)> {
+    let sizes: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+    let listed = Arc::clone(&sizes);
+    let walk = build_verified(root, false, DownloadSource::Soulseek, true, move |_| {
+        Arc::new(move |text: &str| noise_then_song(listed.lock().clone())(text))
+    })
+    .await;
+    let preview = song_and_noise(&walk)?;
+    let state = walk.slskd.state.lock();
+    *sizes.lock() = state
+        .sound
+        .iter()
+        .map(|(file, bytes)| (file.clone(), bytes.len()))
+        .collect();
+    drop(state);
+    Some((walk, preview))
+}
+
+/// #101: a file AcoustID never heard that sounds nothing like the song's own YouTube preview is
+/// refused like any failed check, its peer remembered, and the next peer's file is kept.
+#[tokio::test]
+async fn a_file_that_does_not_sound_like_the_preview_is_passed_over_for_the_next() {
+    let root = Root::new("octo-preview-");
+    let Some((walk, preview)) = verified_walk(&root).await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    walk.slskd.state.lock().preview = Some(preview);
+
+    let path = acquire(&walk, walk.songs[3].external_id.as_deref().expect("an id"), None)
+        .await
+        .expect("the second peer's file is kept");
+
+    let users: Vec<String> = walk.slskd.batches().into_iter().map(|(u, ..)| u).collect();
+    assert_eq!(users, names(&["wrongpeer", "rightpeer"]));
+    assert!(std::path::Path::new(&path).is_file(), "{path}");
+    assert_eq!(placed_flacs(&root), 1);
+    assert!(
+        walk.rejected
+            .is_denied(Some("wrongpeer"), Some(r"A\Drake\04 - Started.flac"))
+    );
+    assert!(
+        !walk
+            .rejected
+            .is_denied(Some("rightpeer"), Some(r"B\Drake\04 - Started.flac"))
+    );
+}
+
+/// With the shim unable to send the preview, the file is judged as it was before: kept.
+#[tokio::test]
+async fn without_a_preview_the_file_acoustid_never_heard_is_kept() {
+    let root = Root::new("octo-preview-");
+    let Some((walk, _)) = verified_walk(&root).await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+
+    acquire(&walk, walk.songs[3].external_id.as_deref().expect("an id"), None)
+        .await
+        .expect("the first peer's file is kept");
+
+    let users: Vec<String> = walk.slskd.batches().into_iter().map(|(u, ..)| u).collect();
+    assert_eq!(users, names(&["wrongpeer"]));
+    assert_eq!(placed_flacs(&root), 1);
+    assert_eq!(walk.rejected.count(), 0);
+}
+
 #[tokio::test]
 async fn without_batches_the_file_is_found_by_name_the_old_way() {
     let root = Root::new("octo-attempts-");
@@ -1583,6 +1757,7 @@ async fn a_song_waiting_for_a_library_job_says_so_and_lands_when_it_ends() {
         DownloadSource::Deezer,
         true,
         Some((deezer.resolver.clone(), false, None)),
+        false,
         |_| Arc::new(|_: &str| Vec::new()),
         move |services| {
             services.tracker = Some(row_tracker);

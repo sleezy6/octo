@@ -17,6 +17,7 @@ pub mod places;
 pub mod radio;
 pub mod settings;
 pub mod soulseek;
+pub mod spotiflac;
 pub mod tagging;
 pub mod updates;
 pub mod validation;

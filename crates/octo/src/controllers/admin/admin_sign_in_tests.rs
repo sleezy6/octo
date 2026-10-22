@@ -369,6 +369,25 @@ async fn only_the_marked_endpoints_answer_without_a_sign_in() {
 }
 
 #[tokio::test]
+async fn the_upcoming_songs_card_asks_for_a_sign_in() {
+    let factory = SignInFactory::new().await;
+    assert_eq!(
+        get(&factory.app, "/api/admin/prefetch").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let clear = send(
+        &factory.app,
+        Method::POST,
+        "/api/admin/prefetch/clear",
+        &[("X-Octo-Admin", "1")],
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(clear.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(clear.json()["signIn"], true);
+}
+
+#[tokio::test]
 async fn an_unknown_admin_path_and_odd_casing_stay_closed() {
     let factory = SignInFactory::new().await;
     assert_eq!(
@@ -1242,4 +1261,140 @@ async fn library_health_fixes_are_refused_while_a_job_writes_the_music_folder() 
     )
     .await;
     assert_eq!(apply.status, StatusCode::ACCEPTED, "{}", apply.text());
+}
+
+// ---- Listening ---------------------------------------------------------------------------------
+
+fn listened(id: &str) -> crate::services::listening::Play {
+    crate::services::listening::Play {
+        song_id: id.into(),
+        cover_id: id.into(),
+        artist: "Kavinsky".into(),
+        title: format!("Song {id}"),
+        album: "OutRun".into(),
+        seconds: 240,
+        is_local: true,
+        played_at: chrono::Utc::now() - chrono::TimeDelta::hours(1),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn listening_needs_a_sign_in_and_a_listener_sees_only_their_own() {
+    let factory = SignInFactory::new().await;
+    let log = &factory.state.listening;
+    assert!(log.record("admin", listened("a")));
+    assert!(log.record("listener", listened("b")));
+
+    assert_eq!(
+        get(&factory.app, "/api/admin/listening").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        admin_write(&factory.app, Method::POST, "/api/admin/listening/clear", None)
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // The app with a listener's sign-in: their own page, whoever it asks for, and no people.
+    let mine = get(
+        &factory.app,
+        "/api/admin/listening?range=7&user=admin&u=listener&p=pw&v=1.16.1&c=test",
+    )
+    .await;
+    assert_eq!(mine.status, StatusCode::OK, "{}", mine.text());
+    let mine = mine.json();
+    assert_eq!(mine["user"], "listener");
+    assert_eq!(mine["everyone"], false);
+    assert!(mine["people"].is_null());
+    assert_eq!(mine["rollup"]["plays"], 1);
+    assert_eq!(mine["rollup"]["topSongs"][0]["songId"], "b");
+    // Clearing is the dashboard's alone.
+    let refused = admin_write(
+        &factory.app,
+        Method::POST,
+        "/api/admin/listening/clear?u=listener&p=pw&v=1.16.1&c=test",
+        None,
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(log.plays_of("listener").len(), 1);
+
+    // The dashboard sees everyone, and one person on asking.
+    let cookie = cookie_of(&factory.sign_in("admin", "pw").await);
+    let all = get_cookie(&factory.app, "/api/admin/listening?range=30", &cookie)
+        .await
+        .json();
+    assert_eq!(all["everyone"], true);
+    assert_eq!(all["range"], 30);
+    assert_eq!(all["people"].as_array().expect("people").len(), 2);
+    assert_eq!(all["rollup"]["plays"], 2);
+    let one = get_cookie(&factory.app, "/api/admin/listening?user=listener", &cookie)
+        .await
+        .json();
+    assert_eq!(one["user"], "listener");
+    assert_eq!(one["rollup"]["plays"], 1);
+
+    let cleared = post_json(
+        &factory.app,
+        "/api/admin/listening/clear?user=listener",
+        &json!({}),
+        &[("Cookie", &cookie)],
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "{}", cleared.text());
+    assert_eq!(cleared.json()["cleared"], 1);
+    assert!(log.plays_of("listener").is_empty());
+    assert_eq!(log.plays_of("admin").len(), 1);
+}
+
+#[tokio::test]
+async fn listening_is_everyones_for_an_admin_app_and_nobodys_for_the_recovery_code() {
+    let factory = SignInFactory::new().await;
+    let log = &factory.state.listening;
+    assert!(log.record("admin", listened("a")));
+    assert!(log.record("listener", listened("b")));
+
+    // A Navidrome admin's own sign-in in the app sees everyone.
+    let admin = get(&factory.app, "/api/admin/listening?u=admin&p=pw&v=1.16.1&c=test").await;
+    assert_eq!(admin.status, StatusCode::OK, "{}", admin.text());
+    assert_eq!(admin.json()["everyone"], true);
+    assert_eq!(admin.json()["rollup"]["plays"], 2);
+
+    // The recovery code fixes settings; it never reads anyone's listening, or clears it.
+    let code = factory.recovery().current().expect("a code");
+    let signed = post_json(
+        &factory.app,
+        "/api/admin/auth/recovery",
+        &json!({ "code": code }),
+        &[],
+    )
+    .await;
+    assert_eq!(signed.status, StatusCode::OK);
+    let cookie = cookie_of(&signed);
+    let refused = get_cookie(&factory.app, "/api/admin/listening", &cookie).await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    let not_cleared = post_json(
+        &factory.app,
+        "/api/admin/listening/clear",
+        &json!({}),
+        &[("Cookie", &cookie)],
+    )
+    .await;
+    assert_eq!(not_cleared.status, StatusCode::FORBIDDEN);
+    assert_eq!(log.plays_of("listener").len(), 1);
+}
+
+#[tokio::test]
+async fn listening_is_hidden_while_the_dashboard_sign_in_is_off() {
+    let state = AppState::for_tests(AppSettings::default());
+    assert!(state.listening.record("admin", listened("a")));
+    let app = app(state.clone());
+    let refused = get(&app, "/api/admin/listening").await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert!(refused.text().contains("sign-in is off"), "{}", refused.text());
+    let not_cleared = admin_write(&app, Method::POST, "/api/admin/listening/clear", None).await;
+    assert_eq!(not_cleared.status, StatusCode::FORBIDDEN);
+    assert_eq!(state.listening.plays_of("admin").len(), 1);
 }

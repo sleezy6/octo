@@ -15,6 +15,7 @@ use crate::models::domain::song::Song;
 use crate::tagging::matching_settings::MatchingSettings;
 use crate::tagging::net::{fixed, signed_fixed};
 use crate::tagging::release_details::ReleaseDetails;
+use crate::tagging::release_distance::ReleaseDistance;
 use crate::tagging::tag_evidence::{FileFacts, ReleaseCandidate, TagEvidence, TagRequest, TagSource};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -290,9 +291,16 @@ impl TagPlan {
 
         if self.album_from_candidate() {
             // A request that named its album keeps it; the release only confirms it, and lends its
-            // facts when it is the same album.
+            // facts when it is the same album. One track of a whole album takes them only from
+            // that album by name: another edition's date, label and ids would file the track
+            // apart from the rest of the album.
             let request_owns = request.as_ref().is_some_and(TagRequest::owns_album);
-            let same_album = !request_owns || chosen.penalty_of("album").is_some_and(|p| p < 1.0);
+            let same_album = match request.as_ref().filter(|r| r.whole_album && request_owns) {
+                Some(request) => c.album_title().is_some_and(|album| {
+                    ReleaseDistance::names_same_album(request.album.as_deref().unwrap_or(""), album)
+                }),
+                None => !request_owns || chosen.penalty_of("album").is_some_and(|p| p < 1.0),
+            };
             if !request_owns {
                 if let Some(album) = c.album_title().filter(|a| !a.is_empty()) {
                     song.album = album.to_string();

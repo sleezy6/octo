@@ -271,11 +271,12 @@ pub struct SubsonicSettings {
     /// Environment variable: COVER_CACHE_MB
     pub cover_cache_mb: i32,
 
-    /// Stamp Octo's octopus on the covers of songs, albums and artists from outside the
-    /// library, for apps other than Octo's own, to mark them as not owned (default: false).
-    /// Off, they look as the catalog draws them. The Octo apps mark them themselves either way.
-    /// Environment variable: BADGE_OUTSIDE_COVERS
-    pub badge_outside_covers: bool,
+    /// Draw the small Octo octopus on the covers of outside songs, albums and artists (default:
+    /// true), so any app shows which songs are not in the library yet and that a heart downloads
+    /// them. Library covers never carry it, and it is never written into a file. Octo's own apps
+    /// mark outside songs themselves and always get plain covers.
+    /// Environment variable: COVER_BADGE
+    pub cover_badge: bool,
 
     /// Apps that read a song's size only to decide whether to show it, comma-separated,
     /// matched against the client name the app sends (the Subsonic `c` parameter) or its
@@ -438,7 +439,7 @@ impl Default for SubsonicSettings {
             sync_catalog_max_songs: 1000,
             stream_size_warm_per_minute: 5,
             cover_cache_mb: 1024,
-            badge_outside_covers: false,
+            cover_badge: true,
             size_flag_clients: "Amperfy".to_string(),
             playlists_directory: "playlists".to_string(),
             download_on_star: true,

@@ -136,6 +136,7 @@ async fn every_dashboard_endpoint_needs_the_sign_in() {
         (Method::GET, "/api/admin/imports/lists/spotify-liked"),
         (Method::POST, "/api/admin/imports/link"),
         (Method::POST, "/api/admin/imports/lists/x/fetch"),
+        (Method::POST, "/api/admin/imports/lists/x/stream"),
         (Method::POST, "/api/admin/imports/trickle/pause"),
         (Method::DELETE, "/api/admin/imports/lists/x"),
     ];
@@ -149,6 +150,62 @@ async fn every_dashboard_endpoint_needs_the_sign_in() {
             reply.text()
         );
     }
+}
+
+#[tokio::test]
+async fn the_dashboard_and_subsonic_import_actions_toggle_the_same_streaming_snapshot() {
+    let rig = rig().await;
+    let token = rig.sign_in("alice");
+    let uploaded = rig
+        .upload(
+            &token,
+            "Snapshot.csv",
+            "Track Name,Artist Name(s)\nTeardrop,Massive Attack\nAngel,Massive Attack\n",
+        )
+        .await
+        .json();
+    let id = uploaded["listId"].as_str().unwrap();
+    let auth = [("X-Octo-Browse-Token", token.as_str()), ("X-Octo-Admin", "1")];
+    let enabled = send(
+        &rig.app,
+        Method::POST,
+        &format!("/api/admin/imports/lists/{id}/stream"),
+        &auth,
+        Some(r#"{"on":true}"#),
+    )
+    .await;
+    assert_eq!(enabled.status, StatusCode::OK, "{}", enabled.text());
+    let detail = send(
+        &rig.app,
+        Method::GET,
+        &format!("/api/admin/imports/lists/{id}"),
+        &auth,
+        None,
+    )
+    .await
+    .json();
+    assert_eq!(detail["list"]["streamWithoutDownloading"], true);
+    assert!(
+        detail["list"]["streamingPlaylistId"]
+            .as_str()
+            .unwrap()
+            .starts_with("oi")
+    );
+    assert_eq!(detail["list"]["keepPlaylist"], false);
+    assert_eq!(detail["list"]["getMissing"], false);
+    assert!(rig.state.imports.streaming_lists("bob").is_empty());
+    assert_eq!(rig.state.imports.overview("alice").trickle.queued, 0);
+
+    let off = get(
+        &rig.app,
+        &format!(
+            "/rest/importAction.view?u=alice&t=good&s=salt&v=1.16.1&c=test&action=stream&id={id}&on=false"
+        ),
+    )
+    .await
+    .json();
+    assert_eq!(off["subsonic-response"]["importAction"]["ok"], true);
+    assert!(rig.state.imports.streaming_lists("alice").is_empty());
 }
 
 #[tokio::test]

@@ -34,7 +34,8 @@ pub(crate) mod test_support;
 
 pub use kept_identity::{KeptIdentity, KeptIdentityTags};
 pub use song_tags::{
-    GenreWrite, embed_cover, front_cover, read_lyrics, write_album_gain, write_lyrics, write_song,
+    GenreWrite, embed_cover, front_cover, read_lyrics, write_album_facts, write_album_gain, write_lyrics,
+    write_song,
 };
 pub use tag_file::{FRONT_COVER, Format, TagError, TagFile, TagPicture};
 pub use tag_writer_extras::{TagField, TagFields, TagWriterExtras};

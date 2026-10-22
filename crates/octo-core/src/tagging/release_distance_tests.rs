@@ -357,3 +357,22 @@ fn barcode_forms_keep_digits_and_add_the_upc() {
         ["00000012345678", "000012345678"]
     );
 }
+
+// ---- the same album by name ---------------------------------------------------------------
+
+#[test]
+fn the_same_album_by_name_is_never_another_edition_of_it() {
+    let edition = "Future Nostalgia (The Moonlight Edition)";
+    assert!(ReleaseDistance::names_same_album(
+        "Future Nostalgia",
+        "future nostalgia"
+    ));
+    assert!(!ReleaseDistance::names_same_album("Future Nostalgia", edition));
+    assert!(!ReleaseDistance::names_same_album(edition, "Future Nostalgia"));
+    assert!(ReleaseDistance::names_same_album(edition, edition));
+    assert!(!ReleaseDistance::names_same_album(
+        "Mezzanine",
+        "Mezzanine (Deluxe)"
+    ));
+    assert!(!ReleaseDistance::names_same_album("Mezzanine", "Collected"));
+}

@@ -236,7 +236,11 @@ fn read_zip(content: &[u8]) -> Result<Vec<FileList>, FileReadError> {
     let mut entries: Vec<(String, usize, u64)> = Vec::new();
     for index in 0..zip.len() {
         let entry = zip.by_index_raw(index).map_err(zip_error)?;
-        entries.push((entry.name().to_string(), index, entry.size()));
+        let name = match entry.name() {
+            Ok(name) => name.into_owned(),
+            Err(_) => String::from_utf8_lossy(entry.name_raw()).into_owned(),
+        };
+        entries.push((name, index, entry.size()));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     // Counted as the files unpack, never from the sizes the zip claims for them.

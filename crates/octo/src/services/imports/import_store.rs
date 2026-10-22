@@ -3,9 +3,11 @@
 //! get copies, so a list never changes under them.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use octo_core::common::dotnet::{eq_ignore_case, to_lower_invariant};
+use octo_core::soulseek::SoulseekRouting;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
@@ -42,6 +44,8 @@ pub fn save(path: &Path, file: &ImportFile) -> bool {
 pub struct ImportStore {
     path: Option<PathBuf>,
     lists: Mutex<Vec<ImportList>>,
+    /// Rebuilt lazily after a change, so a registry miss is O(1) even for a large import.
+    previews: Mutex<Option<HashMap<String, SoulseekRouting>>>,
 }
 
 impl Default for ImportStore {
@@ -60,6 +64,7 @@ impl ImportStore {
         ImportStore {
             path,
             lists: Mutex::new(lists),
+            previews: Mutex::new(None),
         }
     }
 
@@ -86,6 +91,73 @@ impl ImportStore {
         self.lists.lock().clone()
     }
 
+    pub fn streaming_owners(&self) -> Vec<String> {
+        let mut owners: Vec<String> = Vec::new();
+        for list in self
+            .lists
+            .lock()
+            .iter()
+            .filter(|list| list.stream_without_downloading)
+        {
+            if !owners.iter().any(|owner| eq_ignore_case(owner, &list.owner)) {
+                owners.push(list.owner.clone());
+            }
+        }
+        owners
+    }
+
+    /// The owners of streaming lists that have a song by this artist and title without a
+    /// library copy yet. Loose on purpose: a wrong guess only costs one more match.
+    pub fn streaming_owners_missing(&self, artist: Option<&str>, title: Option<&str>) -> Vec<String> {
+        let Some(title) = title.map(loose).filter(|title| !title.is_empty()) else {
+            return Vec::new();
+        };
+        let artist = artist.map(loose).unwrap_or_default();
+        let mut owners: Vec<String> = Vec::new();
+        for list in self
+            .lists
+            .lock()
+            .iter()
+            .filter(|list| list.stream_without_downloading)
+        {
+            let misses = list.tracks.iter().any(|track| {
+                track.library_id.is_none()
+                    && loose(&track.title) == title
+                    && (artist.is_empty() || {
+                        let named = loose(&track.artist);
+                        named.contains(&artist) || artist.contains(&named)
+                    })
+            });
+            if misses && !owners.iter().any(|owner| eq_ignore_case(owner, &list.owner)) {
+                owners.push(list.owner.clone());
+            }
+        }
+        owners
+    }
+
+    /// Reconstruct an imported song evicted from the registry's bounded LRU. The import
+    /// itself is durable, including after a preview becomes local or Octo restarts.
+    pub fn preview_routing(&self, id: &str) -> Option<SoulseekRouting> {
+        // All mutations take lists before previews too.
+        let lists = self.lists.lock();
+        let mut previews = self.previews.lock();
+        let previews = previews.get_or_insert_with(|| {
+            lists
+                .iter()
+                .filter(|list| list.stream_without_downloading)
+                .flat_map(|list| &list.tracks)
+                .map(|track| {
+                    let routing = super::import_streaming::preview_routing(track);
+                    (
+                        crate::services::soulseek::ExternalIdRegistry::make_short_id(&routing),
+                        routing,
+                    )
+                })
+                .collect()
+        });
+        previews.get(id).cloned()
+    }
+
     pub fn get(&self, owner: &str, id: &str) -> Option<ImportList> {
         let lists = self.lists.lock();
         find(&lists, owner, id).map(|i| lists[i].clone())
@@ -99,6 +171,7 @@ impl ImportStore {
         if let Some(at) = find(&lists, &read.owner, &read.id) {
             let existing = lists.remove(at);
             read.keep_playlist = existing.keep_playlist;
+            read.stream_without_downloading = existing.stream_without_downloading;
             read.playlist_id = existing.playlist_id.clone();
             read.playlist_note = existing.playlist_note.clone();
             read.get_missing = existing.get_missing;
@@ -149,6 +222,7 @@ impl ImportStore {
 
     // Called with the lock held.
     fn write(&self, lists: &[ImportList]) {
+        *self.previews.lock() = None;
         if let Some(path) = &self.path {
             super::save(path, &FileRef { lists }, "the imported lists");
         }
@@ -173,6 +247,14 @@ pub(crate) fn culture_compare_ignore_case(a: &str, b: &str) -> Ordering {
         to_lower_invariant(&a.nfd().collect::<String>())
             .cmp(&to_lower_invariant(&b.nfd().collect::<String>()))
     })
+}
+
+/// Lowercase letters and digits only, for comparing names written slightly differently.
+fn loose(text: &str) -> String {
+    text.nfkc()
+        .flat_map(char::to_lowercase)
+        .filter(|c| c.is_alphanumeric())
+        .collect()
 }
 
 #[cfg(test)]

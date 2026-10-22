@@ -22,7 +22,7 @@ use octo_media::audio::{ILoudnessMeter, Loudness, ReplayGainTags};
 use octo_media::cover::cover_image;
 use octo_media::tags::{
     GenreWrite, KeptIdentityTags, TagFile, embed_cover, front_cover, release_fact_tags, tag_writer_extras,
-    write_album_gain, write_song,
+    write_album_facts, write_album_gain, write_song,
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -799,6 +799,33 @@ impl BaseDownloadService {
         self.cover_steps
             .lock()
             .push((text.to_string(), detail.map(str::to_string)));
+    }
+
+    /// Once the walk ends, every track it placed gets the album-level tags the walk settled on,
+    /// rewritten in place: a track tagged before the walk matched the album's own release was
+    /// written without its facts, and two tracks that differ on one of them are two albums to
+    /// the library server. Answers how many files were rewritten.
+    pub fn settle_album_tags(&self, context: &AlbumTagContext<Loudness>, album_title: &str) -> usize {
+        if self.settings.current().metadata.tag_rehearsal {
+            return 0;
+        }
+        let mut rewritten = 0;
+        for (path, song) in context.unsettled() {
+            if !super::file_exists(&path) {
+                continue;
+            }
+            match write_album_facts(Path::new(&path), &song) {
+                Ok(()) => {
+                    rewritten += 1;
+                    debug!("{path} rewritten to the album tags of '{album_title}'");
+                }
+                Err(e) => warn!("Could not write the album's tags to {path}: {e}"),
+            }
+        }
+        if rewritten > 0 {
+            info!("Album '{album_title}': {rewritten} track(s) rewritten to the album's own tags");
+        }
+        rewritten
     }
 
     /// The album gain and peak, written into every file the walk measured, once the walk ends.

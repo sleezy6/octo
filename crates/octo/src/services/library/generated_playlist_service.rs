@@ -381,6 +381,15 @@ impl GeneratedPlaylistService {
         self.current(username, &settings, Utc::now())
     }
 
+    /// The listener's mixes as of now, without refreshing anything or asking Navidrome.
+    pub fn current_lists(&self, username: &str) -> Vec<GeneratedPlaylist> {
+        let settings = self.settings.current().generated_playlists.clone();
+        if dotnet::is_blank(username) {
+            return Vec::new();
+        }
+        self.current(username, &settings, Utc::now())
+    }
+
     /// A mix by id, for this listener, as of now. None for anyone else's id.
     pub fn find(&self, username: &str, id: &str) -> Option<GeneratedPlaylist> {
         let settings = self.settings.current().generated_playlists.clone();

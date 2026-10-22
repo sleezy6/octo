@@ -101,6 +101,10 @@ pub struct ImportList {
     pub matched_utc: Option<DateTime<Utc>>,
     /// Kept as a Navidrome playlist of the songs the library has, in the source's order.
     pub keep_playlist: bool,
+    /// Publish this saved snapshot through Octo, including missing songs as previews. Does
+    /// not enqueue downloads or follow source changes. Independent of the older switches.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stream_without_downloading: bool,
     pub playlist_id: Option<String>,
     /// Whose the playlist is in Navidrome, when Octo could not give it to the owner.
     pub playlist_note: Option<String>,
@@ -131,6 +135,7 @@ impl Default for ImportList {
             read_utc: datetime::min_value(),
             matched_utc: None,
             keep_playlist: false,
+            stream_without_downloading: false,
             playlist_id: None,
             playlist_note: None,
             get_missing: false,

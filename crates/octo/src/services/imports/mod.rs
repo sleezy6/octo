@@ -10,6 +10,7 @@ pub mod import_models;
 pub mod import_playlists;
 pub mod import_service;
 pub mod import_store;
+pub mod import_streaming;
 pub mod import_views;
 pub mod spotify_link_reader;
 pub mod text_list;

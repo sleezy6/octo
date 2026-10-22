@@ -229,6 +229,13 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
     state
         .radio_queues
         .register(resolved_songs.iter().map(|song| song.id.clone()));
+    // Song radio's songs are radio songs for the ones fetched ahead.
+    state.prefetch.note_radio(
+        &resolved_songs
+            .iter()
+            .map(|song| song.id.clone())
+            .collect::<Vec<_>>(),
+    );
 
     // Fire-and-forget prewarm for the top of the queue so the first few taps don't pay the
     // full cold yt-dlp resolve. Local songs are skipped by the prewarmer (they have no

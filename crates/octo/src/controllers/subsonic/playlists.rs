@@ -122,11 +122,20 @@ pub async fn get_playlists(State(state): State<AppState>, req: Request) -> Respo
         .await
         .map(|row| liked_playlist_fields(builder, &row, &mix_settings));
     let family = family_rows(&state, caller.as_ref()).await;
+    let import_owner = state
+        .request_identity
+        .username(&call.parameters, &call.proxy)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let imports = state.imports.streaming_lists(&import_owner);
     if stations.is_empty()
         && family.is_empty()
         && charts.is_empty()
         && generated.is_empty()
         && liked.is_none()
+        && imports.is_empty()
     {
         return call.file(&relay.body, relay.content_type.as_deref());
     }
@@ -135,6 +144,11 @@ pub async fn get_playlists(State(state): State<AppState>, req: Request) -> Respo
         .iter()
         .map(|station| builder.radio_playlist_fields(station))
         .chain(family)
+        .chain(
+            imports
+                .iter()
+                .map(crate::services::imports::import_streaming::playlist_fields),
+        )
         .chain(charts.iter().map(|list| chart_playlist_fields(builder, list)))
         .chain(
             generated
@@ -603,6 +617,59 @@ async fn get_playlist_inner(state: &AppState, req: Request, aborted: &RequestAbo
     let builder = &state.subsonic_response_builder;
     let id = call.param_or("id", "").to_string();
     let username = call.param_or("u", "").to_string();
+
+    if id.starts_with("oi") && is_octo_playlist_id(&id, false) {
+        if !signed_in(state, &call, format).await {
+            return builder
+                .create_error(format, 40, "Wrong username or password")
+                .into_response();
+        }
+        let owner = state
+            .request_identity
+            .username(&call.parameters, &call.proxy)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let Some(list) = state.imports.matched_streaming_list(&owner, &id).await else {
+            return builder
+                .create_error(format, 70, "Playlist not found")
+                .into_response();
+        };
+        let call = &call;
+        let owner = &owner;
+        let entries: Vec<Node> = futures::stream::iter(list.tracks.clone())
+            .map(|track| async move {
+                if let Some(library_id) = &track.library_id {
+                    if let Some(song) = state.imports.cached_song(owner, library_id) {
+                        return Node::from_value(&song);
+                    }
+                    if let Some(song) = library_song_json(call, library_id).await {
+                        state.imports.cache_song(owner, library_id, song.clone());
+                        return Node::from_value(&song);
+                    }
+                }
+                let song = crate::services::imports::import_streaming::preview_song(
+                    &state.external_id_registry,
+                    &track,
+                );
+                let mut fields = builder.convert_song_to_json(&song);
+                // A list read from a file may have no lengths, and some players need the
+                // field to be a number: 0 says the length is unknown.
+                fields.entry("duration".to_string()).or_insert(0.into());
+                Node::from_value(&Value::Object(fields))
+            })
+            .buffered(FAMILY_SONGS_AT_ONCE)
+            .collect()
+            .await;
+        return builder
+            .create_entries_playlist_response(
+                format,
+                crate::services::imports::import_streaming::playlist_fields(&list),
+                &entries,
+            )
+            .into_response();
+    }
 
     // Liked Songs: the listener's hearts as Navidrome holds them now, newest first. Only for a
     // caller that names its listener.

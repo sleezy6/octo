@@ -40,6 +40,7 @@ pub fn routes() -> RouteSet {
         .route("/api/admin/imports/text", post(text))
         .route("/api/admin/imports/services", get(services))
         .route("/api/admin/imports/lists/{id}/playlist", post(playlist))
+        .route("/api/admin/imports/lists/{id}/stream", post(stream))
         .route("/api/admin/imports/lists/{id}/fetch", post(fetch))
         .route("/api/admin/imports/lists/{id}/songs", post(songs))
         .route("/api/admin/imports/lists/{id}/refresh", post(refresh))
@@ -434,6 +435,19 @@ async fn playlist(State(state): State<AppState>, Path(id): Path<String>, request
         .await
         .map_err(|e| AppError::Internal(e.into()))?;
     Ok(answer(&result))
+}
+
+async fn stream(State(state): State<AppState>, Path(id): Path<String>, request: Request) -> Response {
+    let (parts, body) = split(request).await;
+    let request: OnRequest = match bind_body::<OnRequest>(&parts.headers, &body, "request") {
+        Ok(request) => request,
+        Err(refused) => return refused,
+    };
+    let (_, user) = match whose(&state, &parts.headers, &parts.uri).await {
+        Ok(people) => people,
+        Err(refused) => return refused,
+    };
+    answer(&state.imports.set_streaming(&user, &id, request.on))
 }
 
 async fn fetch(State(state): State<AppState>, Path(id): Path<String>, request: Request) -> Response {

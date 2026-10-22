@@ -2,7 +2,8 @@ name: Docker Build & Push
 
 # Publishes Octo's three images (Octo, the yt-dlp shim, octo-sonic) for amd64 and arm64:
 # on every push to main (tagged main and the commit), and on every release tag (tagged with
-# the release, and latest for a dated release). Octo is the Rust server (Dockerfile; the C#
+# the release, and latest for a dated release). A release tag on a commit main already built
+# reuses main's images: it only adds its own tags to them, without checking or building again. Octo is the Rust server (Dockerfile; the C#
 # app in octo/ is in no image). Installs pull all three at their own release's tag, and the
 # update helper pulls them on Update now, so they must be on ghcr.io before anyone can see
 # the release.
@@ -93,9 +94,46 @@ jobs:
             fi
           done
 
+  # Whether a release tag's commit already has all three images on ghcr.io, both platforms
+  # each, under the commit's tag. main's run tags them only after every check and build
+  # below passed, so the tag can take them as they are.
+  reuse:
+    runs-on: ubuntu-latest
+    outputs:
+      built: ${{ steps.find.outputs.built }}
+
+    steps:
+      - name: Login to GitHub Container Registry
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Look for this commit's images
+        id: find
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          built=false
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            built=true
+            for suffix in "" -yt-dlp-shim -sonic; do
+              found="$(docker buildx imagetools inspect "$IMAGE$suffix:${GITHUB_SHA::7}" 2>/dev/null || true)"
+              for platform in linux/amd64 linux/arm64; do
+                grep -q "$platform" <<< "$found" || built=false
+              done
+            done
+          fi
+          echo "built=$built" >> "$GITHUB_OUTPUT"
+          echo "::notice::Images of ${GITHUB_SHA::7} already built: $built"
+
   # Every check in ci.yml (the Rust server, the shim, octo-sonic, the helper and the
   # installer) before anything is published. The C# app's job is left out: no image holds it.
   checks:
+    needs: reuse
+    if: needs.reuse.outputs.built != 'true'
     uses: ./.github/workflows/ci.yml
     with:
       csharp: false
@@ -105,6 +143,8 @@ jobs:
   # in the build context, keyed by their content, so a run on main takes the data as GeoNames
   # has it that day and converts it again only when it changed.
   places:
+    needs: reuse
+    if: needs.reuse.outputs.built != 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -312,11 +352,74 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
         run: docker buildx imagetools inspect "$IMAGE:$VERSION"
 
+  # A release tag on a commit main already built: the same images, under the release's tags.
+  retag:
+    needs: [versions, reuse]
+    if: needs.reuse.outputs.built == 'true'
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: octo
+            suffix: ""
+          - name: yt-dlp-shim
+            suffix: -yt-dlp-shim
+          - name: octo-sonic
+            suffix: -sonic
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image.suffix }}
+          # The same tags merge gives a release.
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=tag
+            type=sha,prefix=
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' && !startsWith(github.ref_name, 'v') }}
+
+      - name: Tag this commit's images for the release
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image.suffix }}
+        run: |
+          mapfile -t tags < <(jq -r '.tags[] | "-t", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools create "${tags[@]}" "$IMAGE:${GITHUB_SHA::7}"
+
+      - name: Inspect
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image.suffix }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "$IMAGE:$VERSION"
+
   # Publishes the release's draft once all three images of the tag are on ghcr.io (see the
   # order at the top). Only for dated releases, the ones Octo's update check offers.
   release:
-    needs: merge
-    if: github.ref_type == 'tag' && !startsWith(github.ref_name, 'v')
+    needs: [merge, retag]
+    if: >-
+      always() && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v')
+      && (needs.merge.result == 'success' || needs.retag.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write

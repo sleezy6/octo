@@ -120,7 +120,7 @@
     trash: 'i-trash', heart: 'i-heart', bell: 'i-bell', sliders: 'i-sliders-horizontal', pulse: 'i-pulse',
     playlist: 'i-playlist', tray: 'i-tray-arrow-down', folder: 'i-folder-open', drives: 'i-hard-drives',
     signin: 'i-sign-in', plugs: 'i-plugs-connected', send: 'i-paper-plane-tilt', checkCircle: 'i-check-circle',
-    stack: 'i-stack', tag: 'i-tag', radio: 'i-radio', caretDown: 'i-caret-down'
+    stack: 'i-stack', tag: 'i-tag', radio: 'i-radio', caretDown: 'i-caret-down', headphones: 'i-headphones'
   };
 
   F.icon = function (name) {

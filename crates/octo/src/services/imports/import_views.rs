@@ -46,6 +46,10 @@ pub struct ListSummary {
     pub not_found: i32,
     pub skipped: i32,
     pub keep_playlist: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stream_without_downloading: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streaming_playlist_id: Option<String>,
     pub playlist_id: Option<String>,
     pub playlist_note: Option<String>,
     pub get_missing: bool,

@@ -19,7 +19,7 @@ use crate::common::{dotnet, live_version};
 
 /// What kind of take a recording is. Everything that is not one of the others is `Studio`,
 /// including a remaster or an edit, which are the same performance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum RecordingKind {
     Studio,
     Live,

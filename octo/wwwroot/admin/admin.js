@@ -168,6 +168,8 @@ function activateTab(name, { focus = false } = {}) {
   if (name === 'about' && typeof loadUpdate === 'function') loadUpdate();
   if (name === 'soulseek' && typeof loadSharing === 'function') loadSharing();
   if (name === 'family' && typeof loadFamily === 'function') loadFamily();
+  if (name === 'downloads' && typeof loadPrefetch === 'function') loadPrefetch();
+  if (typeof showListening === 'function') showListening(name === 'listening');
   if (focus) {
     window.scrollTo({ top: 0 });
     const heading = document.querySelector(`section[data-pane="${name}"] h1`);
@@ -594,6 +596,7 @@ async function loadSettings() {
   const invalid = document.getElementById('config-invalid-banner');
   if (invalid) invalid.hidden = currentSettings?._meta?.ConfigFileValid !== false;
 
+  ensureKeepDaysChoice(currentSettings?.Listening?.KeepDays);
   // Populate every <input>/<select> whose name="Section.Key" matches.
   document.querySelectorAll('[name]').forEach(el => {
     if (!el.name?.includes('.')) return;
@@ -814,6 +817,7 @@ function ensureSaveBar(form) {
     <button type="submit" class="btn btn-primary" ${currentSettings ? '' : 'disabled'} title="Save (Ctrl+S)">Save</button>
     <button type="button" class="btn btn-ghost form-undo">${icon('i-arrow-counter-clockwise')}<span>Undo changes</span></button>
     ${form.id === 'lidarr-connection-form' ? `<button type="button" class="btn btn-ghost" id="lidarr-test-connection">${icon('i-plugs-connected')}<span>Test connection</span></button>` : ''}
+    ${form.id === 'spotiflac-connection-form' ? `<button type="button" class="btn btn-ghost" id="spotiflac-test-connection">${icon('i-plugs-connected')}<span>Test connection</span></button>` : ''}
     <span class="unsaved-status" aria-live="polite"></span>
     <span class="saved-status" role="status"></span>
     <span class="restart-hint">
@@ -985,6 +989,9 @@ document.querySelectorAll('form[data-section]').forEach(form => {
       // The scrobbling card reads the running settings, which catch up with the file a moment later.
       if (form.dataset.section?.startsWith('lastfm')) setTimeout(loadLastFmScrobbling, 700);
       if (form.dataset.section === 'animated-art') setTimeout(loadAnimatedArt, 700);
+      if (form.dataset.section === 'prefetch') setTimeout(loadPrefetch, 700);
+      // The heart priority's Soulseek row says whether SpotiFLAC rides with it.
+      if (form.dataset.section?.startsWith('spotiflac')) renderHeartSourceOrder();
       // The re-check offer on the Verify card follows the saved match score.
       if (form.dataset.section === 'soulseek-verify' || form.dataset.section?.startsWith('library-actions')) {
         setTimeout(loadReviewSweep, 700);
@@ -1064,7 +1071,8 @@ function renderHeartSourceOrder(steps = heartSourceSteps) {
         <span class="source-step" aria-hidden="true">${index + 1}</span>
         <span class="source-copy">
           <span class="source-title">${icon(meta.mark)}${meta.title}</span>
-          <span class="source-detail">${meta.detail}</span>
+          <span class="source-detail">${step.Source === 'Soulseek' && currentSettings?.Spotiflac?.Enabled
+            ? `${meta.detail}, with SpotiFLAC` : meta.detail}</span>
         </span>
         <span class="source-heart-controls" role="group" aria-label="${meta.title} heart types">
           <span class="source-heart-choice">
@@ -1296,6 +1304,75 @@ document.getElementById('rejected-peers-clear')?.addEventListener('click', async
     currentSettings = await (await api('/api/admin/settings', { cache: 'no-store' })).json();
     renderRejectedPeerCount();
     note(button, `Forgot ${body.cleared} rejected peer${body.cleared === 1 ? '' : 's'}.`);
+  } catch (error) {
+    note(button, `Could not clear: ${error.message}`, 'error');
+  }
+});
+
+// ---- Get upcoming songs ahead ----------------------------------------------
+//
+// The card's status line: the songs ready, the space they take against the cap and what is
+// left on the disk, and below it what is being downloaded now, what comes next and the last
+// songs that could not be. Read from /api/admin/prefetch whenever the pane opens or the card
+// is saved. Song names come from outside, so they go on the page as text.
+
+function gigabytes(bytes) {
+  const gb = (bytes || 0) / 1073741824;
+  if (gb === 0) return '0 GB';
+  if (gb < 1) return `${Math.max(1, Math.round(gb * 1024))} MB`;
+  return gb >= 10 ? `${Math.round(gb)} GB` : `${gb.toFixed(1)} GB`;
+}
+
+function songWords(song) {
+  if (song?.artist && song?.title) return `${song.artist} - ${song.title}`;
+  return song?.title || 'A song';
+}
+
+async function loadPrefetch() {
+  const line = document.getElementById('prefetch-status');
+  const activity = document.getElementById('prefetch-activity');
+  const clear = document.getElementById('prefetch-clear');
+  if (!line) return;
+  let status;
+  try {
+    const r = await api('/api/admin/prefetch', { cache: 'no-store' });
+    if (!r.ok) return;
+    status = await r.json();
+  } catch {
+    return;
+  }
+  const parts = [
+    `${status.ready} song${status.ready === 1 ? '' : 's'} ready`,
+    `${gigabytes(status.usedBytes)} of ${gigabytes(status.capBytes)}`,
+  ];
+  if (status.freeBytes != null) parts.push(`${gigabytes(status.freeBytes)} free`);
+  line.textContent = parts.join(' · ');
+  if (clear) clear.disabled = !status.ready;
+
+  const lines = [];
+  if (status.enabled && status.paused) lines.push(`Paused: ${status.paused}.`);
+  if (status.running?.length) lines.push(`Downloading now: ${status.running.map(songWords).join(', ')}.`);
+  if (status.next?.length) lines.push(`Next: ${status.next.map(songWords).join(', ')}.`);
+  if (status.errors?.length) lines.push(`Could not download: ${status.errors.join('; ')}.`);
+  if (activity) {
+    activity.replaceChildren(...lines.map(text => {
+      const p = document.createElement('p');
+      p.textContent = text;
+      return p;
+    }));
+    activity.hidden = lines.length === 0;
+  }
+}
+
+document.getElementById('prefetch-clear')?.addEventListener('click', async event => {
+  const button = event.currentTarget;
+  if (!(await askConfirm('Clear downloaded-ahead songs?', 'They are deleted from the folder, and download again the next time they come up. A song playing right now stays.', 'Clear', true))) return;
+  try {
+    const response = await api('/api/admin/prefetch/clear', { method: 'POST' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json();
+    await loadPrefetch();
+    note(button, `Deleted ${body.cleared} song${body.cleared === 1 ? '' : 's'}.`);
   } catch (error) {
     note(button, `Could not clear: ${error.message}`, 'error');
   }
@@ -3006,6 +3083,51 @@ document.getElementById('lidarr-test-connection')?.addEventListener('click', asy
   }
 });
 
+// SpotiFLAC's Test checks what the page holds, saved or not, and lists each finding: what
+// answered, what is missing, and what to do about it. Nothing is downloaded.
+document.getElementById('spotiflac-test-connection')?.addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  const form = document.getElementById('spotiflac-connection-form');
+  const value = id => document.getElementById(id)?.value ?? '';
+  button.disabled = true;
+  saveStatus(form, 'Testing…', 'busy');
+  try {
+    const r = await api('/api/admin/spotiflac/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: value('f-spotiflac-url'),
+        token: value('f-spotiflac-token'),
+        folder: value('f-spotiflac-folder'),
+        enabled: !!document.getElementById('f-spotiflac-enabled')?.checked,
+      }),
+    });
+    const result = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(result.error || `HTTP ${r.status}`);
+    renderSpotiflacTest(result.checks || []);
+    // What is missing is in the list; the bar only confirms a pass.
+    saveStatus(form, result.ok ? (result.message || 'SpotiFLAC is ready.') : '', 'ok');
+  } catch (err) {
+    renderSpotiflacTest([]);
+    saveStatus(form, `Test failed: ${err.message}`, 'error');
+  } finally {
+    button.disabled = false;
+  }
+});
+
+function renderSpotiflacTest(checks) {
+  const row = document.getElementById('spotiflac-test-row');
+  const list = document.getElementById('spotiflac-test');
+  if (!row || !list) return;
+  const glyph = { ok: 'i-check-circle-fill', warn: 'i-warning-circle-fill', fail: 'i-x-circle-fill' };
+  const words = { ok: 'Passed', warn: 'Warning', fail: 'Missing' };
+  list.innerHTML = checks.map(check => {
+    const state = glyph[check.state] ? check.state : 'warn';
+    return `<li class="test-check ${state}">${icon(glyph[state])}<span class="visually-hidden">${words[state]}: </span><span>${esc(check.text)}</span></li>`;
+  }).join('');
+  row.hidden = checks.length === 0;
+}
+
 function isFieldDirty(el) {
   if (!currentSettings || !el.name?.includes('.')) return false;
   const [section, key] = el.name.split('.');
@@ -4261,6 +4383,9 @@ document.getElementById('fetched-refresh')?.addEventListener('click', loadFetche
 const AMBIENT_PICK_KEY = 'octo.ambient.pick';
 const AMBIENT_LAST_KEY = 'octo.ambient.last';
 let ambientSongs = [];
+// The Listening page, once mounted, and whether it is the page on screen.
+let listeningPage = null;
+let listeningShown = false;
 
 function ambientStoreGet(key) { try { return localStorage.getItem(key); } catch { return null; } }
 function ambientStoreSet(key, value) {
@@ -4282,10 +4407,15 @@ function applyAmbient(colors, accent) {
 }
 
 // Start in the last colour before anything has loaded.
-try {
-  const last = JSON.parse(ambientStoreGet(AMBIENT_LAST_KEY) || 'null');
-  if (last) applyAmbient(last.colors, last.accent);
-} catch { /* nothing kept */ }
+function applyLastAmbient() {
+  try {
+    const last = JSON.parse(ambientStoreGet(AMBIENT_LAST_KEY) || 'null');
+    if (last) applyAmbient(last.colors, last.accent);
+    else applyAmbient(null, null);
+  } catch { /* nothing kept */ }
+}
+applyLastAmbient();
+let ambientLoaded = false;
 
 function chosenAmbientSong() {
   const picked = ambientStoreGet(AMBIENT_PICK_KEY);
@@ -4294,11 +4424,15 @@ function chosenAmbientSong() {
   return ambientSongs.find(s => ambientKey(s) === picked) || ambientSongs[0] || null;
 }
 
-function renderLatestFetched() {
+// lights: true puts the dashboard's lights back even while the Listening page is open (it
+// lights the page from its own top cover, and asks for these back when it has none).
+function renderLatestFetched(lights = false) {
   const card = document.getElementById('latest-fetched');
   if (!card) return;
   const song = chosenAmbientSong();
-  if (applyAmbient(song?.colors, song?.accent)) {
+  if (!lights && listeningShown) {
+    // The Listening page keeps its own lights while it is open.
+  } else if (applyAmbient(song?.colors, song?.accent)) {
     ambientStoreSet(AMBIENT_LAST_KEY, JSON.stringify({ colors: song.colors, accent: song.accent }));
   } else {
     ambientStoreSet(AMBIENT_LAST_KEY, null);
@@ -4356,6 +4490,7 @@ function loadAmbient() {
       if (!r.ok) return;
       const data = await r.json();
       ambientSongs = Array.isArray(data.songs) ? data.songs : [];
+      ambientLoaded = true;
       renderLatestFetched();
     } catch {
       // The light is a nicety: the page keeps whatever colour it has.
@@ -4365,6 +4500,73 @@ function loadAmbient() {
   })();
   return ambientLoading;
 }
+
+// ── Listening: each person's plays, drawn by /admin/listening.js ───────────────────────────
+// The days kept as a choice of its own when it is not one of the presets (set in settings.json).
+function ensureKeepDaysChoice(days) {
+  const select = document.getElementById('f-listening-keep');
+  const n = Number(days);
+  if (!select || !Number.isInteger(n) || n <= 0) return;
+  if (![...select.options].some(option => Number(option.value) === n)) {
+    const option = document.createElement('option');
+    option.value = String(n);
+    option.textContent = `${n} days`;
+    const after = [...select.options].find(o => Number(o.value) > n);
+    select.insertBefore(option, after || null);
+  }
+}
+// Mounted the first time the page opens. Leaving it gives the dashboard its own lights back;
+// coming back reloads it.
+function showListening(on) {
+  if (on === listeningShown) {
+    if (on) listeningPage?.reload();
+    return;
+  }
+  listeningShown = on;
+  if (!on) {
+    listeningPage?.pause();
+    return;
+  }
+  const holder = document.getElementById('listening-root');
+  if (!holder || !window.OctoListening) return;
+  if (listeningPage) {
+    listeningPage.resume();
+    return;
+  }
+  listeningPage = window.OctoListening.mount(holder, {
+    title: 'Listening',
+    canSeeEveryone: true,
+    // The dashboard's own lights, as its song picks them; before they have loaded (the page
+    // opened at #listening), the last ones kept, then the song's once they answer.
+    restoreLights: () => {
+      if (ambientLoaded) renderLatestFetched(true);
+      else {
+        applyLastAmbient();
+        loadAmbient();
+      }
+    },
+    cover: item => (item.songId ? `/api/admin/find/cover?id=${encodeURIComponent(item.songId)}` : ''),
+    fetch: async (days, user) => {
+      const query = `range=${days}${user ? `&user=${encodeURIComponent(user)}` : ''}`;
+      const r = await api(`/api/admin/listening?${query}`, { cache: 'no-store' });
+      const data = await r.json().catch(() => null);
+      return { ok: r.ok, status: r.status, data, error: data?.error || `Octo answered ${r.status}.` };
+    },
+  });
+}
+
+document.getElementById('listening-clear')?.addEventListener('click', async () => {
+  if (!(await askConfirm('Clear listening history?', 'Every play on record is removed, for everyone, and the Listening pages start over.', 'Clear history', true))) return;
+  try {
+    const r = await api('/api/admin/listening/clear', { method: 'POST' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    toast(data.cleared === 1 ? 'Cleared 1 play' : `Cleared ${data.cleared ?? 0} plays`);
+    listeningPage?.reload();
+  } catch (e) {
+    toast(`Couldn't clear the history: ${e.message}`, 'err');
+  }
+});
 
 // ── How a download was tagged ───────────────────────────────────────────────
 // The same block under a Fetched songs row and under "Try it on a song": the release that won
@@ -7489,6 +7691,8 @@ function impShowResult({ error = null, list = null, message = '', from = '' }) {
     </div>
     <span class="lossy-meter imp-result-meter" aria-hidden="true"><span style="width:${pct}%"></span></span>
     <div class="imp-result-actions">
+      ${list.streamWithoutDownloading ? `<span class="imp-result-note">${icon('i-check')}Streaming snapshot in Octo</span>`
+        : `<button type="button" class="btn btn-primary" data-imp-result-stream="${esc(list.id)}">${icon('i-playlist')}<span>Stream without downloading</span></button>`}
       ${missing && !fetching ? `<button type="button" class="btn btn-primary" data-imp-result-fetch="${esc(list.id)}">${icon('i-tray-arrow-down')}<span>Get the ${missing.toLocaleString()} missing</span></button>` : ''}
       ${fetching ? `<span class="imp-result-note">${icon('i-check')}Getting the missing songs</span>` : ''}
       ${list.keepPlaylist ? `<span class="imp-result-note">${icon('i-check')}Kept as a playlist</span>`
@@ -7510,17 +7714,18 @@ async function impFinished(answer, from = '') {
 impEl('imp-result')?.addEventListener('click', async event => {
   const fetchBtn = event.target.closest('[data-imp-result-fetch]');
   const playlistBtn = event.target.closest('[data-imp-result-playlist]');
+  const streamBtn = event.target.closest('[data-imp-result-stream]');
   const openBtn = event.target.closest('[data-imp-result-open]');
   if (event.target.closest('[data-imp-jump]')) {
     impEl('imp-lists').closest('.set-section').scrollIntoView({ block: 'start', behavior: 'smooth' });
     return;
   }
   if (openBtn) { await loadImportDetail(openBtn.dataset.impResultOpen); return; }
-  const button = fetchBtn ?? playlistBtn;
+  const button = fetchBtn ?? playlistBtn ?? streamBtn;
   if (!button) return;
-  const id = fetchBtn ? fetchBtn.dataset.impResultFetch : playlistBtn.dataset.impResultPlaylist;
+  const id = button.dataset.impResultFetch ?? button.dataset.impResultPlaylist ?? button.dataset.impResultStream;
   button.disabled = true;
-  const { ok, answer } = await impPost(`/api/admin/imports/lists/${encodeURIComponent(id)}/${fetchBtn ? 'fetch' : 'playlist'}`, { on: true }, null);
+  const { ok, answer } = await impPost(`/api/admin/imports/lists/${encodeURIComponent(id)}/${fetchBtn ? 'fetch' : streamBtn ? 'stream' : 'playlist'}`, { on: true }, null);
   toast(answer.message || 'Done.', ok ? 'ok' : 'error');
   await loadImports();
   const list = imp.view?.lists?.find(l => l.id === id);
@@ -7583,7 +7788,7 @@ function renderImportLists() {
   holder.innerHTML = `
     <div class="config-table">
       <div class="config-row config-row-head imp-row">
-        <span>List</span><span>In your library</span><span>Keep as playlist</span><span>Get missing songs</span><span></span>
+        <span>List</span><span>In your library</span><span>Stream without downloading</span><span>Keep as playlist</span><span>Get missing songs</span><span></span>
       </div>
       ${lists.map(list => {
         const total = list.total || list.have + list.missing + list.queued + list.downloading + list.done + list.notFound + list.skipped;
@@ -7605,6 +7810,8 @@ function renderImportLists() {
               ${list.partial ? `<span class="lossy-detail">${esc(list.partial)}</span>` : ''}
               ${list.playlistNote ? `<span class="lossy-detail">${esc(list.playlistNote)}</span>` : ''}</span></span>
             <span><span class="lossy-sub">${esc(counts)}</span><span class="lossy-meter"><span style="width:${pct}%"></span></span></span>
+            <span class="imp-switch-cell"><span class="imp-cell-label">Stream without downloading</span><label class="switch" title="Show the saved snapshot in Octo, including previews. Does not queue downloads. Get missing songs is independent."><input type="checkbox" data-imp-stream="${esc(list.id)}" ${list.streamWithoutDownloading ? 'checked' : ''}
+              aria-label="Stream ${esc(list.name)} in Octo without downloading" /><span class="sw-track"></span><span class="sw-thumb"></span></label></span>
             <span class="imp-switch-cell"><span class="imp-cell-label">Keep as playlist</span><label class="switch" title="Keep as playlist"><input type="checkbox" data-imp-playlist="${esc(list.id)}" ${list.keepPlaylist ? 'checked' : ''}
               aria-label="Keep ${esc(list.name)} as a Navidrome playlist" /><span class="sw-track"></span><span class="sw-thumb"></span></label></span>
             <span class="imp-switch-cell"><span class="imp-cell-label">Get missing songs</span><label class="switch" title="Get missing songs"><input type="checkbox" data-imp-fetch="${esc(list.id)}" ${list.getMissing ? 'checked' : ''}
@@ -7796,11 +8003,12 @@ impEl('imp-lists')?.addEventListener('click', async event => {
 impEl('imp-lists')?.addEventListener('change', async event => {
   const playlist = event.target.closest('[data-imp-playlist]');
   const fetchSwitch = event.target.closest('[data-imp-fetch]');
-  const input = playlist ?? fetchSwitch;
+  const streamSwitch = event.target.closest('[data-imp-stream]');
+  const input = playlist ?? fetchSwitch ?? streamSwitch;
   if (!input) return;
-  const id = input.dataset.impPlaylist ?? input.dataset.impFetch;
+  const id = input.dataset.impPlaylist ?? input.dataset.impFetch ?? input.dataset.impStream;
   input.disabled = true;
-  const { ok, answer } = await impPost(`/api/admin/imports/lists/${encodeURIComponent(id)}/${playlist ? 'playlist' : 'fetch'}`,
+  const { ok, answer } = await impPost(`/api/admin/imports/lists/${encodeURIComponent(id)}/${playlist ? 'playlist' : streamSwitch ? 'stream' : 'fetch'}`,
     { on: input.checked }, null);
   toast(answer.message || 'Done.', ok ? 'ok' : 'error');
   await loadImports();

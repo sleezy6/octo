@@ -11,10 +11,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use octo_core::fingerprint::acoust_id_client::parse_lookup;
 use octo_core::fingerprint::{AcoustIdLookup, VerificationResult, VerificationVerdict};
-use octo_core::models::domain::Song;
+use octo_core::models::domain::{Album, Song};
 use octo_core::models::download::DownloadHistoryEntry;
 use octo_core::settings::{
-    AppSettings, FolderStructure, MetadataSettings, SoulseekSettings, SubsonicSettings,
+    AppSettings, DownloadSource, FolderStructure, MetadataSettings, SoulseekSettings, SubsonicSettings,
 };
 use octo_core::tagging::FieldDecision;
 use octo_media::audio::{ILoudnessMeter, Loudness, ReplayGainTags};
@@ -27,6 +27,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use super::placement_tests::{vorbis, vorbis_all};
 use super::test_support::{Harness, build, catalog};
 use super::*;
+use crate::services::common::test_fakes::FakeMetadata;
 use crate::services::fingerprint::MusicBrainzClient;
 use crate::services::metadata::deezer_rate_limit_handler::DeezerRateLimitHandler;
 use crate::services::metadata::deezer_rate_limiter::DeezerRateLimiter;
@@ -162,6 +163,10 @@ impl Default for Options {
 }
 
 async fn build_with(songs: Vec<(&str, Song)>, server: MockServer, options: Options) -> Tagging {
+    build_with_catalog(catalog(songs), server, options).await
+}
+
+async fn build_with_catalog(metadata: Arc<FakeMetadata>, server: MockServer, options: Options) -> Tagging {
     let root = tempfile::tempdir().expect("a temp dir");
     let meter = FakeMeter::new(options.loudness);
     let settings = AppSettings {
@@ -192,7 +197,7 @@ async fn build_with(songs: Vec<(&str, Song)>, server: MockServer, options: Optio
         tracker: options.tracker,
         ..Default::default()
     };
-    let harness = build(root.path(), settings, None, Some(catalog(songs)), services);
+    let harness = build(root.path(), settings, None, Some(metadata), services);
     Tagging {
         harness,
         meter,
@@ -270,7 +275,12 @@ fn lookup(json: &str) -> AcoustIdLookup {
 }
 
 fn confirmed_teardrop() -> VerificationResult {
-    let lookup = lookup(TEARDROP_LOOKUP);
+    confirmed_by(TEARDROP_LOOKUP)
+}
+
+/// A check that confirmed the first recording of this fingerprint answer.
+fn confirmed_by(json: &str) -> VerificationResult {
+    let lookup = lookup(json);
     let recording = lookup.results[0].recordings[0].clone();
     VerificationResult {
         verdict: VerificationVerdict::Confirmed,
@@ -1181,6 +1191,295 @@ async fn a_landed_path_with_no_audio_fails_and_is_never_recorded() {
         assert!(tagging.harness.history.get_recent(50).is_empty(), "{empty_file}");
         assert!(!tagging.meter.called(), "{empty_file}");
     }
+}
+
+// ---- an album heart files every track under the album asked for ----------------------------
+
+const FUTURE_NOSTALGIA: &str = "Future Nostalgia";
+const MOONLIGHT: &str = "Future Nostalgia (The Moonlight Edition)";
+
+/// The hearted album's tracks in its own order: id, title, recording, and the track's place on
+/// the larger edition that holds the same recordings.
+const NOSTALGIA_TRACKS: [(&str, &str, &str, i32); 3] = [
+    ("1", "Levitating (feat. DaBaby)", "rec-levitating", 18),
+    ("2", "Future Nostalgia", "rec-title", 1),
+    ("3", "Don't Start Now", "rec-dsn", 2),
+];
+
+/// Every album-level tag, which must read the same on every track of one album.
+const ALBUM_TAGS: [&str; 18] = [
+    "ALBUM",
+    "ALBUMARTIST",
+    "DATE",
+    "TRACKTOTAL",
+    "DISCTOTAL",
+    "LABEL",
+    "CATALOGNUMBER",
+    "BARCODE",
+    "RELEASETYPE",
+    "RELEASESTATUS",
+    "RELEASECOUNTRY",
+    "ORIGINALDATE",
+    "ORIGINALYEAR",
+    "MUSICBRAINZ_RELEASEGROUPID",
+    "MUSICBRAINZ_ALBUMARTISTID",
+    "MUSICBRAINZ_ALBUMID",
+    "RELEASEDATE",
+    "COMPILATION",
+];
+
+/// The fingerprint service's answer for one recording: the larger edition first, with the
+/// recording at its place there, then the album itself when the recording is on it.
+fn nostalgia_lookup(recording: &str, title: &str, album_place: Option<i32>, edition_place: i32) -> String {
+    let group = |id: &str, title: &str, release: &str, year: i32, tracks: i32, place: i32| {
+        format!(
+            r#"{{"id": "{id}", "title": "{title}", "type": "Album",
+             "artists": [{{"id": "a-dua", "name": "Dua Lipa"}}],
+             "releases": [{{"id": "{release}", "date": {{"year": {year}, "month": 3, "day": 27}}, "country": "XW",
+               "mediums": [{{"position": 1, "track_count": {tracks}, "tracks": [{{"id": "t-{release}-{place}", "position": {place}}}]}}]}}]}}"#
+        )
+    };
+    let mut groups = vec![group("g-moon", MOONLIGHT, "r-moon", 2021, 19, edition_place)];
+    if let Some(place) = album_place {
+        groups.push(group("g-fn", FUTURE_NOSTALGIA, "r-fn", 2020, 3, place));
+    }
+    format!(
+        r#"{{"status": "ok", "results": [{{"id": "acoustid-{recording}", "score": 0.97, "recordings": [{{
+          "id": "{recording}", "title": "{title}", "duration": 200.0, "sources": 40,
+          "artists": [{{"id": "a-dua", "name": "Dua Lipa"}}],
+          "releasegroups": [{}]}}]}}]}}"#,
+        groups.join(",")
+    )
+}
+
+fn nostalgia_details(release: &str, title: &str, group: &str, facts: [&str; 4], tracks: i32) -> String {
+    let [date, label, catalog, barcode] = facts;
+    format!(
+        r#"{{"id": "{release}", "title": "{title}", "status": "Official", "date": "{date}", "country": "XW", "barcode": "{barcode}",
+         "label-info": [{{"catalog-number": "{catalog}", "label": {{"id": "l-{release}", "name": "{label}"}}}}],
+         "release-group": {{"id": "{group}", "title": "{title}", "primary-type": "Album", "secondary-types": [], "first-release-date": "{date}"}},
+         "artist-credit": [{{"name": "Dua Lipa", "artist": {{"id": "a-dua", "name": "Dua Lipa"}}}}],
+         "media": [{{"position": 1, "track-count": {tracks}, "tracks": []}}]}}"#
+    )
+}
+
+fn nostalgia_routes() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "release/r-fn?",
+            nostalgia_details(
+                "r-fn",
+                FUTURE_NOSTALGIA,
+                "g-fn",
+                ["2020-03-27", "Warner FN", "FN-13", "190295269161"],
+                3,
+            ),
+        ),
+        (
+            "release/r-moon?",
+            nostalgia_details(
+                "r-moon",
+                MOONLIGHT,
+                "g-moon",
+                ["2021-02-11", "Warner Moon", "MOON-19", "190296521234"],
+                19,
+            ),
+        ),
+        ("/search?q=", r#"{"data":[]}"#.to_string()),
+    ]
+}
+
+/// The hearted album as the catalog lists it.
+fn nostalgia_album() -> Album {
+    Album {
+        id: "fn".into(),
+        title: FUTURE_NOSTALGIA.into(),
+        artist: "Dua Lipa".into(),
+        year: Some(2020),
+        songs: NOSTALGIA_TRACKS
+            .iter()
+            .zip(1..)
+            .map(|((id, title, _, _), track)| Song {
+                id: (*id).into(),
+                title: (*title).into(),
+                artist: "Dua Lipa".into(),
+                album: FUTURE_NOSTALGIA.into(),
+                track: Some(track),
+                disc_number: Some(1),
+                external_provider: Some("test".into()),
+                external_id: Some((*id).into()),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// The hearted album fetched whole, its track ids resolving to songs the larger edition listed
+/// last (its album, its places, its track count): by a walk, or song by song under a hold on
+/// its listing, as a member's album is. `on_album` says which recordings the fingerprint
+/// service also finds on the album itself, and at which place.
+async fn fetch_nostalgia(on_album: fn(&str) -> Option<i32>, by_walk: bool) -> (Tagging, Vec<String>) {
+    let routed: Vec<(&str, Song)> = NOSTALGIA_TRACKS
+        .iter()
+        .map(|(id, title, _, place)| {
+            (
+                *id,
+                Song {
+                    title: (*title).into(),
+                    artist: "Dua Lipa".into(),
+                    album: MOONLIGHT.into(),
+                    track: Some(*place),
+                    disc_number: Some(1),
+                    total_tracks: Some(19),
+                    external_provider: Some("test".into()),
+                    external_id: Some((*id).into()),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    let metadata = catalog(routed);
+    metadata
+        .albums
+        .lock()
+        .insert(("test".into(), "fn".into()), nostalgia_album());
+    let options = Options {
+        layout: FolderStructure::Organized,
+        ..Default::default()
+    };
+    let tagging = build_with_catalog(metadata, serve(nostalgia_routes()).await, options).await;
+    let root = tagging.root().to_path_buf();
+    tagging.harness.backend.land(move |song, _| {
+        let (_, title, recording, place) = NOSTALGIA_TRACKS
+            .iter()
+            .find(|track| track.1 == song.title)
+            .copied()
+            .expect("a listed track");
+        confirm(
+            song,
+            confirmed_by(&nostalgia_lookup(recording, title, on_album(recording), place)),
+        );
+        landed_flac(&root, "peer share", |file| {
+            file.set_title(Some(title));
+            file.set_performers(&["Dua Lipa".to_string()]);
+        })
+    });
+
+    let service = &tagging.harness.service;
+    if by_walk {
+        let walked = service
+            .download_album_with_source(
+                "test",
+                "fn",
+                DownloadSource::Soulseek,
+                false,
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("walked");
+        assert!(walked);
+    } else {
+        let album = nostalgia_album();
+        service.hold_album_listing("test", &album);
+        for (id, ..) in NOSTALGIA_TRACKS {
+            tagging.download(id).await.expect("downloaded");
+        }
+        service.finish_album_listing("test", &album).await;
+        // The hold is over: the next download of a listed song is its own again.
+        assert!(service.held_album("1").is_none());
+    }
+    let mut files: Vec<String> = files_below(&tagging.root().join("Dua Lipa"))
+        .into_iter()
+        .filter(|file| file.ends_with(".flac"))
+        .collect();
+    files.sort();
+    (tagging, files)
+}
+
+/// Every track sits in the album's one folder at its own place on the album, and reads the same
+/// on every album-level tag.
+fn assert_one_album(files: &[String]) {
+    assert_eq!(files.len(), NOSTALGIA_TRACKS.len(), "{files:?}");
+    for file in files {
+        assert_eq!(
+            Path::new(file).parent().and_then(|dir| dir.file_name()),
+            Some(std::ffi::OsStr::new(FUTURE_NOSTALGIA)),
+            "{file}"
+        );
+        let title = vorbis(file, "TITLE").expect("a title");
+        let place = NOSTALGIA_TRACKS
+            .iter()
+            .position(|track| track.1 == title)
+            .expect("a listed title")
+            + 1;
+        assert_eq!(vorbis(file, "TRACKNUMBER"), Some(place.to_string()), "{file}");
+        assert!(
+            vorbis_all(file, "MUSICBRAINZ_RELEASETRACKID")
+                .iter()
+                .all(|id| !id.starts_with("t-r-moon")),
+            "{file}"
+        );
+    }
+    for name in ALBUM_TAGS {
+        let first = vorbis_all(&files[0], name);
+        for file in &files[1..] {
+            assert_eq!(vorbis_all(file, name), first, "{name} on {file}");
+        }
+    }
+    assert_eq!(vorbis(&files[0], "ALBUM").as_deref(), Some(FUTURE_NOSTALGIA));
+    assert_eq!(vorbis(&files[0], "ALBUMARTIST").as_deref(), Some("Dua Lipa"));
+    assert_eq!(vorbis(&files[0], "DATE").as_deref(), Some("2020"));
+    assert_eq!(vorbis(&files[0], "TRACKTOTAL").as_deref(), Some("3"));
+    assert_ne!(vorbis(&files[0], "LABEL").as_deref(), Some("Warner Moon"));
+    assert_ne!(
+        vorbis(&files[0], "MUSICBRAINZ_RELEASEGROUPID").as_deref(),
+        Some("g-moon")
+    );
+}
+
+/// The second and third recordings are on the album itself, at its places 2 and 3; the first
+/// is found on the larger edition alone.
+fn last_two_on_the_album(recording: &str) -> Option<i32> {
+    ["rec-title", "rec-dsn"]
+        .iter()
+        .position(|on| *on == recording)
+        .map(|at| at as i32 + 2)
+}
+
+#[tokio::test]
+async fn an_album_heart_files_every_track_under_the_album_asked_for_with_one_set_of_album_tags() {
+    // By a walk and song by song alike. The first track is tagged before the album's own
+    // release is known, and gets its facts once the album is in.
+    for by_walk in [true, false] {
+        let (_tagging, files) = fetch_nostalgia(last_two_on_the_album, by_walk).await;
+
+        assert_one_album(&files);
+        assert_eq!(
+            vorbis(&files[0], "LABEL").as_deref(),
+            Some("Warner FN"),
+            "{by_walk}"
+        );
+        assert_eq!(vorbis(&files[0], "CATALOGNUMBER").as_deref(), Some("FN-13"));
+        assert_eq!(
+            vorbis(&files[0], "MUSICBRAINZ_RELEASEGROUPID").as_deref(),
+            Some("g-fn")
+        );
+        assert_eq!(
+            vorbis(&files[0], "MUSICBRAINZ_ALBUMARTISTID").as_deref(),
+            Some("a-dua")
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_album_heart_no_track_of_which_matches_the_album_still_makes_one_album() {
+    let (_tagging, files) = fetch_nostalgia(|_| None, true).await;
+
+    assert_one_album(&files);
+    assert_eq!(vorbis(&files[0], "CATALOGNUMBER"), None);
+    assert_eq!(vorbis(&files[0], "MUSICBRAINZ_RELEASEGROUPID"), None);
 }
 
 // ---- a file named for another format --------------------------------------------------------

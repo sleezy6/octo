@@ -758,6 +758,29 @@ impl LastFmService {
         .await
     }
 
+    /// [`Self::get_artist_top_tags`], telling a call that failed (None: no key, no answer, an
+    /// error status) from an artist Last.fm has no tags for (an empty list).
+    pub async fn get_artist_top_tags_checked(
+        &self,
+        artist: &str,
+        limit: i32,
+    ) -> ElementResult<Option<Vec<String>>> {
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let tags = self
+            .cached(&format!("artist-tags|{artist}|{limit}"), || async {
+                let Some(doc) = self
+                    .get_document("artist.gettoptags", &[("artist", artist)])
+                    .await
+                else {
+                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(None);
+                };
+                tag_names(&doc, limit).map(Some)
+            })
+            .await?;
+        Ok((!failed.load(std::sync::atomic::Ordering::Relaxed)).then_some(tags))
+    }
+
     pub async fn get_track_top_tags(
         &self,
         artist: &str,
@@ -833,14 +856,7 @@ impl LastFmService {
             let Some(doc) = self.get_document(method, parameters).await else {
                 return Ok(None);
             };
-            let Some(values) = try_array(&doc, "toptags", "tag")? else {
-                return Ok(Some(Vec::new()));
-            };
-            take_valid(values, limit, |item| {
-                let name = text(item, "name")?;
-                Ok((!name.is_empty()).then_some(name))
-            })
-            .map(Some)
+            tag_names(&doc, limit).map(Some)
         })
         .await
     }
@@ -937,6 +953,17 @@ impl LastFmService {
             }
         }
     }
+}
+
+/// The tag names of a `toptags` answer, the first `limit` of them.
+fn tag_names(doc: &Value, limit: i32) -> ElementResult<Vec<String>> {
+    let Some(values) = try_array(doc, "toptags", "tag")? else {
+        return Ok(Vec::new());
+    };
+    take_valid(values, limit, |item| {
+        let name = text(item, "name")?;
+        Ok((!name.is_empty()).then_some(name))
+    })
 }
 
 /// `EnsureSuccessStatusCode`, in plain words.

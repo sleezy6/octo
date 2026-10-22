@@ -231,7 +231,7 @@ scripts/updater/install-updater.sh --remove
 Without the helper, **About** shows the command for the new release. From the Octo folder:
 
 ```bash
-git fetch --tags && git checkout --detach 2026.10.15
+git fetch --tags && git checkout --detach 2026.10.21
 docker compose pull octo yt-dlp-shim octo-sonic || docker compose --profile source build octo-source yt-dlp-shim-source octo-sonic-source
 docker compose up -d
 ```
@@ -383,6 +383,10 @@ Yes. Every download is identified before it is filed: the fingerprint service's 
 
 Yes. Every image is published for amd64 and arm64, so a Pi pulls Octo, the yt-dlp shim and octo-sonic instead of compiling them (see [Published images](#published-images)). The yt-dlp sidecar does most of the CPU work; a Pi 4 or Pi 5 handles a single household's listening fine.
 
+### What is the octopus on some covers?
+
+It marks songs, albums and artists that are not in your library yet, so you can tell them apart in any app: a heart on one downloads it. Your own covers never carry it, it is never written into your files, and Octo's own apps mark these songs their own way. To show those covers plain, turn off **Mark outside covers** under Settings, Search and discovery, or set `COVER_BADGE=false` in `.env`. Apps that saved a cover earlier keep their copy until they refresh it.
+
 On a small disk, mind the cover copies: Octo keeps each library cover it has shown in its config folder (`cover-cache/`), up to 1024 MB by default. Set `COVER_CACHE_MB` in `.env` to a smaller number of megabytes, or to 0 to keep none.
 
 ---
@@ -392,7 +396,7 @@ On a small disk, mind the cover copies: Octo keeps each library cover it has sho
 
 ### What if I don't want to use Soulseek?
 
-You can use your Deezer account, YouTube or an existing Lidarr server, or disable automatic acquisition entirely.
+You can use your Deezer account, YouTube, an existing Lidarr server or a SpotiFLAC server of your own (see [Your own SpotiFLAC](#your-own-spotiflac)), or disable automatic acquisition entirely.
 
 YouTube is optional the same way: `YOUTUBE_ENABLED=false` (or **Use YouTube** on Streams & hearts) and a restart, and Octo never asks the yt-dlp shim or YouTube Music. Outside songs then play from your Deezer account whatever the stream source says (without a Deezer ARL they do not play at all), hearts skip YouTube, and YouTube Music leaves radio. The `yt-dlp-shim` service still starts with the bundled compose file; delete it and octo's `- yt-dlp-shim` `depends_on` line to not run it.
 
@@ -856,6 +860,16 @@ They are on by default, whether or not the mixes are. The dashboard's Mixes page
 
 ### Importing your music
 
+To listen before downloading, import a list and turn on **Stream without downloading** on the
+dashboard's **Import** page. The list then shows as a private, read-only playlist in apps
+connected to Octo: songs you have play from your library, and the rest play as previews.
+Heart a preview to keep it, the same way as any outside song. Once the copy is in your library,
+the playlist plays it in the same spot.
+
+The switch never downloads anything by itself. **Keep as playlist** and **Get missing songs** work
+as before, and a list with either of them on still follows its link for songs added later. To
+listen with previews and hearts only, leave **Get missing songs** and download on play off.
+
 The dashboard's **Import** page, and the same view in the Octo apps, shows what your library
 has of the playlists and liked songs you bring from another service. A list can be kept as a
 Navidrome playlist of the songs you have, in the list's order, and filled in as the rest
@@ -915,6 +929,33 @@ Setting it up, on the dashboard's **Deezer** page or in `.env`:
 **Playback cache.** Off by default (`DEEZER_CACHE_ENABLED=true`, or the switch on the Deezer page). With it on, the first play of a song downloads the whole song while it plays and keeps the copy outside your library; playing it again or seeking in it reads the copy and does not ask Deezer. Several people playing the same song share one download, and a download carries on when the player that started it leaves. A seek past what has arrived so far is answered by Deezer directly. Copies not played for `DEEZER_CACHE_RETENTION_DAYS` (7) are removed, and past `DEEZER_CACHE_MAX_GIB` (20) the ones played longest ago go first. The copies live in `DEEZER_CACHE_HOST_PATH` (`./octo-cache/deezer`), mounted at `/app/cache/deezer`; keep it outside your music folder, or Navidrome lists every played song. A heart on a song already cached in the quality you keep is copied from the cache.
 
 The Status page shows whether the account signs in. Octo signs in with your cookie outside Deezer's own apps and decrypts the songs the way the web player does, which Deezer's terms of use do not allow; the account you use carries that risk. The Deezer code is ported from [am-yy/octo](https://github.com/am-yy/octo), which adapted it from [V1ck3s/octo-fiesta](https://github.com/V1ck3s/octo-fiesta).
+
+### Your own SpotiFLAC
+
+For songs Soulseek does not have, Octo can ask a SpotiFLAC server you run yourself. It is off by default. Octo includes no SpotiFLAC, no extensions and no places to download from: SpotiFLAC (its Python module, `pip install SpotiFLAC`, or its Docker image) loads the extension registry you choose, and what it can find depends on the extensions you install in it. Octo finds the song in SpotiFLAC's catalog (by ISRC first, then by artist, title, version and length), asks SpotiFLAC to save it into a hidden folder of the music folder, and checks the file like a Soulseek download: its length, the version its own title names, AcoustID and the spectrum. A file that fails is thrown away and the next source is asked. A file that passes is tagged by Octo, never by SpotiFLAC's tags alone.
+
+1. In `.env`, add `spotiflac` to `COMPOSE_PROFILES` (comma-separated, for example `COMPOSE_PROFILES=spotiflac`), set `SPOTIFLAC_REGISTRIES` to your registry's address and `SPOTIFLAC_WEB_TOKEN` to a long random string, then run `docker compose up -d`. This starts SpotiFLAC's own image beside Octo, with the music folder mounted at the same path.
+2. Open SpotiFLAC's page on port 8010 (`SPOTIFLAC_PORT`) with `?token=` and your token, and install at least one extension.
+3. In Octo's dashboard, open **SpotiFLAC**, set the address to `http://spotiflac:8000` and the same token, press **Test connection**, turn on **Download with SpotiFLAC** and save. (Or set `SPOTIFLAC_ENABLED=true` and `SPOTIFLAC_URL=http://spotiflac:8000` in `.env`.)
+
+SpotiFLAC takes Soulseek's place in **Heart download priority**: after Soulseek finds nothing (the default), before it, or before it only for songs written in Chinese, Japanese, Korean or Thai script. With Soulseek off, SpotiFLAC is asked alone. A SpotiFLAC running elsewhere works too (`spotiflac --web --host 0.0.0.0 --web-token <token>`): it must see Octo's music folder, and **Music folder in SpotiFLAC** says where when its path differs. Multi-user mode (`--web-multiuser`) is not supported, since it saves into each account's own folder.
+
+| `.env` | Default | What it does |
+| --- | --- | --- |
+| `SPOTIFLAC_ENABLED` | `false` | Downloads ask SpotiFLAC |
+| `SPOTIFLAC_URL` | blank | SpotiFLAC's address, as Octo's container reaches it |
+| `SPOTIFLAC_WEB_TOKEN` | blank | SpotiFLAC's web token; the `spotiflac` service starts with the same one |
+| `SPOTIFLAC_PLACEMENT` | `AfterSoulseek` | `AfterSoulseek`, `BeforeSoulseek` or `BeforeSoulseekForAsianScripts` |
+| `SPOTIFLAC_QUALITY` | `LOSSLESS` | `LOSSLESS`, or `HI_RES_LOSSLESS` for hi-res where there is one |
+| `SPOTIFLAC_SERVICES` | blank | Your extension ids to try, in order, separated by commas; blank leaves the order to SpotiFLAC |
+| `SPOTIFLAC_FOLDER` | blank | Octo's music folder as SpotiFLAC sees it, when that path differs |
+| `SPOTIFLAC_TIMEOUT_SECONDS` | `600` | How long one song may take (60 to 3600) |
+| `SPOTIFLAC_AT_ONCE` | `2` | Songs SpotiFLAC is asked for at once (1 to 4) |
+| `SPOTIFLAC_REGISTRIES` | blank | For the `spotiflac` service: your extension registry addresses, separated by commas |
+| `SPOTIFLAC_PORT` | `8010` | For the `spotiflac` service: the port of SpotiFLAC's page |
+| `SPOTIFLAC_IMAGE_TAG` | `latest` | For the `spotiflac` service: the SpotiFLAC image tag |
+| `SPOTIFLAC_DATA_DIR` | `./spotiflac-data` | For the `spotiflac` service: SpotiFLAC's own settings and extensions |
+| `SPOTIFLAC_PUID`, `SPOTIFLAC_PGID` | `1000` | For the `spotiflac` service: the user SpotiFLAC runs as |
 
 ### Playback and acquisition
 
@@ -982,7 +1023,7 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | `createInternetRadioStation`, `updateInternetRadioStation`, `deleteInternetRadioStation` | protect Octo stations while relaying ordinary internet-radio mutations |
 | `/radio/stream/{token}` | consume the ready MP3 pool, optionally frame its existing artist/title as client-requested ICY metadata, and replenish it until disconnect |
 | `stream` | YouTube proxy with Range support, mp4/m4a passthrough |
-| `getCoverArt` | Deezer → iTunes → Last.fm aggregator with Octo watermark |
+| `getCoverArt` | Deezer → iTunes → Last.fm aggregator; outside covers carry the Octo octopus unless `COVER_BADGE=false` |
 | `getArtist` | an artist's albums, EPs and singles from Deezer beside the ones you own, each with its OpenSubsonic `releaseTypes` and, when counted, `ownedCount` |
 | `getAlbum` | external album tracklists, with the songs you already have given as your library's copies (and `ownedCount`), and fills in tracks you're missing from an album you own |
 | `star` | try enabled heart sources in priority order and stop after the first successful track/album acquisition |
@@ -1122,7 +1163,6 @@ Project layout:
 | `crates/octo-media/` | tags (lofty), audio checks, list covers |
 | `crates/octo-subsonic/` | request parsing, response building |
 | `octo/wwwroot/admin/` | the admin UI (vanilla JS, hand-rolled CSS, no build step) |
-| `parity/` | the harness that compares the Rust server's answers with the C# one's |
 | `yt-dlp-shim/` | Python/Flask sidecar (~200 lines) |
 | `sonic/` | octo-sonic, the Sounds alike and transition profile reader (Rust) |
 

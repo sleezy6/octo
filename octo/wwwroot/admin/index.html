@@ -8,6 +8,7 @@
   <!-- Absolute paths so the page renders correctly whether the browser is at
        /admin, /admin/, or /admin/index.html. -->
   <link rel="stylesheet" href="/admin/admin.css" />
+  <link rel="stylesheet" href="/admin/listening.css" />
   <link rel="icon" type="image/png" href="/Assets/octo_logo.png" />
   <link rel="preconnect" href="https://rsms.me" />
   <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
@@ -39,6 +40,10 @@
           <button class="sidebar-nav-item" data-tab="fetched">
             <svg class="icon" aria-hidden="true"><use href="#i-tray-arrow-down"/></svg>
             <span>Fetched songs</span>
+          </button>
+          <button class="sidebar-nav-item" data-tab="listening">
+            <svg class="icon" aria-hidden="true"><use href="#i-headphones"/></svg>
+            <span>Listening</span>
           </button>
         </div>
 
@@ -80,6 +85,10 @@
           <button class="sidebar-nav-item" data-tab="deezer">
             <svg class="icon brand" aria-hidden="true"><use href="#b-deezer"/></svg>
             <span>Deezer</span>
+          </button>
+          <button class="sidebar-nav-item" data-tab="spotiflac">
+            <svg class="icon" aria-hidden="true"><use href="#i-plugs-connected"/></svg>
+            <span>SpotiFLAC</span>
           </button>
           <button class="sidebar-nav-item" data-tab="notifications">
             <svg class="icon" aria-hidden="true"><use href="#i-bell"/></svg>
@@ -184,6 +193,40 @@
           <button type="button" class="btn btn-ghost" id="update-banner-later">Later</button>
         </span>
       </div>
+
+      <!-- ─── LISTENING: drawn by /admin/listening.js ────────────── -->
+      <section data-pane="listening">
+        <div class="ls-mount" id="listening-root"></div>
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Recording</h3>
+            <p class="set-desc">Listening stays on this server. You, your family's managers and the server's admin can see it.</p>
+          </div>
+          <form data-section="listening" class="set-card">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Record listening</div><div class="set-info-d">Keeps each song played to the end, with the app it played on, for the Listening pages here and on the Family page.</div></div>
+              <label class="switch"><input type="checkbox" id="f-listening-enabled" name="Listening.Enabled" checked /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Keep plays for</div><div class="set-info-d">Older plays are removed once a day.</div></div>
+              <select class="set-input" id="f-listening-keep" name="Listening.KeepDays" data-number="true">
+                <option value="30">30 days</option>
+                <option value="90" selected>90 days</option>
+                <option value="180">180 days</option>
+                <option value="365">A year</option>
+              </select>
+            </div>
+          </form>
+        </div>
+        <div class="set-section">
+          <div class="set-card">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Clear listening history</div><div class="set-info-d">Removes every play on record, for everyone. This can't be undone.</div></div>
+              <button type="button" class="btn btn-danger" id="listening-clear">Clear history</button>
+            </div>
+          </div>
+        </div>
+      </section>
 
       <!-- ─── STATUS ──────────────────────────────────────────── -->
       <section data-pane="status" class="active">
@@ -608,6 +651,113 @@
             </div>
           </form>
         </div>
+        <div class="set-section" id="prefetch-section">
+          <div class="set-head">
+            <h3 class="set-title">Get upcoming songs ahead</h3>
+            <p class="set-desc">Downloads the next songs of what is playing as FLAC before they play, so a song you don't own starts lossless.</p>
+          </div>
+          <form data-section="prefetch" class="set-card" id="prefetch-form">
+            <div class="set-row">
+              <div class="set-info">
+                <label class="set-info-t" for="f-prefetch-enabled">Download songs ahead</label>
+                <div class="set-info-d">Octo's apps play the ready FLAC. Other apps need Wait for lossless on play. Off by default.</div>
+                <div class="set-info-more">Songs are kept in their own folder, outside your library. One nobody plays is deleted after the days set under More settings. A heart on a song keeps it: it moves into your library with no second download.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="f-prefetch-enabled" name="Prefetch.Enabled" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Ready now</div>
+                <div class="set-info-d" id="prefetch-status" role="status" aria-live="polite">Nothing downloaded ahead yet.</div>
+                <div class="set-info-d" id="prefetch-activity" hidden></div>
+              </div>
+              <button class="btn btn-ghost btn-danger" id="prefetch-clear" type="button">Clear downloaded-ahead songs</button>
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t" id="prefetch-scope-label">Which songs</div>
+                <div class="set-info-d">Radio covers song radio, the stations and the mixes. Everything takes every song you don't own coming up next.</div>
+              </div>
+              <div class="set-ctrl">
+                <div class="seg" data-seg-for="f-prefetch-scope"><span class="seg-thumb"></span></div>
+                <select id="f-prefetch-scope" class="seg-src" name="Prefetch.Scope" hidden aria-label="Which songs are downloaded ahead">
+                  <option value="RadioOnly" selected>Radio</option>
+                  <option value="All">Everything</option>
+                </select>
+              </div>
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <label class="set-info-t" for="f-prefetch-count">Songs ahead <span class="set-opt">1 to 10</span></label>
+                <div class="set-info-d">How many of the songs after the one playing are downloaded.</div>
+                <div class="set-info-more">The songs come from the play queue the app saved, or from a radio played in its own order. A station your app mixes on the phone has no order to follow.</div>
+              </div>
+              <input class="set-input" id="f-prefetch-count" name="Prefetch.Count" type="number" min="1" max="10" value="3" />
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <label class="set-info-t" for="f-prefetch-at-once">Songs at once <span class="set-opt">1 to 3</span></label>
+                <div class="set-info-d">How many download at the same time. Hearts and plays always go first.</div>
+                <div class="set-info-more">Always one fewer than the downloads Octo runs at once (Downloads at once, on the Soulseek page), so a heart never waits for a song downloaded ahead. With one at a time, nothing is downloaded ahead. To keep downloads from filling your connection, set a speed limit on slskd's own page.</div>
+              </div>
+              <input class="set-input" id="f-prefetch-at-once" name="Prefetch.AtOnce" type="number" min="1" max="3" value="1" />
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <label class="set-info-t" for="f-prefetch-pause">Pause when nothing plays</label>
+                <div class="set-info-d">Starts nothing new once nobody has played anything for ten minutes. On by default.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="f-prefetch-pause" name="Prefetch.PauseWhenStopped" checked /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <label class="set-info-t" for="f-prefetch-mixes">Keep mixes ready</label>
+                <div class="set-info-d">Keeps the first songs of each mix, and a few picked at random for shuffle, downloaded ahead.</div>
+                <div class="set-info-more">Checked every hour, for everyone who played something lately. These wait behind the songs coming up next.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="f-prefetch-mixes" name="Prefetch.KeepMixesReady" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <label class="set-info-t" for="f-prefetch-ready-count">Songs per mix <span class="set-opt">1 to 20</span></label>
+                <div class="set-info-d">How many from the start of each mix, and as many again at random.</div>
+              </div>
+              <input class="set-input" id="f-prefetch-ready-count" name="Prefetch.KeepReadyCount" type="number" min="1" max="20" value="5" />
+            </div>
+            <details class="set-more">
+              <summary>More settings</summary>
+              <div class="set-row">
+                <div class="set-info">
+                  <label class="set-info-t" for="f-prefetch-cache-gb">Space to use <span class="set-opt">GB</span></label>
+                  <div class="set-info-d">Once the folder holds this much, the songs played longest ago are deleted first.</div>
+                </div>
+                <input class="set-input" id="f-prefetch-cache-gb" name="Prefetch.CacheGb" type="number" min="1" max="2000" value="20" />
+              </div>
+              <div class="set-row">
+                <div class="set-info">
+                  <label class="set-info-t" for="f-prefetch-keep-days">Keep for <span class="set-opt">days</span></label>
+                  <div class="set-info-d">A song nobody played for this long is deleted, unless you hearted it.</div>
+                </div>
+                <input class="set-input" id="f-prefetch-keep-days" name="Prefetch.KeepDays" type="number" min="1" max="365" value="30" />
+              </div>
+              <div class="set-row">
+                <div class="set-info">
+                  <label class="set-info-t" for="f-prefetch-min-free">Leave free <span class="set-opt">GB</span></label>
+                  <div class="set-info-d">Nothing new is downloaded while the folder's disk has less free than this.</div>
+                </div>
+                <input class="set-input" id="f-prefetch-min-free" name="Prefetch.MinFreeGb" type="number" min="1" max="500" value="10" />
+              </div>
+              <div class="set-row stack">
+                <div class="set-info">
+                  <label class="set-info-t" for="f-prefetch-folder">Folder <span class="set-opt">optional</span></label>
+                  <div class="set-info-d">Where the songs are kept, outside your music folder. Blank keeps them in <code>prefetch</code> beside settings.json.</div>
+                  <div class="set-info-more">Songs already downloaded ahead stay in the old folder. Clear them before you move it.</div>
+                </div>
+                <input class="set-input" id="f-prefetch-folder" name="Prefetch.Folder" placeholder="/app/config/prefetch" />
+              </div>
+            </details>
+          </form>
+        </div>
 
       </section>
 
@@ -694,6 +844,14 @@
                 <div class="set-info-more">Apps like Symfonium copy your library to the phone and search only that copy, so their searches never reach Octo. With this on, the copy also holds your radio stations' songs you don't own yet: they show up in search, play as previews, and download when hearted. Run a full sync in the app to pick up changes.</div>
               </div>
               <label class="switch"><input type="checkbox" id="f-sync-catalog" name="Subsonic.EnableSyncCatalog" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Mark outside covers</div>
+                <div class="set-info-d">A small octopus on the covers of songs, albums and artists that are not in your library yet, so you can tell them apart: a heart on one downloads it.</div>
+                <div class="set-info-more">Your own covers never carry it, and it is never written into your files. Octo's own apps mark these songs their own way and always get plain covers. Apps that saved a cover earlier keep their copy until they refresh it.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="f-cover-badge" name="Subsonic.CoverBadge" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <details class="set-more">
               <summary>More settings</summary>
@@ -905,7 +1063,7 @@
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title">Dynamic stations</h3>
-            <p class="set-desc">Builds read-only stations from each listener's completed plays. Listening history stays private in Octo.</p>
+            <p class="set-desc">Builds read-only stations from each listener's completed plays. Listening stays on this server. You, your family's managers and the server's admin can see it.</p>
           </div>
           <form data-section="lastfm-personalized" class="set-card">
             <div class="set-row">
@@ -2039,14 +2197,6 @@
               </div>
               <label class="switch"><input type="checkbox" name="Metadata.EmbedFullSizeCovers" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
-            <div class="set-row">
-              <div class="set-info">
-                <div class="set-info-t">Octopus on outside covers</div>
-                <div class="set-info-d">Stamp Octo&rsquo;s octopus on the covers of songs, albums and artists from outside your library, so other apps show them as not owned.</div>
-                <div class="set-info-more">Off, those covers look as the catalog draws them. The Octo apps mark songs from outside your library themselves either way. Covers already shown may stay in an app&rsquo;s own cache until it refreshes them.</div>
-              </div>
-              <label class="switch"><input type="checkbox" name="Subsonic.BadgeOutsideCovers" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
-            </div>
           </form>
         </div>
 
@@ -2349,7 +2499,7 @@
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title" id="imp-lists-title">Your lists</h3>
-            <p class="set-desc">Open a list to see its songs. <strong>Keep as playlist</strong> makes a Navidrome playlist of it in its own order. <strong>Get missing songs</strong> fetches the songs you do not have yet, and any added to it later.</p>
+            <p class="set-desc">Open a list to see its songs. <strong>Stream without downloading</strong> shows the saved snapshot as a private playlist in Octo, including previews of missing songs. Heart a song to keep it. <strong>Keep as playlist</strong> makes a Navidrome playlist of the songs you have. <strong>Get missing songs</strong> separately queues downloads. Streaming snapshots are not updated from their source automatically.</p>
           </div>
           <div class="set-card imp-card imp-lists-card">
             <div id="imp-lists" aria-live="polite"></div>
@@ -3033,6 +3183,130 @@
         </div>
       </section>
 
+      <!-- ─── SPOTIFLAC ──────────────────────────────────────── -->
+      <section data-pane="spotiflac">
+        <header class="page-header">
+          <div>
+            <h1>SpotiFLAC</h1>
+            <p>Downloads through your own SpotiFLAC server, for songs Soulseek does not have.</p>
+          </div>
+        </header>
+
+        <div class="notice">
+          <strong>Octo works with a SpotiFLAC you run yourself.</strong> It includes no SpotiFLAC, no extensions and no places to download from. What SpotiFLAC can find depends on the extensions you install in it. Every file it brings is checked like a Soulseek download (its length, the version it names, AcoustID), and a file that fails is thrown away.
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">What you bring</h3>
+            <p class="set-desc">Set these up in SpotiFLAC first, then test the connection below.</p>
+          </div>
+          <div class="set-card">
+            <ol class="bring-list">
+              <li><span class="bring-t">SpotiFLAC with its web page on</span><span class="bring-d">Started with <code>spotiflac --web --host 0.0.0.0</code>, or the optional <code>spotiflac</code> service in Octo's <code>docker-compose.yml</code>.</span></li>
+              <li><span class="bring-t">Your extension registry and an extension</span><span class="bring-d">SpotiFLAC has none of its own. Give it the registry you choose in <code>SPOTIFLAC_REGISTRIES</code>, then install at least one extension on SpotiFLAC's page.</span></li>
+              <li><span class="bring-t">A web token</span><span class="bring-d">Set <code>SPOTIFLAC_WEB_TOKEN</code> on SpotiFLAC and type the same token here, so nobody else can use it.</span></li>
+              <li><span class="bring-t">Octo's music folder, shared</span><span class="bring-d">SpotiFLAC saves into a hidden folder inside Octo's music folder, so it needs that folder mounted. If its path differs in SpotiFLAC, set it under More settings.</span></li>
+            </ol>
+          </div>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Connection</h3>
+            <p class="set-desc">How Octo reaches SpotiFLAC. Test it before you save.</p>
+          </div>
+          <form data-section="spotiflac-connection" class="set-card" id="spotiflac-connection-form">
+            <div class="set-row">
+              <div class="set-info">
+                <label class="set-info-t" for="f-spotiflac-enabled">Download with SpotiFLAC</label>
+                <div class="set-info-d">Asks SpotiFLAC for songs beside Soulseek, in the order set below.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="f-spotiflac-enabled" name="Spotiflac.Enabled" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <label class="set-info-t" for="f-spotiflac-url">Address</label>
+                <div class="set-info-d">Reachable from Octo's container. With the <code>spotiflac</code> service in Octo's compose file, <code>http://spotiflac:8000</code>.</div>
+              </div>
+              <input class="set-input" id="f-spotiflac-url" name="Spotiflac.Url" type="url" placeholder="http://spotiflac:8000" autocomplete="url" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <label class="set-info-t" for="f-spotiflac-token">Web token</label>
+                <div class="set-info-d">The <code>SPOTIFLAC_WEB_TOKEN</code> SpotiFLAC was started with.</div>
+              </div>
+              <input class="set-input" id="f-spotiflac-token" name="Spotiflac.Token" type="password" autocomplete="new-password" />
+            </div>
+            <div class="set-row stack" id="spotiflac-test-row" hidden>
+              <ul class="test-checks" id="spotiflac-test" role="status" aria-live="polite"></ul>
+            </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Downloads</h3>
+            <p class="set-desc">When SpotiFLAC is asked, and for what.</p>
+          </div>
+          <form data-section="spotiflac-downloads" class="set-card" id="spotiflac-downloads-form">
+            <div class="set-row stack">
+              <div class="set-info">
+                <label class="set-info-t" for="f-spotiflac-placement">When to ask</label>
+                <div class="set-info-d">SpotiFLAC takes Soulseek's place in Heart download priority. With Soulseek off, SpotiFLAC is asked alone.</div>
+                <div class="set-info-more">Asian scripts are Chinese, Japanese, Korean and Thai: a song whose title, artist or album is written in one goes to SpotiFLAC first, every other song to Soulseek first.</div>
+              </div>
+              <select class="set-input" id="f-spotiflac-placement" name="Spotiflac.Placement">
+                <option value="AfterSoulseek">After Soulseek finds nothing</option>
+                <option value="BeforeSoulseek">Before Soulseek</option>
+                <option value="BeforeSoulseekForAsianScripts">Before Soulseek for songs in Asian scripts</option>
+              </select>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <label class="set-info-t" for="f-spotiflac-quality">Quality</label>
+                <div class="set-info-d">What SpotiFLAC is asked for. Hi-res falls back to CD quality when a song has none.</div>
+              </div>
+              <select class="set-input" id="f-spotiflac-quality" name="Spotiflac.Quality">
+                <option value="LOSSLESS">Lossless, CD quality</option>
+                <option value="HI_RES_LOSSLESS">Hi-res lossless where there is one</option>
+              </select>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <label class="set-info-t" for="f-spotiflac-services">Extensions to try <span class="set-opt">optional</span></label>
+                <div class="set-info-d">Your extension ids in the order to try, separated by commas. Blank leaves the order to SpotiFLAC.</div>
+              </div>
+              <input class="set-input" id="f-spotiflac-services" name="Spotiflac.Services" placeholder="ext:your-extension" />
+            </div>
+            <details class="set-more">
+              <summary>More settings</summary>
+              <div class="set-row stack">
+                <div class="set-info">
+                  <label class="set-info-t" for="f-spotiflac-folder">Music folder in SpotiFLAC <span class="set-opt">optional</span></label>
+                  <div class="set-info-d">Where Octo's music folder is mounted in SpotiFLAC, when that is another path. Blank means the same path as in Octo.</div>
+                </div>
+                <input class="set-input" id="f-spotiflac-folder" name="Spotiflac.Folder" placeholder="/music" />
+              </div>
+              <div class="set-row">
+                <div class="set-info">
+                  <label class="set-info-t" for="f-spotiflac-timeout">Time per song <span class="set-opt">seconds</span></label>
+                  <div class="set-info-d">How long one song may take before Octo stops waiting and asks the next source.</div>
+                </div>
+                <input class="set-input" id="f-spotiflac-timeout" name="Spotiflac.TimeoutSeconds" type="number" min="60" max="3600" step="30" value="600" />
+              </div>
+              <div class="set-row">
+                <div class="set-info">
+                  <label class="set-info-t" for="f-spotiflac-at-once">Songs at once <span class="set-opt">1 to 4</span></label>
+                  <div class="set-info-d">How many songs SpotiFLAC is asked for at the same time.</div>
+                </div>
+                <input class="set-input" id="f-spotiflac-at-once" name="Spotiflac.AtOnce" type="number" min="1" max="4" value="2" />
+              </div>
+            </details>
+          </form>
+        </div>
+      </section>
+
       <!-- ─── RAW CONFIG ─────────────────────────────────────── -->
       <section data-pane="raw">
         <header class="page-header">
@@ -3273,6 +3547,7 @@
     </div>
   </div>
 
+  <script src="/admin/listening.js"></script>
   <script src="/admin/admin.js"></script>
 </body>
 </html>

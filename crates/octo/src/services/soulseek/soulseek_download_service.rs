@@ -59,11 +59,13 @@ use crate::services::common::{
 };
 use crate::services::deezer::{DeezerAudioCache, DeezerResolver};
 use crate::services::fingerprint::DownloadVerificationService;
+use crate::services::fingerprint::preview_check::{Heard, PreviewOutcome, PreviewRequest};
 use crate::services::i_download_service::DirectStreamInfo;
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::library::upgrade_queue::AudioSummary;
 use crate::services::lidarr::{ILidarrTrackFetcher, LidarrImport, LidarrImportHandoff, LidarrTrackRequest};
 use crate::services::metadata::deezer_requests::{DeezerRequestCounter, DeezerUse};
+use crate::services::spotiflac::SpotiflacClient;
 use crate::services::you_tube::{YouTubeHit, YouTubeResolver};
 use octo_core::common::acquisition_tracker::user_safe;
 use octo_core::lidarr::lidarr_track_fetcher::LidarrStep;
@@ -199,6 +201,8 @@ pub struct SoulseekDownloadParts {
     pub lidarr_imports: Option<Arc<LidarrImportHandoff>>,
     /// Lidarr's track fetcher, when there is one.
     pub lidarr_fetcher: Option<Arc<dyn ILidarrTrackFetcher>>,
+    /// The person's SpotiFLAC server, when one is set up. Asked only while it is on.
+    pub spotiflac: Option<Arc<SpotiflacClient>>,
 }
 
 /// Hybrid download service:
@@ -223,6 +227,7 @@ pub struct SoulseekDownloadService {
     soulseek_link: Option<Arc<dyn ISoulseekLink>>,
     lidarr_imports: Option<Arc<LidarrImportHandoff>>,
     lidarr_fetcher: Option<Arc<dyn ILidarrTrackFetcher>>,
+    spotiflac: Option<Arc<SpotiflacClient>>,
 
     // Set once slskd has said where its incomplete folder is; until then each download asks again.
     excluded_folders: Mutex<Option<Vec<String>>>,
@@ -288,6 +293,7 @@ impl SoulseekDownloadService {
             soulseek_link: parts.soulseek_link,
             lidarr_imports: parts.lidarr_imports,
             lidarr_fetcher: parts.lidarr_fetcher,
+            spotiflac: parts.spotiflac,
             excluded_folders: Mutex::new(None),
             prepared: Mutex::new(HashMap::new()),
             slskd_downloads: Mutex::new(None),
@@ -393,6 +399,19 @@ impl SoulseekDownloadService {
             return Err(file_not_found(format!(
                 "AcoustID identified Lidarr's file as {}",
                 verdict.describe()
+            )));
+        }
+        let length_known = routing.duration.is_some_and(|s| s > 0)
+            && TagFile::open(&local).is_ok_and(|file| file.duration_seconds() > 0);
+        let track_key = song.external_id.clone().unwrap_or_default();
+        if let Some(reason) = self
+            .refused_by_preview(base, routing, &track_key, &local, &verdict, length_known)
+            .await
+        {
+            // Swept with the job folders when it cannot be removed now.
+            let _ = std::fs::remove_file(&local);
+            return Err(file_not_found(format!(
+                "Lidarr's file for '{artist} - {title}' {reason}"
             )));
         }
         if let Some(said) = verdict.acoust_id_text() {
@@ -986,6 +1005,99 @@ impl SoulseekDownloadService {
         song.verification = Some(Box::new(verdict));
         download.fetched_from = Some("Deezer".to_string());
         Ok(path)
+    }
+
+    // =========================================================================
+    // The preview check
+    // =========================================================================
+
+    /// Holds a download AcoustID could not place against the song's YouTube preview. Some(the
+    /// reason, for the deny list) when the file is refused; None keeps it, judged as before.
+    /// `length_known`: the file's length and the song's were both read, so the length check
+    /// before this one had something to compare.
+    async fn refused_by_preview(
+        &self,
+        base: &BaseDownloadService,
+        routing: &SoulseekRouting,
+        track_key: &str,
+        path: &str,
+        verdict: &VerificationResult,
+        length_known: bool,
+    ) -> Option<String> {
+        let (artist, title) = names(routing);
+        let request = PreviewRequest {
+            artist: &artist,
+            title: &title,
+            // A shown length from the video itself, or from a file downloaded before, is no
+            // independent word on how long the song runs.
+            seconds: routing
+                .duration
+                .or(routing.shown_duration.filter(|_| {
+                    matches!(
+                        routing.shown_duration_source,
+                        LengthSource::Deezer | LengthSource::LastFm
+                    )
+                }))
+                .filter(|s| *s > 0),
+            video_id: routing.you_tube_id.as_deref(),
+        };
+        let outcome = self
+            .verification
+            .hear_against_preview(self.youtube.as_ref(), path, &request, verdict, length_known)
+            .await;
+        let PreviewOutcome::Compared {
+            heard,
+            comparison,
+            trusted,
+            preview,
+        } = outcome
+        else {
+            if let PreviewOutcome::Unavailable(why) = outcome {
+                info!("no preview check for '{artist} - {title}': {why}");
+            }
+            return None;
+        };
+        let video = &preview.video_id;
+        let measured = format!(
+            "bit error {:.2} at {:+.0}s",
+            comparison.bit_error, comparison.offset_seconds
+        );
+        match heard {
+            Heard::Match => {
+                info!("'{artist} - {title}' matched the preview {video} ({measured})");
+                base.log_step(
+                    track_key,
+                    acquisition_event_kinds::CHECK,
+                    "Sounds like its YouTube preview",
+                    None,
+                );
+                None
+            }
+            Heard::Mismatch => {
+                warn!(
+                    "the file did not sound like the song: '{artist} - {title}' against the preview {video} \
+                     ({measured}); discarding it"
+                );
+                base.log_step(
+                    track_key,
+                    acquisition_event_kinds::CHECK,
+                    "Did not sound like the song",
+                    Some("Nothing in it sounds like the song's YouTube preview; thrown away"),
+                );
+                Some("did not sound like the song".to_string())
+            }
+            Heard::Unclear => {
+                info!(
+                    "'{artist} - {title}' could not be told apart from the preview {video} ({measured}, {}); keeping it",
+                    if trusted {
+                        "a preview that names the song"
+                    } else {
+                        "a preview that may not be the song"
+                    }
+                );
+                None
+            }
+        }
     }
 
     // =========================================================================
@@ -1989,6 +2101,21 @@ impl SoulseekDownloadService {
                         continue;
                     }
 
+                    // AcoustID has never heard this sound, or no length stood behind the file:
+                    // the song's YouTube preview is asked instead, and a clear no is a failed check.
+                    let length_known = routing.duration.is_some_and(|s| s > 0) && actual_secs > 0;
+                    if let Some(reason) = self
+                        .refused_by_preview(base, routing, &track_key, &local_path, &verdict, length_known)
+                        .await
+                    {
+                        discard_rejected_download(&local_path, attempt_started_utc);
+                        self.deny_candidate(hit, routing, &reason);
+                        let refused = format!("the file {reason}");
+                        last_refusal = Some((refused.clone(), reason));
+                        last_error = Some(refused);
+                        continue;
+                    }
+
                     // Last, and the only check that never rejects: the right song made from an MP3 is
                     // still the right song. It decides only whether another peer's copy is worth a
                     // try, which is why it runs after the checks that can throw a file away.
@@ -2704,13 +2831,14 @@ impl DownloadBackend for SoulseekDownloadService {
         let source = download
             .source_override
             .unwrap_or(base.subsonic_settings().download_source);
-        // Soulseek switched off: the combined source is YouTube alone, and Soulseek alone has
-        // nothing to try.
+        // Soulseek switched off, and SpotiFLAC too: the combined source is YouTube alone, and
+        // Soulseek alone has nothing to try. With SpotiFLAC on, it stands in for Soulseek.
+        let lossless = self.slskd.is_on() || self.spotiflac_on().is_some();
         let source = match source {
-            DownloadSource::SoulseekThenYouTube if !self.slskd.is_on() => DownloadSource::YouTube,
+            DownloadSource::SoulseekThenYouTube if !lossless => DownloadSource::YouTube,
             DownloadSource::YouTube => DownloadSource::YouTube,
             DownloadSource::Deezer => DownloadSource::Deezer,
-            _ if !self.slskd.is_on() => {
+            _ if !lossless => {
                 return Err(
                     InvalidOperationException(super::soulseek_client::SOULSEEK_OFF.to_string()).into(),
                 );
@@ -2732,14 +2860,14 @@ impl DownloadBackend for SoulseekDownloadService {
                 // token.
                 let snapshot = routing.snapshot();
                 match self
-                    .download_via_soulseek(base, &snapshot, download, &profile, cancellation_token)
+                    .download_lossless(base, &snapshot, download, &profile, cancellation_token)
                     .await
                 {
                     Ok(path) => Ok(path),
-                    // With YouTube off there is nothing to fall back to, and Soulseek's own
-                    // failure is the answer.
+                    // With YouTube off there is nothing to fall back to, and the lossless step's
+                    // own failure is the answer.
                     Err(e) if !cancellation_token.is_cancelled() && self.youtube.is_on() => {
-                        warn!("Soulseek download failed ({e}); falling back to YouTube MP3");
+                        warn!("Lossless download failed ({e}); falling back to YouTube MP3");
                         if !download.suppress_notify {
                             base.notifications().notify(NotificationEvent {
                                 artist: snapshot.artist.clone(),
@@ -2761,7 +2889,7 @@ impl DownloadBackend for SoulseekDownloadService {
             }
             _ => {
                 let snapshot = routing.snapshot();
-                self.download_via_soulseek(base, &snapshot, download, &profile, cancellation_token)
+                self.download_lossless(base, &snapshot, download, &profile, cancellation_token)
                     .await
             }
         }
@@ -3450,6 +3578,10 @@ fn find_directory(root: &str, name: &str, accept: impl Fn(&str) -> bool) -> std:
     }
     Ok(None)
 }
+
+#[path = "spotiflac_download.rs"]
+mod spotiflac_download;
+pub use spotiflac_download::SPOTIFLAC_SOURCE;
 
 #[cfg(test)]
 #[path = "soulseek_download_service_tests.rs"]

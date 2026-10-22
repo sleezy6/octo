@@ -38,8 +38,9 @@ struct Recorded {
 }
 
 fn recorded(file: &str, name: &str) -> Recorded {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../parity/recordings/csharp/{file}.json"));
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../docs/rust-migration/fixtures/wire/csharp/{file}.json"
+    ));
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let recording: Value = serde_json::from_str(&text).expect("a recording");
     let entry = recording["entries"]

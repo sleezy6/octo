@@ -39,9 +39,8 @@ FROM chef AS build
 # Unset by default, so cargo uses every core the builder has. A machine short of memory for
 # the LTO link and the heavier crates (lofty, image, cosmic-text) passes 2.
 ARG CARGO_BUILD_JOBS
-# Unset by default, so the release profile's thin LTO applies. The parity box, when its host is
-# short of memory, passes "off": the same program without the 3 GB link (parity/box-run.sh
-# --low-memory).
+# Unset by default, so the release profile's thin LTO applies. "off" builds the same program
+# without the 3 GB link, for a host short of memory.
 ARG CARGO_PROFILE_RELEASE_LTO
 COPY --from=planner /src/recipe.json recipe.json
 # Every third-party crate, compiled once and cached in this layer.

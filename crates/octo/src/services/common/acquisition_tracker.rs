@@ -285,6 +285,8 @@ pub struct AcquisitionTracker {
     listeners: Mutex<Vec<(u64, EndedListener)>>,
     logged_after_end: Mutex<Vec<(u64, LoggedAfterEndListener)>>,
     next_listener: AtomicU64,
+    /// Rows a download ahead is working on: its lines never land in a row that has ended.
+    hushed: Mutex<std::collections::HashSet<String>>,
 }
 
 /// The key every stage of the pipeline files a song under.
@@ -352,7 +354,19 @@ impl AcquisitionTracker {
             listeners: Mutex::new(Vec::new()),
             logged_after_end: Mutex::new(Vec::new()),
             next_listener: AtomicU64::new(1),
+            hushed: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// A download ahead is working on this row's song: until [`Self::unhush`], its lines are
+    /// kept only while the row is running.
+    pub fn hush(&self, provider: &str, external_id: &str) {
+        self.hushed.lock().insert(key_of(provider, external_id));
+    }
+
+    /// The download ahead is over.
+    pub fn unhush(&self, provider: &str, external_id: &str) {
+        self.hushed.lock().remove(&key_of(provider, external_id));
     }
 
     /// Subscribes to lines that arrive for a row that has already ended (lyrics, an upgrade's
@@ -881,6 +895,9 @@ impl AcquisitionTracker {
             let Some(entry) = state.entries.get_mut(&key) else {
                 return;
             };
+            if entry.finished() && self.hushed.lock().contains(&key) {
+                return;
+            }
             add(entry, now, kind, text, detail, None);
             if !heard.is_empty()
                 && let Some(line) = entry.events.last_mut()

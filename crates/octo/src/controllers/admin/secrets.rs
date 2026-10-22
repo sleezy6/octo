@@ -29,6 +29,7 @@ pub const SECRET_FIELDS: &[(&str, &str, &str)] = &[
     ("Notifications", "NtfyToken", "ntfy token"),
     ("Notifications", "DiscordWebhookUrl", "Discord webhook address"),
     ("ListenBrainz", "Token", "ListenBrainz token"),
+    ("Spotiflac", "Token", "SpotiFLAC web token"),
 ];
 
 /// Credentials that are sent to an address the settings also hold: section, address, key, and
@@ -38,6 +39,7 @@ pub const SECRET_ADDRESSES: &[(&str, &str, &str, &str)] = &[
     ("Soulseek", "BaseUrl", "Password", "slskd password"),
     ("Lidarr", "BaseUrl", "ApiKey", "Lidarr API key"),
     ("Notifications", "NtfyUrl", "NtfyToken", "ntfy token"),
+    ("Spotiflac", "Url", "Token", "SpotiFLAC web token"),
 ];
 
 /// Credentials kept one per listener: section, map, and the field inside each entry, or None
@@ -282,6 +284,10 @@ pub fn running_secrets(state: &AppState) -> JsonObject {
             ("Token", text(&current.listen_brainz.token)),
             ("UserTokens", tokens),
         ]),
+    );
+    secrets.insert(
+        "Spotiflac".into(),
+        n_obj([("Token", text(&current.spotiflac.token))]),
     );
     secrets
 }

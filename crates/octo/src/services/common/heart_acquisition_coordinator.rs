@@ -21,6 +21,7 @@ use crate::services::i_download_service::IDownloadService;
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::library::{HeartOwnership, OwnedCopy};
 use crate::services::lidarr::ILidarrHeartAcquisitionService;
+use crate::services::prefetch::PrefetchedFiles;
 use crate::services::soulseek::soulseek_link::SoulseekLinkState;
 use crate::services::soulseek::{ExternalIdRegistry, ISoulseekLink};
 
@@ -38,6 +39,8 @@ pub struct HeartCoordinatorExtras {
     /// is already there, as before.
     pub owned: Option<Arc<HeartOwnership>>,
     pub stars: Option<Arc<StarOnArrival>>,
+    /// The songs fetched ahead: a heart on one is kept at once, without the source chain.
+    pub ahead: Option<Arc<dyn PrefetchedFiles>>,
 }
 
 /// How one song's heart chain ended.
@@ -191,6 +194,32 @@ impl HeartAcquisitionCoordinator {
         client_id: Option<&str>,
         owner: Option<&str>,
     ) {
+        self.queue_play_as(provider, external_id, requested_by, client_id, owner, false);
+    }
+
+    /// A song coming up next, queued with DownloadOnPlay on as the play it will be, only
+    /// earlier. Unlike a play under way, it is queued with Wait for lossless on play on too,
+    /// since that waits only for the song playing.
+    pub fn queue_play_ahead(
+        self: &Arc<Self>,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        client_id: Option<&str>,
+        owner: Option<&str>,
+    ) {
+        self.queue_play_as(provider, external_id, requested_by, client_id, owner, true);
+    }
+
+    fn queue_play_as(
+        self: &Arc<Self>,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        client_id: Option<&str>,
+        owner: Option<&str>,
+        ahead: bool,
+    ) {
         let settings = self.settings.current().subsonic.clone();
         // A family member's play keeps a copy only when they may add songs at once, and then in
         // their own library; `owner` is who signed in. Everyone else plays as always.
@@ -203,7 +232,7 @@ impl HeartAcquisitionCoordinator {
         };
         // WaitForLosslessOnPlay acquires the track itself, from its own source.
         if settings.download_on_play
-            && !settings.wait_for_lossless_on_play
+            && (ahead || !settings.wait_for_lossless_on_play)
             && let Some(source) = self.play_source()
         {
             let holds = self
@@ -590,6 +619,8 @@ impl HeartAcquisitionCoordinator {
         );
         let target = AcquisitionTarget::Member(user.to_string());
         let mut landed = Vec::new();
+        // Each song is filed at its place on this album, with the album tags its songs settle.
+        self.direct_downloads.hold_album_listing(provider, &album);
         for song in tracks {
             let track_provider = song.external_provider.as_deref().unwrap_or(provider);
             let track_id = song.external_id.as_deref().unwrap_or_default();
@@ -608,6 +639,7 @@ impl HeartAcquisitionCoordinator {
                 Err(e) => warn!("Album song {track_provider}:{track_id} for {user} failed: {e}"),
             }
         }
+        self.direct_downloads.finish_album_listing(provider, &album).await;
         landed
     }
 
@@ -704,6 +736,39 @@ impl HeartAcquisitionCoordinator {
             .await
         {
             return Ok(TrackOutcome::AlreadyThere);
+        }
+        // A song fetched ahead is kept at once: no outage hold, no Lidarr hand-off. The download
+        // takes the file from the folder instead of a transfer.
+        if self
+            .extras
+            .ahead
+            .as_ref()
+            .is_some_and(|ahead| ahead.has(provider, external_id))
+        {
+            info!("{provider}:{external_id} was downloaded ahead; keeping that copy");
+            let completion = self.direct_queue.enqueue_for(
+                target,
+                false,
+                provider,
+                external_id,
+                true,
+                false,
+                true,
+                Some(DownloadSource::Soulseek),
+                true,
+                requested_by,
+                false,
+                None,
+            );
+            return Ok(match completion.wait().await {
+                Ok(path) => TrackOutcome::Landed(path),
+                Err(failure) => {
+                    if let Some(tracker) = self.tracker() {
+                        tracker.fail(provider, external_id, Some(&failure.to_string()));
+                    }
+                    TrackOutcome::Failed(failure.to_string())
+                }
+            });
         }
         let steps: Vec<HeartDownloadSource> = self
             .enabled_steps(false)
@@ -897,9 +962,11 @@ impl HeartAcquisitionCoordinator {
     }
 
     fn enabled_steps(&self, album_heart: bool) -> Vec<HeartDownloadSource> {
-        let soulseek_off = self.extras.soulseek.as_ref().is_some_and(|link| link.is_off());
-        let you_tube_off = !self.settings.you_tube_enabled();
         let snapshot = self.settings.current();
+        // SpotiFLAC rides on the Soulseek step, so with SpotiFLAC on the step stays.
+        let soulseek_off = self.extras.soulseek.as_ref().is_some_and(|link| link.is_off())
+            && !snapshot.spotiflac.is_on();
+        let you_tube_off = !self.settings.you_tube_enabled();
         let deezer_unset = !snapshot.deezer.is_configured();
         snapshot
             .subsonic
@@ -1076,7 +1143,7 @@ impl HeartAcquisitionCoordinator {
     /// When a Soulseek step stops waiting for slskd, or `None` when it never waits: another
     /// source, no link, the wait switched off, or Lidarr later in the chain. The wait exists so
     /// an outage does not turn a lossless heart into a YouTube MP3; Lidarr can bring a lossless
-    /// copy now.
+    /// copy now, and so can SpotiFLAC when it is on.
     fn soulseek_deadline(
         &self,
         steps: &[HeartDownloadSource],
@@ -1086,7 +1153,8 @@ impl HeartAcquisitionCoordinator {
         let link = self.extras.soulseek.as_ref()?;
         (steps[index] == HeartDownloadSource::Soulseek
             && link.hold_limit() > TimeDelta::zero()
-            && !steps[index + 1..].contains(&HeartDownloadSource::Lidarr))
+            && !steps[index + 1..].contains(&HeartDownloadSource::Lidarr)
+            && !self.settings.current().spotiflac.is_on())
         .then(|| held_since_utc.unwrap_or_else(|| link.utc_now()) + link.hold_limit())
     }
 

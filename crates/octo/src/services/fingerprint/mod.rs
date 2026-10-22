@@ -6,6 +6,7 @@ pub mod acoust_id_rate_limit_handler;
 pub mod acoust_id_rate_limiter;
 pub mod download_verification_service;
 pub mod music_brainz_client;
+pub mod preview_check;
 
 pub use acoust_id_client::AcoustIdClient;
 pub use acoust_id_rate_limit_handler::AcoustIdRateLimitHandler;

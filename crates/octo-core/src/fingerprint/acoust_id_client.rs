@@ -3,6 +3,7 @@
 //! ([`parse_lookup`]) and building of its forms. The HTTP client and its rate limiter
 //! are in `octo::services::fingerprint`.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::common::dotnet;
@@ -14,7 +15,8 @@ use crate::json::element::{
 };
 
 /// One credited artist and the text MusicBrainz joins it to the next one with.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AcoustIdCredit {
     pub name: String,
     pub artist_id: Option<String>,
@@ -33,7 +35,8 @@ impl AcoustIdCredit {
 
 /// The release a recording was matched on. It supplies what names the album, numbers the
 /// track and finds the cover, and it is chosen per recording by `pick_release`.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AcoustIdRelease {
     pub release_id: Option<String>,
     pub release_group_id: Option<String>,
@@ -62,7 +65,8 @@ pub struct AcoustIdRelease {
 /// lookup. There is no separate MusicBrainz client on purpose: AcoustID's metadata IS
 /// MusicBrainz data, and asking for it via meta= costs nothing extra on a call already
 /// being made and already inside a rate budget.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AcoustIdRecording {
     pub recording_id: String,
     pub title: String,

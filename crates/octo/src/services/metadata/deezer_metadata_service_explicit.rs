@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use octo_core::common::SongIdentity;
 use octo_core::common::dotnet::{escape_data_string, is_blank};
 use octo_core::json::element::{ElementResult, get_int64, str_prop, try_get_property};
+use octo_core::metadata::deezer_image::deezer_image;
 use octo_core::metadata::deezer_metadata_service::{CatalogTrackAnswer, CatalogTrackFacts};
 use octo_core::tagging::explicit_lookup::IExplicitCatalog;
 use serde_json::Value;
@@ -55,9 +56,9 @@ impl DeezerMetadataService {
                     .and_then(|artist| artist.get("name"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let cover = ["cover_xl", "cover_big", "cover_medium"]
-                    .iter()
-                    .find_map(|key| album.get(*key).and_then(Value::as_str))
+                let cover = deezer_image(album, &["cover_xl", "cover_big", "cover_medium"])
+                    .ok()
+                    .flatten()
                     .unwrap_or("");
                 if !cover.is_empty() && !found.iter().any(|(_, _, seen)| seen == cover) {
                     found.push((title.to_string(), artist.to_string(), cover.to_string()));

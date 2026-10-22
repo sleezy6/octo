@@ -859,3 +859,172 @@ async fn api_key_requests_arriving_together_ask_once() {
     assert_eq!(fixture.token_info_calls(), 1);
     assert_eq!(fixture.last_fm.calls_to("track.updateNowPlaying").len(), 4);
 }
+
+// ---------------------------------------------------------------------------------------
+// Now playing moves the songs fetched ahead
+// ---------------------------------------------------------------------------------------
+
+/// A now-playing scrobble queues the next songs of the listener's saved queue to be fetched
+/// ahead, in the background; a completed play does not.
+#[tokio::test]
+async fn a_now_playing_scrobble_queues_the_next_songs_ahead() {
+    let navidrome = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(navidrome_json(NAVIDROME_OK))
+        .mount(&navidrome)
+        .await;
+    let folder = tempfile::tempdir().expect("a temp dir");
+    let mut app_settings = settings(&navidrome.uri());
+    app_settings.prefetch.enabled = true;
+    app_settings.prefetch.scope = octo_core::settings::PrefetchScope::All;
+    app_settings.prefetch.folder = folder.path().to_string_lossy().into_owned();
+    app_settings.soulseek.base_url = Some(format!(
+        "http://{}",
+        crate::services::test_support::refused_address()
+    ));
+    let state = AppState::for_tests(app_settings);
+    let ids: Vec<String> = ["One", "Two", "Three", "Four", "Five"]
+        .iter()
+        .map(|title| {
+            state.external_id_registry.register(SoulseekRouting {
+                kind: RoutingKind::Song,
+                artist: Some("Artist".into()),
+                title: Some(title.to_string()),
+                ..Default::default()
+            })
+        })
+        .collect();
+    state
+        .prefetch
+        .saved_queue("alice", ids.clone(), Some(ids[0].clone()), Some(0));
+    let app = app(&state);
+
+    let done = get(
+        &app,
+        &format!(
+            "/rest/scrobble?id={}&submission=true&f=json&{}",
+            ids[0],
+            auth("alice", "good", "Octo")
+        ),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        state.prefetch.status().await.next.is_empty(),
+        "a completed play moves nothing"
+    );
+
+    let playing = get(
+        &app,
+        &format!(
+            "/rest/scrobble?id={}&submission=false&f=json&{}",
+            ids[0],
+            auth("alice", "good", "Octo")
+        ),
+    )
+    .await;
+    assert_eq!(playing.status, StatusCode::OK);
+    let mut next = Vec::new();
+    for _ in 0..200 {
+        next = state.prefetch.status().await.next;
+        if !next.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let titles: Vec<Option<String>> = next.into_iter().map(|song| song.title).collect();
+    // From the song after the next: the app buffers the next one itself.
+    assert_eq!(
+        titles,
+        [
+            Some("Three".to_string()),
+            Some("Four".to_string()),
+            Some("Five".to_string())
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Listening
+// ---------------------------------------------------------------------------------------
+
+/// The fixture with the radio and ListenBrainz off, so only the listening log learns.
+async fn listening_only() -> Fixture {
+    let fixture = Fixture::new(false, false).await;
+    let mut settings = (*fixture.state.settings.current()).clone();
+    settings.last_fm.enable_radio = false;
+    settings.last_fm.enable_personalized_stations = false;
+    settings.listen_brainz.token = String::new();
+    settings.listen_brainz.user_tokens.clear();
+    fixture.state.settings.set(settings);
+    fixture
+}
+
+async fn as_octo_app(fixture: &Fixture, query: &str) {
+    let reply = send(
+        &fixture.app,
+        axum::http::Method::GET,
+        &format!("/rest/scrobble?u=bob&t=token&s=salt&c=Octo&f=json&{query}"),
+        &[("User-Agent", "Octo/1.9.0 (Android)")],
+        "",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+}
+
+#[tokio::test]
+async fn a_completed_play_is_written_down_with_its_app_whatever_the_radio_does() {
+    let fixture = listening_only().await;
+    // Reported once, three minutes after it started; the next song ends it.
+    let started = minutes_ago_ms(3);
+    as_octo_app(&fixture, &format!("id=lib1&submission=true&time={started}")).await;
+    assert!(fixture.state.listening.plays_of("bob").is_empty());
+    as_octo_app(&fixture, "id=lib9&submission=false").await;
+    let log = Arc::clone(&fixture.state.listening);
+    until(move || !log.plays_of("bob").is_empty()).await;
+    let plays = fixture.state.listening.plays_of("bob");
+    assert_eq!(plays.len(), 1);
+    let play = &plays[0];
+    assert_eq!(play.song_id, "lib1");
+    assert_eq!(play.title, "Title lib1");
+    assert_eq!(play.genre.as_deref(), Some("Rock"));
+    assert_eq!(play.app, "Octo 1.9.0 (Android)");
+    assert_eq!(play.platform, "android");
+    assert_eq!(play.source, "scrobble");
+    assert!(play.is_local);
+    assert_eq!(play.played_at.timestamp_millis(), started);
+    // Timed to when the next song started, never past the song's 180 seconds.
+    assert!((170..=180).contains(&play.seconds), "{}", play.seconds);
+    // The radio learned nothing: it is off.
+    assert_eq!(fixture.plays("bob"), 0);
+}
+
+#[tokio::test]
+async fn a_heart_while_the_song_plays_marks_the_play() {
+    let fixture = listening_only().await;
+    as_octo_app(&fixture, "id=lib2&submission=false").await;
+    let star = fixture
+        .get("/rest/star?u=bob&t=token&s=salt&c=Octo&f=json&id=lib2")
+        .await;
+    assert!(star.contains(r#""status":"ok""#), "{star}");
+    as_octo_app(&fixture, "id=lib2&submission=true").await;
+    as_octo_app(&fixture, "id=lib10&submission=false").await;
+    let log = Arc::clone(&fixture.state.listening);
+    until(move || !log.plays_of("bob").is_empty()).await;
+    assert!(fixture.state.listening.plays_of("bob")[0].hearted);
+}
+
+#[tokio::test]
+async fn with_recording_off_no_play_is_written() {
+    let fixture = listening_only().await;
+    let mut settings = (*fixture.state.settings.current()).clone();
+    settings.listening.enabled = false;
+    fixture.state.settings.set(settings);
+    as_octo_app(&fixture, "id=lib3&submission=false").await;
+    as_octo_app(&fixture, "id=lib3&submission=true").await;
+    as_octo_app(&fixture, "id=lib11&submission=false").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(fixture.state.listening.plays_of("bob").is_empty());
+    assert!(fixture.state.listening.people().is_empty());
+}

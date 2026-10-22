@@ -338,6 +338,23 @@ pub fn set_original_date(file: &mut TagFile, date: Option<&str>) {
     }
 }
 
+/// Takes the original release date off, under every name [`set_original_date`] writes it.
+pub fn clear_original_date(file: &mut TagFile) {
+    if let Some(id3) = file.id3v2.as_mut() {
+        id3.remove_frames("TDOR");
+        id3.remove_frames("TORY");
+    }
+    if let Some(xiph) = file.xiph.as_mut() {
+        xiph.remove_field("ORIGINALDATE");
+        xiph.remove_field("ORIGINALYEAR");
+    }
+    if let Some(apple) = file.apple.as_mut() {
+        while apple.dash_boxes(APPLE_MEAN, "originaldate").is_some() {
+            apple.remove_dash_box(APPLE_MEAN, "originaldate");
+        }
+    }
+}
+
 /// The release track id, in the frame taggers and the library server read it from.
 pub fn set_release_track_id(file: &mut TagFile, id: Option<&str>) {
     set_text(file, TagFields::RELEASE_TRACK_ID, id);

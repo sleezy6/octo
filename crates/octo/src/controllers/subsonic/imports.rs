@@ -244,7 +244,7 @@ fn answer_action(state: &AppState, call: &str, result: &ImportActionResult) -> A
     Ok(octo_answer(state, "importAction", to_value(result)?).into_response())
 }
 
-/// One thing to do: addLink (url), playlist (id, on), fetch (id, on), songs (id, key...), refresh
+/// One thing to do: addLink (url), playlist/stream/fetch (id, on), songs (id, key...), refresh
 /// (id), remove (id), pause, resume, retry (key... or none for every song not found), skip
 /// (key...), clear.
 pub async fn import_action(State(state): State<AppState>, req: Request) -> AppResult {
@@ -269,6 +269,7 @@ pub async fn import_action(State(state): State<AppState>, req: Request) -> AppRe
         anyhow::Ok(match to_lower_invariant(&what).as_str() {
             "addlink" => imports.add_link(&user, &url).await?,
             "playlist" => imports.set_playlist(&user, &id, on).await,
+            "stream" => imports.set_streaming(&user, &id, on),
             "fetch" => imports.set_get_missing(&user, &id, on),
             "songs" => imports.get_songs(&user, &id, &keys),
             "refresh" => imports.refresh(&user, &id).await?,

@@ -715,6 +715,8 @@ input[type="number"].set-input { max-width: 160px; }
 .set-info-t { display: block; font-size: var(--t-body); font-weight: 500; color: var(--ink); line-height: 1.35; }
 .set-info-d { display: block; margin-top: var(--s-2xs); font-size: var(--t-meta); color: var(--text-muted); line-height: 1.5; max-width: 62ch; }
 .set-opt { color: var(--text-muted); font-weight: 400; font-size: var(--t-meta); }
+/* The songs downloaded ahead: what runs and what failed, close under the status line. */
+#prefetch-activity p { margin: 0; }
 .set-ctrl { flex-shrink: 0; display: flex; align-items: center; gap: var(--s-m); }
 .set-row.is-disabled .set-info { opacity: 0.5; }
 .set-inline { display: flex; gap: var(--s-m); }
@@ -1470,7 +1472,7 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .imp-card { padding: var(--s-xl); display: flex; flex-direction: column; gap: var(--s-l); }
 .set-card.imp-card > :not([hidden]):not([type="hidden"]) ~ :not([type="hidden"]) { border-top: 0; }
 .imp-card > .set-row { padding: 0; }
-.imp-row { grid-template-columns: minmax(0, 2.2fr) minmax(0, 1.6fr) 92px 104px 136px; gap: var(--s-l); align-items: center; }
+.imp-row { grid-template-columns: minmax(0, 2.2fr) minmax(0, 1.6fr) 112px 92px 104px 136px; gap: var(--s-l); align-items: center; }
 .imp-row.picked, .imp-track.picked { background: var(--accent-selected); }
 .imp-row .key, .imp-track .key, .imp-trickle-row .key { font-family: inherit; color: var(--ink); overflow-wrap: anywhere; }
 .imp-name { color: var(--ink); font-weight: 500; text-align: left; }
@@ -1487,11 +1489,13 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .imp-num { width: 96px; flex: none; }
 .imp-switch-cell { display: flex; align-items: center; gap: var(--s-m); }
 .imp-cell-label { display: none; color: var(--ink-2); font-size: 12px; }
-@container (max-width: 640px) {
+@container (max-width: 900px) {
   .imp-row { grid-template-columns: 1fr 1fr; }
-  .imp-row > span:nth-child(1), .imp-row > span:nth-child(2), .imp-row > span:nth-child(5) { grid-column: 1 / -1; }
+  .imp-row > span:nth-child(1), .imp-row > span:nth-child(2), .imp-row > span:nth-child(6) { grid-column: 1 / -1; }
   .imp-row.config-row-head { display: none; }
   .imp-cell-label { display: inline; }
+}
+@container (max-width: 640px) {
   .imp-track { grid-template-columns: 28px 1fr; }
   .imp-track > span:nth-child(n+3) { grid-column: 2 / -1; }
   .imp-trickle-row { grid-template-columns: 1fr auto; }
@@ -2706,3 +2710,43 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 
 /* Animated art: the two look-up buttons side by side. */
 .art-actions { display: flex; gap: var(--s-s); flex-wrap: wrap; margin-top: -7px; }
+/* ── SpotiFLAC page ── */
+/* What the person brings, numbered. The number sits on the title line: a 24 px disc on the cap
+ * height midline of a 20 px line. */
+.bring-list { list-style: none; margin: 0; padding: 0; counter-reset: bring; }
+.bring-list li {
+  counter-increment: bring;
+  display: grid;
+  grid-template-columns: 24px 1fr;
+  column-gap: var(--s-l);
+  padding: var(--s-xl) var(--s-2xl);
+}
+.bring-list li + li { border-top: 1px solid var(--hairline); }
+.bring-list li::before {
+  content: counter(bring);
+  grid-row: 1 / span 2;
+  width: 24px; height: 24px;
+  display: grid; place-items: center;
+  border-radius: var(--r-pill);
+  background: var(--accent-tonal);
+  color: var(--text-secondary);
+  font-size: var(--t-label); font-weight: 600;
+}
+.bring-t { display: block; font-size: var(--t-body); font-weight: 500; color: var(--ink); line-height: 1.35; }
+.bring-d { display: block; margin-top: var(--s-2xs); font-size: var(--t-meta); color: var(--text-muted); line-height: 1.5; max-width: 62ch; }
+/* The Test's findings. Each icon sits on the cap height midline of its first line (16 px on a
+ * 19.5 px line). */
+.test-checks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--s-m); }
+.test-check {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  column-gap: var(--s-m);
+  font-size: var(--t-meta); line-height: 1.5;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.test-check .icon { width: 16px; height: 16px; margin-top: 3px; }
+.test-check.ok .icon { color: var(--good); }
+.test-check.warn .icon { color: var(--warn); }
+.test-check.fail { color: var(--ink); }
+.test-check.fail .icon { color: var(--bad); }

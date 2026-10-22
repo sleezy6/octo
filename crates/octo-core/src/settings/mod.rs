@@ -15,12 +15,15 @@ pub mod last_fm;
 pub mod library_action;
 pub mod lidarr;
 pub mod listen_brainz;
+pub mod listening;
 pub mod metadata;
 pub mod notification;
+pub mod prefetch;
 pub mod radio_source;
 pub mod restart_tracker;
 pub mod server;
 pub mod soulseek;
+pub mod spotiflac;
 pub mod store;
 pub mod subsonic;
 mod text;
@@ -47,12 +50,15 @@ pub use library_action::{
 };
 pub use lidarr::{LidarrCompletionMode, LidarrSettings};
 pub use listen_brainz::ListenBrainzSettings;
+pub use listening::ListeningSettings;
 pub use metadata::{AnimatedArtMode, LyricsSaveTo, MetadataSettings};
 pub use notification::NotificationSettings;
+pub use prefetch::{PrefetchScope, PrefetchSettings};
 pub use radio_source::RadioSourceSettings;
 pub use restart_tracker::RestartTracker;
 pub use server::ServerSettings;
 pub use soulseek::SoulseekSettings;
+pub use spotiflac::{SpotiflacPlacement, SpotiflacSettings};
 pub use store::{RawConfig, SettingsStore};
 pub use subsonic::{
     DownloadMode, DownloadSource, ExplicitFilter, FolderStructure, HeartDownloadSource, HeartDownloadStep,
@@ -84,6 +90,9 @@ pub struct AppSettings {
     pub admin: AdminSettings,
     pub imports: ImportSettings,
     pub family: FamilySettings,
+    pub spotiflac: SpotiflacSettings,
+    pub prefetch: PrefetchSettings,
+    pub listening: ListeningSettings,
 }
 
 impl AppSettings {
@@ -107,7 +116,7 @@ impl AppSettings {
     }
 
     /// The configuration section names, in registration order.
-    pub const SECTIONS: [&'static str; 17] = [
+    pub const SECTIONS: [&'static str; 20] = [
         "Genre",
         "LibraryActions",
         "GeneratedPlaylists",
@@ -125,6 +134,9 @@ impl AppSettings {
         "Admin",
         "Imports",
         "Family",
+        "Spotiflac",
+        "Prefetch",
+        "Listening",
     ];
 
     /// Binds every section from the merged configuration. A value that does not convert
@@ -150,6 +162,9 @@ impl AppSettings {
             admin: bind_section(tree, "Admin", &mut warnings),
             imports: bind_section(tree, "Imports", &mut warnings),
             family: bind_section(tree, "Family", &mut warnings),
+            spotiflac: bind_section(tree, "Spotiflac", &mut warnings),
+            prefetch: bind_section(tree, "Prefetch", &mut warnings),
+            listening: bind_section(tree, "Listening", &mut warnings),
         };
         // Navidrome's address is read without the spaces and trailing slashes it may have been
         // typed with, so every upstream URL Octo builds from it has one slash (a trailing slash

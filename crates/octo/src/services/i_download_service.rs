@@ -4,12 +4,14 @@
 //! Where a download cannot be done the methods answer `Err`, and a caller that branches on the
 //! kind downcasts (`ReplacementRejectedException`).
 
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
+use octo_core::models::domain::Album;
 use octo_core::models::download::DownloadInfo;
 use octo_core::settings::DownloadSource;
 use tokio_util::sync::CancellationToken;
@@ -116,6 +118,36 @@ pub trait IDownloadService: Send + Sync {
         requested_by: Option<Vec<String>>,
     ) -> anyhow::Result<bool>;
 
+    /// Holds an album's own listing while its tracks are fetched one by one outside a walk (a
+    /// member's album, song by song into their library): each listed track is filed at its
+    /// place on that album, and its tracks settle one set of album-level tags. Ended with
+    /// [`IDownloadService::finish_album_listing`]. The default holds nothing.
+    fn hold_album_listing(&self, external_provider: &str, album: &Album) {
+        let _ = (external_provider, album);
+    }
+
+    /// Ends the hold of [`IDownloadService::hold_album_listing`]: every track fetched under it
+    /// gets the album-level tags its tracks settled on.
+    async fn finish_album_listing(&self, external_provider: &str, album: &Album) {
+        let _ = (external_provider, album);
+    }
+
+    /// Fetches a song ahead of its play: a real FLAC copy only, from the lossless sources
+    /// (Soulseek and SpotiFLAC as its settings place it), never YouTube or Lidarr. Checked and
+    /// tagged like any download, then kept in `folder` as `<provider>_<id>.<ext>` beside its
+    /// facts, outside the library: nothing is registered, logged as fetched or scanned. A song
+    /// the listener already has answers [`Ahead::AlreadyYours`]. The default fetches nothing.
+    async fn download_ahead(
+        &self,
+        external_provider: &str,
+        external_id: &str,
+        folder: &Path,
+        cancellation_token: &CancellationToken,
+    ) -> anyhow::Result<Ahead> {
+        let _ = (external_provider, external_id, folder, cancellation_token);
+        anyhow::bail!("This download service does not fetch songs ahead")
+    }
+
     /// Checks if a song is currently being downloaded
     fn get_download_status(&self, song_id: &str) -> Option<DownloadInfo>;
 
@@ -145,6 +177,15 @@ pub trait IDownloadService: Send + Sync {
         range_header: Option<&str>,
         cancellation_token: &CancellationToken,
     ) -> anyhow::Result<Option<DirectStreamInfo>>;
+}
+
+/// What [`IDownloadService::download_ahead`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ahead {
+    /// The song is ready in the folder, here.
+    Kept { path: PathBuf },
+    /// The library (or the family) already has the song, here; nothing was kept.
+    AlreadyYours { path: PathBuf },
 }
 
 /// Information about a direct stream from a provider CDN.

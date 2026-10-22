@@ -207,6 +207,40 @@ impl ImportMatcher {
         true
     }
 
+    /// Playlist reads reuse the library index and already learned ISRCs. They never start
+    /// catalog lookups, source refreshes or downloads on a player's request, and read the library
+    /// only when `read_if_stale` says a song they miss has landed: false when no index read in
+    /// the last [`Self::KEEP_INDEX_FOR`] is at hand otherwise.
+    pub async fn match_streaming_tracks_for(
+        &self,
+        owner: &str,
+        tracks: &mut [ImportTrack],
+        read_if_stale: bool,
+    ) -> bool {
+        let fresh = self
+            .index
+            .lock()
+            .clone()
+            .filter(|(_, at)| self.now() - *at < Self::KEEP_INDEX_FOR)
+            .map(|(index, _)| index);
+        let index = match fresh {
+            Some(index) => index,
+            None if read_if_stale => match self.library_index().await {
+                Some(index) => index,
+                None => return false,
+            },
+            None => return false,
+        };
+        self.within(owner, |visible| {
+            for track in tracks {
+                track.library_id = index
+                    .find_known(track, &self.known_recordings(track), visible)
+                    .map(|row| row.id.clone());
+            }
+        });
+        true
+    }
+
     /// Which way round a plain list's lines are written, judged by which reading names more of
     /// the songs `owner` can see. Artist - Title when the library cannot be read.
     pub async fn orientation_for(&self, owner: &str, lines: &[TextLine]) -> Orientation {

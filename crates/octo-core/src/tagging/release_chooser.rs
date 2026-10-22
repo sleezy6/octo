@@ -80,13 +80,7 @@ impl ReleaseChooser {
         });
 
         let best = &ranked[0];
-        let mut confidence = if best.distance <= Self::STRONG_THRESHOLD {
-            TagConfidence::Strong
-        } else if best.distance <= Self::MEDIUM_THRESHOLD {
-            TagConfidence::Medium
-        } else {
-            TagConfidence::Low
-        };
+        let mut confidence = Self::confidence_for(best.distance);
 
         if confidence != TagConfidence::Low && ranked.len() > 1 && Self::is_ambiguous(best, &ranked[1]) {
             confidence = TagConfidence::Ambiguous;
@@ -109,6 +103,17 @@ impl ReleaseChooser {
         };
         plan.notes.extend(note);
         plan
+    }
+
+    /// How sure a winner at this distance is, before any ambiguity is weighed.
+    pub fn confidence_for(distance: f64) -> TagConfidence {
+        if distance <= Self::STRONG_THRESHOLD {
+            TagConfidence::Strong
+        } else if distance <= Self::MEDIUM_THRESHOLD {
+            TagConfidence::Medium
+        } else {
+            TagConfidence::Low
+        }
     }
 
     /// Two best candidates of different release groups, the same kind, within the margin.

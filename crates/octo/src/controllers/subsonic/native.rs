@@ -282,6 +282,9 @@ async fn try_serve_native_radio(
         state
             .radio_queues
             .register(songs.iter().map(|song| song.id.clone()));
+        state
+            .prefetch
+            .note_radio(&songs.iter().map(|song| song.id.clone()).collect::<Vec<_>>());
         let metadata = Arc::clone(&state.metadata_service);
         let prewarm = songs.clone();
         tokio::spawn(async move { metadata.prewarm_you_tube_ids(&prewarm, 8).await });

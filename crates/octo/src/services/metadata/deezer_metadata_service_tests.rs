@@ -834,6 +834,20 @@ async fn search_artists_async_maps_name_image_and_album_count() {
     assert_eq!(hits[1].picture_url.as_deref(), Some("https://cdn/d.jpg"));
 }
 
+/// An artist Deezer has no picture for comes back with its stand-in (an empty hash in the
+/// address); that is no picture, so the apps draw their own empty tile.
+#[tokio::test]
+async fn search_artists_leaves_out_deezers_stand_in() {
+    let json = r#"{"data":[
+        {"id":5181383,"name":"LINKIN PARK x STEVE AOKI","picture_xl":"https://cdn-images.dzcdn.net/images/artist//1000x1000-000000-80-0-0.jpg","picture_medium":"https://cdn-images.dzcdn.net/images/artist//250x250-000000-80-0-0.jpg","nb_album":1}]}"#;
+    let h = Harness::new(vec![("/search/artist", json)]).await;
+
+    let hits = h.service.search_artists("linkin park steve aoki", 10).await;
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].picture_url, None);
+}
+
 #[tokio::test]
 async fn search_artists_async_throttled_returns_empty_without_caching() {
     // Caching an empty list on a refusal is what would make external artists vanish

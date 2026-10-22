@@ -25,6 +25,7 @@ use tracing::{debug, info, warn};
 use super::acoust_id_client::AcoustIdClient;
 use super::acoust_id_rate_limiter::AcoustIdRateLimiter;
 use super::music_brainz_client::{MusicBrainzClient, MusicBrainzError};
+use super::preview_check::{self, PreviewOutcome, PreviewRequest, PreviewSource};
 
 /// The ISRCs MusicBrainz listed per recording id, with ids compared ignoring case.
 pub type RecordingIsrcs = HashMap<String, Vec<String>>;
@@ -130,6 +131,28 @@ impl DownloadVerificationService {
         } else {
             self.takes_for(title, album)
         }
+    }
+
+    /// Whether a download sounds like the song's YouTube preview, for a verdict that leaves the
+    /// question to it ([`preview_check::wanted`]). Unavailable, and no work, while Octo is not
+    /// policing downloads or the verdict settled the file.
+    pub async fn hear_against_preview(
+        &self,
+        source: &dyn PreviewSource,
+        path: &str,
+        request: &PreviewRequest<'_>,
+        verdict: &VerificationResult,
+        length_known: bool,
+    ) -> PreviewOutcome {
+        if !self.remembers_rejections() || !preview_check::wanted(verdict, length_known) {
+            return PreviewOutcome::NotAsked;
+        }
+        let timeout = self
+            .settings
+            .current()
+            .soulseek
+            .effective_fingerprint_timeout_seconds();
+        preview_check::check(source, &self.fingerprinter, Path::new(path), request, timeout).await
     }
 
     /// AcoustID can answer at all.

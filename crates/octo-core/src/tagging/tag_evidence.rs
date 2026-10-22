@@ -51,6 +51,9 @@ pub struct TagRequest {
     pub catalog_album_id: Option<String>,
     pub catalog_track_id: Option<String>,
     pub version_markers: BTreeSet<String>,
+    /// One track of a whole album being fetched: only a release that is that album by name
+    /// lends its facts, never a larger edition holding the same recording.
+    pub whole_album: bool,
 }
 
 impl TagRequest {

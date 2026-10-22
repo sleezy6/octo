@@ -11,7 +11,7 @@ pub mod spectrum_analyzer;
 pub(crate) mod net_format;
 mod tool;
 
-pub use audio_fingerprinter::{AudioFingerprinter, FingerprintOutcome, FingerprintResult};
+pub use audio_fingerprinter::{AudioFingerprinter, FingerprintOutcome, FingerprintResult, RawFingerprint};
 pub use loudness_meter::{ILoudnessMeter, Loudness, LoudnessMeter, ReplayGainTags};
 pub use spectrum_analyzer::{SpectrumAnalyzer, SpectrumReport, SpectrumVerdict};
 

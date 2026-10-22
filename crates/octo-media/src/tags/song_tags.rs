@@ -278,6 +278,52 @@ pub fn write_album_gain(path: &Path, gain_db: f64, peak: f64) -> Result<(), TagE
     file.save()
 }
 
+/// The album-level rewrite of one placed file, in place so the library server keeps the file's
+/// id: the tag body written again from the song, its genres and cover kept, with every
+/// album-level field the song leaves empty taken off, so each track of an album ends with
+/// exactly the same ones.
+pub fn write_album_facts(path: &Path, song: &Song) -> Result<(), TagError> {
+    let mut file = TagFile::open(path)?;
+    let blank = |value: &Option<String>| is_null_or_white_space(value.as_deref());
+    for (field, value) in [
+        (TagFields::LABEL, &song.label),
+        (TagFields::CATALOG_NUMBER, &song.catalog_number),
+        (TagFields::BARCODE, &song.barcode),
+        (TagFields::RELEASE_TYPE, &song.release_type),
+        (TagFields::RELEASE_STATUS, &song.release_status),
+        (TagFields::RELEASE_COUNTRY, &song.release_country),
+    ] {
+        if blank(value) {
+            extras::set_or_clear_text(&mut file, field, None);
+        }
+    }
+    let album_is_release =
+        !blank(&song.music_brainz_release_group_id) && VerificationResult::album_is_from_release(song);
+    if !album_is_release {
+        extras::set_or_clear_text(&mut file, TagFields::RELEASE_GROUP_ID, None);
+    }
+    if !album_is_release || song.music_brainz_album_artist_ids.is_empty() {
+        extras::set_or_clear_text(&mut file, TagFields::ALBUM_ARTIST_ID, None);
+    }
+    if !album_is_release || blank(&song.music_brainz_release_track_id) {
+        extras::set_or_clear_text(&mut file, TagFields::RELEASE_TRACK_ID, None);
+    }
+    if blank(&song.original_date) {
+        extras::clear_original_date(&mut file);
+    }
+    if song.year.is_none() {
+        file.set_year(0);
+    }
+    if song.total_tracks.is_none() {
+        file.set_track_count(0);
+    }
+    if song.total_discs.is_none() {
+        file.set_disc_count(0);
+    }
+    write_song(&mut file, song, &GenreWrite::Keep, false);
+    file.save()
+}
+
 /// The lyrics in the song's own tags, or an error when the file cannot be read as audio.
 pub fn read_lyrics(path: &Path) -> Result<Option<String>, TagError> {
     Ok(TagFile::open(path)?.lyrics())
@@ -364,6 +410,66 @@ mod tests {
         assert_eq!(extras::read_text(&file, TagFields::RELEASE_TRACK_ID), None);
         assert_eq!(extras::read_text(&file, TagFields::ALBUM_ARTIST_ID), None);
         assert_eq!(extras::read_recording_id(&mut file).as_deref(), Some("recording"));
+    }
+
+    /// The album-level rewrite leaves exactly the song's album facts: another release's are
+    /// taken off where the song has none, and the genres stay.
+    #[test]
+    fn the_album_rewrite_leaves_only_the_songs_album_facts() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = write(dir.path(), "song.flac", &flac());
+        let edition = Song {
+            title: "Levitating".into(),
+            artist: "Dua Lipa".into(),
+            album: "Future Nostalgia".into(),
+            track: Some(18),
+            total_tracks: Some(19),
+            year: Some(2021),
+            label: Some("Edition label".into()),
+            catalog_number: Some("MOON-19".into()),
+            release_country: Some("XW".into()),
+            original_date: Some("2021-02-11".into()),
+            music_brainz_album_title: Some("Future Nostalgia".into()),
+            music_brainz_release_group_id: Some("g-moon".into()),
+            music_brainz_release_track_id: Some("t-moon".into()),
+            music_brainz_album_artist_ids: vec!["a-dua".into()],
+            ..Default::default()
+        };
+        let mut file = TagFile::open(&path).expect("opens");
+        write_song(&mut file, &edition, &GenreWrite::Write(vec!["Pop".into()]), false);
+        file.save().expect("saved");
+
+        let album = Song {
+            track: Some(5),
+            total_tracks: Some(13),
+            year: Some(2020),
+            label: None,
+            catalog_number: Some("FN-13".into()),
+            release_country: None,
+            original_date: None,
+            music_brainz_album_title: None,
+            music_brainz_release_group_id: None,
+            music_brainz_release_track_id: None,
+            music_brainz_album_artist_ids: Vec::new(),
+            ..edition
+        };
+        write_album_facts(&path, &album).expect("rewritten");
+
+        let file = TagFile::open(&path).expect("opens");
+        assert_eq!((file.track(), file.track_count(), file.year()), (5, 13, 2020));
+        assert_eq!(extras::read_text(&file, TagFields::LABEL), None);
+        assert_eq!(
+            extras::read_text(&file, TagFields::CATALOG_NUMBER).as_deref(),
+            Some("FN-13")
+        );
+        assert_eq!(extras::read_text(&file, TagFields::RELEASE_COUNTRY), None);
+        assert_eq!(file.music_brainz_release_group_id(), None);
+        assert_eq!(extras::read_text(&file, TagFields::RELEASE_TRACK_ID), None);
+        assert_eq!(extras::read_text(&file, TagFields::ALBUM_ARTIST_ID), None);
+        let xiph = file.xiph.as_ref().expect("a Vorbis comment");
+        assert_eq!(xiph.first_field("ORIGINALDATE"), None);
+        assert_eq!(xiph.first_field("ORIGINALYEAR"), None);
+        assert_eq!(file.genres(), ["Pop"]);
     }
 
     #[test]

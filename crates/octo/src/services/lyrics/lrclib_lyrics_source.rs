@@ -43,9 +43,8 @@ impl LrclibLyricsSource {
     pub const DEFAULT_BASE_URL: &'static str = "https://lrclib.net";
     const MINIMUM_GAP: Duration = Duration::from_millis(250);
     const DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
-    /// The longest "retry in a moment" a lookup waits out before going on to the searches.
-    /// Longer, and LRCLIB is left alone for as long as it asked (issue #98).
-    const SHORT_WAIT: Duration = Duration::from_secs(2);
+    /// The longest Retry-After a lookup waits out to ask again; a longer one ends the lookup.
+    const SHORT_COOLDOWN: Duration = Duration::from_secs(2);
 
     /// The source over the `lyrics` client ([`super::lyrics_http::lyrics_http_client`]).
     pub fn new(client: reqwest::Client) -> Self {
@@ -77,14 +76,10 @@ impl LrclibLyricsSource {
         query: &LyricsQuery,
         ct: &CancellationToken,
     ) -> Result<LyricsLookup, ShapeError> {
-        let get = self.send(&self.get_url(query), ct).await;
-        // A busy /api/get does not end the lookup: its search often answers a moment later
-        // (issue #98). A short wait LRCLIB asks for is waited out first; a long one is honored
-        // by asking nothing more.
-        let mut busy = get.transient;
-        if busy && !self.wait_out_a_short_cool_down(ct).await {
-            return Ok(LyricsLookup::failed());
-        }
+        // A busy /api/get does not end the lookup: /api/search often answers at the same moment.
+        // It ends as "not now" only when nothing was found and some request went unanswered.
+        let get = self.send_patiently(&self.get_url(query), ct, 1).await;
+        let mut transient = get.transient;
         if let Some(found) = &get.json {
             // LRCLIB's own lookup is close to exact, but not strict about the kind of recording,
             // so its answer is held to the same rule as a search hit.
@@ -96,12 +91,9 @@ impl LrclibLyricsSource {
         // Then its search, as asked and as the same song written other ways ("suicideboys" for
         // "$uicideboy$"), until one finds it.
         for variant in LyricsIdentity::searches(query, 3) {
-            let search = self.send(&self.search_url(&variant), ct).await;
+            let search = self.send_patiently(&self.search_url(&variant), ct, 2).await;
             if search.transient {
-                busy = true;
-                if !self.wait_out_a_short_cool_down(ct).await {
-                    break;
-                }
+                transient = true;
                 continue;
             }
             let Some(results) = &search.json else {
@@ -111,30 +103,11 @@ impl LrclibLyricsSource {
                 return Ok(LyricsLookup::new(Some(Self::parse(hit, Some(query))?), false));
             }
         }
-        // Found nowhere: "no lyrics" only when every request answered, else "not now", so a
-        // later play asks again.
-        Ok(if busy {
+        Ok(if transient {
             LyricsLookup::failed()
         } else {
             LyricsLookup::miss()
         })
-    }
-
-    /// After a request that did not answer: true to go on, once a cool-down LRCLIB asked for
-    /// is over when it is short ([`Self::SHORT_WAIT`]); false when it asked for longer, or the
-    /// lookup was canceled while waiting.
-    async fn wait_out_a_short_cool_down(&self, ct: &CancellationToken) -> bool {
-        let Some(until) = self.cool_down_until() else {
-            return !ct.is_cancelled();
-        };
-        let left = until.saturating_duration_since(Instant::now());
-        if left > Self::SHORT_WAIT {
-            return false;
-        }
-        tokio::select! {
-            () = tokio::time::sleep(left) => true,
-            () = ct.cancelled() => false,
-        }
     }
 
     fn candidates(results: &[Value]) -> Result<LyricsSearch, ShapeError> {
@@ -278,6 +251,44 @@ impl LrclibLyricsSource {
         })
     }
 
+    /// [`Self::send`] once a short Retry-After has passed, up to `tries` times while the service
+    /// keeps asking for short waits. A long Retry-After is honored: nothing is sent before it ends.
+    async fn send_patiently(&self, url: &str, ct: &CancellationToken, tries: usize) -> Answer {
+        let not_now = || Answer {
+            json: None,
+            transient: true,
+        };
+        for tried in 1..=tries {
+            if !self.wait_out_short_cool_down(ct).await {
+                return not_now();
+            }
+            let answer = self.send(url, ct).await;
+            if !answer.transient || tried == tries || !self.cooling_down() {
+                return answer;
+            }
+        }
+        not_now()
+    }
+
+    /// Waits until the service's cool-down ends when that is soon; false when it is too far off
+    /// or the wait was canceled.
+    async fn wait_out_short_cool_down(&self, ct: &CancellationToken) -> bool {
+        let Some(until) = self.cool_down_until() else {
+            return true;
+        };
+        let now = Instant::now();
+        if until <= now {
+            return true;
+        }
+        if until - now > Self::SHORT_COOLDOWN {
+            return false;
+        }
+        tokio::select! {
+            () = tokio::time::sleep_until(until) => true,
+            () = ct.cancelled() => false,
+        }
+    }
+
     async fn send(&self, url: &str, ct: &CancellationToken) -> Answer {
         let failed = Answer {
             json: None,
@@ -368,7 +379,7 @@ impl ILyricsSource for LrclibLyricsSource {
         // The first search that returns anything: a person choosing wants the entries, and the
         // later searches only exist for a song the first one could not find.
         for variant in LyricsIdentity::searches(query, 3) {
-            let search = self.send(&self.search_url(&variant), ct).await;
+            let search = self.send_patiently(&self.search_url(&variant), ct, 2).await;
             if search.transient {
                 return LyricsSearch::failed();
             }
@@ -390,7 +401,7 @@ impl ILyricsSource for LrclibLyricsSource {
             return LyricsLookup::failed();
         }
         let get = self
-            .send(&format!("{}/api/get/{number}", self.base_url), ct)
+            .send_patiently(&format!("{}/api/get/{number}", self.base_url), ct, 2)
             .await;
         if get.transient {
             return LyricsLookup::failed();

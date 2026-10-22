@@ -181,6 +181,7 @@ impl ReleaseIdentifier {
             catalog_album_id: Self::catalog_album_id_of(song.album_id.as_deref()),
             catalog_track_id: song.external_id.clone(),
             version_markers: SongIdentity::distinct_versions(&parsed, None),
+            whole_album: false,
         }
     }
 
@@ -194,8 +195,8 @@ impl ReleaseIdentifier {
     }
 
     /// Identify one file. `tags_are_evidence` is false for a file whose tags are an uploader's,
-    /// not a peer's. The album context, when the file is one track of a walk, steers the choice
-    /// onto the walk's release.
+    /// not a peer's. The album context, when the file is one track of a walk, keeps the choice
+    /// on the walk's album and steers it onto the walk's release.
     ///
     /// Fails only when `ct` is canceled while the release lookup is being asked; a cancellation
     /// during the catalog or database stage only costs their candidates.
@@ -220,7 +221,13 @@ impl ReleaseIdentifier {
         let threshold = settings.fingerprint_threshold;
         let fingerprinted = Self::fingerprinted_ids(lookup, threshold);
         let identity = Identity::of(song.verification.as_deref());
-        let request = Self::without_contradicted_album(request, identity.as_ref(), &mut notes);
+        let mut request = Self::without_contradicted_album(request, identity.as_ref(), &mut notes);
+        if let Some(album) = album {
+            request.whole_album = request
+                .album
+                .as_deref()
+                .is_some_and(|asked| SongIdentity::key(asked) == SongIdentity::key(album.album_title()));
+        }
         let mut candidates = CandidateSources::from_fingerprint(lookup, threshold);
         if let (Some(identity), Some(lookup)) = (&identity, lookup) {
             Self::keep_identified_takes(&mut candidates, identity, lookup, &mut notes);
@@ -335,6 +342,7 @@ impl ReleaseIdentifier {
         plan.catalog_best = catalog_best;
         plan.notes.extend(notes);
         if let Some(album) = album {
+            album.keep_on_album(&mut plan);
             album.prefer_settled_release(&mut plan);
         }
 
