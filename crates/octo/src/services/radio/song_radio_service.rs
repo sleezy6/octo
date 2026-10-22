@@ -265,9 +265,17 @@ impl SongRadioService {
                 |(song, _)| seed_normalizer::track_key(&song.artist, &song.title),
             )
         };
-        // Octo's apps mix the radio themselves from the order of fit.
+        // Octo's apps mix the radio themselves from the order of fit: the songs the listener
+        // heard lately still come after the rest, each part by score.
         if client_order && !library_led {
-            kept.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            kept.sort_by(|a, b| {
+                let heard_of = |(song, _): &(Song, f64)| {
+                    heard.contains(&seed_normalizer::track_key(&song.artist, &song.title))
+                };
+                heard_of(a)
+                    .cmp(&heard_of(b))
+                    .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            });
         }
         let songs: Vec<Song> = kept.into_iter().map(|(song, _)| song).collect();
         self.remember_served(listener, &songs);

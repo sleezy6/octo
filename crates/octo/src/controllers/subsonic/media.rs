@@ -1567,33 +1567,68 @@ fn family_cover_seeds(
                     }),
                 });
             }
+            // An outside song: one Octo routed (a registry id), whose cover the cover sources
+            // find by artist and album, or one named by the catalog (`ext-deezer-song-…`),
+            // whose cover the catalog gives a URL for.
             Serve::Outside(outside) => {
-                let Some(routing) = state.external_id_registry.lookup(&outside) else {
-                    continue;
-                };
-                let routing = routing.snapshot();
-                let artist = routing.artist.clone().unwrap_or_default();
-                let album = routing
-                    .album
-                    .clone()
-                    .filter(|album| !album.is_empty())
-                    .or_else(|| routing.title.clone())
-                    .unwrap_or_default();
-                let distinct = format!(
-                    "outside|{}|{}",
-                    SongIdentity::key(&artist),
-                    SongIdentity::key(&album)
-                );
-                if !albums.insert(distinct.clone()) {
+                if let Some(routing) = state.external_id_registry.lookup(&outside) {
+                    let routing = routing.snapshot();
+                    let artist = routing.artist.clone().unwrap_or_default();
+                    let album = routing
+                        .album
+                        .clone()
+                        .filter(|album| !album.is_empty())
+                        .or_else(|| routing.title.clone())
+                        .unwrap_or_default();
+                    let distinct = format!(
+                        "outside|{}|{}",
+                        SongIdentity::key(&artist),
+                        SongIdentity::key(&album)
+                    );
+                    if !albums.insert(distinct.clone()) {
+                        continue;
+                    }
+                    let covers = Arc::clone(&state.cover_art_aggregator);
+                    seeds.push(CoverSeed {
+                        identity: distinct,
+                        fetch: Arc::new(move || {
+                            let covers = Arc::clone(&covers);
+                            let routing = routing.clone();
+                            async move { Ok(covers.get_cover(&routing, true).await.map(|b| b.to_vec())) }
+                                .boxed()
+                        }),
+                    });
                     continue;
                 }
-                let covers = Arc::clone(&state.cover_art_aggregator);
+                let (is_external, provider, _, external_id) = state.local_library.parse_external_id(&outside);
+                let (Some(provider), Some(external_id)) = (provider, external_id) else {
+                    continue;
+                };
+                if !is_external || !albums.insert(format!("catalog|{provider}|{external_id}")) {
+                    continue;
+                }
+                let metadata = Arc::clone(&state.music_metadata);
+                let deezer = Arc::clone(&state.deezer_client);
                 seeds.push(CoverSeed {
-                    identity: distinct,
+                    identity: format!("catalog|{provider}|{external_id}"),
                     fetch: Arc::new(move || {
-                        let covers = Arc::clone(&covers);
-                        let routing = routing.clone();
-                        async move { Ok(covers.get_cover(&routing, true).await.map(|b| b.to_vec())) }.boxed()
+                        let metadata = Arc::clone(&metadata);
+                        let deezer = Arc::clone(&deezer);
+                        let (provider, external_id) = (provider.clone(), external_id.clone());
+                        async move {
+                            // Only the catalog's own image host, through its client (8 MB,
+                            // 8 seconds), as New Releases' covers are fetched.
+                            let url = metadata
+                                .get_song(&provider, &external_id)
+                                .await
+                                .and_then(|song| song.cover_art_url)
+                                .filter(|url| is_catalog_image(url));
+                            Ok(match url {
+                                Some(url) => catalog_image(&deezer, &url).await,
+                                None => None,
+                            })
+                        }
+                        .boxed()
                     }),
                 });
             }

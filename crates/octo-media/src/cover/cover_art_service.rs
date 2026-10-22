@@ -375,12 +375,20 @@ impl CoverArtService {
     /// The covers folder's picture for the list, sized, when there is one that reads.
     fn override_cover(&self, shown: &str, lookup: &str, size: i32) -> Option<Vec<u8>> {
         let custom = self.find_override(shown, lookup)?;
-        let ticks = std::fs::metadata(&custom)
-            .and_then(|m| m.modified())
+        // When it was written and how big it is: a picture replaced within a coarse file
+        // system's time step still reads as new.
+        let (ticks, bytes) = std::fs::metadata(&custom)
             .ok()
-            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_nanos());
-        let override_key = format!("override\n{}\n{ticks}\n{size}", custom.display());
+            .map(|m| {
+                let ticks = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos());
+                (ticks, m.len())
+            })
+            .unwrap_or((0, 0));
+        let override_key = format!("override\n{}\n{ticks}\n{bytes}\n{size}", custom.display());
         if let Some(cached) = self.named_covers.lock().get(&override_key) {
             return Some(cached.clone());
         }

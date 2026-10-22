@@ -1174,9 +1174,12 @@ async fn family_playlist(state: &AppState, call: &SubsonicCall, id: &str) -> Res
         .map(|song| song.get("duration").and_then(Value::as_i64).unwrap_or(0))
         .sum();
     let mut fields = family_playlist_fields(&playlist, caller, entries.len(), seconds);
+    // The cover id counts as `getPlaylists` does for this caller, so it stays the same from
+    // the list to the playlist and an app keeps the cover it has.
+    let (shown_count, _) = family_playlist_totals(state, &playlist, caller).await;
     fields.insert(
         "coverArt".into(),
-        family_cover_id(state, &playlist, entries.len()).into(),
+        family_cover_id(state, &playlist, shown_count).into(),
     );
     state
         .subsonic_response_builder

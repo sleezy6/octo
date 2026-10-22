@@ -232,6 +232,8 @@ fn score(
                     }
                     if kept.deezer_track_id.is_none() && track.deezer_track_id.is_some() {
                         kept.deezer_track_id = track.deezer_track_id.clone();
+                        // With the id comes Deezer's length, so the song needs no lookup.
+                        kept.duration = kept.duration.or(track.duration);
                     }
                 }
                 _ => {}

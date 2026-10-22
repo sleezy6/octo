@@ -37,7 +37,9 @@ impl SoulseekDownloadService {
         profile: &SearchProfile,
         ct: &CancellationToken,
     ) -> anyhow::Result<String> {
-        let soulseek_on = self.slskd.is_on();
+        // Soulseek takes its turn only when slskd is set up and logged in: a search while it
+        // is not logged in finds nothing and would keep SpotiFLAC waiting for it.
+        let soulseek_on = self.slskd.is_on() && !self.slskd_not_logged_in().await;
         let Some(client) = self.spotiflac_on() else {
             return self
                 .download_via_soulseek(base, routing, download, profile, ct)
@@ -84,6 +86,14 @@ impl SoulseekDownloadService {
                     .await
             }
             other => other,
+        }
+    }
+
+    /// Whether slskd says it is not logged in to the Soulseek network, as the link last read it.
+    async fn slskd_not_logged_in(&self) -> bool {
+        match &self.soulseek_link {
+            Some(link) => link.read(false).await.map(|r| r.link) == Some(SoulseekLinkState::NotLoggedIn),
+            None => false,
         }
     }
 
@@ -201,7 +211,10 @@ impl SoulseekDownloadService {
             Ok(job) => job,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&job_dir);
-                return Err(anyhow::anyhow!("SpotiFLAC did not take the download: {e}"));
+                // The error itself stays underneath, so a caller can tell an outage from a
+                // refusal; the words still say both.
+                let said = format!("SpotiFLAC did not take the download: {e}");
+                return Err(anyhow::Error::from(e).context(said));
             }
         };
         info!(

@@ -464,13 +464,16 @@ fn the_same_song_from_deezer_keeps_its_deezer_id() {
     let deezer = RadioAnswer::new(
         crate::radio::radio_provider::DEEZER,
         RadioMatch::Song,
-        vec![SimilarTrack::new("Portishead", "Roads", 1.0).with_deezer_track_id(Some("3135556".into()))],
+        vec![
+            SimilarTrack::new("Portishead", "Roads", 1.0)
+                .with_duration(Some(305))
+                .with_deezer_track_id(Some("3135556".into())),
+        ],
         Vec::new(),
     );
     let picks = blend(&[last_fm, deezer], &even(), 10, "seed", None, FULL_ANSWER);
     assert_eq!(picks.len(), 1);
-    assert_eq!(
-        picks[0].track.as_ref().and_then(|t| t.deezer_track_id.as_deref()),
-        Some("3135556")
-    );
+    let track = picks[0].track.as_ref().expect("a track");
+    assert_eq!(track.deezer_track_id.as_deref(), Some("3135556"));
+    assert_eq!(track.duration, Some(305), "Deezer's length comes with its id");
 }

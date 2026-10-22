@@ -379,6 +379,24 @@ impl LastFmRadioStateStore {
             .unwrap_or_default()
     }
 
+    /// The keys of the songs this user played since `since`, without copying the rest of their
+    /// state. A bootstrap's seeds (library songs noted as plays to start a new listener's
+    /// radio) are not plays and are left out.
+    pub fn played_keys_since(&self, username: &str, since: DateTime<Utc>) -> IgnoreCaseKeys {
+        let mut guard = self.state.lock();
+        let state = self.load_locked(&mut guard);
+        state
+            .get(&user_key(username))
+            .map(|user| {
+                user.plays
+                    .iter()
+                    .filter(|play| play.played_at_utc > since && !play.source.starts_with("bootstrap"))
+                    .map(|play| seed_normalizer::track_key(&play.artist, &play.title))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The keys of the songs this user rated one star, without copying the rest of their state.
     pub fn radio_ban_keys(&self, username: &str) -> IgnoreCaseKeys {
         let mut guard = self.state.lock();

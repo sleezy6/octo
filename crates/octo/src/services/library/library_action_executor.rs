@@ -321,6 +321,20 @@ fn is_file_not_found(error: &anyhow::Error) -> bool {
         )
 }
 
+/// SpotiFLAC could not be asked: not reachable, refusing the token, or not SpotiFLAC at its
+/// address. The lossless step had no answer, not "no copy", so the next source is still asked.
+fn is_spotiflac_out(error: &anyhow::Error) -> bool {
+    use crate::services::spotiflac::SpotiflacError;
+    matches!(
+        error.downcast_ref::<SpotiflacError>(),
+        Some(
+            SpotiflacError::Unreachable { .. }
+                | SpotiflacError::Unauthorized
+                | SpotiflacError::NotSpotiflac { .. }
+        )
+    )
+}
+
 /// `InvalidOperationException`, as Lidarr's client and fetcher report it, and as the Soulseek
 /// download service does (no artist or title, no Lidarr, no download path).
 fn is_invalid_operation(error: &anyhow::Error) -> bool {
@@ -1305,7 +1319,10 @@ impl LibraryActionExecutor {
                     Err(e)
                         if attempt + 1 < sources.len()
                             && handoff.as_ref().is_none_or(|h| h.revealed_path().is_none())
-                            && (is_file_not_found(&e) || is_rejected(&e).is_some() || is_invalid_operation(&e)) =>
+                            && (is_file_not_found(&e)
+                                || is_rejected(&e).is_some()
+                                || is_invalid_operation(&e)
+                                || is_spotiflac_out(&e)) =>
                     {
                         let why = is_rejected(&e)
                             .map(|rejected| rejected.problem.clone())

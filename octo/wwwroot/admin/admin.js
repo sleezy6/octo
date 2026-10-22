@@ -6526,9 +6526,11 @@ function renderLossy() {
   if (view?.source) parts.push(`Copies come from ${view.source}.`);
   if (view) parts.push(`${view.why}`);
   // Soulseek's state matters only while Soulseek is one of the sources, and with another source
-  // beside it an outage just means the others are asked without it.
+  // beside it an outage just means the others are asked without it. With SpotiFLAC on, it
+  // takes Soulseek's turn meanwhile, so nothing waits.
   const plan = view?.plan || ['Soulseek'];
-  const others = plan.filter(source => source !== 'Soulseek');
+  const spotiflac = /SpotiFLAC/.test(view?.source || '');
+  const others = plan.filter(source => source !== 'Soulseek').concat(spotiflac ? ['SpotiFLAC'] : []);
   if (view?.soulseek?.warning && plan.includes('Soulseek'))
     parts.push(others.length ? `${view.soulseek.detail} ${others.join(' and ')} ${others.length > 1 ? 'are' : 'is'} asked without it until it is back.` : view.soulseek.detail);
   document.getElementById('lossy-status').textContent = parts.join(' ');

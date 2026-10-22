@@ -852,7 +852,11 @@ impl Acquisition {
             Clock::system(),
         );
         let upgrade_queue = stores.upgrade_queue.clone();
-        let upgrade_sources = Arc::new(UpgradeSources::new(settings.clone(), Some(soulseek_link.clone())));
+        let spotiflac = Arc::new(SpotiflacClient::new(settings.clone()));
+        let upgrade_sources = Arc::new(
+            UpgradeSources::new(settings.clone(), Some(soulseek_link.clone()))
+                .with_spotiflac(spotiflac.clone()),
+        );
         let library_ownership = Arc::new(LibraryOwnership::new(
             settings.clone(),
             Some(OwnershipNavidrome {
@@ -878,7 +882,6 @@ impl Acquisition {
             Some(clients.music_brainz.clone()),
         ));
         let lidarr_track_fetcher: Arc<dyn ILidarrTrackFetcher> = lidarr_fetcher.clone();
-        let spotiflac = Arc::new(SpotiflacClient::new(settings.clone()));
 
         // The download service: the base is built over the services above, and the Soulseek
         // backend's optional ones are the link and Lidarr's two. A handler test may swap in its

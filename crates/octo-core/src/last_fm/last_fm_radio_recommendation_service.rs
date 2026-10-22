@@ -102,6 +102,19 @@ pub struct Candidate {
     pub source: String,
 }
 
+/// Gives `kept` the ids `other` knows for the same song and it does not: the video a source
+/// named and the Deezer track id, each with the length that came with it.
+fn take_ids(kept: &mut Candidate, other: &SimilarTrack) {
+    if kept.track.you_tube_id.is_none() && other.you_tube_id.is_some() {
+        kept.track.you_tube_id = other.you_tube_id.clone();
+        kept.track.duration = kept.track.duration.or(other.duration);
+    }
+    if kept.track.deezer_track_id.is_none() && other.deezer_track_id.is_some() {
+        kept.track.deezer_track_id = other.deezer_track_id.clone();
+        kept.track.duration = kept.track.duration.or(other.duration);
+    }
+}
+
 /// How much a play counts, by where it came from (see [`RADIO_PLAY_WEIGHT`]).
 pub fn source_weight(play: &LastFmRadioPlay) -> f64 {
     match play.source.as_str() {
@@ -387,6 +400,8 @@ pub fn shape_walk(
         .collect();
 
     // Grouped by the track key (ordinal), keeping each group's heaviest, the first of equals.
+    // Whichever is kept takes the ids the others know (YouTube Music's video, Deezer's track),
+    // so the song plays what a source named and needs no search.
     let mut groups: IndexMap<String, Candidate> = IndexMap::new();
     for mut item in candidates.into_iter().filter(|item| {
         !item.track.artist.is_empty()
@@ -403,7 +418,10 @@ pub fn shape_walk(
         match groups.get_mut(&key) {
             Some(best) => {
                 if item.weight > best.weight {
-                    *best = item;
+                    let other = std::mem::replace(best, item);
+                    take_ids(best, &other.track);
+                } else {
+                    take_ids(best, &item.track);
                 }
             }
             None => {
@@ -1084,6 +1102,59 @@ mod tests {
         ];
         suppress_station_overlap(&mut stations);
         assert_eq!(stations[1].tracks.len(), 12);
+    }
+
+    /// The same song from two sources is one station track, the heavier source's, with the
+    /// ids either source knew: Deezer's track id and length from Deezer, YouTube Music's video
+    /// from YouTube Music, whichever weighed more.
+    #[test]
+    fn a_station_track_takes_the_ids_every_source_knew_for_it() {
+        let settings = LastFmSettings {
+            radio_track_count: 10,
+            ..Default::default()
+        };
+        use crate::radio::radio_provider::{DEEZER, LAST_FM, YOU_TUBE_MUSIC};
+        let candidates = vec![
+            Candidate {
+                track: SimilarTrack::new("Portishead", "Roads", 1.0).with_provider(Some(LAST_FM.into())),
+                weight: 2.0,
+                source: format!("{LAST_FM}:x"),
+            },
+            Candidate {
+                track: SimilarTrack::new("Portishead", "Roads", 1.0)
+                    .with_duration(Some(305))
+                    .with_deezer_track_id(Some("3135556".into()))
+                    .with_provider(Some(DEEZER.into())),
+                weight: 1.0,
+                source: format!("{DEEZER}:x"),
+            },
+            Candidate {
+                track: SimilarTrack::new("Portishead", "Roads", 1.0)
+                    .with_you_tube_id(Some("vid".into()))
+                    .with_provider(Some(YOU_TUBE_MUSIC.into())),
+                weight: 3.0,
+                source: format!("{YOU_TUBE_MUSIC}:x"),
+            },
+        ];
+        let none = IgnoreCaseKeys::new();
+        let tracks = shape(
+            candidates,
+            &[],
+            &settings,
+            &none,
+            &mut DotnetRandom::new(1),
+            &none,
+            10,
+            false,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(tracks.len(), 1, "{tracks:?}");
+        assert_eq!(tracks[0].source, YOU_TUBE_MUSIC);
+        assert_eq!(tracks[0].you_tube_id.as_deref(), Some("vid"));
+        assert_eq!(tracks[0].deezer_track_id.as_deref(), Some("3135556"));
+        assert_eq!(tracks[0].duration, Some(305));
     }
 
     /// Placement keeps the walk's gaps: with plenty of artists, no artist comes back within

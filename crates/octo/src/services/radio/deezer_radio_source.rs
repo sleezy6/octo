@@ -16,7 +16,6 @@ use octo_core::settings::SettingsStore;
 
 use super::radio_source::IRadioSource;
 use crate::services::metadata::DeezerMetadataService;
-use crate::services::metadata::deezer_metadata_service::ARTIST_NAME_CANDIDATES;
 use crate::services::metadata::deezer_metadata_service::radio::RadioTrack;
 use crate::services::metadata::deezer_requests::DeezerUse;
 
@@ -31,15 +30,17 @@ impl DeezerRadioSource {
         DeezerRadioSource { deezer, settings }
     }
 
-    /// The catalog artist Deezer files under the seed's very name. A search's best guess for an
-    /// uploader's channel name could be anyone, so nothing else counts.
+    /// The catalog artist Deezer files under the seed's very name, the best known of them
+    /// when several share it (Deezer lists lesser namesakes first). A search's best guess for
+    /// an uploader's channel name could be anyone, so nothing else counts.
     async fn artist_id(&self, name: &str) -> Option<String> {
-        let wanted = seed_normalizer::artist(name);
+        let plain = seed_normalizer::artist(name);
+        let plain = if plain.trim().is_empty() { name } else { &plain };
         self.deezer
-            .search_artists(name, ARTIST_NAME_CANDIDATES)
+            .artists_named(plain, false)
             .await
             .into_iter()
-            .find(|hit| seed_normalizer::artist(&hit.name).eq_ignore_ascii_case(&wanted))
+            .next()
             .map(|hit| hit.deezer_id)
     }
 }

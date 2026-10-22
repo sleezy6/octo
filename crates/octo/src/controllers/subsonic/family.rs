@@ -83,7 +83,7 @@ pub fn routes() -> RouteSet {
         )
         .subsonic(
             "setFamilyPlaylistCover",
-            axum::routing::post(set_family_playlist_cover),
+            get(set_family_playlist_cover).post(set_family_playlist_cover),
         )
         .subsonic(
             "deleteFamilyPlaylistCover",
@@ -722,6 +722,10 @@ pub async fn set_family_playlist_cover(State(state): State<AppState>, req: Reque
         Some(picture) => picture,
         None => return error(&state, &call.format, 10, "Choose a picture first."),
     };
+    // One picture is read at a time: a photo decodes to hundreds of megabytes, and uploads
+    // are rare.
+    static ONE_AT_A_TIME: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let _turn = ONE_AT_A_TIME.acquire().await;
     let store = std::sync::Arc::clone(&state.family_playlists);
     let id = playlist.id.clone();
     let kept = tokio::task::spawn_blocking(move || store.set_cover(&id, &picture))
@@ -729,6 +733,7 @@ pub async fn set_family_playlist_cover(State(state): State<AppState>, req: Reque
         .unwrap_or_else(|e| {
             Err(crate::services::family::family_playlist_covers::CoverRefused::NotWritten(e.to_string()))
         });
+    drop(_turn);
     if let Err(refused) = kept {
         tracing::info!(
             "setFamilyPlaylistCover for {}: {}",
@@ -742,7 +747,7 @@ pub async fn set_family_playlist_cover(State(state): State<AppState>, req: Reque
         call.caller.user,
         playlist.id
     );
-    cover_reply(&state, &call, &playlist)
+    cover_reply(&state, &call, &playlist).await
 }
 
 /// `deleteFamilyPlaylistCover`: `id`. Removes the playlist's own picture, so its painted cover
@@ -760,7 +765,7 @@ pub async fn delete_family_playlist_cover(State(state): State<AppState>, req: Re
             playlist.id
         );
     }
-    cover_reply(&state, &call, &playlist)
+    cover_reply(&state, &call, &playlist).await
 }
 
 /// The family playlist `id` names, when the caller may change its cover.
@@ -792,13 +797,14 @@ fn coverable_playlist(
     Ok(playlist)
 }
 
-/// `familyPlaylistCover`: the playlist's id and its cover id as of now.
-fn cover_reply(
+/// `familyPlaylistCover`: the playlist's id and its cover id as of now, counted as
+/// `getPlaylists` counts it for this caller, so the two agree.
+async fn cover_reply(
     state: &AppState,
     call: &FamilyCall,
     playlist: &crate::services::family::FamilyPlaylist,
 ) -> Response {
-    let count = crate::services::family::family_playlists::shown_entries(playlist, &call.caller).len();
+    let (count, _) = super::playlists::family_playlist_totals(state, playlist, &call.caller).await;
     let node = json!({
         "id": playlist.id,
         "coverArt": super::playlists::family_cover_id(state, playlist, count),

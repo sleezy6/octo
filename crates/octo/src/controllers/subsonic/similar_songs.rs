@@ -175,17 +175,9 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
     let heard: IgnoreCaseKeys = listener
         .as_deref()
         .map(|listener| {
-            let since = chrono::Utc::now() - chrono::TimeDelta::days(8);
             state
                 .last_fm_radio_state
-                .get_user(listener)
-                .plays
-                .iter()
-                .filter(|play| play.played_at_utc > since)
-                .map(|play| {
-                    octo_core::last_fm::last_fm_radio_seed_normalizer::track_key(&play.artist, &play.title)
-                })
-                .collect()
+                .played_keys_since(listener, chrono::Utc::now() - chrono::TimeDelta::days(8))
         })
         .unwrap_or_default();
     let seed = RadioSeed {

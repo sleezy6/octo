@@ -212,14 +212,27 @@ impl FamilyPlaylistStore {
         Some(self.covers.as_ref()?.join(format!("{id}.jpg")))
     }
 
-    /// When the playlist's own picture was last written (nanoseconds since 1970), so a new
+    /// Every file the covers folder would serve as the playlist's picture: the one Octo writes
+    /// (`.jpg`) and the other kinds someone may put there by hand, in the order they are looked
+    /// for.
+    fn cover_files(&self, id: &str) -> Vec<PathBuf> {
+        let Some(jpg) = self.cover_path(id) else {
+            return Vec::new();
+        };
+        ["jpg", "jpeg", "png", "webp"]
+            .into_iter()
+            .map(|extension| jpg.with_extension(extension))
+            .collect()
+    }
+
+    /// A stamp of the playlist's own picture (when it was last written and its size), so a new
     /// one gets a new cover id; None while it has none.
     pub fn cover_stamp(&self, id: &str) -> Option<u128> {
-        let modified = std::fs::metadata(self.cover_path(id)?).ok()?.modified().ok()?;
-        modified
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|since| since.as_nanos())
+        self.cover_files(id).into_iter().find_map(|path| {
+            let meta = std::fs::metadata(path).ok()?;
+            let since = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+            Some(since.as_nanos() ^ (u128::from(meta.len()) << 96))
+        })
     }
 
     /// Keeps `picture` as the playlist's own cover, in place of the painted one or the picture
@@ -233,11 +246,14 @@ impl FamilyPlaylistStore {
         family_playlist_covers::write_whole(&path, &kept)
     }
 
-    /// Removes the playlist's own picture: its painted cover shows again. True when there was
-    /// one.
+    /// Removes the playlist's own picture, whichever kind of file it is: its painted cover
+    /// shows again. True when there was one.
     pub fn remove_cover(&self, id: &str) -> bool {
-        self.cover_path(id)
-            .is_some_and(|path| std::fs::remove_file(path).is_ok())
+        let mut removed = false;
+        for path in self.cover_files(id) {
+            removed |= std::fs::remove_file(path).is_ok();
+        }
+        removed
     }
 
     /// Points every entry of every playlist that names library song `old` at `new` instead, in
