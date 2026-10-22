@@ -36,9 +36,11 @@ use crate::http::catch_all;
 use crate::http::error::{AppError, AppResult, json_status, problem};
 use crate::http::routes::RouteSet;
 use crate::http::static_files::{RangeOutcome, parse_range};
+use crate::middleware::family_gate::GateReading;
 use crate::services::common::track_acquisition_queue::Completion;
 use crate::services::cover_art::local_cover_cache::{CoverPicture, Fetched, NotKept};
-use crate::services::family::{FamilyCaller, LibraryScope, audio_gate, family_caller};
+use crate::services::family::family_playlists::{self, Serve};
+use crate::services::family::{FamilyCaller, FamilyPlaylist, LibraryScope, audio_gate, family_caller};
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::library::{GeneratedPlaylist, navidrome_song_list};
 use crate::services::prefetch::{Source, from_start};
@@ -811,6 +813,8 @@ fn content_type_for_file(path: &str) -> &'static str {
 /// Proxies external covers. Uses type from ID to determine which API to call.
 /// Format: ext-{provider}-{type}-{id} (e.g., ext-deezer-artist-259, ext-deezer-album-96126)
 pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppResult {
+    // Who is asking, for a family playlist's cover: only someone it is shared with sees it.
+    let reading = GateReading::of(req.extensions()).cloned();
     let call = match SubsonicCall::read(&state, req).await {
         Ok(call) => call,
         Err(response) => return Ok(response),
@@ -878,9 +882,16 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
     // A made list's cover id (Liked Songs, a mix or a chart list) is its list id, then `_` and
     // a tag naming the picture as drawn.
     let list_id = match id.split_once('_') {
-        Some((list, _)) if list.starts_with("og") => list,
+        Some((list, _)) if list.starts_with("og") || list.starts_with("of") => list,
         _ => id.as_str(),
     };
+
+    // A family playlist: its own picture, else painted from its first songs' covers.
+    if list_id.starts_with("of")
+        && super::action_helpers::is_octo_playlist_id(list_id, state.settings.current().family.enabled)
+    {
+        return Ok(family_playlist_cover(&state, &call, reading, list_id).await);
+    }
 
     // Liked Songs: Octo's painted cover with a heart, picked by its name.
     let cover_user = call.param("u").to_string();
@@ -1434,6 +1445,158 @@ fn chart_cover_seeds(
                     .boxed()
                 }),
             });
+        }
+        if seeds.len() == 4 {
+            break;
+        }
+    }
+    seeds
+}
+
+/// A family playlist's cover for whoever asks: the picture uploaded for it, else one painted
+/// like a mix's, colored by its first songs' covers, with its name and how many songs the
+/// caller is shown. Someone it is not shared with gets the plain placeholder.
+async fn family_playlist_cover(
+    state: &AppState,
+    call: &SubsonicCall,
+    reading: Option<GateReading>,
+    id: &str,
+) -> Response {
+    let caller = match reading {
+        Some(reading) => reading
+            .verify(state)
+            .await
+            .ok()
+            .map(|verified| verified.caller().clone()),
+        None => None,
+    };
+    let Some((caller, playlist)) = caller.and_then(|caller| {
+        family_playlists::find(&state.family_playlists, &caller, id).map(|playlist| (caller, playlist))
+    }) else {
+        return serve_placeholder(state, false).await;
+    };
+    let (count, _) = super::playlists::family_playlist_totals(state, &playlist, &caller).await;
+    let seeds_state = state.clone();
+    let seeds_proxy = call.proxy.clone();
+    let parameters = call.parameters.clone();
+    let seeds_playlist = playlist.clone();
+    let list = ListCover {
+        // Looked up by its id: its uploaded picture is `<covers>/<id>.jpg`, and no picture
+        // named after another list is taken for it. The cover shows its name.
+        name: playlist.id.clone(),
+        label: None,
+        kind: list_kinds::FAMILY.to_string(),
+        seeds: Some(Arc::new(move || {
+            let state = seeds_state.clone();
+            let proxy = seeds_proxy.clone();
+            let parameters = parameters.clone();
+            let playlist = seeds_playlist.clone();
+            let caller = caller.clone();
+            async move {
+                Ok(family_cover_seeds(
+                    &state,
+                    &proxy,
+                    &playlist,
+                    &caller,
+                    &parameters,
+                ))
+            }
+            .boxed()
+        })),
+        song_count: Some(i32::try_from(count).unwrap_or(i32::MAX)),
+        cover_title: Some(playlist.name.clone()),
+        glyph: None,
+    };
+    let bytes = state
+        .cover_art_service
+        .get_list_cover(&list, requested_cover_size(call))
+        .await;
+    if bytes.is_empty() {
+        return serve_placeholder(state, false).await;
+    }
+    file(bytes, "image/jpeg")
+}
+
+/// The songs whose covers color a family playlist's painted cover: the first four albums the
+/// caller is shown. A library song's album cover is read from Navidrome as the caller; an
+/// outside song's comes from the cover sources.
+fn family_cover_seeds(
+    state: &AppState,
+    proxy: &crate::services::subsonic::SubsonicProxyService,
+    playlist: &FamilyPlaylist,
+    caller: &FamilyCaller,
+    parameters: &octo_subsonic::Parameters,
+) -> Vec<CoverSeed> {
+    let auth: octo_subsonic::Parameters = parameters
+        .iter()
+        .filter(|(key, _)| key.as_str() != "id" && key.as_str() != "size")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut albums = std::collections::HashSet::new();
+    let mut seeds = Vec::new();
+    for shown in family_playlists::shown_entries(playlist, caller) {
+        match shown.serve {
+            Serve::Library { id, .. } => {
+                let cover = state
+                    .library_index
+                    .song(&id)
+                    .map(|song| song.album_id)
+                    .filter(|album| !album.is_empty())
+                    .map_or_else(|| id.clone(), |album| format!("al-{album}"));
+                if !albums.insert(format!("library|{cover}")) {
+                    continue;
+                }
+                let proxy = proxy.clone();
+                let mut asking = auth.clone();
+                asking.insert("id".into(), cover.clone());
+                asking.insert("size".into(), "128".into());
+                seeds.push(CoverSeed {
+                    identity: format!("navidrome|{cover}"),
+                    fetch: Arc::new(move || {
+                        let proxy = proxy.clone();
+                        let asking = asking.clone();
+                        async move {
+                            let picture = proxy.relay("rest/getCoverArt", &asking).await?;
+                            let image = picture
+                                .content_type
+                                .as_deref()
+                                .is_some_and(|ct| dotnet::starts_with_ignore_case(ct, "image/"));
+                            Ok(image.then(|| picture.body.to_vec()))
+                        }
+                        .boxed()
+                    }),
+                });
+            }
+            Serve::Outside(outside) => {
+                let Some(routing) = state.external_id_registry.lookup(&outside) else {
+                    continue;
+                };
+                let routing = routing.snapshot();
+                let artist = routing.artist.clone().unwrap_or_default();
+                let album = routing
+                    .album
+                    .clone()
+                    .filter(|album| !album.is_empty())
+                    .or_else(|| routing.title.clone())
+                    .unwrap_or_default();
+                let distinct = format!(
+                    "outside|{}|{}",
+                    SongIdentity::key(&artist),
+                    SongIdentity::key(&album)
+                );
+                if !albums.insert(distinct.clone()) {
+                    continue;
+                }
+                let covers = Arc::clone(&state.cover_art_aggregator);
+                seeds.push(CoverSeed {
+                    identity: distinct,
+                    fetch: Arc::new(move || {
+                        let covers = Arc::clone(&covers);
+                        let routing = routing.clone();
+                        async move { Ok(covers.get_cover(&routing, true).await.map(|b| b.to_vec())) }.boxed()
+                    }),
+                });
+            }
         }
         if seeds.len() == 4 {
             break;

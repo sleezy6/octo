@@ -406,7 +406,9 @@ async fn family_rows(state: &AppState, caller: Option<&FamilyCaller>) -> Vec<ser
     let mut rows = Vec::new();
     for playlist in family_playlists::visible_playlists(&state.family_playlists, caller) {
         let (count, seconds) = family_playlist_totals(state, &playlist, caller).await;
-        rows.push(family_playlist_fields(&playlist, caller, count, seconds));
+        let mut row = family_playlist_fields(&playlist, caller, count, seconds);
+        row.insert("coverArt".into(), family_cover_id(state, &playlist, count).into());
+        rows.push(row);
     }
     rows
 }
@@ -414,7 +416,7 @@ async fn family_rows(state: &AppState, caller: Option<&FamilyCaller>) -> Vec<ser
 /// What a family playlist's row counts for `viewer`: the songs they are shown and how many
 /// seconds those last. A kid profile's count and length leave out explicit songs, library and
 /// outside alike, as their `getPlaylist` answer does.
-async fn family_playlist_totals(
+pub(crate) async fn family_playlist_totals(
     state: &AppState,
     playlist: &FamilyPlaylist,
     viewer: &FamilyCaller,
@@ -496,6 +498,32 @@ async fn outside_lookup(state: &AppState, id: &str) -> (Option<i64>, Option<Stri
 
 fn utc_millis(at: &DateTime<Utc>) -> String {
     at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// A family playlist's cover id: its id, then `_` and a tag that changes with what the cover
+/// shows (its own picture, the painted design, how many songs the viewer is shown and the
+/// newest addition), so an app that keeps covers asks again after a change.
+pub(crate) fn family_cover_id(state: &AppState, playlist: &FamilyPlaylist, count: usize) -> String {
+    use sha2::{Digest, Sha256};
+    let changed = playlist
+        .entries
+        .iter()
+        .map(|entry| entry.added)
+        .chain([playlist.created])
+        .max()
+        .unwrap_or(playlist.created);
+    let picture = state.family_playlists.cover_stamp(&playlist.id).unwrap_or(0);
+    let design = octo_media::cover::CoverBook::shipped().version;
+    let digest = Sha256::digest(
+        format!(
+            "{picture}|{design}|{count}|{}|{}",
+            utc_millis(&changed),
+            playlist.name
+        )
+        .as_bytes(),
+    );
+    let tag: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("{}_{tag}", playlist.id)
 }
 
 /// One family playlist's row as `viewer` sees it: owned by "Family", public, with the number
@@ -1145,7 +1173,11 @@ async fn family_playlist(state: &AppState, call: &SubsonicCall, id: &str) -> Res
         .iter()
         .map(|song| song.get("duration").and_then(Value::as_i64).unwrap_or(0))
         .sum();
-    let fields = family_playlist_fields(&playlist, caller, entries.len(), seconds);
+    let mut fields = family_playlist_fields(&playlist, caller, entries.len(), seconds);
+    fields.insert(
+        "coverArt".into(),
+        family_cover_id(state, &playlist, entries.len()).into(),
+    );
     state
         .subsonic_response_builder
         .create_chart_playlist_response(&call.format, fields, &entries)

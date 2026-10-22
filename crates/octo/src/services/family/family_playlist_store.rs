@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::family_playlist_covers::{self, CoverRefused};
 use super::store_file;
 
 /// One song in a family playlist.
@@ -79,6 +80,8 @@ pub fn family_playlist_id(name: &str, created: &DateTime<Utc>) -> String {
 pub struct FamilyPlaylistStore {
     playlists: Mutex<Vec<FamilyPlaylist>>,
     path: Option<PathBuf>,
+    /// The covers folder beside the file, where a playlist's own picture is kept.
+    covers: Option<PathBuf>,
     save_lock: Mutex<()>,
     load_warning: Option<String>,
 }
@@ -91,9 +94,14 @@ impl FamilyPlaylistStore {
     pub fn new(path: Option<impl AsRef<Path>>) -> Self {
         let path = store_file::clean_path(path);
         let (playlists, load_warning) = store_file::load::<Vec<FamilyPlaylist>>(path.as_deref());
+        let covers = path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|folder| folder.join("covers"));
         FamilyPlaylistStore {
             playlists: Mutex::new(playlists),
             path,
+            covers,
             save_lock: Mutex::new(()),
             load_warning,
         }
@@ -188,8 +196,48 @@ impl FamilyPlaylistStore {
         };
         if removed {
             self.save();
+            self.remove_cover(id);
         }
         removed
+    }
+
+    /// Where the playlist's own picture is kept, whether or not it has one: the covers folder,
+    /// under its id. None for an id that is not a playlist id, or with no folder.
+    pub fn cover_path(&self, id: &str) -> Option<PathBuf> {
+        let well_formed =
+            id.len() == 22 && id.starts_with("of") && id.bytes().all(|b| b.is_ascii_alphanumeric());
+        if !well_formed {
+            return None;
+        }
+        Some(self.covers.as_ref()?.join(format!("{id}.jpg")))
+    }
+
+    /// When the playlist's own picture was last written (nanoseconds since 1970), so a new
+    /// one gets a new cover id; None while it has none.
+    pub fn cover_stamp(&self, id: &str) -> Option<u128> {
+        let modified = std::fs::metadata(self.cover_path(id)?).ok()?.modified().ok()?;
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|since| since.as_nanos())
+    }
+
+    /// Keeps `picture` as the playlist's own cover, in place of the painted one or the picture
+    /// before it. Slow (it reads and redraws the picture): not on an async thread.
+    pub fn set_cover(&self, id: &str, picture: &[u8]) -> Result<(), CoverRefused> {
+        if self.get(id).is_none() {
+            return Err(CoverRefused::NotFound);
+        }
+        let path = self.cover_path(id).ok_or(CoverRefused::NowhereToKeep)?;
+        let kept = family_playlist_covers::prepared(picture)?;
+        family_playlist_covers::write_whole(&path, &kept)
+    }
+
+    /// Removes the playlist's own picture: its painted cover shows again. True when there was
+    /// one.
+    pub fn remove_cover(&self, id: &str) -> bool {
+        self.cover_path(id)
+            .is_some_and(|path| std::fs::remove_file(path).is_ok())
     }
 
     /// Points every entry of every playlist that names library song `old` at `new` instead, in
@@ -327,5 +375,32 @@ mod tests {
             reloaded.get(&keep.id).expect("there").entries,
             vec![entry("e1", "alex")]
         );
+    }
+
+    #[test]
+    fn a_playlist_keeps_its_own_picture_in_the_covers_folder_until_it_goes() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = FamilyPlaylistStore::new(Some(dir.path().join("family-playlists.json")));
+        let made = store.create("Road Trip", "winters", now());
+        let path = store.cover_path(&made.id).expect("a place");
+        assert_eq!(path, dir.path().join("covers").join(format!("{}.jpg", made.id)));
+        assert_eq!(store.cover_stamp(&made.id), None);
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(400, 300)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encodes");
+        assert_eq!(store.set_cover(&made.id, png.get_ref()), Ok(()));
+        assert!(store.cover_stamp(&made.id).is_some());
+        assert_eq!(image::image_dimensions(&path).expect("a picture"), (300, 300));
+        assert_eq!(
+            store.set_cover("of00000000000000000000", png.get_ref()),
+            Err(CoverRefused::NotFound)
+        );
+        assert_eq!(store.cover_path("../../etc/passwd"), None);
+
+        assert!(store.delete(&made.id));
+        assert!(!path.exists());
+        assert!(!FamilyPlaylistStore::in_memory().remove_cover(&made.id));
     }
 }

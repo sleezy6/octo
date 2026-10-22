@@ -82,6 +82,14 @@ pub fn routes() -> RouteSet {
             get(create_family_playlist).post(create_family_playlist),
         )
         .subsonic(
+            "setFamilyPlaylistCover",
+            axum::routing::post(set_family_playlist_cover),
+        )
+        .subsonic(
+            "deleteFamilyPlaylistCover",
+            get(delete_family_playlist_cover).post(delete_family_playlist_cover),
+        )
+        .subsonic(
             "startFamilySignIn",
             get(start_family_sign_in).post(start_family_sign_in),
         )
@@ -108,7 +116,9 @@ pub fn routes() -> RouteSet {
 }
 
 /// The extension's name and versions, as `getOpenSubsonicExtensions` lists it.
-pub const FAMILY_EXTENSION: (&str, i32) = ("octoFamily", 1);
+/// Version 2 added a family playlist's cover (`coverArt`, `setFamilyPlaylistCover`,
+/// `deleteFamilyPlaylistCover`).
+pub const FAMILY_EXTENSION: (&str, i32) = ("octoFamily", 2);
 
 /// Adds `octoFamily` to a `getOpenSubsonicExtensions` answer (an ok one; a failed or unreadable
 /// answer goes out as it came).
@@ -673,8 +683,13 @@ pub async fn create_family_playlist(State(state): State<AppState>, req: Request)
         .await
     {
         Ok(playlist) => {
+            let cover = state
+                .family_playlists
+                .get(&playlist.id)
+                .map(|made| super::playlists::family_cover_id(&state, &made, 0));
             let node = json!({
                 "id": playlist.id,
+                "coverArt": cover,
                 "name": playlist.name,
                 "comment": "",
                 "owner": "Family",
@@ -689,6 +704,159 @@ pub async fn create_family_playlist(State(state): State<AppState>, req: Request)
         }
         Err(e) => family_failure(&state, &call.format, &e),
     }
+}
+
+/// `setFamilyPlaylistCover`: `id` (in the query), and the picture as the body: a multipart
+/// form with the picture in `image` (or `file`, or the first part that is a file), or the
+/// picture's own bytes with an `image/...` content type. JPEG, PNG, WebP, GIF or BMP, up to
+/// 20 MB and at least 100 pixels on a side; kept as its center square. For whoever may rename
+/// the playlist (its maker, or someone who manages the family). Answers `familyPlaylistCover`
+/// with the playlist's new `coverArt`.
+pub async fn set_family_playlist_cover(State(state): State<AppState>, req: Request) -> Response {
+    let call = started!(state, req);
+    let playlist = match coverable_playlist(&state, &call) {
+        Ok(playlist) => playlist,
+        Err(answer) => return *answer,
+    };
+    let picture = match uploaded_picture(&state, &call.call).await {
+        Some(picture) => picture,
+        None => return error(&state, &call.format, 10, "Choose a picture first."),
+    };
+    let store = std::sync::Arc::clone(&state.family_playlists);
+    let id = playlist.id.clone();
+    let kept = tokio::task::spawn_blocking(move || store.set_cover(&id, &picture))
+        .await
+        .unwrap_or_else(|e| {
+            Err(crate::services::family::family_playlist_covers::CoverRefused::NotWritten(e.to_string()))
+        });
+    if let Err(refused) = kept {
+        tracing::info!(
+            "setFamilyPlaylistCover for {}: {}",
+            playlist.id,
+            refused.message()
+        );
+        return error(&state, &call.format, 0, &refused.message());
+    }
+    tracing::info!(
+        "{} set a cover for family playlist {}",
+        call.caller.user,
+        playlist.id
+    );
+    cover_reply(&state, &call, &playlist)
+}
+
+/// `deleteFamilyPlaylistCover`: `id`. Removes the playlist's own picture, so its painted cover
+/// shows again; for whoever may set one. Answers as `setFamilyPlaylistCover` does.
+pub async fn delete_family_playlist_cover(State(state): State<AppState>, req: Request) -> Response {
+    let call = started!(state, req);
+    let playlist = match coverable_playlist(&state, &call) {
+        Ok(playlist) => playlist,
+        Err(answer) => return *answer,
+    };
+    if state.family_playlists.remove_cover(&playlist.id) {
+        tracing::info!(
+            "{} removed the cover of family playlist {}",
+            call.caller.user,
+            playlist.id
+        );
+    }
+    cover_reply(&state, &call, &playlist)
+}
+
+/// The family playlist `id` names, when the caller may change its cover.
+fn coverable_playlist(
+    state: &AppState,
+    call: &FamilyCall,
+) -> Result<crate::services::family::FamilyPlaylist, Box<Response>> {
+    use crate::services::family::family_playlists;
+    let id = call.param("id");
+    if id.is_empty() {
+        return Err(Box::new(error(
+            state,
+            &call.format,
+            10,
+            "Required parameter is missing: id",
+        )));
+    }
+    let Some(playlist) = family_playlists::find(&state.family_playlists, &call.caller, id) else {
+        return Err(Box::new(error(state, &call.format, 70, "Playlist not found.")));
+    };
+    if !family_playlists::may_rename(&call.caller, &playlist) {
+        return Err(Box::new(error(
+            state,
+            &call.format,
+            50,
+            "Only the person who made this playlist, or someone who manages the family, can change its cover.",
+        )));
+    }
+    Ok(playlist)
+}
+
+/// `familyPlaylistCover`: the playlist's id and its cover id as of now.
+fn cover_reply(
+    state: &AppState,
+    call: &FamilyCall,
+    playlist: &crate::services::family::FamilyPlaylist,
+) -> Response {
+    let count = crate::services::family::family_playlists::shown_entries(playlist, &call.caller).len();
+    let node = json!({
+        "id": playlist.id,
+        "coverArt": super::playlists::family_cover_id(state, playlist, count),
+    });
+    octo_reply(state, &call.format, Some(("familyPlaylistCover", &node)))
+}
+
+/// The picture a call sent: a multipart form's `image` or `file` part (else its first file
+/// part), or the whole body when it says it is a picture.
+async fn uploaded_picture(state: &AppState, call: &SubsonicCall) -> Option<Vec<u8>> {
+    let incoming = &call.incoming;
+    let content_type = incoming.content_type().unwrap_or("").to_string();
+    let media = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if media.starts_with("image/") || media == "application/octet-stream" {
+        return Some(incoming.body.to_vec()).filter(|body| !body.is_empty());
+    }
+    if media != "multipart/form-data" {
+        return None;
+    }
+    let request = axum::http::Request::builder()
+        .header(header::CONTENT_TYPE, &content_type)
+        .body(axum::body::Body::from(incoming.body.clone()))
+        .ok()?;
+    let mut form =
+        <axum::extract::Multipart as axum::extract::FromRequest<AppState>>::from_request(request, state)
+            .await
+            .ok()?;
+    let mut named: Option<Vec<u8>> = None;
+    let mut first_file: Option<Vec<u8>> = None;
+    while let Ok(Some(field)) = form.next_field().await {
+        let is_named = field
+            .name()
+            .is_some_and(|n| n.eq_ignore_ascii_case("image") || n.eq_ignore_ascii_case("file"));
+        let is_file = field.file_name().is_some()
+            || field
+                .content_type()
+                .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("image/"));
+        if !(is_named || (is_file && first_file.is_none())) {
+            continue;
+        }
+        let Ok(bytes) = field.bytes().await else {
+            return None;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        if is_named {
+            named = Some(bytes.to_vec());
+            break;
+        }
+        first_file = Some(bytes.to_vec());
+    }
+    named.or(first_file)
 }
 
 /// Where a request comes from: the client address, and the peer Octo can vouch for.

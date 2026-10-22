@@ -163,6 +163,8 @@ pub const REST_ENDPOINTS: &[(&str, EndpointClass)] = &[
     ("changeFamilyPassword", Read),
     ("removeFromMyLibrary", Read),
     ("createFamilyPlaylist", Read),
+    ("setFamilyPlaylistCover", Read),
+    ("deleteFamilyPlaylistCover", Read),
     ("startFamilySignIn", Read),
     ("redeemFamilySignIn", Read),
     ("getFamilySignInPending", Read),

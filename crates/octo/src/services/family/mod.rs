@@ -9,6 +9,7 @@ pub mod caller;
 pub mod device_registry;
 #[cfg(test)]
 pub(crate) mod fake_navidrome;
+pub mod family_playlist_covers;
 pub mod family_playlist_store;
 pub mod family_playlists;
 pub mod family_pool_store;

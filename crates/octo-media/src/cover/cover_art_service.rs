@@ -41,6 +41,8 @@ pub mod list_kinds {
     pub const NOTICE: &str = "notice";
     /// Liked Songs.
     pub const LIKED: &str = "liked";
+    /// A family playlist.
+    pub const FAMILY: &str = "family";
 }
 
 /// A boxed future, as the seed callbacks return them.
@@ -472,6 +474,7 @@ impl CoverArtService {
             Some(list_kinds::CHART) => "Chart",
             Some(list_kinds::NEW_SONGS) => "New",
             Some(list_kinds::TRENDING) => "Trending",
+            Some(list_kinds::FAMILY) => "Playlist",
             _ => "Mix",
         };
         let mut title = shown;

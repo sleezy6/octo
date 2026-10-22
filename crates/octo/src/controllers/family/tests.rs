@@ -2636,6 +2636,125 @@ async fn create_family_playlist_answers_a_playlist_node() {
     assert_eq!(approval["error"]["code"], 50);
 }
 
+/// A call sent with a binary body, answered with its raw bytes.
+async fn raw_bytes(
+    app: &App,
+    method: Method,
+    uri: &str,
+    content_type: Option<&str>,
+    body: Vec<u8>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(content_type) = content_type {
+        req = req.header("content-type", content_type);
+    }
+    let mut req = req.body(Body::from(body)).expect("a request");
+    let address: SocketAddr = format!("{HOME}:50000").parse().expect("an address");
+    req.extensions_mut().insert(ConnectInfo(address));
+    let res = app.clone().oneshot(req).await.expect("infallible");
+    let (parts, body) = res.into_parts();
+    let body = body.collect().await.expect("a body").to_bytes();
+    (parts.status, parts.headers, body.to_vec())
+}
+
+fn png(width: u32, height: u32) -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(width, height)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .expect("encodes");
+    out.into_inner()
+}
+
+/// An app sets a family playlist's cover with the picture as the body or in a multipart form;
+/// the cover id changes with it, getCoverArt serves it at the size asked for, and removing it
+/// brings back the painted cover.
+#[tokio::test]
+async fn an_app_sets_and_removes_a_family_playlists_cover() {
+    let f = fam().await;
+    let made = f
+        .rest_as_alex("createFamilyPlaylist", "name=Road%20trip")
+        .await
+        .subsonic();
+    let id = made["playlist"]["id"].as_str().expect("an id").to_string();
+    let painted = made["playlist"]["coverArt"]
+        .as_str()
+        .expect("a cover id")
+        .to_string();
+    assert!(painted.starts_with(&format!("{id}_")), "{painted}");
+
+    let sign = format!("u=alex&p={ALEX_APP}&v=1.16.1&c=test&f=json");
+    let set = format!("/rest/setFamilyPlaylistCover?{sign}&id={id}");
+    let (status, _, body) = raw_bytes(&f.app, Method::POST, &set, Some("image/png"), png(800, 600)).await;
+    assert_eq!(status, StatusCode::OK);
+    let reply: Value = serde_json::from_slice(&body).expect("json");
+    let own = reply["subsonic-response"]["familyPlaylistCover"]["coverArt"]
+        .as_str()
+        .expect("a cover id")
+        .to_string();
+    assert_ne!(own, painted, "{reply}");
+    let kept = f.state.family_playlists.cover_path(&id).expect("a place");
+    assert_eq!(image::image_dimensions(&kept).expect("a picture"), (600, 600));
+
+    // Octo's list covers come at 600 to 1200 pixels, the size asked for within that.
+    let cover = format!("/rest/getCoverArt?{sign}&id={own}&size=900");
+    let (status, headers, body) = raw_bytes(&f.app, Method::GET, &cover, None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/jpeg");
+    let served = image::load_from_memory(&body).expect("a picture");
+    assert_eq!((served.width(), served.height()), (900, 900));
+
+    // A multipart form, as a browser or an app's file picker sends it.
+    let boundary = "octo-cover-boundary";
+    let mut form = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"c.png\"\r\nContent-Type: image/png\r\n\r\n"
+    )
+    .into_bytes();
+    form.extend(png(400, 400));
+    form.extend(format!("\r\n--{boundary}--\r\n").into_bytes());
+    let (status, _, body) = raw_bytes(
+        &f.app,
+        Method::POST,
+        &set,
+        Some(&format!("multipart/form-data; boundary={boundary}")),
+        form,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let reply: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(reply["subsonic-response"]["status"], "ok", "{reply}");
+    assert_eq!(image::image_dimensions(&kept).expect("a picture"), (400, 400));
+
+    // Not a picture: refused, and the cover kept.
+    let (_, _, body) = raw_bytes(&f.app, Method::POST, &set, Some("image/png"), b"nope".to_vec()).await;
+    let reply: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(reply["subsonic-response"]["status"], "failed", "{reply}");
+    assert!(kept.exists());
+    let (_, _, body) = raw_bytes(&f.app, Method::POST, &set, None, Vec::new()).await;
+    let reply: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(reply["subsonic-response"]["error"]["code"], 10, "{reply}");
+
+    let removed = f
+        .rest_as_alex("deleteFamilyPlaylistCover", &format!("id={id}"))
+        .await
+        .subsonic();
+    assert_eq!(
+        removed["familyPlaylistCover"]["coverArt"],
+        painted.as_str(),
+        "{removed}"
+    );
+    assert!(!kept.exists());
+    let cover = format!("/rest/getCoverArt?{sign}&id={painted}&size=300");
+    let (status, headers, _) = raw_bytes(&f.app, Method::GET, &cover, None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/jpeg");
+
+    let missing = f
+        .rest_as_alex("deleteFamilyPlaylistCover", "id=of00000000000000000000")
+        .await
+        .subsonic();
+    assert_eq!(missing["error"]["code"], 70);
+}
+
 #[tokio::test]
 async fn family_extension_only_when_on() {
     for on in [true, false] {
@@ -2650,7 +2769,7 @@ async fn family_extension_only_when_on() {
             .await;
         let r = f.rest_as_owner("getOpenSubsonicExtensions", "").await;
         assert_eq!(
-            r.body.contains(r#"{"name":"octoFamily","versions":[1]}"#),
+            r.body.contains(r#"{"name":"octoFamily","versions":[2]}"#),
             on,
             "{}",
             r.body
