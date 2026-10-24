@@ -1,6 +1,7 @@
-//! What the Listening page shows, worked out from plays: a range of the last 7, 30 or 90 days
-//! (today and the days before it, in the server's time zone), the range before it for the
-//! change, and the plays' days, hours, songs, artists, genres, sessions and apps.
+//! What the Listening page shows, worked out from plays: a range of the last 7, 30 or 90 days,
+//! or a year when plays are kept that long (today and the days before it, in the server's time
+//! zone), the range before it for the change, and the plays' days, hours, songs, artists,
+//! genres, sessions and apps.
 //!
 //! Pure functions over the plays and a clock, so every number is tested on fixed rows.
 
@@ -10,10 +11,12 @@ use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, TimeZone, Timelike, Utc};
 use serde::Serialize;
 
 use super::genres::genre_key;
-use super::listening_log::{Play, UNKNOWN_APP, UNKNOWN_PLATFORM};
+use super::listening_log::{Play, UNKNOWN_APP, UNKNOWN_PLATFORM, platform_of};
 
-/// The ranges the page offers, in days.
+/// The ranges the page always offers, in days.
 pub const RANGES: [i64; 3] = [7, 30, 90];
+/// The year range, offered only when plays are kept that long.
+pub const YEAR: i64 = 365;
 /// The range shown when none is asked for.
 pub const DEFAULT_RANGE: i64 = 30;
 /// Plays closer than this (from one's end to the next one's start) are one session.
@@ -25,12 +28,21 @@ pub const HEARTED_SHOWN: usize = 3;
 /// The share of the range before that must be on record for a change to be shown.
 pub const ON_RECORD_FOR_CHANGE: f64 = 0.75;
 
-/// The range asked for: 7, 30 or 90 ("30" and "30d" alike); anything else is 30.
-pub fn range_of(text: Option<&str>) -> i64 {
+/// The ranges offered with plays kept for `keep_days`: the year only when a year is kept.
+pub fn ranges(keep_days: i64) -> Vec<i64> {
+    let mut ranges = RANGES.to_vec();
+    if keep_days >= YEAR {
+        ranges.push(YEAR);
+    }
+    ranges
+}
+
+/// The range asked for: one of [`ranges`] ("30" and "30d" alike); anything else is 30.
+pub fn range_of(text: Option<&str>, keep_days: i64) -> i64 {
     let text = text.unwrap_or("").trim().trim_end_matches(['d', 'D']);
     text.parse::<i64>()
         .ok()
-        .filter(|days| RANGES.contains(days))
+        .filter(|days| ranges(keep_days).contains(days))
         .unwrap_or(DEFAULT_RANGE)
 }
 
@@ -555,12 +567,14 @@ fn hearted(plays: &[&Play]) -> Vec<Hearted> {
     list
 }
 
-/// Plays by app, the most used first.
+/// Plays by app, the most used first. A play written with no platform takes the one its app's
+/// name says: the app's label is its `c`, and an Octo app's label keeps its User-Agent's
+/// parentheses.
 fn apps(plays: &[&Play]) -> Vec<AppShare> {
     let mut tallies: HashMap<(String, String), usize> = HashMap::new();
     for play in plays {
-        let platform = if play.platform.is_empty() {
-            UNKNOWN_PLATFORM.to_string()
+        let platform = if play.platform.is_empty() || play.platform == UNKNOWN_PLATFORM {
+            platform_of(&play.app, &play.app).to_string()
         } else {
             play.platform.clone()
         };

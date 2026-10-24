@@ -970,6 +970,7 @@ async fn build_served(
         lidarr_imports: None,
         lidarr_fetcher: None,
         spotiflac: None,
+        preview_copies: None,
     };
     let (service, backend) = SoulseekDownloadService::build(core, services, parts);
     Walk {
@@ -1063,6 +1064,221 @@ async fn a_whole_folder_is_one_search_and_one_batch_and_every_song_lands() {
     assert_eq!(files.len(), 4);
     assert!(destination.starts_with(".octo-incoming/slskd/"), "{destination}");
     assert_eq!(placed_flacs(&root), 4);
+}
+
+/// Two hearts of one album at once (two of its songs, or one heart sent twice) walk it once. Two
+/// walks side by side each queued their own batch for the same songs, and the second batch took
+/// the first's place in the songs' queue, so no song waited on the first batch and nothing cancelled
+/// it: its files landed in a job folder nobody looked in.
+#[tokio::test]
+async fn two_walks_of_one_album_at_once_queue_one_batch() {
+    let root = Root::new("octo-albumwalk-");
+    let walk = build(&root, true, |songs| {
+        Arc::new(move |text: &str| {
+            if text == "Drake Nothing Was the Same" {
+                let files: Vec<(String, i32)> = songs
+                    .iter()
+                    .map(|s| (remote(r"Music\Drake\NWTS", s), duration_of(s)))
+                    .collect();
+                vec![response("albumpeer", &files)]
+            } else {
+                Vec::new()
+            }
+        })
+    })
+    .await;
+    for song in &walk.songs {
+        walk.slskd
+            .length(&remote(r"Music\Drake\NWTS", song), duration_of(song));
+    }
+
+    let (first, second) = tokio::join!(walk_album(&walk), walk_album(&walk));
+
+    assert!(first && second);
+    assert_eq!(walk.slskd.searches(), names(&["Drake Nothing Was the Same"]));
+    assert_eq!(walk.slskd.batches().len(), 1, "{:?}", walk.slskd.batches());
+    assert_eq!(placed_flacs(&root), 4);
+}
+
+/// The album is let go once its walk ends, so a later heart walks it again.
+#[tokio::test]
+async fn a_walk_after_the_last_one_ended_runs_again() {
+    let root = Root::new("octo-albumwalk-");
+    let walk = build(&root, true, |songs| {
+        Arc::new(move |text: &str| {
+            if text == "Drake Nothing Was the Same" {
+                let files: Vec<(String, i32)> = songs
+                    .iter()
+                    .map(|s| (remote(r"Music\Drake\NWTS", s), duration_of(s)))
+                    .collect();
+                vec![response("albumpeer", &files)]
+            } else {
+                Vec::new()
+            }
+        })
+    })
+    .await;
+    for song in &walk.songs {
+        walk.slskd
+            .length(&remote(r"Music\Drake\NWTS", song), duration_of(song));
+    }
+
+    assert!(walk_album(&walk).await);
+    walk_album(&walk).await;
+
+    assert_eq!(
+        walk.slskd.searches(),
+        names(&["Drake Nothing Was the Same", "Drake Nothing Was the Same"])
+    );
+}
+
+/// The album search answers the whole folder from one peer; with `slow`, its first answer takes
+/// half a second, long enough to catch the walk in the middle.
+fn the_album_folder(slow: bool) -> impl FnOnce(Vec<Song>) -> Answers {
+    move |songs| {
+        let first = Arc::new(Mutex::new(slow));
+        Arc::new(move |text: &str| {
+            if text != "Drake Nothing Was the Same" {
+                return Vec::new();
+            }
+            if std::mem::take(&mut *first.lock()) {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            let files: Vec<(String, i32)> = songs
+                .iter()
+                .map(|s| (remote(r"Music\Drake\NWTS", s), duration_of(s)))
+                .collect();
+            vec![response("albumpeer", &files)]
+        })
+    }
+}
+
+/// A walk of the album on its own task, for `source`, until `token` is cancelled.
+fn spawn_walk(
+    walk: &Walk,
+    source: DownloadSource,
+    token: CancellationToken,
+) -> tokio::task::JoinHandle<bool> {
+    let (service, album) = (Arc::clone(&walk.service), walk.album_id.clone());
+    tokio::spawn(async move {
+        service
+            .download_album_with_source("soulseek", &album, source, false, &token, None)
+            .await
+            .expect("the walk runs")
+    })
+}
+
+/// Waits until the fake slskd has been asked for a search.
+async fn until_searched(walk: &Walk) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while walk.slskd.searches().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the walk searches");
+}
+
+/// A walk that fails answers false to the request that waited on it too.
+#[tokio::test]
+async fn a_walk_that_fails_answers_false_to_its_waiter() {
+    let root = Root::new("octo-albumwalk-");
+    let walk = build(&root, true, |_| Arc::new(|_: &str| Vec::new())).await;
+
+    let (first, second) = tokio::join!(walk_album(&walk), walk_album(&walk));
+
+    assert!(!first && !second);
+    // The two asked for at once searched exactly as much as one walk on its own does.
+    let together = walk.slskd.searches();
+    assert!(!walk_album(&walk).await);
+    assert_eq!(walk.slskd.searches().len(), 2 * together.len(), "{together:?}");
+    assert_eq!(placed_flacs(&root), 0);
+}
+
+/// A walk dropped halfway gives the album up, so the next walk searches for it again.
+#[tokio::test]
+async fn an_aborted_walk_lets_the_album_go() {
+    let root = Root::new("octo-albumwalk-");
+    let walk = build(&root, true, the_album_folder(true)).await;
+    for song in &walk.songs {
+        walk.slskd
+            .length(&remote(r"Music\Drake\NWTS", song), duration_of(song));
+    }
+
+    let aborted = spawn_walk(&walk, DownloadSource::Soulseek, CancellationToken::new());
+    until_searched(&walk).await;
+    aborted.abort();
+    assert!(aborted.await.is_err_and(|e| e.is_cancelled()));
+
+    assert!(walk_album(&walk).await);
+    assert_eq!(
+        walk.slskd.searches(),
+        names(&["Drake Nothing Was the Same", "Drake Nothing Was the Same"])
+    );
+    assert_eq!(placed_flacs(&root), 4);
+}
+
+/// A request that leaves while it waits answers false at once, and the walk it waited on goes on
+/// to the end.
+#[tokio::test]
+async fn a_cancelled_waiter_answers_false_and_the_walk_goes_on() {
+    let root = Root::new("octo-albumwalk-");
+    let walk = build(&root, true, the_album_folder(true)).await;
+    for song in &walk.songs {
+        walk.slskd
+            .length(&remote(r"Music\Drake\NWTS", song), duration_of(song));
+    }
+
+    let running = spawn_walk(&walk, DownloadSource::Soulseek, CancellationToken::new());
+    until_searched(&walk).await;
+    let leaving = CancellationToken::new();
+    let waiter = spawn_walk(&walk, DownloadSource::Soulseek, leaving.clone());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    leaving.cancel();
+
+    let waited = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("the waiter leaves at once")
+        .expect("the waiter ends");
+    assert!(!waited);
+    assert!(!running.is_finished());
+    let walked = tokio::time::timeout(Duration::from_secs(60), running)
+        .await
+        .expect("the walk ends within a minute")
+        .expect("the walk ends");
+    assert!(walked);
+    assert_eq!(walk.slskd.searches(), names(&["Drake Nothing Was the Same"]));
+    assert_eq!(placed_flacs(&root), 4);
+}
+
+/// A Soulseek walk asked for while a YouTube walk of the same album runs does not take the YouTube
+/// walk's answer: it waits for that walk to end and then looks for the lossless copies itself.
+#[tokio::test]
+async fn a_soulseek_walk_during_a_you_tube_walk_runs_its_own_walk_afterwards() {
+    let root = Root::new("octo-albumwalk-");
+    let walk = build(&root, true, the_album_folder(false)).await;
+    for song in &walk.songs {
+        walk.slskd
+            .length(&remote(r"Music\Drake\NWTS", song), duration_of(song));
+    }
+    let token = CancellationToken::new();
+    let walk_from = |source| {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            walk.service
+                .download_album_with_source("soulseek", &walk.album_id, source, false, &token, None),
+        )
+    };
+
+    let (you_tube, soulseek) = tokio::join!(
+        walk_from(DownloadSource::YouTube),
+        walk_from(DownloadSource::Soulseek)
+    );
+
+    assert!(you_tube.expect("in time").expect("the YouTube walk runs"));
+    assert!(soulseek.expect("in time").expect("the Soulseek walk runs"));
+    assert_eq!(walk.slskd.state.lock().you_tube_downloads.len(), 4);
+    assert_eq!(walk.slskd.searches(), names(&["Drake Nothing Was the Same"]));
 }
 
 #[tokio::test]

@@ -58,7 +58,7 @@ pub fn may_clear(caller: Option<&AdminCaller>) -> bool {
     })
 }
 
-/// `GET /api/admin/listening?range=7|30|90[&user=]`: everyone's listening with the people
+/// `GET /api/admin/listening?range=7|30|90|365[&user=]`: everyone's listening with the people
 /// grid, or one person's. The Octo app with a listener's own sign-in sees that listener only.
 pub async fn get_listening(
     State(state): State<AppState>,
@@ -69,17 +69,18 @@ pub async fn get_listening(
         Ok(scope) => scope,
         Err(words) => return error_json(StatusCode::FORBIDDEN, words),
     };
-    let days = rollups::range_of(query_value(query.as_deref(), "range").as_deref());
+    let keep_days = state.settings.current().listening.effective_keep_days();
+    let days = rollups::range_of(query_value(query.as_deref(), "range").as_deref(), keep_days);
     let (user, everyone) = match scope {
         Scope::Everyone => (query_value(query.as_deref(), "user"), true),
         Scope::Only(user) => (Some(user), false),
     };
     let log = state.listening.clone();
-    let keep_days = state.settings.current().listening.effective_keep_days();
     let answer = tokio::task::spawn_blocking(move || {
         let mut page = listening::page(&log, days, user.as_deref(), everyone);
         page["everyone"] = json!(everyone);
         page["keepDays"] = json!(keep_days);
+        page["ranges"] = json!(rollups::ranges(keep_days));
         page
     })
     .await;

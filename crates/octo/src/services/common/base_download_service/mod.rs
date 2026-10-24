@@ -64,7 +64,7 @@ use octo_core::tagging::{AlbumTagContext, ReleaseIdentifier};
 use octo_media::audio::{ILoudnessMeter, Loudness};
 use octo_media::tags::TagWriterExtras;
 use parking_lot::Mutex;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::{Semaphore, SemaphorePermit, watch};
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -151,6 +151,8 @@ pub struct TrackDownload {
     pub muted: bool,
     /// Only FLAC files are candidates; the base still refuses one made from lossy audio.
     pub flac_only: bool,
+    /// A download ahead of a play, which leaves an album walk's queued files to the walk.
+    pub ahead: bool,
 }
 
 /// The source-specific parts of the download pipeline. Every call is handed the base, so a
@@ -327,6 +329,37 @@ fn is_flac_path(path: &str) -> bool {
     dotnet::eq_ignore_case(get_extension(path), ".flac")
 }
 
+/// A walk in [`BaseDownloadService::album_walks`]: the source and the people it walks for, and
+/// its answer once it ends.
+struct RunningWalk {
+    source: Option<DownloadSource>,
+    requested_by: Option<Vec<String>>,
+    /// The track the walk leaves out, or empty for none.
+    exclude: String,
+    answer: watch::Receiver<Option<bool>>,
+}
+
+/// An album's place in [`BaseDownloadService::album_walks`], given up when its walk ends, however
+/// it ends.
+struct AlbumWalkEntry<'a> {
+    walks: &'a Mutex<HashMap<String, RunningWalk>>,
+    album_external_id: &'a str,
+}
+
+impl Drop for AlbumWalkEntry<'_> {
+    fn drop(&mut self) {
+        self.walks.lock().remove(self.album_external_id);
+    }
+}
+
+/// Waits for a walk to end and gives its answer, `None` when it ended without one (it panicked or
+/// its caller left). Its answer's sender goes only after its place is given up, so the album is
+/// free by the time this returns.
+async fn walk_ended(running: &mut watch::Receiver<Option<bool>>) -> Option<bool> {
+    while running.changed().await.is_ok() {}
+    *running.borrow()
+}
+
 /// Abstract base class for download services, as a struct: common download logic, tracking,
 /// and metadata writing. The backend implements provider-specific download and authentication.
 pub struct BaseDownloadService {
@@ -351,6 +384,10 @@ pub struct BaseDownloadService {
     /// The albums being fetched song by song outside a walk, newest last: their tracks are
     /// filed and tagged as one walk's would be.
     held_albums: Mutex<Vec<Arc<AlbumTagContext<Loudness>>>>,
+    /// The albums being walked, by external id, each with its walk's source, people and answer. A
+    /// walk asked for while one of the same album runs waits for that one: two walks side by side
+    /// would each queue a batch for the same songs, and the second would orphan the first.
+    album_walks: Mutex<HashMap<String, RunningWalk>>,
     /// One permit: one download at a time inside the lock.
     download_lock: Semaphore,
 
@@ -402,6 +439,7 @@ impl BaseDownloadService {
             cache_path,
             active_downloads: Mutex::new(HashMap::new()),
             held_albums: Mutex::new(Vec::new()),
+            album_walks: Mutex::new(HashMap::new()),
             download_lock: Semaphore::new(1),
             identifier: OnceLock::new(),
             #[cfg(test)]
@@ -934,6 +972,7 @@ impl BaseDownloadService {
                 external_provider: external_provider.to_string(),
                 status: DownloadStatus::InProgress,
                 started_at: Utc::now(),
+                ahead: options.prefetch,
                 ..Default::default()
             },
         );
@@ -1002,6 +1041,7 @@ impl BaseDownloadService {
                     fetched_from: None,
                     muted: false,
                     flac_only,
+                    ahead: options.prefetch,
                 };
                 let transferred = self
                     .backend
@@ -1501,7 +1541,85 @@ impl BaseDownloadService {
         .boxed()
     }
 
+    /// One walk of an album at a time. A request that comes while one runs for the same source and
+    /// the same people, and that walks every track that walk walks, answers what that walk answers,
+    /// and starts no walk of its own. Any other
+    /// request waits for that walk to end and then walks the album itself: its own source may find
+    /// what the running one could not, and its own people decide what it may upgrade.
     async fn walk_album(
+        &self,
+        album_external_id: &str,
+        exclude_track_external_id: &str,
+        source_override: Option<DownloadSource>,
+        suppress_summary: bool,
+        cancellation_token: &CancellationToken,
+        requested_by: Option<Vec<String>>,
+    ) -> anyhow::Result<bool> {
+        let answer = loop {
+            let running = {
+                let mut walks = self.album_walks.lock();
+                match walks.get(album_external_id) {
+                    Some(running) => Err((
+                        running.source == source_override
+                            && running.requested_by == requested_by
+                            && (running.exclude.is_empty() || running.exclude == exclude_track_external_id),
+                        running.answer.clone(),
+                    )),
+                    None => {
+                        let (answer, running) = watch::channel(None);
+                        walks.insert(
+                            album_external_id.to_string(),
+                            RunningWalk {
+                                source: source_override,
+                                requested_by: requested_by.clone(),
+                                exclude: exclude_track_external_id.to_string(),
+                                answer: running,
+                            },
+                        );
+                        Ok(answer)
+                    }
+                }
+            };
+            let (shared, mut running) = match running {
+                Ok(answer) => break answer,
+                Err(waiting) => waiting,
+            };
+            if shared {
+                info!("Album {album_external_id} is being walked already; this request waits for that walk");
+            } else {
+                info!(
+                    "Album {album_external_id} is being walked for another source or person; this request walks it once that walk ends"
+                );
+            }
+            let ended = tokio::select! {
+                _ = cancellation_token.cancelled() => return Ok(false),
+                ended = walk_ended(&mut running) => ended,
+            };
+            if shared {
+                // A walk that ended without an answer answers false.
+                return Ok(ended.unwrap_or(false));
+            }
+        };
+        // Made after `answer`, so it drops first: the album is free before the walk's waiters wake.
+        let _walking = AlbumWalkEntry {
+            walks: &self.album_walks,
+            album_external_id,
+        };
+        let walked = self
+            .walk_album_once(
+                album_external_id,
+                exclude_track_external_id,
+                source_override,
+                suppress_summary,
+                cancellation_token,
+                requested_by,
+            )
+            .await;
+        answer.send_replace(Some(walked.as_ref().is_ok_and(|all| *all)));
+        walked
+    }
+
+    async fn walk_album_once(
         &self,
         album_external_id: &str,
         exclude_track_external_id: &str,
@@ -1756,7 +1874,9 @@ impl BaseDownloadService {
             // Check if download is already in progress or recently completed.
             let song_id = format!("ext-{provider}-{track_id}");
             if let Some(active) = self.active_download(&song_id) {
-                if active.status == DownloadStatus::InProgress {
+                // A download ahead lands its file outside the library: the download below waits
+                // for it and keeps its file.
+                if active.status == DownloadStatus::InProgress && !active.ahead {
                     debug!("Track {track_id} download already in progress, skipping");
                     return Ok(());
                 }

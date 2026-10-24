@@ -43,11 +43,52 @@ fn rows(plays: &[Play]) -> Vec<(&str, &Play)> {
 
 #[test]
 fn ranges_are_read_from_their_numbers() {
-    assert_eq!(range_of(Some("7")), 7);
-    assert_eq!(range_of(Some("90d")), 90);
-    assert_eq!(range_of(Some(" 30 ")), 30);
-    assert_eq!(range_of(Some("14")), DEFAULT_RANGE);
-    assert_eq!(range_of(None), DEFAULT_RANGE);
+    assert_eq!(range_of(Some("7"), 90), 7);
+    assert_eq!(range_of(Some("90d"), 90), 90);
+    assert_eq!(range_of(Some(" 30 "), 90), 30);
+    assert_eq!(range_of(Some("14"), 90), DEFAULT_RANGE);
+    assert_eq!(range_of(None, 90), DEFAULT_RANGE);
+}
+
+#[test]
+fn a_year_is_offered_only_when_a_year_is_kept() {
+    assert_eq!(range_of(Some("365"), 90), DEFAULT_RANGE);
+    assert_eq!(range_of(Some("365"), 364), DEFAULT_RANGE);
+    assert_eq!(range_of(Some("365d"), 365), 365);
+    assert_eq!(ranges(90), [7, 30, 90]);
+    assert_eq!(ranges(365), [7, 30, 90, 365]);
+}
+
+#[test]
+fn a_play_written_with_no_platform_takes_its_apps() {
+    let mut plays = Vec::new();
+    for (app, platform) in [
+        ("Amperfy 1.4", "unknown"),
+        ("Amperfy 1.4", "iphone"),
+        ("DSub", ""),
+        ("Octo 1.9.0 (Android)", "unknown"),
+        ("Unknown app", "unknown"),
+    ] {
+        let mut p = play("A", app, at(19, 10, 0), 60);
+        p.app = app.into();
+        p.platform = platform.into();
+        plays.push(p);
+    }
+    let r = rollup(&rows(&plays), now(), 7, &pacific());
+    let apps: Vec<(&str, &str, usize)> = r
+        .apps
+        .iter()
+        .map(|a| (a.name.as_str(), a.platform.as_str(), a.plays))
+        .collect();
+    assert_eq!(
+        apps,
+        [
+            ("Amperfy", "iphone", 2),
+            ("DSub", "android", 1),
+            ("Octo for Android", "android", 1),
+            (UNKNOWN_APP, UNKNOWN_PLATFORM, 1),
+        ]
+    );
 }
 
 #[test]

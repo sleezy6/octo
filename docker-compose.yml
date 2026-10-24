@@ -454,6 +454,11 @@ services:
       SEARCH_CACHE_MAX: ${YTDLP_SEARCH_CACHE_MAX:-1024}
       URL_CACHE_MAX: ${YTDLP_URL_CACHE_MAX:-512}
       URL_CACHE_TTL: ${YTDLP_URL_CACHE_TTL:-3600}
+      # The YouTube player client asked for stream URLs. visionos hands out URLs that play
+      # at once; blank uses yt-dlp's own clients, whose URLs play only 4 to 14 s after they
+      # are made (the shim waits). When this client gives no URL where yt-dlp's own does,
+      # the shim uses yt-dlp's own for half an hour.
+      YTDLP_PLAYER_CLIENT: ${YTDLP_PLAYER_CLIENT-visionos}
       # Root the /download endpoint may write under (matches the /music mount).
       DOWNLOAD_ROOT: /music
       # Run yt-dlp from the volume below rather than the copy baked into the

@@ -757,6 +757,29 @@
               </div>
             </details>
           </form>
+          <div class="set-card kr-card" id="keep-ready-card">
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Keep playlists ready</div>
+                <div class="set-info-d">Picked playlists start right away in any app. Every song's preview is kept here, and the first few also download as FLAC.</div>
+                <div class="set-info-more">Checked every hour. Previews are kept even while nothing plays; the FLAC downloads follow Pause when nothing plays. Kept songs count toward Space to use.</div>
+              </div>
+              <div class="set-ctrl" id="keep-ready-person-wrap" hidden>
+                <select class="set-input kr-person" id="keep-ready-person" aria-label="Whose playlists"></select>
+              </div>
+            </div>
+            <div class="set-row" id="keep-ready-most-row" hidden>
+              <div class="set-info">
+                <label class="set-info-t" for="f-keep-ready-most">Also the playlists played most</label>
+                <div class="set-info-d">Keeps the three playlists this person plays from most ready too, learned from what they play in any app.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="f-keep-ready-most" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="kr-lists" id="keep-ready-lists" role="group" aria-label="Playlists to keep ready" hidden></div>
+            <div class="set-row kr-note-row" id="keep-ready-note-row">
+              <div class="set-info-d kr-note" id="keep-ready-note" role="status" aria-live="polite">Loading playlists…</div>
+            </div>
+          </div>
         </div>
 
       </section>

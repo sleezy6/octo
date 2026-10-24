@@ -20,6 +20,10 @@ pub struct DownloadInfo {
     pub started_at: DateTime<Utc>,
     #[serde(with = "datetime::utc_option")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// A download ahead of a play: an album walk that meets it downloads the song through it
+    /// rather than skipping it, since its file lands outside the library.
+    #[serde(skip)]
+    pub ahead: bool,
 }
 
 impl Default for DownloadInfo {
@@ -35,6 +39,7 @@ impl Default for DownloadInfo {
             // A date that was never set reads as the minimum date.
             started_at: datetime::min_value(),
             completed_at: None,
+            ahead: false,
         }
     }
 }

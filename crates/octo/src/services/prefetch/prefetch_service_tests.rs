@@ -529,3 +529,52 @@ async fn the_status_reads_the_folder_and_clear_empties_it() {
     w.service.store().touch("soulseek", &w.ids[2]);
     assert_eq!(w.service.clear(), 0);
 }
+
+#[tokio::test]
+async fn a_song_kept_ready_that_comes_up_moves_ahead_of_the_kept_ones() {
+    let w = world(|s| {
+        s.prefetch.count = 1;
+        s.soulseek.parallel_downloads = 1;
+    });
+    w.service
+        .keep_ready(vec![("alice".into(), vec![w.ids[5].clone(), w.ids[4].clone()])])
+        .await;
+    assert_eq!(w.service.queued_ids(), vec![w.ids[5].clone(), w.ids[4].clone()]);
+    // Alice plays the third song: the fifth is now coming up.
+    w.save_queue("alice", 2);
+    w.service.on_playing("alice", &w.ids[2], None).await;
+    assert_eq!(w.service.queued_ids(), vec![w.ids[4].clone(), w.ids[5].clone()]);
+}
+
+#[tokio::test]
+async fn a_song_kept_ready_keeps_its_listener_when_they_go_idle() {
+    let w = world(|s| s.soulseek.parallel_downloads = 1);
+    w.save_queue("alice", 0);
+    w.service.on_playing("alice", &w.ids[0], None).await;
+    w.service
+        .keep_ready(vec![("alice".into(), vec![w.ids[6].clone()])])
+        .await;
+    w.later(Duration::minutes(40));
+    w.service.step().await;
+    let kept = w
+        .service
+        .queued_jobs()
+        .into_iter()
+        .find(|(id, _, _)| *id == w.ids[6])
+        .expect("still kept");
+    assert_eq!(kept.1, ["alice"], "whose library it goes to");
+}
+
+#[tokio::test]
+async fn songs_kept_ready_go_to_the_prefetch_folder_with_download_on_play_too() {
+    let w = world(|s| {
+        s.subsonic.download_on_play = true;
+        s.soulseek.parallel_downloads = 1;
+    });
+    w.service
+        .keep_ready(vec![("alice".into(), vec![w.ids[6].clone()])])
+        .await;
+    let jobs = w.service.queued_jobs();
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].2, "into the prefetch folder, not the library");
+}

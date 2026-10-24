@@ -14,7 +14,11 @@
   'use strict';
 
   const RANGE_KEY = 'octo.listening.range';
+  // The ranges every server offers; the answer's own `ranges` adds a year when plays are kept
+  // that long.
   const RANGES = [7, 30, 90];
+  const YEAR = 365;
+  const rangeLabel = (n) => (n === YEAR ? '1 year' : `${n} days`);
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const GENRE_SHADES = [1, 0.78, 0.6, 0.46, 0.36, 0.28, 0.22];
   const LIGHTS = ['--amb-1', '--amb-2', '--amb-3', '--accent-rgb'];
@@ -46,7 +50,7 @@
   function storedRange() {
     try {
       const n = Number(localStorage.getItem(RANGE_KEY));
-      return RANGES.includes(n) ? n : 30;
+      return RANGES.includes(n) || n === YEAR ? n : 30;
     } catch { return 30; }
   }
   function storeRange(n) {
@@ -121,7 +125,7 @@
   function mount(container, options) {
     const o = Object.assign({ canSeeEveryone: false, title: 'Listening' }, options || {});
     const uid = `ls${Math.random().toString(36).slice(2, 8)}`;
-    const state = { days: RANGES.includes(o.days) ? o.days : storedRange(), who: o.user || null, data: null, people: [], layout: null, seq: 0, chart: 0, top: null, palette: null, paused: false };
+    const state = { days: RANGES.includes(o.days) || o.days === YEAR ? o.days : storedRange(), ranges: RANGES, who: o.user || null, data: null, people: [], layout: null, seq: 0, chart: 0, top: null, palette: null, paused: false };
     const shown = new Map();
     const style = document.documentElement.style;
     let alive = true;
@@ -134,9 +138,7 @@
         <div class="ls-words"><h1 tabindex="-1">${esc(o.title)}</h1><p class="ls-lede"></p></div>
         <div class="ls-controls">
           <div class="seg ls-who" role="group" aria-label="Whose listening" hidden><span class="seg-thumb"></span></div>
-          <div class="seg ls-range" role="group" aria-label="Time range"><span class="seg-thumb"></span>
-            ${RANGES.map((n) => `<button type="button" data-days="${n}" aria-pressed="${n === state.days}">${n} days</button>`).join('')}
-          </div>
+          <div class="seg ls-range" role="group" aria-label="Time range"><span class="seg-thumb"></span></div>
         </div>
       </header>
       <div class="ls-body"></div>`;
@@ -145,6 +147,16 @@
     const body = $('.ls-body');
     const rangeSeg = $('.ls-range');
     const whoSeg = $('.ls-who');
+    // One button per range offered, after the switch's thumb.
+    function drawRanges(list) {
+      state.ranges = list;
+      rangeSeg.querySelectorAll('button[data-days]').forEach((b) => b.remove());
+      rangeSeg.insertAdjacentHTML('beforeend', list.map((n) => `<button type="button" data-days="${n}" aria-pressed="${n === state.days}">${rangeLabel(n)}</button>`).join(''));
+    }
+    drawRanges(RANGES);
+    // Until the first answer says which ranges this server offers, the switch keeps its place
+    // and shows nothing, so a year's button never pops in beside the others.
+    rangeSeg.style.visibility = 'hidden';
 
     // ── Lights ─────────────────────────────────────────────────────────────────────────
     function applyPalette(p) {
@@ -277,14 +289,18 @@
       return show(new Date(t.getTime() + (d.utcOffsetMinutes || 0) * 60000), 'UTC');
     }
 
-    // The ranges offered: none longer than the days kept.
-    function fitRanges(keepDays) {
-      const keep = Number(keepDays) || 90;
-      const fits = RANGES.filter((n) => n <= keep);
-      const allowed = fits.length ? fits : [RANGES[0]];
+    // The ranges offered: those the answer lists, none longer than the days kept.
+    function fitRanges(d) {
+      const offered = Array.isArray(d.ranges) && d.ranges.length ? d.ranges.map(Number) : RANGES;
+      if (offered.join() !== state.ranges.join()) drawRanges(offered);
+      const keep = Number(d.keepDays) || 90;
+      const fits = offered.filter((n) => n <= keep);
+      const allowed = fits.length ? fits : [offered[0]];
       rangeSeg.querySelectorAll('button[data-days]').forEach((b) => { b.hidden = !allowed.includes(Number(b.dataset.days)); });
       if (allowed.includes(state.days)) return false;
       state.days = allowed[allowed.length - 1];
+      // The saved range follows, so the next visit asks for one the server keeps.
+      storeRange(state.days);
       rangeSeg.querySelectorAll('button[data-days]').forEach((b) => b.setAttribute('aria-pressed', String(Number(b.dataset.days) === state.days)));
       return true;
     }
@@ -305,6 +321,7 @@
 
     function renderError(message) {
       state.layout = 'error';
+      rangeSeg.style.visibility = '';
       body.innerHTML = `
         <section class="ls-panel ls-state ls-error ls-rise" role="alert">
           <span class="ls-state-ic">${svg('warning')}</span>
@@ -325,8 +342,8 @@
       if (onRecord) {
         title = `Nothing played in the last ${r.days} days`;
         text = `${someone ? `${someone}'s` : own ? 'Your' : 'Earlier'} listening is still here; a longer range shows it.`;
-        const longer = RANGES.find((n) => n > r.days);
-        if (longer) action = `<button type="button" class="btn ls-longer" data-days="${longer}">Show ${longer} days</button>`;
+        const longer = state.ranges.find((n) => n > r.days && !rangeSeg.querySelector(`[data-days="${n}"]`).hidden);
+        if (longer) action = `<button type="button" class="btn ls-longer" data-days="${longer}">Show ${longer === YEAR ? 'the last year' : `${longer} days`}</button>`;
       } else {
         title = someone ? `${someone} hasn't played anything yet` : own ? 'Your listening will show up here' : 'Listening will show up here';
         text = someone
@@ -459,9 +476,13 @@
       tween(part('artists'), r.artists, fmt0);
       tween(part('library'), r.libraryShare * 100, (n) => `${Math.round(n)}%`);
       part('library-k').textContent = o.canSeeEveryone ? 'from the library' : 'from your library';
-      // A change is only shown when the range before was on record for most of its length.
+      // A change is only shown when the range before was on record for most of its length. A year
+      // has no year before it on record (plays are kept a year at most), so it shows no change.
       const delta = part('delta');
-      if (r.change.kind === 'change' && r.change.percent != null) {
+      if (r.days >= YEAR) {
+        const since = r.change.since || r.firstPlay;
+        delta.textContent = since ? `Listening on record since ${shortDate(dayOf(since))}` : '';
+      } else if (r.change.kind === 'change' && r.change.percent != null) {
         const pct = r.change.percent;
         delta.innerHTML = `<span class="ls-chip ${pct < 0 ? 'down' : ''}">${pct >= 0 ? '+' : '\u2212'}${Math.abs(pct)}%</span> vs the ${r.days} days before (${fmt1(r.hoursBefore)} h)`;
       } else {
@@ -648,7 +669,8 @@
       if (Array.isArray(d.people)) state.people = d.people;
       renderHeading();
       renderWho();
-      if (fitRanges(d.keepDays)) { load(); return; }
+      if (fitRanges(d)) { load(); return; }
+      rangeSeg.style.visibility = '';
       if (!d.rollup || d.rollup.plays === 0) { renderEmpty(d); placeThumbs(); return; }
       rangeSeg.hidden = false;
       if (state.layout !== 'page') buildPage();

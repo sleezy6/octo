@@ -240,6 +240,16 @@ fn a_right_file_against_a_live_take_is_unclear() {
     assert_eq!(judge(&comparison, false), Heard::Unclear, "{comparison:?}");
 }
 
+/// A skit over one loop: few different numbers, but a new one at nearly every item, so every
+/// stretch is compared and the right file matches its preview.
+#[test]
+fn a_right_file_built_on_one_loop_matches_its_preview() {
+    let pair = fixture!("loop-skit.json");
+    let comparison = compare(&pair.file, &pair.preview).expect("enough audio");
+    assert!(comparison.bit_error < 0.05, "{comparison:?}");
+    assert_eq!(judge(&comparison, true), Heard::Match);
+}
+
 /// The water drops against a preview that may not be the song stay a question for a person.
 #[test]
 fn a_mismatch_against_a_preview_that_may_not_be_the_song_is_unclear() {
@@ -303,6 +313,76 @@ fn between_the_thresholds_is_unclear() {
 fn too_little_audio_is_not_compared() {
     assert_eq!(compare(&sound(1, 20.0), &sound(1, 200.0)), None);
     assert_eq!(compare(&sound(1, 120.0), &[]), None);
+}
+
+/// A held tone: one number over and over.
+fn tone(seconds: f64) -> Vec<u32> {
+    vec![0x5A5A_5A5A; (seconds / ITEM_SECONDS) as usize]
+}
+
+/// Silence in both is not the same song: the best stretch of a song with a quiet gap has to be
+/// one with sound in it.
+#[test]
+fn a_silent_stretch_in_both_does_not_pass_for_the_same_song() {
+    let mut file = tone(40.0);
+    file.extend(sound(1, 80.0));
+    let mut preview = tone(40.0);
+    preview.extend(sound(2, 150.0));
+    let comparison = compare(&file, &preview).expect("enough audio");
+    // A stretch may be up to 30% silence, and that part agrees by itself: unclear, never a match.
+    assert!(comparison.bit_error > MATCH_AT_MOST, "{comparison:?}");
+    assert_ne!(judge(&comparison, true), Heard::Match);
+}
+
+/// The sound after a silent gap still lines up with the song.
+#[test]
+fn a_right_file_with_a_silent_gap_still_matches() {
+    let song = sound(3, 150.0);
+    let mut file = tone(35.0);
+    file.extend(&song);
+    let comparison = compare(&file, &reencoded(&song, 2)).expect("enough audio");
+    assert_eq!(judge(&comparison, true), Heard::Match, "{comparison:?}");
+}
+
+#[test]
+fn a_silent_file_is_not_the_song() {
+    let comparison = compare(&tone(120.0), &sound(1, 200.0)).expect("a preview with sound");
+    assert_eq!(judge(&comparison, true), Heard::Mismatch, "{comparison:?}");
+}
+
+#[test]
+fn a_silent_preview_says_nothing() {
+    assert_eq!(compare(&sound(1, 120.0), &tone(200.0)), None);
+}
+
+/// A download that is all held tone against a preview that opens on the same tone could be the
+/// same recording, so it is not refused.
+#[test]
+fn a_quiet_download_says_nothing_against_a_preview_as_quiet_where_they_line_up() {
+    let mut preview = tone(60.0);
+    preview.extend(sound(1, 180.0));
+    assert_eq!(compare(&tone(120.0), &preview), None);
+}
+
+/// A song built on one short loop: few different numbers, but a new one at nearly every item.
+fn looped(seed: u64, seconds: f64) -> Vec<u32> {
+    let pattern = sound(seed, 5.0);
+    pattern
+        .iter()
+        .copied()
+        .cycle()
+        .take((seconds / ITEM_SECONDS) as usize)
+        .collect()
+}
+
+/// A loop that keeps coming back, like a skit over one sample, is compared like any music.
+#[test]
+fn a_looping_song_is_still_compared() {
+    let song = looped(5, 150.0);
+    let comparison = compare(&song[..song.len() * 4 / 5], &reencoded(&song, 2)).expect("enough audio");
+    assert_eq!(judge(&comparison, true), Heard::Match, "{comparison:?}");
+    let other = compare(&looped(6, 120.0), &song).expect("enough audio");
+    assert_eq!(judge(&other, true), Heard::Mismatch, "{other:?}");
 }
 
 // ---- The check end to end ---------------------------------------------------------------

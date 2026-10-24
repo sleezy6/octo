@@ -2,7 +2,7 @@
 
 Every change this modified version makes to [winters27/octo](https://github.com/winters27/octo),
 one row each: what upstream does, what this version does instead, and the settings, endpoints
-and files involved. Upstream's own changes are merged in as they come; a row goes when upstream
+and files involved. Upstream's own changes are merged in as they come (last: 2026.10.22.1); a row goes when upstream
 takes the same change over (as it did with the cover badge and the busy-LRCLIB fix in 2026.10.21;
 note that upstream's `Subsonic:CoverBadge` is on by default where this fork's `BadgeOutsideCovers`
 was off, so `COVER_BADGE=false` keeps outside covers plain from then on).

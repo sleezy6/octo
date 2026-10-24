@@ -1398,3 +1398,80 @@ async fn listening_is_hidden_while_the_dashboard_sign_in_is_off() {
     assert_eq!(not_cleared.status, StatusCode::FORBIDDEN);
     assert_eq!(state.listening.plays_of("admin").len(), 1);
 }
+
+// ---- Playlists kept ready ----------------------------------------------------------------------
+
+#[tokio::test]
+async fn playlists_kept_ready_are_each_persons_and_hidden_while_the_sign_in_is_off() {
+    let factory = SignInFactory::new().await;
+    let log = &factory.state.listening;
+    assert!(log.record("admin", listened("a")));
+    assert!(log.record("listener", listened("b")));
+    assert_eq!(
+        get(&factory.app, "/api/admin/prefetch/keep-ready").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // The dashboard: anyone's, with the people to choose from.
+    let cookie = cookie_of(&factory.sign_in("admin", "pw").await);
+    let theirs = get_cookie(
+        &factory.app,
+        "/api/admin/prefetch/keep-ready?user=listener",
+        &cookie,
+    )
+    .await;
+    assert_eq!(theirs.status, StatusCode::OK, "{}", theirs.text());
+    let theirs = theirs.json();
+    assert_eq!(theirs["user"], "listener");
+    assert_eq!(theirs["mostPlayed"], true);
+    assert_eq!(theirs["people"].as_array().expect("people").len(), 2);
+    let put = |body: Value| {
+        let cookie = cookie.clone();
+        let app = factory.app.clone();
+        async move {
+            send(
+                &app,
+                Method::PUT,
+                "/api/admin/prefetch/keep-ready",
+                &[("X-Octo-Admin", "1"), ("Cookie", &cookie)],
+                Some(&body.to_string()),
+            )
+            .await
+        }
+    };
+    let saved = put(json!({ "user": "listener", "lists": [], "mostPlayed": false })).await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.text());
+    assert_eq!(saved.json()["mostPlayed"], false);
+    assert_eq!(
+        get_cookie(
+            &factory.app,
+            "/api/admin/prefetch/keep-ready?user=listener",
+            &cookie
+        )
+        .await
+        .json()["mostPlayed"],
+        false
+    );
+    let unknown = put(json!({ "user": "listener", "lists": ["oi-nobodys"] })).await;
+    assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
+    assert!(
+        unknown.text().contains("not one of listener's playlists"),
+        "{}",
+        unknown.text()
+    );
+
+    // An app's own sign-in does not open it: members choose theirs on the family page.
+    let app_call = get(
+        &factory.app,
+        "/api/admin/prefetch/keep-ready?user=admin&u=listener&p=pw&v=1.16.1&c=test",
+    )
+    .await;
+    assert_eq!(app_call.status, StatusCode::UNAUTHORIZED);
+
+    // With the sign-in off, nobody's.
+    let state = AppState::for_tests(AppSettings::default());
+    let open = app(state);
+    let refused = get(&open, "/api/admin/prefetch/keep-ready").await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert!(refused.text().contains("dashboard sign-in"), "{}", refused.text());
+}

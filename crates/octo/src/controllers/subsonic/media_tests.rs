@@ -1239,3 +1239,171 @@ async fn a_range_past_the_end_of_a_known_stream_is_a_416_with_its_size() {
     .await;
     assert_eq!(downloads.stream_calls().len(), 1);
 }
+
+// ---- A kept outside song in Octo's apps --------------------------------------------------
+
+/// An outside song with a preview to stream, a library that can be given its file, and the
+/// state over both, with getting songs ahead off.
+fn kept_song_state(
+    navidrome: &MockServer,
+    wait_for_lossless: bool,
+) -> (crate::app::AppState, Arc<FakeStreams>, Arc<FakeLibrary>) {
+    let downloads = Arc::new(FakeStreams::streaming(
+        "soulseek",
+        "track-id",
+        &[1, 2, 3],
+        "audio/mp4",
+    ));
+    let library = Arc::new(FakeLibrary::with_external(
+        "external-track",
+        "soulseek",
+        "track-id",
+    ));
+    let state = state_with(
+        playback_settings(&navidrome.uri(), wait_for_lossless, false),
+        |inner| {
+            inner.download_service = downloads.clone();
+            inner.local_library = library.clone();
+        },
+    );
+    (state, downloads, library)
+}
+
+/// The song's file in the library, as a heart leaves it.
+fn keep_file(library: &FakeLibrary, dir: &tempfile::TempDir) {
+    let path = dir.path().join("song.mp3");
+    std::fs::write(&path, [7, 7, 7, 7]).expect("written");
+    library.local_paths.lock().insert(
+        ("soulseek".into(), "track-id".into()),
+        path.to_string_lossy().into_owned(),
+    );
+}
+
+#[tokio::test]
+async fn an_octo_app_plays_a_kept_songs_file_with_getting_songs_ahead_off() {
+    let navidrome = ping_ok().await;
+    let (state, downloads, library) = kept_song_state(&navidrome, false);
+    let dir = tempfile::tempdir().expect("a temp dir");
+    keep_file(&library, &dir);
+    let app = app(&state);
+
+    let reply = get(
+        &app,
+        "/rest/stream?id=external-track&u=alice&t=good&s=salt&v=1.16.1&c=Octo",
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body.as_ref(), [7, 7, 7, 7]);
+    assert_eq!(reply.header("content-type"), Some("audio/mpeg"));
+    assert!(downloads.stream_calls().is_empty(), "no preview opened");
+}
+
+#[tokio::test]
+async fn other_apps_keep_a_kept_songs_preview() {
+    let navidrome = ping_ok().await;
+    let (state, downloads, library) = kept_song_state(&navidrome, false);
+    let dir = tempfile::tempdir().expect("a temp dir");
+    keep_file(&library, &dir);
+    let app = app(&state);
+
+    let reply = get(
+        &app,
+        "/rest/stream?id=external-track&u=alice&t=good&s=salt&v=1.16.1&c=NaviBeat",
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body.as_ref(), [1, 2, 3]);
+    assert_eq!(reply.header("content-type"), Some("audio/mp4"));
+    assert_eq!(downloads.stream_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn an_octo_app_play_that_started_on_the_preview_keeps_it_once_the_file_lands() {
+    let navidrome = ping_ok().await;
+    let (state, downloads, library) = kept_song_state(&navidrome, false);
+    let app = app(&state);
+    let url = "/rest/stream?id=external-track&u=alice&t=good&s=salt&v=1.16.1&c=Octo";
+
+    let first = send(&app, Method::GET, url, &[("Range", "bytes=0-")], Body::empty()).await;
+    assert_eq!(first.body.as_ref(), [1, 2, 3]);
+
+    let dir = tempfile::tempdir().expect("a temp dir");
+    keep_file(&library, &dir);
+    let later = send(&app, Method::GET, url, &[("Range", "bytes=2-")], Body::empty()).await;
+
+    assert_eq!(later.body.as_ref(), [1, 2, 3], "still the preview");
+    assert_eq!(later.header("content-type"), Some("audio/mp4"));
+    assert_eq!(downloads.stream_calls().len(), 2);
+}
+
+#[tokio::test]
+async fn an_octo_app_still_waits_for_lossless_on_a_song_not_kept_yet() {
+    let navidrome = ping_ok().await;
+    let (state, downloads, _library) = kept_song_state(&navidrome, true);
+    let app = app(&state);
+    let response = tokio::spawn(async move {
+        get(
+            &app,
+            "/rest/stream?id=external-track&u=alice&t=good&s=salt&v=1.16.1&c=Octo",
+        )
+        .await
+    });
+
+    let queue = state.track_acquisition_queue.clone();
+    let request = tokio::time::timeout(Duration::from_secs(30), queue.dequeue(&CancellationToken::new()))
+        .await
+        .expect("the stream queued an acquisition")
+        .expect("a request");
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("octo-playback.flac");
+    std::fs::write(&path, [4, 5, 6]).expect("written");
+    request
+        .completion
+        .try_set_result(path.to_string_lossy().into_owned());
+    queue.release(&request);
+
+    let response = response.await.expect("the request ran");
+    assert_eq!(response.body.as_ref(), [4, 5, 6]);
+    assert_eq!(response.header("content-type"), Some("audio/flac"));
+    assert!(
+        downloads.stream_calls().is_empty(),
+        "the play waited for the lossless copy"
+    );
+}
+
+#[tokio::test]
+async fn an_octo_app_play_served_its_lossless_copy_keeps_it_on_the_next_range() {
+    let navidrome = ping_ok().await;
+    let (state, downloads, library) = kept_song_state(&navidrome, true);
+    let app = app(&state);
+    let url = "/rest/stream?id=external-track&u=alice&t=good&s=salt&v=1.16.1&c=Octo";
+    let first = {
+        let app = app.clone();
+        tokio::spawn(async move { get(&app, url).await })
+    };
+    let queue = state.track_acquisition_queue.clone();
+    let request = tokio::time::timeout(Duration::from_secs(30), queue.dequeue(&CancellationToken::new()))
+        .await
+        .expect("the stream queued an acquisition")
+        .expect("a request");
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("octo-playback.flac");
+    std::fs::write(&path, [4, 5, 6]).expect("written");
+    request
+        .completion
+        .try_set_result(path.to_string_lossy().into_owned());
+    queue.release(&request);
+    assert_eq!(first.await.expect("ran").body.as_ref(), [4, 5, 6]);
+    // The copy is now the song's file in the library.
+    library.local_paths.lock().insert(
+        ("soulseek".into(), "track-id".into()),
+        path.to_string_lossy().into_owned(),
+    );
+
+    let later = send(&app, Method::GET, url, &[("Range", "bytes=2-")], Body::empty()).await;
+    assert_eq!(later.header("content-type"), Some("audio/flac"));
+    assert_eq!(later.body.as_ref(), [6]);
+    assert!(downloads.stream_calls().is_empty(), "never the preview");
+}

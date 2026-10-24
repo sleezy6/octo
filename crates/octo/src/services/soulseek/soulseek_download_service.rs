@@ -52,6 +52,7 @@ use super::soulseek_client::{SoulseekClient, SoulseekClientError};
 use super::soulseek_link::ISoulseekLink;
 use super::soulseek_metadata_service::SoulseekMetadataService;
 use crate::services::common::acquisition_tracker::acquisition_event_kinds;
+use crate::services::common::base_download_service::AheadBusy;
 use crate::services::common::download_picks::{LIDARR_SOURCE, SOULSEEK_SOURCE};
 use crate::services::common::{
     AcquisitionState, BaseDownloadService, DownloadBackend, DownloadCore, DownloadServices,
@@ -65,6 +66,8 @@ use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::library::upgrade_queue::AudioSummary;
 use crate::services::lidarr::{ILidarrTrackFetcher, LidarrImport, LidarrImportHandoff, LidarrTrackRequest};
 use crate::services::metadata::deezer_requests::{DeezerRequestCounter, DeezerUse};
+use crate::services::prefetch::PreviewCopies;
+use crate::services::prefetch::preview_copies::copy_after;
 use crate::services::spotiflac::SpotiflacClient;
 use crate::services::you_tube::{YouTubeHit, YouTubeResolver};
 use octo_core::common::acquisition_tracker::user_safe;
@@ -203,6 +206,8 @@ pub struct SoulseekDownloadParts {
     pub lidarr_fetcher: Option<Arc<dyn ILidarrTrackFetcher>>,
     /// The person's SpotiFLAC server, when one is set up. Asked only while it is on.
     pub spotiflac: Option<Arc<SpotiflacClient>>,
+    /// Whole copies of previews, which a preview is served from once it has one.
+    pub preview_copies: Option<Arc<PreviewCopies>>,
 }
 
 /// Hybrid download service:
@@ -228,6 +233,7 @@ pub struct SoulseekDownloadService {
     lidarr_imports: Option<Arc<LidarrImportHandoff>>,
     lidarr_fetcher: Option<Arc<dyn ILidarrTrackFetcher>>,
     spotiflac: Option<Arc<SpotiflacClient>>,
+    preview_copies: Option<Arc<PreviewCopies>>,
 
     // Set once slskd has said where its incomplete folder is; until then each download asks again.
     excluded_folders: Mutex<Option<Vec<String>>>,
@@ -294,6 +300,7 @@ impl SoulseekDownloadService {
             lidarr_imports: parts.lidarr_imports,
             lidarr_fetcher: parts.lidarr_fetcher,
             spotiflac: parts.spotiflac,
+            preview_copies: parts.preview_copies,
             excluded_folders: Mutex::new(None),
             prepared: Mutex::new(HashMap::new()),
             slskd_downloads: Mutex::new(None),
@@ -1618,11 +1625,18 @@ impl SoulseekDownloadService {
         });
         self.sweep_job_folders(base);
 
+        // A download ahead leaves a file an album walk queued to the walk, which keeps the song in
+        // the library.
+        if download.ahead && self.prepared.lock().contains_key(&track_key) {
+            return Err(AheadBusy.into());
+        }
         // A copy picked in Find songs is the only one tried: no search, and no other peer after it.
+        // A download ahead leaves the pick to the download it was made for.
         let picked = base
             .services()
             .picks
             .as_ref()
+            .filter(|_| !download.ahead)
             .and_then(|picks| picks.take(&track_key, SOULSEEK_SOURCE))
             .and_then(|pick| pick.to_hit());
         let remembers = self.verification.remembers_rejections();
@@ -1661,8 +1675,9 @@ impl SoulseekDownloadService {
             .as_ref()
             .is_some_and(|picked| soulseek_candidates::judge(picked, song_judged).1 >= 2);
         // An album walk may have queued this song's file already, from one peer's folder of the
-        // album. That file is tried first, without a search; the search runs only if it fails.
-        let prepared = if picked.is_none() {
+        // album. That file is tried first, without a search; the search runs only if it fails. A
+        // download ahead leaves it to the walk, which keeps the song in the library.
+        let prepared = if picked.is_none() && !download.ahead {
             self.prepared.lock().remove(&track_key)
         } else {
             None
@@ -2745,6 +2760,18 @@ impl DownloadBackend for SoulseekDownloadService {
             return Ok(None);
         };
 
+        // A whole copy answers on its own, as long as it is the size the song is known to be.
+        let confirmed = self
+            .id_registry
+            .stream_facts(external_id)
+            .filter(|facts| facts.size_confirmed)
+            .and_then(|facts| facts.size);
+        if let Some(copies) = &self.preview_copies
+            && let Some(copy) = copies.serve(&video_id, range_header, confirmed).await
+        {
+            return Ok(Some(copy));
+        }
+
         let Some(opened) = self.youtube.open_stream(&video_id, range_header).await else {
             warn!("yt-dlp shim failed to open stream for vid={video_id}");
             return Ok(None);
@@ -2779,6 +2806,19 @@ impl DownloadBackend for SoulseekDownloadService {
                 .map(|range| format!(", range={range}"))
                 .unwrap_or_default()
         );
+
+        // A player that reads the preview in pieces (a probe of its first bytes, or a range past
+        // its start) gets a whole copy made once, and its next pieces come from there.
+        if let Some(copies) = &self.preview_copies
+            && copy_after(opened.status_code, range_header)
+        {
+            let total = played_size(
+                opened.status_code,
+                opened.content_length,
+                opened.content_range.as_deref(),
+            );
+            copies.start(&video_id, total);
+        }
 
         // The response owns the shim's connection: dropping the stream closes it.
         Ok(Some(DirectStreamInfo {

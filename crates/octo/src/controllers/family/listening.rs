@@ -17,13 +17,16 @@ fn query_value(query: Option<&str>, name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-async fn page(state: &AppState, days: i64, user: Option<String>, everyone: bool) -> Response {
+/// The page for the range `range` asks for.
+async fn page(state: &AppState, range: Option<String>, user: Option<String>, everyone: bool) -> Response {
     let log = state.listening.clone();
     let keep_days = state.settings.current().listening.effective_keep_days();
+    let days = rollups::range_of(range.as_deref(), keep_days);
     let answer = tokio::task::spawn_blocking(move || {
         let mut page = listening::page(&log, days, user.as_deref(), everyone);
         page["everyone"] = json!(everyone);
         page["keepDays"] = json!(keep_days);
+        page["ranges"] = json!(rollups::ranges(keep_days));
         page
     })
     .await;
@@ -36,17 +39,22 @@ async fn page(state: &AppState, days: i64, user: Option<String>, everyone: bool)
     }
 }
 
-/// `GET /api/family/me/listening?range=7|30|90`: the signed-in member's own listening.
+/// `GET /api/family/me/listening?range=7|30|90|365`: the signed-in member's own listening.
 pub async fn my_listening(State(state): State<AppState>, web: Web, RawQuery(query): RawQuery) -> Response {
     let (signed, _) = match web.member(&state).await {
         Ok(found) => found,
         Err(res) => return res,
     };
-    let days = rollups::range_of(query_value(query.as_deref(), "range").as_deref());
-    page(&state, days, Some(signed.user().to_string()), false).await
+    page(
+        &state,
+        query_value(query.as_deref(), "range"),
+        Some(signed.user().to_string()),
+        false,
+    )
+    .await
 }
 
-/// `GET /api/family/listening?range=7|30|90[&user=]`: everyone's listening with the people
+/// `GET /api/family/listening?range=7|30|90|365[&user=]`: everyone's listening with the people
 /// grid, or one person's, for someone who manages the family.
 pub async fn family_listening(
     State(state): State<AppState>,
@@ -56,6 +64,11 @@ pub async fn family_listening(
     if let Err(res) = web.manager(&state).await {
         return res;
     }
-    let days = rollups::range_of(query_value(query.as_deref(), "range").as_deref());
-    page(&state, days, query_value(query.as_deref(), "user"), true).await
+    page(
+        &state,
+        query_value(query.as_deref(), "range"),
+        query_value(query.as_deref(), "user"),
+        true,
+    )
+    .await
 }

@@ -15,6 +15,7 @@ pub mod address;
 pub mod admin_entry;
 pub mod handover;
 pub mod imports;
+pub mod keep_ready;
 pub mod listening;
 pub mod manage;
 
@@ -109,6 +110,10 @@ pub fn routes() -> RouteSet {
         .route("/api/family/me/ntfy", put(set_ntfy))
         .route("/api/family/me/lastfm", get(my_last_fm))
         .route("/api/family/me/listening", get(listening::my_listening))
+        .route(
+            "/api/family/me/keep-ready",
+            get(keep_ready::my_keep_ready).put(keep_ready::set_my_keep_ready),
+        )
         .route("/api/family/me/imports", get(imports::my_imports))
         .route("/api/family/me/imports/text", post(imports::import_text))
         .route(

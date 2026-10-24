@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use super::play_source::PlaySources;
+use super::preview_copies::PreviewCopies;
 use super::queue_window::{SavedQueue, window};
 use super::store::{PrefetchStore, free_bytes, prepare_folder};
 use crate::services::common::base_download_service::AheadBusy;
@@ -85,6 +86,8 @@ enum Reason {
     Upcoming,
     /// It is kept ready in a mix, after everything that plays soon.
     Mix,
+    /// It is in a playlist kept ready, with the mixes kept ready.
+    Kept,
 }
 
 /// How a song is fetched.
@@ -174,6 +177,7 @@ pub struct PrefetchService {
     sources: PlaySources,
     wake: Notify,
     mixes: OnceLock<Arc<GeneratedPlaylistService>>,
+    copies: OnceLock<Arc<PreviewCopies>>,
 }
 
 impl PrefetchService {
@@ -185,6 +189,7 @@ impl PrefetchService {
             sources,
             wake: Notify::new(),
             mixes: OnceLock::new(),
+            copies: OnceLock::new(),
         })
     }
 
@@ -205,9 +210,37 @@ impl PrefetchService {
             .collect()
     }
 
+    /// The songs waiting to be fetched, in order, with the listeners each is for and whether it
+    /// goes to the prefetch folder.
+    #[cfg(test)]
+    pub(crate) fn queued_jobs(&self) -> Vec<(String, Vec<String>, bool)> {
+        self.state
+            .lock()
+            .queued
+            .iter()
+            .map(|job| {
+                (
+                    job.external_id.clone(),
+                    job.listeners.clone(),
+                    job.kind == Kind::Ahead,
+                )
+            })
+            .collect()
+    }
+
     /// Gives the service the mixes, for keeping them ready. Once only.
     pub fn use_mixes(&self, mixes: Arc<GeneratedPlaylistService>) {
         let _ = self.mixes.set(mixes);
+    }
+
+    /// Gives the service the preview copies, which it sweeps with its own folder. Once only.
+    pub fn use_preview_copies(&self, copies: Arc<PreviewCopies>) {
+        let _ = self.copies.set(copies);
+    }
+
+    /// The preview copies, once given.
+    pub fn preview_copies(&self) -> Option<&Arc<PreviewCopies>> {
+        self.copies.get()
     }
 
     fn settings(&self) -> PrefetchSettings {
@@ -364,12 +397,26 @@ impl PrefetchService {
                     }
                     continue;
                 }
-                if let Some(job) = state.queued.iter_mut().find(|j| j.key() == key) {
-                    if !job.is_for(user) {
+                if let Some(at) = state.queued.iter().position(|j| j.key() == key) {
+                    if state.queued[at].reason > Reason::Upcoming {
+                        // Kept ready, and now coming up: it moves up to the songs that play soon.
+                        if let Some(mut job) = state.queued.remove(at) {
+                            job.reason = Reason::Upcoming;
+                            job.kind = kind;
+                            if !job.is_for(user) {
+                                job.listeners.push(user.to_string());
+                            }
+                            let to = state
+                                .queued
+                                .iter()
+                                .position(|j| j.reason > Reason::Upcoming)
+                                .unwrap_or(state.queued.len());
+                            state.queued.insert(to, job);
+                        }
+                    } else if let Some(job) = state.queued.get_mut(at)
+                        && !job.is_for(user)
+                    {
                         job.listeners.push(user.to_string());
-                    }
-                    if job.reason == Reason::Mix {
-                        job.reason = Reason::Upcoming;
                     }
                     continue;
                 }
@@ -391,6 +438,66 @@ impl PrefetchService {
             }
         }
         self.wake.notify_one();
+    }
+
+    /// Queues the songs of the playlists kept ready, after everything else: `songs` is each
+    /// listener's outside song ids. Songs queued for playlists kept ready before and not asked for
+    /// now leave the queue. A listener whose plays keep no copies gets none.
+    pub async fn keep_ready(&self, songs: Vec<(String, Vec<String>)>) {
+        // Into the prefetch folder, under its space and days, even with DownloadOnPlay on: a song
+        // kept ready is not a song played.
+        let kind = Kind::Ahead;
+        let mut fresh = Vec::new();
+        for (user, ids) in songs {
+            if !self.may_keep_copies(&user, None) {
+                continue;
+            }
+            for id in ids {
+                let (true, Some(provider), Some(external_id)) = self.parts.library.parse_song_id(&id) else {
+                    continue;
+                };
+                if self.wanted(&provider, &external_id).await {
+                    fresh.push(Job {
+                        provider,
+                        external_id,
+                        client_id: id,
+                        listeners: vec![user.clone()],
+                        reason: Reason::Kept,
+                        kind,
+                    });
+                }
+            }
+        }
+        {
+            let mut state = self.state.lock();
+            state.queued.retain(|job| job.reason != Reason::Kept);
+            for job in fresh {
+                let key = job.key();
+                if !state.running.contains_key(&key) && !state.queued.iter().any(|j| j.key() == key) {
+                    state.queued.push_back(job);
+                }
+            }
+        }
+        self.wake.notify_one();
+    }
+
+    /// Whether an outside song has its FLAC here: fetched ahead, or in the library.
+    pub async fn flac_ready(&self, id: &str) -> bool {
+        let (true, Some(provider), Some(external_id)) = self.parts.library.parse_song_id(id) else {
+            return false;
+        };
+        self.parts.store.is_ready(&provider, &external_id)
+            || self
+                .parts
+                .library
+                .get_local_path_for_external_song(&provider, &external_id)
+                .await
+                .is_some_and(|path| std::path::Path::new(&path).is_file())
+    }
+
+    /// The bytes the songs fetched ahead take.
+    pub fn flac_bytes(&self) -> u64 {
+        self.parts.store.sizes().1
     }
 
     /// Whether a song is worth fetching ahead: not ready, not being downloaded, not resting
@@ -563,6 +670,9 @@ impl PrefetchService {
             self.parts
                 .store
                 .sweep(settings.effective_keep_days(), settings.effective_cache_bytes());
+            if let Some(copies) = self.copies.get().cloned() {
+                let _ = tokio::task::spawn_blocking(move || copies.sweep()).await;
+            }
         }
         if !settings.enabled {
             let mut state = self.state.lock();
@@ -595,7 +705,10 @@ impl PrefetchService {
             return;
         }
         for job in state.queued.iter_mut() {
-            job.listeners.retain(|l| !idle.contains(&user_key(l)));
+            // A song kept ready keeps the listener it is for, whose library it goes to.
+            if job.reason == Reason::Upcoming {
+                job.listeners.retain(|l| !idle.contains(&user_key(l)));
+            }
         }
         state
             .queued
@@ -640,7 +753,9 @@ impl PrefetchService {
         if self.paused(settings).await.is_some() {
             return false;
         }
-        let cap = settings.effective_cache_bytes();
+        // The space also holds the preview copies kept for playlists kept ready.
+        let kept = self.copies.get().map_or(0, |copies| copies.kept_bytes());
+        let cap = settings.effective_cache_bytes().saturating_sub(kept);
         if self.parts.store.over(cap) {
             self.parts.store.sweep(settings.effective_keep_days(), cap);
             if self.parts.store.over(cap) {

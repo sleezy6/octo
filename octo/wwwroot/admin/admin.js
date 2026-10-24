@@ -1309,6 +1309,134 @@ document.getElementById('rejected-peers-clear')?.addEventListener('click', async
   }
 });
 
+// ---- Keep playlists ready ------------------------------------------------
+//
+// One person's playlists that can hold songs not in the library yet, each picked or kept for
+// being played from most. A click saves at once.
+
+let keepReadyUser = '';
+let keepReadyView = null;
+
+const KEEP_READY_KINDS = { import: 'Imported', mix: 'Mix', chart: 'Chart', family: 'Family playlist' };
+
+function keepReadyMeta(list) {
+  const parts = [KEEP_READY_KINDS[list.kind] || 'Playlist'];
+  if (!list.outside) {
+    parts.push('every song is in the library');
+  } else {
+    parts.push(`${list.previewsReady} of ${list.outside} ready`);
+    if (list.flacReady) parts.push(`${list.flacReady} as FLAC`);
+  }
+  return parts.join(' · ');
+}
+
+function keepReadyRow(list) {
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'kr-list';
+  row.dataset.id = list.id;
+  row.setAttribute('aria-pressed', String(!!list.picked));
+  row.innerHTML = `<span class="kr-check">${icon('i-check')}</span>`
+    + `<span class="kr-text"><span class="kr-name">${esc(list.name)}</span>`
+    + `<span class="kr-meta">${esc(keepReadyMeta(list))}</span></span>`
+    + (list.byMostPlayed ? '<span class="kr-tag">Played most</span>' : '');
+  row.addEventListener('click', () => saveKeepReady({ toggle: list.id }, row));
+  return row;
+}
+
+async function loadKeepReady(user = keepReadyUser) {
+  const card = document.getElementById('keep-ready-card');
+  if (!card) return;
+  const lists = document.getElementById('keep-ready-lists');
+  const mostRow = document.getElementById('keep-ready-most-row');
+  const most = document.getElementById('f-keep-ready-most');
+  const personWrap = document.getElementById('keep-ready-person-wrap');
+  const person = document.getElementById('keep-ready-person');
+  const noteRow = document.getElementById('keep-ready-note-row');
+  const say = text => {
+    document.getElementById('keep-ready-note').textContent = text;
+    noteRow.hidden = !text;
+  };
+  let view;
+  try {
+    const query = user ? `?user=${encodeURIComponent(user)}` : '';
+    const r = await api(`/api/admin/prefetch/keep-ready${query}`, { cache: 'no-store' });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      lists.hidden = true;
+      mostRow.hidden = true;
+      personWrap.hidden = true;
+      say(body.error || `Could not load the playlists (HTTP ${r.status}).`);
+      return;
+    }
+    view = body;
+  } catch {
+    say('Could not load the playlists.');
+    return;
+  }
+  keepReadyView = view;
+  keepReadyUser = view.user || '';
+  const people = view.people || [];
+  personWrap.hidden = people.length < 2;
+  person.replaceChildren(...people.map(name => new Option(name, name, false, name === keepReadyUser)));
+  card.classList.toggle('off', !view.enabled);
+  mostRow.hidden = !keepReadyUser;
+  most.checked = !!view.mostPlayed;
+  // The row that had the focus keeps it through the redraw.
+  const focused = document.activeElement?.closest?.('.kr-list')?.dataset.id;
+  lists.replaceChildren(...view.lists.map(keepReadyRow));
+  lists.hidden = view.lists.length === 0;
+  if (focused) [...lists.children].find(row => row.dataset.id === focused)?.focus();
+
+  let text = '';
+  if (!keepReadyUser) text = 'Playlists show up here once someone has played something.';
+  else if (!view.enabled) text = 'Turn on Download songs ahead to keep playlists ready.';
+  else if (!view.lists.length) text = 'None of these playlists can hold songs that are not in the library yet. Imported playlists streamed without downloading, mixes and charts show up here.';
+  else if (view.mostPlayed && !view.listeningOn) text = 'Finding the playlists played most needs Listening on, so plays are recorded.';
+  else if (view.keptCap && view.keptBytes >= view.keptCap) text = `The space is full at ${gigabytes(view.keptBytes)}. Raise Space to use to keep more ready.`;
+  else if (view.keptBytes) text = `${gigabytes(view.keptBytes)} kept ready.`;
+  say(text);
+}
+
+// Saves go one at a time, each from the choices as the clicks so far left them, so a quick
+// second click never sends a list without the first.
+let keepReadySaving = Promise.resolve();
+
+function saveKeepReady(change, source) {
+  const view = keepReadyView;
+  if (!view) return;
+  if (change.toggle) {
+    const list = view.lists.find(item => item.id === change.toggle);
+    if (list) list.picked = !list.picked;
+    source?.setAttribute('aria-pressed', String(!!list?.picked));
+  }
+  if (change.mostPlayed !== undefined) view.mostPlayed = change.mostPlayed;
+  const user = keepReadyUser;
+  keepReadySaving = keepReadySaving.then(async () => {
+    const lists = view.lists.filter(list => list.picked).map(list => list.id);
+    try {
+      const r = await api('/api/admin/prefetch/keep-ready', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user, lists, mostPlayed: view.mostPlayed }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+    } catch (error) {
+      // On the card's first row, which the redraw keeps.
+      note(document.querySelector('#keep-ready-card > .set-row'), `Could not save: ${error.message}`, 'error');
+    }
+    if (keepReadyView === view) await loadKeepReady(user);
+  });
+}
+
+document.getElementById('keep-ready-person')?.addEventListener('change', event => {
+  loadKeepReady(event.currentTarget.value);
+});
+document.getElementById('f-keep-ready-most')?.addEventListener('change', event => {
+  saveKeepReady({ mostPlayed: event.currentTarget.checked }, event.currentTarget.closest('.set-row'));
+});
+
 // ---- Get upcoming songs ahead ----------------------------------------------
 //
 // The card's status line: the songs ready, the space they take against the cap and what is
@@ -1329,6 +1457,7 @@ function songWords(song) {
 }
 
 async function loadPrefetch() {
+  loadKeepReady();
   const line = document.getElementById('prefetch-status');
   const activity = document.getElementById('prefetch-activity');
   const clear = document.getElementById('prefetch-clear');

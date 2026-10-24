@@ -1727,7 +1727,7 @@ fn record_listening(
         album: song.album.clone(),
         is_local: song.is_local,
         app: octo_core::family::device::app_label(client, &user_agent),
-        platform: listening::platform_of(&user_agent).to_string(),
+        platform: listening::platform_of(&user_agent, client).to_string(),
         device_id: device_id.map(str::to_string),
         source: "scrobble".to_string(),
         ..Default::default()

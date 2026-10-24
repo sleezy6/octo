@@ -128,9 +128,20 @@ struct HeartLine {
     at: DateTime<Utc>,
 }
 
-/// The platform in a User-Agent's parentheses: `Octo/1.9.0 (Android)` is android. Android is
-/// checked before Linux, since Android's own agents name both.
-pub fn platform_of(user_agent: &str) -> &'static str {
+/// The platform a play came from: the app's name when it says (an iPhone app's Mac build names
+/// the Mac in its agent), then the User-Agent's own words in its parentheses
+/// (`Octo/1.9.0 (Android)` is android; Android is checked before Linux, since Android's own agents
+/// name both).
+pub fn platform_of(user_agent: &str, client: &str) -> &'static str {
+    let app = client.trim().to_ascii_lowercase();
+    let lower = user_agent.to_ascii_lowercase();
+    let on_a_mac = lower.contains("macintosh") || lower.contains("mac os") || lower.contains("macos");
+    if IPHONE_APPS.iter().any(|name| app.starts_with(name)) {
+        return if on_a_mac { "macos" } else { "iphone" };
+    }
+    if ANDROID_APPS.iter().any(|name| app.starts_with(name)) {
+        return "android";
+    }
     let inside = user_agent
         .split_once('(')
         .map(|(_, rest)| rest.split(')').next().unwrap_or(rest))
@@ -150,6 +161,12 @@ pub fn platform_of(user_agent: &str) -> &'static str {
         UNKNOWN_PLATFORM
     }
 }
+
+/// Players that only run on iPhone and iPad, by the name they send as `c`. play:Sub sends
+/// `playSub_` and the device's model.
+const IPHONE_APPS: [&str; 5] = ["amperfy", "playsub", "play:sub", "isub", "arpeggi"];
+/// Players that only run on Android, by the name they send as `c`.
+const ANDROID_APPS: [&str; 6] = ["dsub", "ultrasonic", "symfonium", "tempo", "subtracks", "tempus"];
 
 /// What a play is written from: the song as its scrobble described it, and where its genre
 /// may be found.

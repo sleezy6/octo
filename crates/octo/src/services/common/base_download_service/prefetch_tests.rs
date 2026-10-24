@@ -188,12 +188,14 @@ async fn a_real_flac_heart_takes_the_file_too() {
     assert!(Path::new(&landed).starts_with(w.root.path()));
 }
 
-/// A transfer that waits until the test lets it finish, counting how many ran.
+/// A transfer that waits until the test lets it finish, counting how many ran. With
+/// `only_flac_only`, only a transfer that must be a real FLAC (a download ahead's) waits.
 struct GatedBackend {
     root: std::path::PathBuf,
     open: Arc<Notify>,
     started: Arc<Notify>,
     transfers: Arc<AtomicUsize>,
+    only_flac_only: bool,
 }
 
 #[async_trait]
@@ -213,8 +215,10 @@ impl DownloadBackend for GatedBackend {
         _: &CancellationToken,
     ) -> anyhow::Result<String> {
         self.transfers.fetch_add(1, Ordering::SeqCst);
-        self.started.notify_one();
-        self.open.notified().await;
+        if download.flac_only || !self.only_flac_only {
+            self.started.notify_one();
+            self.open.notified().await;
+        }
         let staging = self.root.join(".octo-incoming").join("gated");
         std::fs::create_dir_all(&staging)?;
         let path = staging.join(format!("{}.flac", download.track_id));
@@ -227,73 +231,124 @@ impl DownloadBackend for GatedBackend {
     }
 }
 
+/// A service over a [`GatedBackend`], with songs t1 and t2 of album a1 and a prefetch folder.
+struct Gated {
+    service: Arc<BaseDownloadService>,
+    backend: Arc<GatedBackend>,
+    store: Arc<PrefetchStore>,
+    history: Arc<DownloadHistoryService>,
+    root: tempfile::TempDir,
+    folder: tempfile::TempDir,
+}
+
+impl Gated {
+    fn new(only_flac_only: bool) -> Gated {
+        let root = tempfile::tempdir().expect("the music folder");
+        let folder = tempfile::tempdir().expect("the prefetch folder");
+        let in_folder = folder.path().to_path_buf();
+        let store = Arc::new(PrefetchStore::new(
+            Arc::new(move || in_folder.clone()),
+            Clock::system(),
+        ));
+        // Two transfers may run at once, so a download waits on the running one rather than on
+        // the download lock.
+        let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+            subsonic: SubsonicSettings {
+                auto_detect_download_path: false,
+                ..Default::default()
+            },
+            soulseek: SoulseekSettings {
+                parallel_downloads: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        settings.set_raw("Library:DownloadPath", Some(&root.path().to_string_lossy()));
+        let concurrency = Arc::new(DownloadConcurrency::new(Arc::clone(&settings)));
+        concurrency.prove();
+        let history = Arc::new(DownloadHistoryService::new(root.path().join("history.json")));
+        let metadata = FakeMetadata::default();
+        for id in ["t1", "t2"] {
+            metadata.songs.lock().insert(("test".into(), id.into()), song(id));
+        }
+        metadata.albums.lock().insert(
+            ("test".into(), "a1".into()),
+            octo_core::models::domain::Album {
+                id: "a1".into(),
+                title: "Album".into(),
+                artist: "Artist".into(),
+                songs: vec![song("t1"), song("t2")],
+                ..Default::default()
+            },
+        );
+        let backend = Arc::new(GatedBackend {
+            root: root.path().to_path_buf(),
+            open: Arc::new(Notify::new()),
+            started: Arc::new(Notify::new()),
+            transfers: Arc::new(AtomicUsize::new(0)),
+            only_flac_only,
+        });
+        let service = BaseDownloadService::new(
+            DownloadCore {
+                settings: Arc::clone(&settings),
+                local_library: Arc::new(FakeLocalLibrary::default()),
+                metadata: Arc::new(metadata),
+                navidrome_identity: NavidromeIdentityService::new(
+                    Arc::clone(&settings),
+                    reqwest::Client::new(),
+                ),
+                history: Arc::clone(&history),
+                notifications: Arc::new(NotificationService::new(Vec::new(), Arc::clone(&settings), None)),
+            },
+            DownloadServices {
+                concurrency: Some(concurrency),
+                prefetched: Some(store.clone() as Arc<dyn PrefetchedFiles>),
+                ..Default::default()
+            },
+            backend.clone() as Arc<dyn DownloadBackend>,
+        );
+        Gated {
+            service,
+            backend,
+            store,
+            history,
+            root,
+            folder,
+        }
+    }
+
+    /// A download ahead of `id` on its own task, once its transfer has started.
+    async fn ahead(
+        &self,
+        id: &'static str,
+    ) -> tokio::task::JoinHandle<anyhow::Result<crate::services::i_download_service::Ahead>> {
+        let started = self.backend.started.notified();
+        let service = Arc::clone(&self.service);
+        let folder = self.folder.path().to_path_buf();
+        let ahead = tokio::spawn(async move {
+            service
+                .download_ahead("test", id, &folder, &CancellationToken::new())
+                .await
+        });
+        started.await;
+        ahead
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_heart_waiting_on_a_download_ahead_keeps_its_file_rather_than_its_path() {
-    let root = tempfile::tempdir().expect("the music folder");
-    let folder = tempfile::tempdir().expect("the prefetch folder");
-    let in_folder = folder.path().to_path_buf();
-    let store = Arc::new(PrefetchStore::new(
-        Arc::new(move || in_folder.clone()),
-        Clock::system(),
-    ));
-    // Two transfers may run at once, so the heart waits on the running one rather than on the
-    // download lock.
-    let settings = Arc::new(SettingsStore::for_tests(AppSettings {
-        subsonic: SubsonicSettings {
-            auto_detect_download_path: false,
-            ..Default::default()
-        },
-        soulseek: SoulseekSettings {
-            parallel_downloads: 2,
-            ..Default::default()
-        },
-        ..Default::default()
-    }));
-    settings.set_raw("Library:DownloadPath", Some(&root.path().to_string_lossy()));
-    let concurrency = Arc::new(DownloadConcurrency::new(Arc::clone(&settings)));
-    concurrency.prove();
-    let history = Arc::new(DownloadHistoryService::new(root.path().join("history.json")));
-    let metadata = FakeMetadata::default();
-    metadata
-        .songs
-        .lock()
-        .insert(("test".into(), "t1".into()), song("t1"));
-    let backend = Arc::new(GatedBackend {
-        root: root.path().to_path_buf(),
-        open: Arc::new(Notify::new()),
-        started: Arc::new(Notify::new()),
-        transfers: Arc::new(AtomicUsize::new(0)),
-    });
-    let service = BaseDownloadService::new(
-        DownloadCore {
-            settings: Arc::clone(&settings),
-            local_library: Arc::new(FakeLocalLibrary::default()),
-            metadata: Arc::new(metadata),
-            navidrome_identity: NavidromeIdentityService::new(Arc::clone(&settings), reqwest::Client::new()),
-            history: Arc::clone(&history),
-            notifications: Arc::new(NotificationService::new(Vec::new(), Arc::clone(&settings), None)),
-        },
-        DownloadServices {
-            concurrency: Some(concurrency),
-            prefetched: Some(store.clone() as Arc<dyn PrefetchedFiles>),
-            ..Default::default()
-        },
-        backend.clone() as Arc<dyn DownloadBackend>,
-    );
-
-    let started = backend.started.notified();
-    let ahead = {
-        let service = Arc::clone(&service);
-        let folder = folder.path().to_path_buf();
-        tokio::spawn(async move {
-            service
-                .download_ahead("test", "t1", &folder, &CancellationToken::new())
-                .await
-        })
-    };
-    started.await;
+    let gated = Gated::new(false);
+    let Gated {
+        service,
+        backend,
+        store,
+        history,
+        root,
+        folder,
+    } = &gated;
+    let ahead = gated.ahead("t1").await;
     let hearted = {
-        let service = Arc::clone(&service);
+        let service = Arc::clone(service);
         tokio::spawn(async move { heart(&service, "t1").await })
     };
     // The heart is waiting on the running download now.
@@ -320,6 +375,62 @@ async fn a_heart_waiting_on_a_download_ahead_keeps_its_file_rather_than_its_path
     assert!(Path::new(&landed).is_file());
     assert!(store.ready("test", "t1").is_none());
     assert_eq!(history.get_recent(10).len(), 1);
+}
+
+/// A hearted album's walk that reaches a song while a download ahead of it runs waits for that
+/// download and keeps its file, so every song of the album ends up in the library.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_album_walk_keeps_the_song_a_download_ahead_is_fetching() {
+    let gated = Gated::new(true);
+    let ahead = gated.ahead("t2").await;
+    let walked = {
+        let service = Arc::clone(&gated.service);
+        tokio::spawn(async move {
+            service
+                .download_remaining_album_tracks(
+                    "a1",
+                    "",
+                    None,
+                    false,
+                    &CancellationToken::new(),
+                    Some(vec!["alice".into()]),
+                )
+                .await
+        })
+    };
+    // The walk has fetched t1 and come to t2 by now.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    gated.backend.open.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(20), ahead)
+        .await
+        .expect("in time")
+        .expect("ran")
+        .expect("downloaded ahead");
+    let walked = tokio::time::timeout(Duration::from_secs(20), walked)
+        .await
+        .expect("in time")
+        .expect("ran")
+        .expect("walked");
+    assert!(walked);
+    let mut kept: Vec<String> = gated
+        .history
+        .get_recent(10)
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+    kept.sort();
+    assert_eq!(kept.len(), 2, "both songs are in the library: {kept:?}");
+    for path in &kept {
+        assert!(Path::new(path).starts_with(gated.root.path()), "{path}");
+        assert!(Path::new(path).is_file(), "{path}");
+    }
+    assert_eq!(
+        gated.backend.transfers.load(Ordering::SeqCst),
+        2,
+        "t2 is fetched once"
+    );
+    assert!(gated.store.ready("test", "t2").is_none());
 }
 
 #[tokio::test]

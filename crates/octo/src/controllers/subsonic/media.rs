@@ -126,15 +126,27 @@ pub async fn stream(State(state): State<AppState>, req: Request) -> AppResult {
     let provider = provider.unwrap_or_default();
     let external_id = external_id.unwrap_or_default();
 
-    // Octo's apps read the bytes they get, whatever the listing declared, so a song fetched
-    // ahead plays as its FLAC there, for every play that starts on it, and every other play of
-    // theirs keeps the preview it started on.
+    // Octo's apps read the bytes they get, whatever the listing declared, so a song with a file
+    // here (fetched ahead, or kept by a heart) plays as that file there, for every play that
+    // starts on it, and every other play of theirs keeps the preview it started on. With getting
+    // songs ahead off and Wait for lossless on play on, every play takes the path below, which
+    // serves a kept file and waits for a copy not kept yet.
     let prefetching = state.settings.current().prefetch.enabled;
-    if prefetching {
+    let waits_for_lossless = state.settings.current().subsonic.wait_for_lossless_on_play;
+    let octo_app = draws_its_own_marks(&call);
+    let owned = octo_app
+        && !prefetching
+        && !waits_for_lossless
+        && state
+            .local_library
+            .get_local_path_for_external_song(&provider, &external_id)
+            .await
+            .is_some_and(|path| Path::new(&path).is_file());
+    if prefetching || owned {
         // Who is asking only names the play; a lookup that fails leaves it to the address.
         let who = signed_in_user(&state, &call).await.unwrap_or_default();
         note_playing(&state, &call, caller.as_ref(), &id, Some(who.clone()));
-        if draws_its_own_marks(&call) {
+        if octo_app {
             let play = OctoPlay {
                 caller: caller.as_ref(),
                 who: &who,
@@ -278,8 +290,9 @@ fn play_keys(who: &str, address: Option<IpAddr>, client: &str) -> Vec<String> {
     }
 }
 
-/// A play in an Octo app while getting songs ahead is on. A request from the first byte gets the
-/// song's FLAC when one is ready for this caller (downloaded ahead, or kept by a heart), and the
+/// A play of an outside song in an Octo app, while getting songs ahead is on or the song is kept
+/// here. A request from the first byte gets the song's FLAC when one is ready for this caller
+/// (downloaded ahead, or kept by a heart), and the
 /// preview otherwise; a later range gets what its play started on, and a refusal (503) when that
 /// file has gone, so the player starts again. The play's own acquisition (DownloadOnPlay,
 /// LidarrAlbumOnPlay, the lossless copy of Wait for lossless on play) is started either way, but
@@ -293,6 +306,7 @@ async fn play_in_octo_app(
         .prefetch
         .store()
         .ready(play.provider, play.external_id)
+        .filter(|_| state.settings.current().prefetch.enabled)
         .filter(|_| state.prefetch.may_keep_copies(play.who, play.caller))
         .map(|path| path.to_string_lossy().into_owned());
     let ready = match &ahead {

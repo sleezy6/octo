@@ -47,6 +47,9 @@ mod login_props_tests;
 #[path = "listening_tests.rs"]
 mod listening_tests;
 
+#[path = "keep_ready_tests.rs"]
+mod keep_ready_tests;
+
 const HOME: &str = "192.168.1.20";
 const AWAY: &str = "203.0.113.9";
 /// Alex's one login password: what every app of theirs signs in with.

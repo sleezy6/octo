@@ -328,6 +328,7 @@ impl Setup {
             deezer: None,
             deezer_cache: None,
             stream_from_deezer: false,
+            preview_copies: None,
         };
         let (service, _) = SoulseekDownloadService::build(core, services, parts);
         Fetch {
