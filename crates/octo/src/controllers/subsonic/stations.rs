@@ -19,6 +19,7 @@ use super::action_helpers::{
     RequestAborted, SubsonicCall, int_param, materialize_picks, playlist_stations, queue_refresh_if_stale,
     serve_station_songs, suggested_sources,
 };
+use super::caller_checks::listener_name_of;
 use super::playlists::signed_in;
 use crate::app::AppState;
 use crate::http::routes::RouteSet;
@@ -87,7 +88,7 @@ async fn station_songs(state: &AppState, req: Request, aborted: &RequestAborted)
             .into_response();
     }
     // A listener's stations are theirs alone: the list is the caller's own, as for getPlaylist.
-    let username = call.param_or("u", "").to_string();
+    let username = listener_name_of(state, &call.parameters, &call.proxy, &call.parts.headers).await;
     let Some(station) = playlist_stations(state, &username)
         .into_iter()
         .find(|station| station.id == id)

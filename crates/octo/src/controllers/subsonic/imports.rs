@@ -12,7 +12,7 @@ use octo_subsonic::subsonic_response_builder::SubsonicReply;
 use serde_json::{Value, json};
 use tracing::info;
 
-use super::caller_checks::{SubsonicCall, is_successful_subsonic_response};
+use super::caller_checks::{SubsonicCall, is_successful_subsonic_response, listener_name};
 use crate::app::AppState;
 use crate::controllers::admin::imports::app_error;
 use crate::http::error::{AppError, AppResult, SUBSONIC_VERSION};
@@ -72,15 +72,16 @@ async fn caller(state: &AppState, call: &SubsonicCall) -> Result<String, Respons
     if !is_successful_subsonic_response(&check.body, "json") {
         return Err(error(state, 40, "Wrong username or password"));
     }
-    // An API key alone names nobody here, and lists belong to someone.
-    match call.param_opt("u").filter(|u| !is_blank(u)) {
-        Some(user) => Ok(user.trim().to_string()),
-        None => Err(error(
+    // Lists belong to someone: `u`, else the API key's owner.
+    let user = listener_name(state, call).await;
+    if is_blank(&user) {
+        return Err(error(
             state,
             0,
-            "Sign in with a username to import; an API key alone does not say who is asking.",
-        )),
+            "Octo could not tell who is asking; sign in with a username or a valid API key.",
+        ));
     }
+    Ok(user.trim().to_string())
 }
 
 fn to_value(value: &impl serde::Serialize) -> AppResult<Value> {

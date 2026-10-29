@@ -132,10 +132,25 @@ fn charts_lists_each_chart_with_its_playlist_while_it_is_one() {
         },
     ];
 
-    let response = answer(&builder().create_charts_response(Some("us"), &charts));
+    let pinned = vec!["jp".to_string()];
+    let countries = vec!["jp".to_string(), "us".to_string()];
+    let header = ChartsHeader {
+        country: Some("us"),
+        setting: "auto",
+        pinned: &pinned,
+        server: Some("us"),
+        countries: &countries,
+        max_pinned: 3,
+    };
+    let response = answer(&builder().create_charts_response(&header, &charts));
     let listed = &response["subsonic-response"]["charts"];
 
     assert_eq!(listed["country"], "us");
+    assert_eq!(listed["setting"], "auto");
+    assert_eq!(listed["pinned"], json!(["jp"]));
+    assert_eq!(listed["serverCountry"], "us");
+    assert_eq!(listed["countries"], json!(["jp", "us"]));
+    assert_eq!(listed["maxPinned"], 3);
     assert_eq!(
         listed["chart"][0],
         json!({"id": "34", "name": "Popular right now", "label": "Top songs", "kind": "overall", "playlist": "og123", "on": true})
@@ -199,7 +214,7 @@ fn the_top_songs_extension_is_listed_only_while_search_discovery_is_on() {
             .find(|e| e["name"] == "octoTopSongs")
             .cloned()
     };
-    assert_eq!(listed(true).unwrap()["versions"], json!([1, 2]));
+    assert_eq!(listed(true).unwrap()["versions"], json!([1, 2, 3]));
     assert!(listed(false).is_none());
     // The older call never lists it, so the answers recorded before charts stay as they were.
     let older = answer(&builder().merge_open_subsonic_extensions("json", None, None, true, false));

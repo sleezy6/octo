@@ -17,7 +17,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::*;
 use crate::services::common::test_fakes::{OfflineLink, until};
 use crate::services::common::track_acquisition_queue::AcquisitionRequest;
-use crate::services::library::library_action_test_support::{Extras, RecordingLibrary, executor, store};
+use crate::services::library::library_action_test_support::{
+    Extras, RecordingLibrary, executor, slash_root, store,
+};
+use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::library::replacement_handoff::ArrivedTags;
 
 const FILE_NAME: &str = "Massive Attack - Teardrop";
@@ -97,7 +100,7 @@ impl Fixture {
             .await;
 
         Fixture {
-            original: original.to_string_lossy().into_owned(),
+            original: slash_root(&original),
             root,
             _dir: dir,
             original_size,
@@ -110,10 +113,7 @@ impl Fixture {
     }
 
     fn revealed(&self) -> String {
-        self.root
-            .join(format!("{FILE_NAME}.flac"))
-            .to_string_lossy()
-            .into_owned()
+        slash_root(&self.root.join(format!("{FILE_NAME}.flac")))
     }
 
     fn executor(
@@ -151,7 +151,7 @@ impl Fixture {
             },
             ..Default::default()
         });
-        settings.set_raw("Library:DownloadPath", Some(&self.root.to_string_lossy()));
+        settings.set_raw("Library:DownloadPath", Some(&slash_root(&self.root)));
         let executor = executor(
             &settings,
             Extras {
@@ -195,7 +195,7 @@ impl Fixture {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::write(&staged, bytes).expect("written");
-        staged.to_string_lossy().into_owned()
+        slash_root(&staged)
     }
 
     /// A lossless file larger than the original, as Better quality demands.
@@ -227,7 +227,7 @@ impl Fixture {
                 if path.is_dir() {
                     walk(&path, found);
                 } else if path.extension().is_some_and(|e| e == "mp3") {
-                    found.push(path.to_string_lossy().into_owned());
+                    found.push(slash_root(&path));
                 }
             }
         }
@@ -322,6 +322,45 @@ async fn better_quality_during_a_soulseek_outage_touches_nothing_and_stays_asked
 }
 
 #[tokio::test]
+async fn wrong_song_honors_a_picked_source() {
+    let f = Fixture::new().await;
+    let executor = f.executor(false, Some(Arc::new(OfflineLink)), None);
+
+    for action in [LibraryAction::WrongSong, LibraryAction::WrongVersion] {
+        // Soulseek picked and out: nothing to try. Any other pick is the only source tried.
+        assert!(
+            executor
+                .sources_for(action, Some(DownloadSource::Soulseek))
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            executor.sources_for(action, Some(DownloadSource::Lidarr)).await,
+            vec![Some(DownloadSource::Lidarr)]
+        );
+        assert_eq!(executor.sources_for(action, None).await, vec![None]);
+    }
+
+    // With nothing to try, the request waits as Better quality does: not consumed, nothing touched.
+    let outcome = executor
+        .apply(LibraryActionRequest {
+            only_source: Some(DownloadSource::Soulseek),
+            ..wrong_version()
+        })
+        .await
+        .expect("an outcome");
+    assert_eq!(outcome.state, LibraryActionState::Failed);
+    assert_eq!(
+        outcome.code.as_deref(),
+        Some(LibraryActionCodes::SOULSEEK_OFFLINE)
+    );
+    assert!(!outcome.consumed());
+    assert!(f.queue.is_idle());
+    assert!(Path::new(&f.original).exists());
+    assert!(f.journal.recent(10).is_empty());
+}
+
+#[tokio::test]
 async fn a_second_action_on_the_same_song_is_skipped_while_the_first_runs() {
     let f = Fixture::new().await;
     let executor = f.plain_executor();
@@ -354,7 +393,7 @@ async fn a_second_action_on_the_same_song_is_skipped_while_the_first_runs() {
     assert!(Path::new(&f.revealed()).exists());
     assert!(!Path::new(&f.original).exists());
     assert_eq!(f.action().state, LibraryActionState::Applied);
-    assert_eq!(f.forgotten(), std::slice::from_ref(&f.original));
+    assert_eq!(f.forgotten(), [get_full_path(&f.original)]);
 }
 
 /// The request joined a download already in flight, so its handoff was never used and the file
@@ -466,7 +505,10 @@ async fn a_failure_after_the_replacement_moved_in_does_not_undo_it() {
     reveal(&download, &f.staged(&flac(), ".flac"))
         .await
         .expect("admitted");
-    assert_eq!(f.action().revealed_path, Some(f.revealed()));
+    assert_eq!(
+        f.action().revealed_path.as_deref().map(get_full_path),
+        Some(get_full_path(&f.revealed()))
+    );
     f.fail(
         &download,
         anyhow::Error::new(std::io::Error::other("the mappings could not be saved")),
@@ -789,7 +831,11 @@ async fn another_take_replaced_anyway_takes_the_plain_songs_names_once_its_place
             .all(|(_, album)| album.as_deref() != Some("Mezzanine (Studio)")),
         "{asked:?}"
     );
-    assert_eq!(placed, f.original, "the original's own path");
+    assert_eq!(
+        get_full_path(&placed),
+        get_full_path(&f.original),
+        "the original's own path"
+    );
 }
 
 #[tokio::test]
@@ -873,7 +919,7 @@ async fn a_delete_quarantines_the_file_and_is_never_done_twice() {
         outcome.quarantine_path.as_deref(),
         Some(f.quarantined()[0].as_str())
     );
-    assert_eq!(f.forgotten(), std::slice::from_ref(&f.original));
+    assert_eq!(f.forgotten(), [get_full_path(&f.original)]);
     assert!(
         f.journal
             .is_never_requested(Some("Massive Attack"), Some("Teardrop"))

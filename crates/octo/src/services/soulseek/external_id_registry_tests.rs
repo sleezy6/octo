@@ -585,3 +585,189 @@ fn a_re_pin_and_a_size_are_written_down_and_outlive_a_restart() {
     );
     assert_eq!(again.stream_facts(&id), None);
 }
+
+#[test]
+fn refusing_a_video_unpins_it_and_keeps_it_out() {
+    let registry = ExternalIdRegistry::in_memory();
+    let id = registry.register(song("KILLY", "Killamonjaro"));
+    assert!(registry.set_you_tube_id(&id, "summer-cem"));
+
+    assert!(registry.refuse_video(&id, "summer-cem"));
+    let snapshot = registry.lookup(&id).expect("known").snapshot();
+    assert_eq!(snapshot.you_tube_id, None);
+    assert!(snapshot.refuses_video("summer-cem"));
+
+    assert!(!registry.set_you_tube_id(&id, "summer-cem"));
+    assert!(!registry.pin_video(&id, "summer-cem", false));
+    assert!(!registry.refuse_video("no-such-id", "x"));
+}
+
+#[test]
+fn registering_the_same_song_again_keeps_its_refused_videos() {
+    let registry = ExternalIdRegistry::in_memory();
+    let id = registry.register(song("KILLY", "Killamonjaro"));
+    assert!(registry.refuse_video(&id, "summer-cem"));
+
+    let again = registry.register(song("KILLY", "Killamonjaro"));
+    assert_eq!(again, id);
+    assert!(
+        registry
+            .lookup(&id)
+            .expect("known")
+            .snapshot()
+            .refuses_video("summer-cem")
+    );
+    assert!(!registry.set_you_tube_id(&id, "summer-cem"));
+}
+
+#[test]
+fn a_refused_video_outlives_a_restart() {
+    let (_dir, path) = temp_path("octo-ids.json");
+    let first = ExternalIdRegistry::new(Some(&path));
+    let id = first.register(song("KILLY", "Killamonjaro"));
+    first.flush();
+    assert!(first.refuse_video(&id, "summer-cem"));
+    first.flush();
+    drop(first);
+
+    let reopened = ExternalIdRegistry::new(Some(&path));
+    let routing = reopened.lookup(&id).expect("restored");
+    assert!(routing.lock().refuses_video("summer-cem"));
+    assert!(!reopened.set_you_tube_id(&id, "summer-cem"));
+}
+
+fn song_of_length(artist: &str, title: &str, seconds: i32) -> SoulseekRouting {
+    SoulseekRouting {
+        duration: Some(seconds),
+        ..song(artist, title)
+    }
+}
+
+#[test]
+fn a_refusal_holds_for_every_id_of_the_song_cached_or_registered_later() {
+    let registry = ExternalIdRegistry::in_memory();
+    let a = registry.register(song_of_length("KILLY", "Killamonjaro", 153));
+    let b = registry.register(song_of_length("killy", "Killamonjaro!", 179));
+    assert_ne!(a, b);
+    assert!(registry.set_you_tube_id(&b, "summer-cem"));
+
+    assert!(registry.refuse_video(&a, "summer-cem"));
+
+    let other = registry.lookup(&b).expect("known").snapshot();
+    assert!(other.refuses_video("summer-cem"));
+    assert_eq!(other.you_tube_id, None);
+
+    let later = registry.register(song_of_length("KILLY", "Killamonjaro", 200));
+    let later = registry.lookup(&later).expect("known").snapshot();
+    assert!(later.refuses_video("summer-cem"));
+
+    let mut decoded = song("KILLY", "Killamonjaro");
+    registry.apply_refusals(&mut decoded);
+    assert_eq!(decoded.refused_videos, ["summer-cem"]);
+    assert_eq!(registry.refusals_for(&decoded), ["summer-cem"]);
+
+    let mut stranger = song("Someone", "Else");
+    registry.apply_refusals(&mut stranger);
+    assert!(stranger.refused_videos.is_empty());
+}
+
+#[test]
+fn a_song_refusal_outlives_a_restart_and_old_installs_load_without_the_file() {
+    let (dir, path) = temp_path("octo-ids.json");
+    let first = ExternalIdRegistry::new(Some(&path));
+    first.refuse_song_video("KILLY", "Killamonjaro", "summer-cem");
+    first.flush();
+    drop(first);
+    assert!(dir.path().join("refused-videos.json").exists());
+
+    let reopened = ExternalIdRegistry::new(Some(&path));
+    assert_eq!(
+        reopened.refusals_for(&song("KILLY", "Killamonjaro")),
+        ["summer-cem"]
+    );
+
+    let (_fresh, fresh_path) = temp_path("octo-ids.json");
+    let fresh = ExternalIdRegistry::new(Some(&fresh_path));
+    assert!(fresh.refusals_for(&song("KILLY", "Killamonjaro")).is_empty());
+}
+
+#[test]
+fn a_song_with_no_artist_or_title_records_no_refusal() {
+    let registry = ExternalIdRegistry::in_memory();
+    assert!(!registry.refuse_song_video("", "Title", "v"));
+    assert!(!registry.refuse_song_video("Artist", " ", "v"));
+    assert!(ExternalIdRegistry::song_key("", "Title").is_none());
+    assert!(registry.refusals_for(&song("", "Title")).is_empty());
+}
+
+#[test]
+fn song_refusals_are_capped_per_song_and_overall() {
+    let registry = ExternalIdRegistry::in_memory();
+    for n in 0..7 {
+        registry.refuse_song_video("Artist", "Title", &format!("v{n}"));
+    }
+    assert_eq!(
+        registry.refusals_for(&song("Artist", "Title")),
+        ["v2", "v3", "v4", "v5", "v6"]
+    );
+
+    let registry = ExternalIdRegistry::in_memory();
+    for n in 0..=ExternalIdRegistry::MAX_REFUSED_SONGS {
+        registry.refuse_song_video(&format!("Artist {n}"), "Title", "v");
+    }
+    assert!(registry.refusals_for(&song("Artist 0", "Title")).is_empty());
+    assert_eq!(registry.refusals_for(&song("Artist 1", "Title")), ["v"]);
+    assert_eq!(
+        registry.refusals_for(&song(
+            &format!("Artist {}", ExternalIdRegistry::MAX_REFUSED_SONGS),
+            "Title"
+        )),
+        ["v"]
+    );
+}
+
+#[test]
+fn a_pick_is_stamped_only_while_the_song_plays_that_video() {
+    let registry = ExternalIdRegistry::in_memory();
+    let id = registry.register(song("Daft Punk", "Emotion"));
+    assert!(!registry.remember_pick(&id, "vid-a", 3));
+    assert!(registry.set_you_tube_id(&id, "vid-a"));
+    assert!(!registry.remember_pick(&id, "vid-b", 3));
+    assert!(registry.remember_pick(&id, "vid-a", 3));
+    assert_eq!(registry.lookup(&id).expect("known").snapshot().video_pick, 3);
+
+    assert!(registry.set_you_tube_id(&id, "vid-b"));
+    assert_eq!(registry.lookup(&id).expect("known").snapshot().video_pick, 0);
+}
+
+#[test]
+fn a_mint_with_a_video_is_named_and_a_search_remint_keeps_the_stamp() {
+    let registry = ExternalIdRegistry::in_memory();
+    let named = SoulseekRouting {
+        you_tube_id: Some("vid-a".into()),
+        ..song("Daft Punk", "Emotion")
+    };
+    let id = registry.register(named);
+    assert_eq!(
+        registry.lookup(&id).expect("known").snapshot().video_pick,
+        SoulseekRouting::VIDEO_NAMED
+    );
+
+    // A pinned, stamped song minted again with no video keeps both.
+    let other = registry.register(song("Daft Punk", "Around"));
+    registry.set_you_tube_id(&other, "vid-b");
+    registry.remember_pick(&other, "vid-b", 3);
+    let again = registry.register(song("Daft Punk", "Around"));
+    assert_eq!(again, other);
+    let kept = registry.lookup(&other).expect("known").snapshot();
+    assert_eq!((kept.you_tube_id.as_deref(), kept.video_pick), (Some("vid-b"), 3));
+
+    // A fresh mint that names the same video keeps the stamp too.
+    assert!(registry.remember_pick(&id, "vid-a", 3));
+    let same = registry.register(SoulseekRouting {
+        you_tube_id: Some("vid-a".into()),
+        ..song("Daft Punk", "Emotion")
+    });
+    assert_eq!(same, id);
+    assert_eq!(registry.lookup(&id).expect("known").snapshot().video_pick, 3);
+}

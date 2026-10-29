@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use octo_core::fingerprint::{AcoustIdLookup, AcoustIdRecording, AcoustIdResult};
 use octo_core::models::domain::{Album, Song};
 use octo_core::settings::{AppSettings, DownloadSource, SettingsStore, SoulseekSettings, SubsonicSettings};
 use octo_core::soulseek::{RoutingKind, SoulseekFileHit, SoulseekRouting};
@@ -492,6 +493,15 @@ struct SlskdState {
     sound: HashMap<String, Vec<u8>>,
     /// The audio the shim's /stream sends whole; none answers the two-byte partial reply.
     preview: Option<Vec<u8>>,
+    /// The videos the shim's /search answers with, best first; the first one not skipped wins.
+    /// Empty answers the one video "vid123".
+    search_videos: Vec<String>,
+    /// The audio the shim's /download writes; none writes silent frames.
+    download_audio: Option<Vec<u8>>,
+    /// What AcoustID answers for the file of each video, by video id.
+    lookup_by_video: HashMap<String, Value>,
+    /// The video the shim wrote a file for last.
+    last_download: String,
 }
 
 /// slskd as far as one walk needs: logged in, searches answered from a script, and every batch
@@ -619,15 +629,39 @@ impl Respond for FakeSlskd {
             };
         }
         if path == "/search" {
+            let skipped: Vec<String> = request
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "skip")
+                .map(|(_, v)| v.split(',').map(str::to_string).collect())
+                .unwrap_or_default();
+            let video = {
+                let state = self.state.lock();
+                if state.search_videos.is_empty() {
+                    Some("vid123".to_string())
+                } else {
+                    state.search_videos.iter().find(|v| !skipped.contains(v)).cloned()
+                }
+            };
+            let Some(video) = video else {
+                return json_answer(&json!({"error": "no_hit"}), 404);
+            };
             return json_answer(
-                &json!({"video_id": "vid123", "title": "Started", "duration": 180,
+                &json!({"video_id": video, "title": "Started", "duration": 180,
                         "size": 12000, "itag": "140", "ext": "m4a", "abr": 129.5}),
                 200,
             );
         }
         if path == "/v2/lookup" {
-            // An AcoustID that has never heard any of it.
-            return json_answer(&json!({"status": "ok", "results": []}), 200);
+            // The answer set for the video last downloaded; else an AcoustID that has never
+            // heard any of it.
+            let state = self.state.lock();
+            let answer = state
+                .lookup_by_video
+                .get(&state.last_download)
+                .cloned()
+                .unwrap_or_else(|| json!({"status": "ok", "results": []}));
+            return json_answer(&answer, 200);
         }
         if path == "/stream"
             && let Some(preview) = self.state.lock().preview.clone()
@@ -648,8 +682,22 @@ impl Respond for FakeSlskd {
                 .unwrap_or_default();
             let file = format!("{dest}.mp3");
             std::fs::create_dir_all(std::path::Path::new(&file).parent().expect("a parent")).expect("made");
-            std::fs::write(&file, crate::services::test_support::mp3()).expect("written");
-            self.state.lock().you_tube_downloads.push(file.clone());
+            let audio = self
+                .state
+                .lock()
+                .download_audio
+                .clone()
+                .unwrap_or_else(crate::services::test_support::mp3);
+            std::fs::write(&file, audio).expect("written");
+            let video = request
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "id")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default();
+            let mut state = self.state.lock();
+            state.last_download = video;
+            state.you_tube_downloads.push(file.clone());
             return json_answer(&json!({"path": file}), 200);
         }
         if path == "/api/v0/transfers/downloads/batches" {
@@ -726,6 +774,17 @@ impl Respond for FakeSlskd {
     }
 }
 
+/// A Review queue that keeps every verdict a download asked about.
+#[derive(Default)]
+struct AskedReviews(Mutex<Vec<VerificationResult>>);
+
+impl crate::services::common::ReviewQueue for AskedReviews {
+    fn add_review(&self, _: &str, _: &str, _: &Song, verdict: &VerificationResult) -> bool {
+        self.0.lock().push(verdict.clone());
+        true
+    }
+}
+
 struct Walk {
     service: Arc<BaseDownloadService>,
     /// The Soulseek half, which Find songs asks directly.
@@ -735,6 +794,9 @@ struct Walk {
     songs: Vec<Song>,
     album_id: String,
     rejected: Arc<RejectedPeerRegistry>,
+    settings: Arc<SettingsStore>,
+    /// What downloads asked about in Review, once Review is switched on in `settings`.
+    reviews: Arc<AskedReviews>,
     _server: MockServer,
 }
 
@@ -822,6 +884,61 @@ async fn build_served(
     soulseek_on: bool,
     deezer: Option<(Arc<DeezerResolver>, bool, Option<Arc<DeezerAudioCache>>)>,
     verified: bool,
+    answers: impl FnOnce(Vec<Song>) -> Answers,
+    extra: impl FnOnce(&mut DownloadServices),
+) -> Walk {
+    build_all(
+        root,
+        album_folders,
+        source,
+        soulseek_on,
+        verified,
+        None,
+        None,
+        deezer,
+        answers,
+        extra,
+    )
+    .await
+}
+
+/// `build_full` with the service keeping `preview_copies`.
+async fn build_full_copies(
+    root: &Root,
+    album_folders: bool,
+    source: DownloadSource,
+    soulseek_on: bool,
+    verified: bool,
+    preview_copies: Option<Arc<PreviewCopies>>,
+    answers: impl FnOnce(Vec<Song>) -> Answers,
+) -> Walk {
+    build_all(
+        root,
+        album_folders,
+        source,
+        soulseek_on,
+        verified,
+        preview_copies,
+        None,
+        None,
+        answers,
+        |_| {},
+    )
+    .await
+}
+
+/// `build_full_copies` with the service fetching through `lidarr_fetcher`, Deezer as a source
+/// of audio (`deezer`, see [`build_full`]), and the download services changed by `extra`.
+#[allow(clippy::too_many_arguments)]
+async fn build_all(
+    root: &Root,
+    album_folders: bool,
+    source: DownloadSource,
+    soulseek_on: bool,
+    verified: bool,
+    preview_copies: Option<Arc<PreviewCopies>>,
+    lidarr_fetcher: Option<Arc<dyn ILidarrTrackFetcher>>,
+    deezer: Option<(Arc<DeezerResolver>, bool, Option<Arc<DeezerAudioCache>>)>,
     answers: impl FnOnce(Vec<Song>) -> Answers,
     extra: impl FnOnce(&mut DownloadServices),
 ) -> Walk {
@@ -941,8 +1058,10 @@ async fn build_served(
         history: Arc::new(DownloadHistoryService::new(root.0.path().join("history.json"))),
         notifications: Arc::new(NotificationService::new(Vec::new(), Arc::clone(&settings), None)),
     };
+    let reviews = Arc::new(AskedReviews::default());
     let mut services = DownloadServices {
         concurrency: Some(Arc::new(DownloadConcurrency::new(Arc::clone(&settings)))),
+        review_queue: Some(reviews.clone()),
         ..Default::default()
     };
     extra(&mut services);
@@ -968,9 +1087,9 @@ async fn build_served(
         id_registry: registry.clone(),
         soulseek_link: None,
         lidarr_imports: None,
-        lidarr_fetcher: None,
+        lidarr_fetcher,
         spotiflac: None,
-        preview_copies: None,
+        preview_copies,
     };
     let (service, backend) = SoulseekDownloadService::build(core, services, parts);
     Walk {
@@ -981,6 +1100,8 @@ async fn build_served(
         songs,
         album_id: "album-1".into(),
         rejected,
+        settings,
+        reviews,
         _server: server,
     }
 }
@@ -1564,8 +1685,12 @@ async fn a_peer_that_delivers_the_wrong_length_is_passed_over_for_the_next() {
 /// fpcalc is missing.
 fn made_sound(source: &str, format: &[&str]) -> Option<Vec<u8>> {
     let on_path = |program: &str| {
-        std::env::var_os("PATH")
-            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                dir.join(format!("{program}{}", std::env::consts::EXE_SUFFIX))
+                    .is_file()
+            })
+        })
     };
     if !on_path("ffmpeg") || !on_path("fpcalc") {
         return None;
@@ -1689,6 +1814,231 @@ async fn without_a_preview_the_file_acoustid_never_heard_is_kept() {
     assert_eq!(users, names(&["wrongpeer"]));
     assert_eq!(placed_flacs(&root), 1);
     assert_eq!(walk.rejected.count(), 0);
+}
+
+/// What AcoustID answers for every Soulseek file: "Drake - Started", through one submission.
+fn lone_lookup() -> Value {
+    json!({"status": "ok", "results": [{
+        "id": "result", "score": 0.97,
+        "recordings": [{
+            "id": "rec-started", "title": "Started", "artists": [{"name": "Drake"}],
+            "duration": 180, "sources": 1,
+        }],
+    }]})
+}
+
+#[test]
+fn a_lone_link_to_the_song_still_says_which_take_a_file_is() {
+    let live = VerificationResult {
+        reason: InconclusiveReason::LoneLink,
+        recording_id: Some("rec".into()),
+        kind: Some(RecordingKind::Live),
+        ..Default::default()
+    };
+    assert_eq!(take_of(&live), Some(RecordingKind::Live));
+    let confirmed = VerificationResult {
+        verdict: VerificationVerdict::Confirmed,
+        reason: InconclusiveReason::None,
+        ..live.clone()
+    };
+    assert_eq!(take_of(&confirmed), Some(RecordingKind::Live));
+    let elsewhere = VerificationResult {
+        recording_id: None,
+        ..live.clone()
+    };
+    assert_eq!(take_of(&elsewhere), None);
+    let unsure = VerificationResult {
+        reason: InconclusiveReason::BelowThreshold,
+        ..live
+    };
+    assert_eq!(take_of(&unsure), None);
+}
+
+/// Review switched on, with alice keeping the library.
+fn review_on(walk: &Walk) {
+    let mut settings = (*walk.settings.current()).clone();
+    settings.library_actions.enabled = true;
+    settings.library_actions.review_enabled = true;
+    settings.library_actions.allowed_users = vec!["alice".into()];
+    walk.settings.set(settings);
+}
+
+/// One person's link to the song is not enough alone: the preview a believed row plays refuses
+/// the noise (its peer remembered) and confirms the song, which is then asked about nowhere.
+#[tokio::test]
+async fn a_lone_link_is_confirmed_by_a_preview_that_agrees_and_refused_by_one_that_does_not() {
+    let root = Root::new("octo-preview-");
+    let Some((walk, preview)) = verified_walk(&root).await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    {
+        let mut state = walk.slskd.state.lock();
+        state.preview = Some(preview);
+        state.lookup_by_video.insert(String::new(), lone_lookup());
+    }
+    review_on(&walk);
+
+    let path = acquire(&walk, walk.songs[3].external_id.as_deref().expect("an id"), None)
+        .await
+        .expect("the second peer's file is kept");
+
+    let users: Vec<String> = walk.slskd.batches().into_iter().map(|(u, ..)| u).collect();
+    assert_eq!(users, names(&["wrongpeer", "rightpeer"]));
+    assert!(std::path::Path::new(&path).is_file(), "{path}");
+    assert!(
+        walk.rejected
+            .is_denied(Some("wrongpeer"), Some(r"A\Drake\04 - Started.flac"))
+    );
+    assert!(
+        !walk
+            .rejected
+            .is_denied(Some("rightpeer"), Some(r"B\Drake\04 - Started.flac"))
+    );
+    // Confirmed, so nobody is asked about it.
+    assert!(walk.reviews.0.lock().is_empty());
+}
+
+/// With no preview to back it, a lone link is kept and asked about, carrying the recording a
+/// person's Keep sends AcoustID a second link to.
+#[tokio::test]
+async fn a_lone_link_without_a_preview_is_kept_and_asked_about() {
+    let root = Root::new("octo-preview-");
+    let Some((walk, _)) = verified_walk(&root).await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    walk.slskd
+        .state
+        .lock()
+        .lookup_by_video
+        .insert(String::new(), lone_lookup());
+    review_on(&walk);
+
+    acquire(&walk, walk.songs[3].external_id.as_deref().expect("an id"), None)
+        .await
+        .expect("the first peer's file is kept");
+
+    assert_eq!(walk.rejected.count(), 0);
+    let asked = walk.reviews.0.lock().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].reason, InconclusiveReason::LoneLink);
+    assert_eq!(asked[0].candidate_recording_id.as_deref(), Some("rec-started"));
+}
+
+/// A Lidarr fetcher that hands over whatever audio it was given.
+#[derive(Default)]
+struct FakeFetcher {
+    audio: Mutex<Vec<u8>>,
+    fetched: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl ILidarrTrackFetcher for FakeFetcher {
+    async fn fetch(
+        &self,
+        _request: &LidarrTrackRequest,
+        destination_directory: &str,
+        _ct: &CancellationToken,
+    ) -> Result<String, octo_core::lidarr::LidarrError> {
+        std::fs::create_dir_all(destination_directory).expect("made");
+        let path = combine(destination_directory, "04 - Started.flac");
+        std::fs::write(&path, self.audio.lock().clone()).expect("written");
+        self.fetched.lock().push(path.clone());
+        Ok(path)
+    }
+}
+
+/// A walk whose Lidarr fetcher hands over the sound `song_and_noise` made for the peer `wanted`
+/// ("A" the noise, "B" the song), with the song's preview playing; None where ffmpeg or fpcalc
+/// is missing.
+async fn lidarr_walk(root: &Root, wanted: &str) -> Option<(Walk, Arc<FakeFetcher>)> {
+    let fetcher = Arc::new(FakeFetcher::default());
+    let walk = build_all(
+        root,
+        false,
+        DownloadSource::Soulseek,
+        true,
+        true,
+        None,
+        Some(fetcher.clone()),
+        None,
+        |_| Arc::new(|_: &str| Vec::new()),
+        |_| {},
+    )
+    .await;
+    let preview = song_and_noise(&walk)?;
+    let mut state = walk.slskd.state.lock();
+    *fetcher.audio.lock() = state.sound[&format!(r"{wanted}\Drake\04 - Started.flac")].clone();
+    state.preview = Some(preview);
+    drop(state);
+    Some((walk, fetcher))
+}
+
+/// Lidarr's fetched file gets the checks an imported one does: AcoustID hearing it as another
+/// song removes it and refuses the download.
+#[tokio::test]
+async fn a_lidarr_fetched_file_that_acoust_id_hears_as_another_song_is_removed_and_refused() {
+    let root = Root::new("octo-lidarr-");
+    let Some((walk, fetcher)) = lidarr_walk(&root, "B").await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    walk.slskd.state.lock().lookup_by_video.insert(
+        String::new(),
+        json!({"status": "ok", "results": [{
+            "id": "result", "score": 0.97,
+            "recordings": [{
+                "id": "rec-other", "title": "Another Song", "artists": [{"name": "Someone Else"}],
+                "duration": 180, "sources": 9,
+            }],
+        }]}),
+    );
+
+    let refused = acquire(
+        &walk,
+        walk.songs[3].external_id.as_deref().expect("an id"),
+        Some(DownloadSource::Lidarr),
+    )
+    .await
+    .expect_err("another song is refused");
+
+    assert!(refused.to_string().contains("AcoustID identified"), "{refused}");
+    let fetched = fetcher.fetched.lock().clone();
+    assert_eq!(fetched.len(), 1);
+    assert!(!std::path::Path::new(&fetched[0]).exists(), "{}", fetched[0]);
+    assert_eq!(placed_flacs(&root), 0);
+}
+
+/// A fetched file AcoustID has one person's word for, that sounds nothing like the song's
+/// YouTube preview, is removed and refused.
+#[tokio::test]
+async fn a_lidarr_fetched_file_the_preview_calls_another_song_is_removed_and_refused() {
+    let root = Root::new("octo-lidarr-");
+    let Some((walk, fetcher)) = lidarr_walk(&root, "A").await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    walk.slskd
+        .state
+        .lock()
+        .lookup_by_video
+        .insert(String::new(), lone_lookup());
+    review_on(&walk);
+
+    let refused = acquire(
+        &walk,
+        walk.songs[3].external_id.as_deref().expect("an id"),
+        Some(DownloadSource::Lidarr),
+    )
+    .await
+    .expect_err("the noise is refused");
+
+    assert!(refused.to_string().contains("Lidarr's file for"), "{refused}");
+    let fetched = fetcher.fetched.lock().clone();
+    assert_eq!(fetched.len(), 1);
+    assert!(!std::path::Path::new(&fetched[0]).exists(), "{}", fetched[0]);
+    assert_eq!(placed_flacs(&root), 0);
 }
 
 #[tokio::test]
@@ -1859,6 +2209,131 @@ async fn a_play_takes_youtube_musics_video_for_the_song_before_the_yt_dlp_search
             .iter()
             .any(|r| r.url.path() == "/stream" && r.url.query().unwrap_or("").contains("id=ytm-atv"))
     );
+}
+
+// ---- A video the current ranking prefers is taken only by a play from the first byte --------
+
+const OLD_VIDEO: &str = "oldvideo-01";
+const NEW_VIDEO: &str = "newvideo-02";
+
+/// A preview source that always has the same 1000 bytes.
+struct SteadyPreview;
+
+#[async_trait::async_trait]
+impl crate::services::prefetch::PreviewSource for SteadyPreview {
+    async fn open_whole(&self, _video_id: &str) -> Option<crate::services::prefetch::WholePreview> {
+        let body: Vec<std::io::Result<bytes::Bytes>> = vec![Ok(bytes::Bytes::from(vec![7u8; 1000]))];
+        Some(crate::services::prefetch::WholePreview {
+            content_type: "audio/mp4".to_string(),
+            total: 1000,
+            body: Box::pin(futures::stream::iter(body)),
+        })
+    }
+}
+
+/// A walk keeping preview copies, whose first song plays `OLD_VIDEO` while `NEW_VIDEO` waits,
+/// with a copy of the old video made.
+async fn waiting_walk(root: &Root) -> (Walk, String, Arc<PreviewCopies>) {
+    let copies = PreviewCopies::new(
+        root.0.path().join("previews"),
+        Arc::new(SteadyPreview),
+        octo_core::common::Clock::system(),
+        || 0,
+    );
+    let walk = build_full_copies(
+        root,
+        false,
+        DownloadSource::Soulseek,
+        true,
+        false,
+        Some(copies.clone()),
+        |_| Arc::new(|_: &str| Vec::new()),
+    )
+    .await;
+    let id = walk.songs[0].external_id.clone().expect("an id");
+    walk.registry.set_you_tube_id(&id, OLD_VIDEO);
+    assert!(walk.registry.set_pending_video(&id, OLD_VIDEO, NEW_VIDEO));
+    copies.start(OLD_VIDEO, None);
+    for _ in 0..500 {
+        if copies.is_ready(OLD_VIDEO) {
+            return (walk, id, copies);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the copy of the old video was never made");
+}
+
+/// The videos the shim was asked to stream, in order.
+async fn streamed(walk: &Walk) -> Vec<String> {
+    walk._server
+        .received_requests()
+        .await
+        .expect("recording")
+        .iter()
+        .filter(|r| r.url.path() == "/stream")
+        .filter_map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "id")
+                .map(|(_, v)| v.into_owned())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_play_picking_up_past_the_first_byte_streams_the_old_video_and_leaves_the_new_one_waiting() {
+    let root = Root::new("octo-stream-");
+    let (walk, id, copies) = waiting_walk(&root).await;
+    // Past the first byte the old copy answers on its own; take it away so the shim is asked.
+    copies.drop_copy(OLD_VIDEO);
+
+    walk.service
+        .get_direct_stream("soulseek", &id, Some("bytes=1000-"), &CancellationToken::new())
+        .await
+        .expect("no error")
+        .expect("a stream");
+
+    let routing = walk.registry.lookup(&id).expect("known").snapshot();
+    assert_eq!(routing.you_tube_id.as_deref(), Some(OLD_VIDEO));
+    assert_eq!(routing.pending_video.as_deref(), Some(NEW_VIDEO));
+    assert_eq!(streamed(&walk).await, [OLD_VIDEO]);
+}
+
+#[tokio::test]
+async fn a_play_from_the_first_byte_streams_the_new_video_and_drops_the_old_copy() {
+    let root = Root::new("octo-stream-");
+    let (walk, id, copies) = waiting_walk(&root).await;
+
+    walk.service
+        .get_direct_stream("soulseek", &id, None, &CancellationToken::new())
+        .await
+        .expect("no error")
+        .expect("a stream");
+
+    let routing = walk.registry.lookup(&id).expect("known").snapshot();
+    assert_eq!(routing.you_tube_id.as_deref(), Some(NEW_VIDEO));
+    assert_eq!(routing.video_pick, SoulseekRouting::VIDEO_PICK);
+    assert_eq!(routing.pending_video, None);
+    assert_eq!(streamed(&walk).await, [NEW_VIDEO]);
+    assert!(!copies.is_ready(OLD_VIDEO), "the old video's copy went");
+}
+
+#[tokio::test]
+async fn the_old_copy_stays_while_another_song_still_pins_the_old_video() {
+    let root = Root::new("octo-stream-");
+    let (walk, id, copies) = waiting_walk(&root).await;
+    let other = walk.songs[1].external_id.clone().expect("an id");
+    walk.registry.set_you_tube_id(&other, OLD_VIDEO);
+
+    walk.service
+        .get_direct_stream("soulseek", &id, Some("bytes=0-"), &CancellationToken::new())
+        .await
+        .expect("no error")
+        .expect("a stream");
+
+    let routing = walk.registry.lookup(&id).expect("known").snapshot();
+    assert_eq!(routing.you_tube_id.as_deref(), Some(NEW_VIDEO));
+    assert!(copies.is_ready(OLD_VIDEO), "another song still plays it");
 }
 
 #[tokio::test]
@@ -2541,10 +3016,417 @@ fn a_video_too_short_or_called_a_sample_is_not_the_song() {
         duration: Some(duration),
         channel: None,
         stream: StreamFacts::default(),
+        ..YouTubeHit::default()
     };
     assert!(!is_the_song(&video("Burial - Archangel", 59), Some(238)));
     assert!(is_the_song(&video("Burial - Archangel", 240), Some(238)));
     assert!(is_the_song(&video("Burial - Archangel", 59), None));
     assert!(!is_the_song(&video("Burial - Archangel (Preview)", 59), None));
     assert!(!is_the_song(&video("Archangel sample", 238), Some(238)));
+}
+
+// ---- What a YouTube download does when AcoustID names another song --------------------------
+
+/// A verdict that heard `artist - title` as recording `rec`, which AcoustID lists at
+/// `recording_seconds` against a file of 153 s.
+fn heard_at(
+    verdict: VerificationVerdict,
+    artist: &str,
+    title: &str,
+    recording_seconds: Option<i32>,
+) -> VerificationResult {
+    let recording = AcoustIdRecording {
+        duration_seconds: recording_seconds,
+        sources: 10,
+        ..AcoustIdRecording::new("rec", title, [artist], None, None)
+    };
+    VerificationResult {
+        verdict,
+        score: 0.97,
+        matched_artist: Some(artist.into()),
+        matched_title: Some(title.into()),
+        recording_id: Some("rec".into()),
+        duration_seconds: 153,
+        lookup: Some(AcoustIdLookup::new(
+            true,
+            None,
+            vec![AcoustIdResult::new(0.97, vec![recording])],
+        )),
+        ..Default::default()
+    }
+}
+
+fn heard(verdict: VerificationVerdict, artist: &str, title: &str) -> VerificationResult {
+    heard_at(verdict, artist, title, Some(153))
+}
+
+/// Whether `verdict` names another recording than `KILLY - Killamonjaro`, when the catalog says
+/// the song runs `catalog` seconds and any take is wanted.
+fn another_recording(verdict: &VerificationResult, catalog: i32) -> bool {
+    names_another_recording(verdict, "KILLY", "Killamonjaro", Some(catalog), &Takes::Any)
+}
+
+#[test]
+fn another_artists_song_of_another_title_is_another_recording() {
+    // A video of another artist's song of a like title.
+    let summer_cem = heard(
+        VerificationVerdict::Mismatch,
+        "Summer Cem & BILLA JOE",
+        "KILLY MANJARO",
+    );
+    assert!(another_recording(&summer_cem, 153));
+}
+
+#[test]
+fn the_artists_other_song_is_another_recording_only_at_another_length() {
+    let other_song = heard(VerificationVerdict::Mismatch, "KILLY", "Distance");
+    assert!(another_recording(&other_song, 179));
+    assert!(!another_recording(&other_song, 153));
+}
+
+#[test]
+fn a_cover_by_another_artist_is_another_recording_only_at_another_length() {
+    let cover = heard(VerificationVerdict::Mismatch, "Some Band", "Killamonjaro");
+    assert!(another_recording(&cover, 173));
+    // At the song's own length it may be an alias of the artist: asked about, not thrown away.
+    assert!(!another_recording(&cover, 153));
+}
+
+#[test]
+fn a_title_variant_at_the_songs_length_is_kept_and_asked_about() {
+    let variant = heard(VerificationVerdict::Mismatch, "KILLY", "Killamonjaro Part 2");
+    assert!(!names_another_recording(
+        &variant,
+        "KILLY",
+        "Killamonjaro Pt. 2",
+        Some(153),
+        &Takes::Any
+    ));
+}
+
+#[test]
+fn a_certain_take_nobody_asked_for_is_another_recording() {
+    let mut live = heard(VerificationVerdict::Mismatch, "KILLY", "Killamonjaro");
+    live.kind = Some(RecordingKind::Live);
+    live.kind_certain = true;
+    assert!(another_recording(&live, 153));
+    // The same take, asked for by the title, is the song.
+    assert!(!names_another_recording(
+        &live,
+        "KILLY",
+        "Killamonjaro (Live)",
+        Some(153),
+        &Takes::Any
+    ));
+    // A take the verdict is not sure of is a question.
+    live.kind_certain = false;
+    assert!(!another_recording(&live, 153));
+}
+
+#[test]
+fn another_version_of_the_title_is_another_recording() {
+    let remix = heard(VerificationVerdict::Mismatch, "KILLY", "Killamonjaro (Remix)");
+    assert!(another_recording(&remix, 153));
+}
+
+#[test]
+fn a_verdict_that_names_nothing_or_confirms_is_not() {
+    let nothing_named = VerificationResult {
+        verdict: VerificationVerdict::Mismatch,
+        ..Default::default()
+    };
+    let confirmed = heard(VerificationVerdict::Confirmed, "Summer Cem", "KILLY MANJARO");
+    for verdict in [nothing_named, confirmed] {
+        assert!(!another_recording(&verdict, 153), "{verdict:?}");
+    }
+}
+
+#[test]
+fn a_name_in_another_script_is_kept_and_asked_about() {
+    let japanese = heard(VerificationVerdict::Mismatch, "高橋洋子", "残酷な天使のテーゼ");
+    assert!(!names_another_recording(
+        &japanese,
+        "Yoko Takahashi",
+        "A Cruel Angel's Thesis",
+        Some(153),
+        &Takes::Any
+    ));
+    let russian = heard(VerificationVerdict::Mismatch, "Кино", "Звезда по имени Солнце");
+    assert!(!names_another_recording(
+        &russian,
+        "Viktor Tsoi",
+        "Star Called Sun",
+        Some(153),
+        &Takes::Any
+    ));
+}
+
+#[test]
+fn an_unbelieved_link_is_kept_and_asked_about() {
+    let too_long = heard_at(
+        VerificationVerdict::Mismatch,
+        "Summer Cem & BILLA JOE",
+        "KILLY MANJARO",
+        Some(210),
+    );
+    let no_length = heard_at(
+        VerificationVerdict::Mismatch,
+        "Summer Cem & BILLA JOE",
+        "KILLY MANJARO",
+        None,
+    );
+    let mut dwarfed = heard(
+        VerificationVerdict::Mismatch,
+        "Summer Cem & BILLA JOE",
+        "KILLY MANJARO",
+    );
+    let other = AcoustIdRecording {
+        duration_seconds: Some(153),
+        sources: 250,
+        ..AcoustIdRecording::new("other", "Something Else", ["Other"], None, None)
+    };
+    dwarfed.lookup.as_mut().expect("a lookup").results[0]
+        .recordings
+        .push(other);
+    let mut no_lookup = heard(
+        VerificationVerdict::Mismatch,
+        "Summer Cem & BILLA JOE",
+        "KILLY MANJARO",
+    );
+    no_lookup.lookup = None;
+    for verdict in [too_long, no_length, dwarfed, no_lookup] {
+        assert!(!another_recording(&verdict, 153), "{verdict:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_refused_video_is_not_taken_again() {
+    let root = Root::new("octo-stream-");
+    let walk = build(&root, false, |_| Arc::new(|_: &str| Vec::new())).await;
+    let song = walk.songs[0].clone();
+    let id = song.external_id.clone().expect("an id");
+    let length = walk.registry.lookup(&id).expect("known").snapshot().duration;
+    // YouTube Music would hand back the refused video.
+    walk.slskd.state.lock().ytm_tracks = Some(json!([{
+        "videoId": "ytm-atv", "title": song.title, "artists": [song.artist],
+        "durationSeconds": length.unwrap_or(200), "videoType": "MUSIC_VIDEO_TYPE_ATV",
+    }]));
+    walk.registry.refuse_video(&id, "ytm-atv");
+
+    walk.service
+        .get_direct_stream("soulseek", &id, Some("bytes=0-1"), &CancellationToken::new())
+        .await
+        .expect("no error")
+        .expect("a stream");
+
+    let routing = walk.registry.lookup(&id).expect("known").snapshot();
+    assert_eq!(routing.you_tube_id.as_deref(), Some("vid123"));
+    let asked = walk._server.received_requests().await.expect("recording");
+    assert!(
+        asked
+            .iter()
+            .any(|r| r.url.path() == "/search" && r.url.query().unwrap_or("").contains("skip=ytm-atv")),
+        "{asked:?}"
+    );
+}
+
+// ---- A YouTube file that is another recording: the next video is tried ----------------------
+
+/// What AcoustID answers for a 180 s file it hears as `artist - title`.
+fn heard_lookup(artist: &str, title: &str) -> Value {
+    json!({"status": "ok", "results": [{
+        "id": "result", "score": 0.97,
+        "recordings": [{
+            "id": "rec", "title": title, "artists": [{"name": artist}],
+            "duration": 180, "sources": 10,
+        }],
+    }]})
+}
+
+/// A walk whose YouTube downloads are real 180 s audio; None where ffmpeg or fpcalc is missing.
+async fn recording_walk(root: &Root, videos: &[&str]) -> Option<Walk> {
+    let melody = "aevalsrc=exprs=0.4*sin(2*PI*t*220*pow(2\\,floor(mod(t*2\\,8))*2/12))\
+                  +0.3*sin(2*PI*t*330*pow(2\\,floor(mod(t*3\\,5))*3/12)):s=44100:d=180";
+    let audio = made_sound(melody, &["-c:a", "libmp3lame", "-f", "mp3"])?;
+    let walk = build_verified(root, false, DownloadSource::YouTube, true, |_| {
+        Arc::new(|_: &str| Vec::new())
+    })
+    .await;
+    {
+        let mut state = walk.slskd.state.lock();
+        state.download_audio = Some(audio);
+        state.search_videos = videos.iter().map(|v| v.to_string()).collect();
+    }
+    Some(walk)
+}
+
+fn searches_of(requests: &[Request]) -> Vec<String> {
+    requests
+        .iter()
+        .filter(|r| r.url.path() == "/search")
+        .map(|r| r.url.query().unwrap_or("").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_video_that_is_another_recording_is_refused_and_the_next_one_is_kept() {
+    let root = Root::new("octo-attempts-");
+    let Some(walk) = recording_walk(&root, &["bad", "good"]).await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    {
+        let mut state = walk.slskd.state.lock();
+        state
+            .lookup_by_video
+            .insert("bad".into(), heard_lookup("Other Artist", "Other Song"));
+        state
+            .lookup_by_video
+            .insert("good".into(), heard_lookup("Drake", "Started"));
+    }
+    let id = walk.songs[3].external_id.clone().expect("an id");
+
+    acquire(&walk, &id, None).await.expect("the second video lands");
+
+    let routing = walk.registry.lookup(&id).expect("known").snapshot();
+    assert_eq!(routing.you_tube_id.as_deref(), Some("good"));
+    assert_eq!(routing.refused_videos, ["bad"]);
+    assert_eq!(walk.registry.refusals_for(&routing), ["bad"]);
+    assert_eq!(walk.slskd.state.lock().you_tube_downloads.len(), 2);
+    let asked = walk._server.received_requests().await.expect("recording");
+    let searches = searches_of(&asked);
+    assert!(searches.len() >= 2, "{searches:?}");
+    assert!(!searches[0].contains("skip="), "{searches:?}");
+    assert!(searches[1].contains("skip=bad"), "{searches:?}");
+}
+
+/// A YouTube Music row that names the song, artist and length is a second word beside one
+/// person's AcoustID link: the MP3 is confirmed and nobody is asked about it.
+#[tokio::test]
+async fn a_lone_link_through_a_row_that_names_the_song_is_confirmed() {
+    let root = Root::new("octo-attempts-");
+    let Some(walk) = recording_walk(&root, &["vid"]).await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    {
+        let mut state = walk.slskd.state.lock();
+        state.ytm_tracks = Some(json!([{
+            "videoId": "ytm-row", "title": "Started", "artists": ["Drake"],
+            "durationSeconds": 180, "videoType": "MUSIC_VIDEO_TYPE_ATV",
+        }]));
+        state.lookup_by_video.insert("ytm-row".into(), lone_lookup());
+    }
+    review_on(&walk);
+    let id = walk.songs[3].external_id.clone().expect("an id");
+
+    acquire(&walk, &id, None).await.expect("the row's MP3 lands");
+
+    let routing = walk.registry.lookup(&id).expect("known").snapshot();
+    assert_eq!(routing.you_tube_id.as_deref(), Some("ytm-row"));
+    assert!(walk.reviews.0.lock().is_empty());
+}
+
+/// A video whose own facts do not name the song backs nothing: the lone link stays a question.
+#[tokio::test]
+async fn a_lone_link_through_a_video_nothing_names_is_asked_about() {
+    let root = Root::new("octo-attempts-");
+    let Some(walk) = recording_walk(&root, &["vid"]).await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    walk.slskd
+        .state
+        .lock()
+        .lookup_by_video
+        .insert("vid".into(), lone_lookup());
+    review_on(&walk);
+    let id = walk.songs[3].external_id.clone().expect("an id");
+
+    acquire(&walk, &id, None).await.expect("the video's MP3 lands");
+
+    let asked = walk.reviews.0.lock().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].reason, InconclusiveReason::LoneLink);
+}
+
+#[tokio::test]
+async fn three_videos_that_are_other_recordings_fail_the_download() {
+    let root = Root::new("octo-attempts-");
+    let Some(walk) = recording_walk(&root, &["a", "b", "c", "d"]).await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    for video in ["a", "b", "c", "d"] {
+        walk.slskd
+            .state
+            .lock()
+            .lookup_by_video
+            .insert(video.into(), heard_lookup("Other Artist", "Other Song"));
+    }
+    let id = walk.songs[3].external_id.clone().expect("an id");
+
+    let error = acquire(&walk, &id, None).await.expect_err("no video is right");
+
+    assert!(error.to_string().contains("AcoustID identified"), "{error:#}");
+    let routing = walk.registry.lookup(&id).expect("known").snapshot();
+    assert_eq!(routing.refused_videos, ["a", "b", "c"]);
+    assert_eq!(walk.slskd.state.lock().you_tube_downloads.len(), 3);
+}
+
+#[tokio::test]
+async fn a_pinned_video_that_is_refused_is_never_downloaded_twice() {
+    let root = Root::new("octo-attempts-");
+    let Some(walk) = recording_walk(&root, &["bad", "good"]).await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    {
+        let mut state = walk.slskd.state.lock();
+        state
+            .lookup_by_video
+            .insert("bad".into(), heard_lookup("Other Artist", "Other Song"));
+        state
+            .lookup_by_video
+            .insert("good".into(), heard_lookup("Drake", "Started"));
+    }
+    let id = walk.songs[3].external_id.clone().expect("an id");
+    assert!(walk.registry.set_you_tube_id(&id, "bad"));
+
+    acquire(&walk, &id, None).await.expect("the other video lands");
+
+    let downloads = walk.slskd.state.lock().you_tube_downloads.clone();
+    assert_eq!(downloads.len(), 2, "{downloads:?}");
+    assert!(downloads[0].contains("bad-"), "{downloads:?}");
+    assert!(downloads[1].contains("good-"), "{downloads:?}");
+}
+
+#[tokio::test]
+async fn a_refused_video_is_not_downloaded_again() {
+    let root = Root::new("octo-attempts-");
+    let walk = build_with(&root, false, DownloadSource::YouTube, |_| {
+        Arc::new(|_: &str| Vec::new())
+    })
+    .await;
+    let song = walk.songs[0].clone();
+    let id = song.external_id.clone().expect("an id");
+    let length = walk.registry.lookup(&id).expect("known").snapshot().duration;
+    // YouTube Music would hand back the refused video.
+    walk.slskd.state.lock().ytm_tracks = Some(json!([{
+        "videoId": "ytm-atv", "title": song.title, "artists": [song.artist],
+        "durationSeconds": length.unwrap_or(200), "videoType": "MUSIC_VIDEO_TYPE_ATV",
+    }]));
+    walk.registry.refuse_video(&id, "ytm-atv");
+
+    acquire(&walk, &id, None).await.expect("the YouTube copy lands");
+
+    let routing = walk.registry.lookup(&id).expect("known").snapshot();
+    assert_eq!(routing.you_tube_id.as_deref(), Some("vid123"));
+    let asked = walk._server.received_requests().await.expect("recording");
+    assert!(
+        asked
+            .iter()
+            .any(|r| r.url.path() == "/search" && r.url.query().unwrap_or("").contains("skip=ytm-atv")),
+        "{asked:?}"
+    );
 }

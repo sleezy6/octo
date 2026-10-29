@@ -3,7 +3,9 @@
 //! there is not asked for again for an hour, so however many listeners and apps ask, Apple sees
 //! a few requests an hour per list.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use octo_core::charts::apple_pages::{
@@ -72,10 +74,72 @@ impl From<ApplePageError> for PageError {
     }
 }
 
-/// One request at a time, [`INTERVAL`] apart, for every page this reads.
+/// How many interactive reads in a row go before the oldest background read gets a turn.
+const NOW_STREAK: usize = 4;
+
+/// Whether a read is interactive (`now`) or background (`behind`). Clones share one flag, so a
+/// read already waiting at the gate turns urgent when a request asks for the same answer.
+#[derive(Debug, Clone)]
+pub struct LaneCell(Arc<AtomicBool>);
+
+impl LaneCell {
+    pub fn now() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+
+    pub fn behind() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn is_now(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Makes the read interactive. True when it was not already.
+    pub fn make_now(&self) -> bool {
+        !self.0.swap(true, Ordering::SeqCst)
+    }
+}
+
+/// One request at a time, [`INTERVAL`] apart, for every page this reads. Interactive reads go
+/// before background ones; after [`NOW_STREAK`] interactive grants in a row the oldest background
+/// read goes, so a steady interactive load never starves the background.
 pub struct Gate {
     interval: Duration,
     next: tokio::sync::Mutex<Option<Instant>>,
+    /// Interactive reads waiting.
+    waiting_now: AtomicUsize,
+    /// Interactive grants since the last background one.
+    now_streak: AtomicUsize,
+    /// The next ticket for a background read.
+    behind_order: AtomicU64,
+    /// The tickets of the background reads waiting, the oldest first.
+    serving_behind: Mutex<BTreeSet<u64>>,
+    /// Signaled whenever a waiter leaves or a read turns urgent.
+    freed: tokio::sync::Notify,
+}
+
+/// An interactive read waiting at the gate.
+struct NowWait<'a>(&'a Gate);
+
+impl Drop for NowWait<'_> {
+    fn drop(&mut self) {
+        self.0.waiting_now.fetch_sub(1, Ordering::SeqCst);
+        self.0.freed.notify_waiters();
+    }
+}
+
+/// A background read waiting at the gate, by its ticket.
+struct BehindWait<'a> {
+    gate: &'a Gate,
+    ticket: u64,
+}
+
+impl Drop for BehindWait<'_> {
+    fn drop(&mut self) {
+        self.gate.serving_behind.lock().remove(&self.ticket);
+        self.gate.freed.notify_waiters();
+    }
 }
 
 impl Gate {
@@ -83,35 +147,123 @@ impl Gate {
         Self {
             interval,
             next: tokio::sync::Mutex::new(None),
+            waiting_now: AtomicUsize::new(0),
+            now_streak: AtomicUsize::new(0),
+            behind_order: AtomicU64::new(0),
+            serving_behind: Mutex::new(BTreeSet::new()),
+            freed: tokio::sync::Notify::new(),
         }
     }
 
-    /// Waits for this request's turn. Waiters queue on the lock, so they go one after another.
+    /// Waits for a background turn. Waiters go one after another.
     pub async fn wait(&self) {
-        self.wait_unless(|| false).await;
+        self.wait_in(&LaneCell::behind(), || false).await;
     }
 
-    /// Waits for this request's turn unless, when its place in the queue comes up, `answered`
-    /// says it needs none (a request before it already learned the answer). True when the
-    /// request may go.
+    /// Waits for a background turn unless, when its place comes up, `answered` says it needs
+    /// none (a request before it already learned the answer). True when the request may go.
     pub async fn wait_unless(&self, answered: impl Fn() -> bool) -> bool {
-        let mut next = self.next.lock().await;
-        if answered() {
-            return false;
+        self.wait_in(&LaneCell::behind(), answered).await
+    }
+
+    /// Makes the waiting background reads look at their lane again, after one turned urgent.
+    pub fn wake_behind(&self) {
+        self.freed.notify_waiters();
+    }
+
+    fn join_now(&self) -> NowWait<'_> {
+        self.waiting_now.fetch_add(1, Ordering::SeqCst);
+        NowWait(self)
+    }
+
+    fn join_behind(&self) -> BehindWait<'_> {
+        let ticket = self.behind_order.fetch_add(1, Ordering::SeqCst);
+        self.serving_behind.lock().insert(ticket);
+        BehindWait { gate: self, ticket }
+    }
+
+    /// Whether a background read may queue for the slot: it is the oldest background read, and
+    /// either nothing interactive is waiting or interactive reads have had their run. Background
+    /// reads so go one at a time in the order they came.
+    fn behind_may_go(&self, ticket: u64) -> bool {
+        self.serving_behind.lock().first() == Some(&ticket)
+            && (self.waiting_now.load(Ordering::SeqCst) == 0
+                || self.now_streak.load(Ordering::SeqCst) >= NOW_STREAK)
+    }
+
+    /// Whether an interactive read lets the background read that is due go first.
+    fn now_should_yield(&self) -> bool {
+        self.now_streak.load(Ordering::SeqCst) >= NOW_STREAK && !self.serving_behind.lock().is_empty()
+    }
+
+    /// Waits for this read's turn in its lane unless, when its place comes up, `answered` says
+    /// it needs none. True when the read may go.
+    pub async fn wait_in(&self, lane: &LaneCell, answered: impl Fn() -> bool) -> bool {
+        let mut now_wait: Option<NowWait<'_>> = None;
+        let mut behind_wait: Option<BehindWait<'_>> = None;
+        if lane.is_now() {
+            now_wait = Some(self.join_now());
+        } else {
+            behind_wait = Some(self.join_behind());
         }
-        if let Some(at) = *next
-            && at > Instant::now()
-        {
-            tokio::time::sleep_until(at).await;
+        loop {
+            let note = self.freed.notified();
+            tokio::pin!(note);
+            note.as_mut().enable();
+            if behind_wait.is_some() && lane.is_now() {
+                behind_wait = None;
+                now_wait = Some(self.join_now());
+            }
+            if let Some(behind) = &behind_wait
+                && !self.behind_may_go(behind.ticket)
+            {
+                note.await;
+                continue;
+            }
+            let mut next = if behind_wait.is_some() {
+                // A background read queued here looks again when a read turns urgent.
+                tokio::select! {
+                    guard = self.next.lock() => guard,
+                    () = note.as_mut() => continue,
+                }
+            } else {
+                self.next.lock().await
+            };
+            if let Some(behind) = &behind_wait {
+                if lane.is_now() {
+                    continue;
+                }
+                if !self.behind_may_go(behind.ticket) {
+                    continue;
+                }
+            } else if self.now_should_yield() {
+                drop(next);
+                note.await;
+                continue;
+            }
+            if answered() {
+                return false;
+            }
+            if let Some(at) = *next
+                && at > Instant::now()
+            {
+                tokio::time::sleep_until(at).await;
+            }
+            *next = Some(Instant::now() + self.interval);
+            if now_wait.is_some() {
+                self.now_streak.fetch_add(1, Ordering::SeqCst);
+            } else {
+                self.now_streak.store(0, Ordering::SeqCst);
+            }
+            return true;
         }
-        *next = Some(Instant::now() + self.interval);
-        true
     }
 }
 
 pub struct AppleMusicPages {
     client: reqwest::Client,
     base: String,
+    genres_base: String,
     gate: Gate,
     country: MemoryCache<String>,
     rooms: MemoryCache<Arc<Vec<SongRoom>>>,
@@ -122,6 +274,7 @@ pub struct AppleMusicPages {
 
 impl AppleMusicPages {
     pub const BASE: &'static str = "https://music.apple.com";
+    pub const GENRES_BASE: &'static str = "https://itunes.apple.com";
 
     pub fn new() -> Self {
         Self::with_base_url(Self::BASE, INTERVAL)
@@ -139,6 +292,7 @@ impl AppleMusicPages {
         Self {
             client,
             base: base.trim_end_matches('/').to_string(),
+            genres_base: Self::GENRES_BASE.to_string(),
             gate: Gate::new(interval),
             country: MemoryCache::new(16),
             rooms: MemoryCache::new(256),
@@ -148,16 +302,64 @@ impl AppleMusicPages {
         }
     }
 
+    /// The genre list read from another host (a test's mock server).
+    pub fn with_genres_base_url(mut self, base: &str) -> Self {
+        self.genres_base = base.trim_end_matches('/').to_string();
+        self
+    }
+
+    /// A genre's English name from Apple's US genre list, or None when it cannot be read or the
+    /// name is not in Latin script. Takes its turn at the shared gate; a failure is not
+    /// remembered, so the next ask tries again.
+    pub async fn genre_english_name(&self, id: &str) -> Option<String> {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let url = format!(
+            "{}/WebObjects/MZStoreServices.woa/ws/genres?id={id}&cc=us",
+            self.genres_base
+        );
+        self.gate.wait().await;
+        let response = self.client.get(&url).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body = response.bytes().await.ok()?;
+        if body.len() > MAX_BODY {
+            return None;
+        }
+        let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
+        let name = json.get(id)?.get("name")?.as_str()?.trim();
+        (!name.is_empty() && octo_core::charts::chart_settings::is_latin_script(name))
+            .then(|| name.to_string())
+    }
+
+    /// The gate every page waits at, for waking background reads that turned urgent.
+    pub fn gate(&self) -> &Gate {
+        &self.gate
+    }
+
+    /// [`Self::chart_on`] in the background lane.
+    pub async fn chart(&self, country: Option<&str>, genre: &str) -> Result<Arc<ApplePage>, PageError> {
+        self.chart_on(country, genre, &LaneCell::behind()).await
+    }
+
     /// A chart: the overall one (`34`) or a genre's, for a country, or for the server's own when
     /// `country` is None (Apple sends a link without one on to the country it sees the server in).
-    pub async fn chart(&self, country: Option<&str>, genre: &str) -> Result<Arc<ApplePage>, PageError> {
+    pub async fn chart_on(
+        &self,
+        country: Option<&str>,
+        genre: &str,
+        lane: &LaneCell,
+    ) -> Result<Arc<ApplePage>, PageError> {
         let country = match country {
             Some(code) if is_country_code(code) => Some(code),
             Some(_) => return Err(PageError::Unavailable("not a country".into())),
             None => None,
         };
-        if let Some(code) = country
-            && let Some(page) = self.pages.get(&page_key(code, genre))
+        let key = country.map(|code| page_key(code, genre));
+        if let Some(key) = &key
+            && let Some(page) = self.pages.get(key)
         {
             return Ok(page);
         }
@@ -169,7 +371,14 @@ impl AppleMusicPages {
             url.push_str("/?genreId=");
             url.push_str(genre);
         }
-        let html = self.fetch(&url).await?;
+        // A page fetched while this read waited costs no slot.
+        let held = || key.as_ref().is_some_and(|key| self.pages.get(key).is_some());
+        let Some(html) = self.fetch(&url, lane, held).await? else {
+            return key
+                .as_ref()
+                .and_then(|key| self.pages.get(key))
+                .ok_or_else(|| PageError::Unavailable("the page was dropped".into()));
+        };
         if genre == OVERALL {
             let countries = parse_countries(&html);
             if !countries.is_empty() {
@@ -187,12 +396,17 @@ impl AppleMusicPages {
         Ok(page)
     }
 
-    /// The country Apple sees the server in, or None while that cannot be learned.
+    /// [`Self::detected_country_on`] in the background lane.
     pub async fn detected_country(&self) -> Option<String> {
+        self.detected_country_on(&LaneCell::behind()).await
+    }
+
+    /// The country Apple sees the server in, or None while that cannot be learned.
+    pub async fn detected_country_on(&self, lane: &LaneCell) -> Option<String> {
         if let Some(code) = self.known_country() {
             return Some(code);
         }
-        let page = self.chart(None, OVERALL).await.ok()?;
+        let page = self.chart_on(None, OVERALL, lane).await.ok()?;
         is_country_code(&page.country).then(|| page.country.clone())
     }
 
@@ -202,9 +416,14 @@ impl AppleMusicPages {
         self.country.get("country")
     }
 
+    /// [`Self::rooms_on`] in the background lane.
+    pub async fn rooms(&self, country: &str) -> Result<Arc<Vec<SongRoom>>, PageError> {
+        self.rooms_on(country, &LaneCell::behind()).await
+    }
+
     /// The New page's song rooms this week, asked for in English (so their titles can be
     /// matched), and again without when English is refused.
-    pub async fn rooms(&self, country: &str) -> Result<Arc<Vec<SongRoom>>, PageError> {
+    pub async fn rooms_on(&self, country: &str, lane: &LaneCell) -> Result<Arc<Vec<SongRoom>>, PageError> {
         if !is_country_code(country) {
             return Err(PageError::Unavailable("not a country".into()));
         }
@@ -216,10 +435,11 @@ impl AppleMusicPages {
             return Err(error);
         }
         let english = format!("{}/{country}/new?l=en-US", self.base);
-        let html = match self.fetch(&english).await {
+        let html = match self.fetch_html(&english, lane).await {
             Ok(html) => Ok(html),
             Err(PageError::NoSuchPage | PageError::Unavailable(_)) => {
-                self.fetch(&format!("{}/{country}/new", self.base)).await
+                self.fetch_html(&format!("{}/{country}/new", self.base), lane)
+                    .await
             }
             Err(other) => Err(other),
         };
@@ -237,26 +457,52 @@ impl AppleMusicPages {
         }
     }
 
-    /// This week's Best New Songs or Trending Songs: the room's id and its songs.
+    /// [`Self::room_on`] in the background lane.
     pub async fn room(&self, country: &str, kind: RoomKind) -> Result<(String, Arc<ApplePage>), PageError> {
-        let rooms = self.rooms(country).await?;
+        self.room_on(country, kind, &LaneCell::behind()).await
+    }
+
+    /// This week's Best New Songs or Trending Songs: the room's id and its songs.
+    pub async fn room_on(
+        &self,
+        country: &str,
+        kind: RoomKind,
+        lane: &LaneCell,
+    ) -> Result<(String, Arc<ApplePage>), PageError> {
+        let rooms = self.rooms_on(country, lane).await?;
         let room = room_for(&rooms, kind).ok_or(PageError::NoRoom)?;
         let key = page_key(country, &format!("room:{}", room.room_id));
         if let Some(page) = self.pages.get(&key) {
             return Ok((room.room_id.clone(), page));
         }
-        let html = self
-            .fetch(&format!("{}/{country}/room/{}", self.base, room.room_id))
-            .await?;
+        let url = format!("{}/{country}/room/{}", self.base, room.room_id);
+        let Some(html) = self.fetch(&url, lane, || self.pages.get(&key).is_some()).await? else {
+            return self
+                .pages
+                .get(&key)
+                .map(|page| (room.room_id.clone(), page))
+                .ok_or_else(|| PageError::Unavailable("the page was dropped".into()));
+        };
         let page = Arc::new(parse_songs(&html)?);
         self.pages.set(key, page.clone(), 1, PAGE_TTL);
         Ok((room.room_id.clone(), page))
     }
 
+    /// [`Self::album_animated_art_on`] in the background lane.
+    pub async fn album_animated_art(&self, country: &str, album_id: u64) -> Result<PageLoops, PageError> {
+        self.album_animated_art_on(country, album_id, &LaneCell::behind())
+            .await
+    }
+
     /// An album's animated art from its page in `country`'s store, then the US store when that
     /// store has no such page. The page is read only up to the end of the tall clip, which
     /// sits about two thirds of the way in.
-    pub async fn album_animated_art(&self, country: &str, album_id: u64) -> Result<PageLoops, PageError> {
+    pub async fn album_animated_art_on(
+        &self,
+        country: &str,
+        album_id: u64,
+        lane: &LaneCell,
+    ) -> Result<PageLoops, PageError> {
         let mut stores = vec![country];
         if country != "us" {
             stores.push("us");
@@ -264,7 +510,7 @@ impl AppleMusicPages {
         let mut last = PageError::NoSuchPage;
         for store in stores.into_iter().filter(|c| is_country_code(c)) {
             let url = format!("{}/{store}/album/{album_id}", self.base);
-            match self.fetch_through_tall_loop(&url).await {
+            match self.fetch_through_tall_loop(&url, lane).await {
                 Ok(html) => return Ok(parse_animated_art(&html)),
                 Err(PageError::NoSuchPage) => {}
                 Err(other) => last = other,
@@ -275,12 +521,12 @@ impl AppleMusicPages {
 
     /// The page at `url` up to [`TALL_LOOP_TAIL`] past the tall clip's key, or whole when it has
     /// none. Takes its turn at the gate like every other page.
-    async fn fetch_through_tall_loop(&self, url: &str) -> Result<String, PageError> {
+    async fn fetch_through_tall_loop(&self, url: &str, lane: &LaneCell) -> Result<String, PageError> {
         const TALL: &[u8] = b"\"motionDetailTall\":";
         if let Some(error) = self.missing.get(url) {
             return Err(error);
         }
-        self.gate.wait().await;
+        self.gate.wait_in(lane, || false).await;
         let mut response = self
             .client
             .get(url)
@@ -320,6 +566,17 @@ impl AppleMusicPages {
         Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
+    /// Whether [`Self::countries`] holds this country, in any case, without copying the list.
+    pub fn has_country(&self, code: &str) -> bool {
+        let code = code.trim();
+        let read = self.countries.lock();
+        if read.is_empty() {
+            APPLE_COUNTRIES.iter().any(|c| c.eq_ignore_ascii_case(code))
+        } else {
+            read.iter().any(|c| c.eq_ignore_ascii_case(code))
+        }
+    }
+
     /// Apple Music's countries, from the last overall chart's country switcher, else the list
     /// as it was on 2026-10-07.
     pub fn countries(&self) -> Vec<String> {
@@ -331,15 +588,39 @@ impl AppleMusicPages {
         }
     }
 
-    async fn fetch(&self, url: &str) -> Result<String, PageError> {
+    /// The page at `url` whole, read in `lane`, for a page nothing else could have fetched
+    /// meanwhile.
+    async fn fetch_html(&self, url: &str, lane: &LaneCell) -> Result<String, PageError> {
+        match self.fetch(url, lane, || false).await? {
+            Some(html) => Ok(html),
+            None => Err(PageError::Unavailable("the page was held".into())),
+        }
+    }
+
+    /// The page at `url` whole, read in `lane`; Ok(None) when `held` says the answer arrived
+    /// while this read waited, so it takes no slot.
+    async fn fetch(
+        &self,
+        url: &str,
+        lane: &LaneCell,
+        held: impl Fn() -> bool,
+    ) -> Result<Option<String>, PageError> {
         if let Some(error) = self.missing.get(url) {
             return Err(error);
         }
-        // A request that waited in the queue while the one before it failed takes that failure.
-        if !self.gate.wait_unless(|| self.missing.get(url).is_some()).await
-            && let Some(error) = self.missing.get(url)
+        // A request that waited in the queue while the one before it failed takes that failure;
+        // one whose answer arrived meanwhile takes that.
+        if !self
+            .gate
+            .wait_in(lane, || held() || self.missing.get(url).is_some())
+            .await
         {
-            return Err(error);
+            if let Some(error) = self.missing.get(url) {
+                return Err(error);
+            }
+            if held() {
+                return Ok(None);
+            }
         }
         let mut response = match self.client.get(url).send().await {
             Ok(response) => response,
@@ -371,7 +652,7 @@ impl AppleMusicPages {
             }
             body.extend_from_slice(&chunk);
         }
-        Ok(String::from_utf8_lossy(&body).into_owned())
+        Ok(Some(String::from_utf8_lossy(&body).into_owned()))
     }
 }
 

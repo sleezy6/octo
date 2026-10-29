@@ -360,6 +360,7 @@ fn identity_journal() -> Arc<LibraryActionJournal> {
         revealed_path: None,
         copy: false,
         download_allowed: false,
+        denied_source: None,
     });
     Arc::new(journal)
 }

@@ -1009,7 +1009,18 @@ fn words_fit_inside_the_margins() {
                 side,
             );
             let margin = (side as f32 * book().layout.margin).round();
-            assert_eq!(3, art.words.len(), "{name} at {side}");
+            // A name too long to fit whole beside the light line, and then the foot line, gives
+            // them up: it is set smaller, never cut, or the cover is its artwork only.
+            let alone = art.words.len() < 3;
+            if alone {
+                assert!(art.words.iter().all(|w| !w.measured.cut), "{name} at {side}: cut");
+                assert!(
+                    art.words.iter().all(|w| w.role != WordsRole::Line),
+                    "{name} at {side}: a light line without room"
+                );
+            } else {
+                assert_eq!(3, art.words.len(), "{name} at {side}");
+            }
             for words in &art.words {
                 let b = words.inked();
                 assert!(
@@ -1034,8 +1045,9 @@ fn words_fit_inside_the_margins() {
             // The foot line comes first in the list; the name, then the line under it, then the
             // foot line, top to bottom.
             assert!(
-                art.words[2].top >= art.words[1].inked()[3] - 0.5
-                    && art.words[0].top >= art.words[2].inked()[3],
+                alone
+                    || (art.words[2].top >= art.words[1].inked()[3] - 0.5
+                        && art.words[0].top >= art.words[2].inked()[3]),
                 "{name} at {side}: order"
             );
         }
@@ -1043,7 +1055,7 @@ fn words_fit_inside_the_margins() {
 }
 
 #[test]
-fn long_names_wrap_onto_three_lines_at_most_and_the_longest_is_cut() {
+fn long_names_wrap_onto_three_lines_at_most_and_one_that_cannot_fit_is_artwork_only() {
     let fixture = Fixture::new();
     let service = fixture.service();
     let wraps = service
@@ -1060,13 +1072,12 @@ fn long_names_wrap_onto_three_lines_at_most_and_the_longest_is_cut() {
         .words
         .remove(0);
     let long = ["Unreasonably"; 12].join(" ");
-    let cut = service
+    let too_long = service
         .compose(
             &CoverArtService::spec(&long, None, Some(list_kinds::MIX), None, None),
             600,
         )
-        .words
-        .remove(0);
+        .words;
 
     assert!(
         (2..=3).contains(&wraps.measured.lines),
@@ -1074,8 +1085,71 @@ fn long_names_wrap_onto_three_lines_at_most_and_the_longest_is_cut() {
         wraps.measured.lines
     );
     assert!(!wraps.measured.cut);
-    assert_eq!(3, cut.measured.lines);
-    assert!(cut.measured.cut);
+    assert!(too_long.is_empty(), "a name that cannot fit whole is never cut");
+}
+
+#[test]
+fn every_pinned_chart_name_fits_without_cutting() {
+    use octo_core::charts::chart_settings::{APPLE_COUNTRIES, ENGLISH_GENRES, country_name, pinned_name};
+
+    let mut names: Vec<String> = ["Popular", "Best New Songs", "Trending Songs"]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    names.extend(
+        ENGLISH_GENRES
+            .iter()
+            .filter(|(id, _)| *id != "34")
+            .map(|(_, name)| format!("Top {name}")),
+    );
+    let setter = CoverTypesetter;
+    let (mut laid_out, mut artwork_only) = (0, 0);
+    for code in APPLE_COUNTRIES {
+        assert!(!country_name(code).is_empty());
+        for name in &names {
+            let title = pinned_name(name, code);
+            for side in [300, 600, 1200] {
+                let spec =
+                    CoverArtService::spec(&title, Some(&title), Some(list_kinds::CHART), Some(50), None);
+                let words = cover_layout::words(&spec, side, &setter, book());
+                if words.is_empty() {
+                    artwork_only += 1;
+                    continue;
+                }
+                laid_out += 1;
+                let shown = words
+                    .iter()
+                    .find(|w| w.role == WordsRole::Title)
+                    .unwrap_or_else(|| panic!("{title} at {side}: words without the name"));
+                assert!(!shown.measured.cut, "{title} at {side} is cut");
+                let (lines, cut) = setter.lines(&shown.text, &shown.type_, shown.width);
+                assert!(!cut, "{title} at {side} is cut");
+                let joined: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+                assert_eq!(joined.join(" "), title, "{title} at {side}");
+                assert!(
+                    lines.len() as i32 <= 3,
+                    "{title} at {side}: {} lines",
+                    lines.len()
+                );
+            }
+        }
+    }
+    assert!(
+        laid_out > artwork_only,
+        "{laid_out} laid out, {artwork_only} artwork only"
+    );
+}
+
+#[test]
+fn popular_japan_keeps_its_light_line_and_footer_at_600() {
+    let title = "Popular \u{b7} Japan";
+    let spec = CoverArtService::spec(title, Some(title), Some(list_kinds::CHART), Some(50), None);
+
+    let words = cover_layout::words(&spec, 600, &CoverTypesetter, book());
+
+    let roles: Vec<WordsRole> = words.iter().map(|w| w.role).collect();
+    assert_eq!(roles, vec![WordsRole::Footer, WordsRole::Title, WordsRole::Line]);
+    assert!(words.iter().all(|w| !w.measured.cut));
 }
 
 #[test]

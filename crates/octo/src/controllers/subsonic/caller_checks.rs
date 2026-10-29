@@ -206,6 +206,27 @@ pub(crate) async fn signed_in_user(state: &AppState, call: &SubsonicCall) -> Res
     }
 }
 
+/// The listener's name for a per-listener feature: [`signed_in_user`], or "" when it is unknown
+/// or cannot be asked. Never an error.
+pub(crate) async fn listener_name(state: &AppState, call: &SubsonicCall) -> String {
+    signed_in_user(state, call).await.unwrap_or_default()
+}
+
+/// [`listener_name`] for a call held as its parts: the parameters, the request-scoped proxy and
+/// the headers.
+pub(crate) async fn listener_name_of(
+    state: &AppState,
+    parameters: &Parameters,
+    proxy: &SubsonicProxyService,
+    headers: &HeaderMap,
+) -> String {
+    match state.request_identity.username(parameters, proxy).await {
+        Ok(Some(username)) => username,
+        Ok(None) => super::action_helpers::native_username(state, parameters, headers),
+        Err(_) => String::new(),
+    }
+}
+
 /// `NativeUsername`: u, else the Navidrome JWT carried in `X-Nd-Authorization` or
 /// `Authorization: Bearer`: first the token map captured from logins, then the payload's
 /// `username`, `preferred_username`, `user`, `name` or `sub` claim. Empty when none says.

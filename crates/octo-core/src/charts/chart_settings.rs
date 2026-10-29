@@ -4,6 +4,7 @@
 //! (Popular right now), `new` Best New Songs, `trending` Trending Songs, and any other number
 //! an Apple genre chart.
 
+use super::apple_genre_names::APPLE_GENRE_NAMES;
 use super::apple_pages::ChartGenre;
 
 /// Apple's "All Genres", the overall chart.
@@ -23,6 +24,13 @@ pub const CHART_SONGS: usize = 50;
 pub const ROOM_SONGS: usize = 100;
 /// The most lists the `Charts` setting takes besides the overall.
 pub const MAX_LISTS: usize = 14;
+/// The most countries a listener pins besides their own.
+pub const MAX_PINNED: usize = 3;
+/// Between a chart id and a pinned country in a list id (`34@jp`) and a playlist key
+/// (`chart:popular@jp`).
+pub const PIN_MARK: char = '@';
+/// Apple Music countries the country list has no English name for.
+const APPLE_ONLY_NAMES: &[(&str, &str)] = &[("xk", "Kosovo")];
 
 /// The US genre menu as read 2026-10-07: the English names Octo uses for these ids (Apple's
 /// chart pages name genres in the country's own language), and the menu while Apple's own
@@ -169,13 +177,53 @@ pub fn kind_word(id: &str) -> Option<&'static str> {
     })
 }
 
-/// A genre's name: Octo's English one when it knows the id, else Apple's own.
+/// Whether every letter of `name` is Latin script (accents included); digits, spaces and
+/// punctuation are fine.
+pub fn is_latin_script(name: &str) -> bool {
+    name.chars().all(|c| {
+        let latin_letter = matches!(
+            c,
+            '\u{41}'..='\u{5A}'
+                | '\u{61}'..='\u{7A}'
+                | '\u{AA}'
+                | '\u{BA}'
+                | '\u{C0}'..='\u{24F}'
+                | '\u{1E00}'..='\u{1EFF}'
+                | '\u{2C60}'..='\u{2C7F}'
+                | '\u{A720}'..='\u{A7FF}'
+        );
+        if c.is_alphabetic() {
+            latin_letter
+        } else {
+            c < '\u{300}' || ('\u{2000}'..='\u{206F}').contains(&c)
+        }
+    })
+}
+
+/// A genre's English name from the tables: Octo's short names for the ids the apps show, then
+/// Apple's full list.
+pub fn table_genre_name(id: &str) -> Option<&'static str> {
+    if let Some((_, name)) = ENGLISH_GENRES.iter().find(|(g, _)| *g == id) {
+        return Some(name);
+    }
+    let number = |s: &str| s.parse::<u64>().ok();
+    let wanted = number(id)?;
+    APPLE_GENRE_NAMES
+        .binary_search_by(|(g, _)| number(g).cmp(&Some(wanted)))
+        .ok()
+        .map(|at| APPLE_GENRE_NAMES[at].1)
+}
+
+/// A genre's name: Octo's English one when a table knows the id, else the country menu's own
+/// name when it is in Latin script. None when only a foreign-script name is known.
 pub fn genre_name(menu: &[ChartGenre], id: &str) -> Option<String> {
-    ENGLISH_GENRES
-        .iter()
-        .find(|(g, _)| *g == id)
-        .map(|(_, n)| (*n).to_string())
-        .or_else(|| menu.iter().find(|g| g.id == id).map(|g| g.name.clone()))
+    if let Some(name) = table_genre_name(id) {
+        return Some(name.to_string());
+    }
+    menu.iter()
+        .find(|g| g.id == id)
+        .filter(|g| is_latin_script(&g.name))
+        .map(|g| g.name.clone())
 }
 
 /// The playlist's name: `Popular right now`, `Best New Songs`, `Trending Songs` or `Top {genre}`.
@@ -205,6 +253,94 @@ pub fn english_menu() -> Vec<ChartGenre> {
             name: (*name).into(),
         })
         .collect()
+}
+
+/// A list's id: the chart id for the listener's own country, `{chart}@{country}` for a pinned one.
+pub fn list_id(chart: &str, pinned: Option<&str>) -> String {
+    match pinned {
+        Some(country) => format!("{chart}{PIN_MARK}{country}"),
+        None => chart.to_string(),
+    }
+}
+
+/// A list id's chart and pinned country: `"34@jp"` -> `("34", Some("jp"))`, `"34"` -> `("34", None)`.
+pub fn split_list(list: &str) -> (&str, Option<&str>) {
+    match list.split_once(PIN_MARK) {
+        Some((chart, country)) if !country.is_empty() => (chart, Some(country)),
+        _ => (list, None),
+    }
+}
+
+/// The key a list's playlist id is made from: the chart's own key, with the pinned country after it.
+pub fn list_key(list: &str) -> String {
+    let (chart, pinned) = split_list(list);
+    match pinned {
+        Some(country) => format!("{}{PIN_MARK}{country}", playlist_key(chart)),
+        None => playlist_key(chart),
+    }
+}
+
+/// A list key's chart and pinned country: `chart:popular@jp` -> `("34", Some("jp"))`.
+pub fn list_from_key(key: &str) -> Option<(String, Option<String>)> {
+    let (base, pinned) = match key.split_once(PIN_MARK) {
+        Some((base, country)) if !country.is_empty() => (base, Some(country.to_string())),
+        _ => (key, None),
+    };
+    chart_from_key(base).map(|chart| (chart, pinned))
+}
+
+/// A country's English name, or its code in upper case when no name is known.
+pub fn country_name(code: &str) -> String {
+    let code = code.trim().to_ascii_lowercase();
+    crate::common::countries::english_name(&code)
+        .or_else(|| {
+            APPLE_ONLY_NAMES
+                .iter()
+                .find(|(c, _)| *c == code)
+                .map(|(_, name)| *name)
+        })
+        .map_or_else(|| code.to_ascii_uppercase(), str::to_string)
+}
+
+/// A pinned list's name: `Popular right now · Brazil`.
+pub fn pinned_name(name: &str, country: &str) -> String {
+    format!("{name} · {}", country_name(country))
+}
+
+/// Why pinned countries as sent cannot be saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinsError {
+    /// More than [`MAX_PINNED`] countries.
+    TooMany,
+    /// A part that is no two-letter country code, as sent.
+    NotACountry(String),
+}
+
+/// Pinned countries as sent: comma-separated or repeated two-letter codes, lowercase, no
+/// repeats, never `home`, at most [`MAX_PINNED`]. Anything else is the caller's mistake: the
+/// first part that is no country, or too many countries.
+pub fn parse_pins<'a>(
+    parts: impl IntoIterator<Item = &'a str>,
+    home: Option<&str>,
+) -> Result<Vec<String>, PinsError> {
+    let mut out: Vec<String> = Vec::new();
+    for part in parts.into_iter().flat_map(|p| p.split(',')) {
+        let code = part.trim().to_ascii_lowercase();
+        if code.is_empty() {
+            continue;
+        }
+        if !matches!(parse_country(&code), ChartCountry::Fixed(_)) {
+            return Err(PinsError::NotACountry(part.trim().to_string()));
+        }
+        if Some(code.as_str()) == home || out.contains(&code) {
+            continue;
+        }
+        out.push(code);
+    }
+    if out.len() > MAX_PINNED {
+        return Err(PinsError::TooMany);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

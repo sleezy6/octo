@@ -508,6 +508,23 @@ impl PreviewCopies {
         }
     }
 
+    /// Removes this video's complete copy and its index entry, unless a playlist kept ready
+    /// holds it. A file still being read when it goes is read on to its end. Blocking file work.
+    pub fn drop_copy(&self, video_id: &str) {
+        let now = self.clock.now();
+        {
+            let mut state = self.state.lock();
+            if state.index.get(video_id).is_none_or(|entry| entry.kept(now)) {
+                return;
+            }
+            state.index.remove(video_id);
+        }
+        if is_video_id(video_id) {
+            let _ = std::fs::remove_file(self.copy_path(video_id));
+        }
+        self.persist();
+    }
+
     /// Whether this video's copy is complete.
     pub fn is_ready(&self, video_id: &str) -> bool {
         self.state.lock().index.contains_key(video_id)

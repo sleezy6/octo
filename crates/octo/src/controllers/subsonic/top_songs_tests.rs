@@ -7,6 +7,7 @@ use wiremock::matchers::{method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
 
 use super::super::test_app::*;
+use super::{TopSongsService, who_of};
 use crate::app::{AppState, TestServices};
 use crate::http::pipeline::App;
 
@@ -123,6 +124,11 @@ async fn deezer() -> MockServer {
 }
 
 async fn harness(charts: &str, discovery: bool) -> Harness {
+    harness_over(charts, discovery, None).await
+}
+
+/// [`harness`] reading Apple at `apple_url` instead of the stock stand-in.
+async fn harness_over(charts: &str, discovery: bool, apple_url: Option<String>) -> Harness {
     let (navidrome, apple, deezer) = (navidrome().await, apple().await, deezer().await);
     let settings = AppSettings {
         subsonic: SubsonicSettings {
@@ -141,7 +147,7 @@ async fn harness(charts: &str, discovery: bool) -> Harness {
     let state = AppState::for_tests_with(
         settings,
         TestServices {
-            apple_music_base_url: Some(apple.uri()),
+            apple_music_base_url: Some(apple_url.unwrap_or_else(|| apple.uri())),
             deezer_base_url: Some(deezer.uri()),
             ..Default::default()
         },
@@ -451,4 +457,406 @@ async fn a_missing_artist_is_navidromes_to_refuse() {
             .iter()
             .any(|p| p == "/rest/getTopSongs")
     );
+}
+
+// ---- each listener's chart countries ----------------------------------------------------
+
+const BOB: &str = "u=bob&t=good&s=salt&v=1.16.1&c=test";
+
+/// Apple's pages for another country: Japan's own overall chart for `jp`, the US pages under
+/// that country's storefront for the rest.
+async fn pages_for(h: &Harness, code: &str) {
+    let mine = |body: &str| body.replace("\"storefront\":\"us\"", &format!("\"storefront\":\"{code}\""));
+    let overall = if code == "jp" {
+        fixture!("jp_all").to_string()
+    } else {
+        mine(fixture!("us_all"))
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/{code}/new/top-charts/songs")))
+        .and(query_param_is_missing("genreId"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(overall.into_bytes(), "text/html"))
+        .mount(&h._apple)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{code}/new/top-charts/songs/")))
+        .and(query_param("genreId", "18"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(mine(fixture!("us_18")).into_bytes(), "text/html"),
+        )
+        .mount(&h._apple)
+        .await;
+}
+
+fn choose(h: &Harness, user: &str, country: &str, pinned: &[&str]) {
+    h._state.top_songs.listeners().set(
+        user,
+        crate::services::charts::ListenerCharts {
+            country: country.to_string(),
+            pinned: pinned.iter().map(|c| (*c).to_string()).collect(),
+            ..Default::default()
+        },
+    );
+}
+
+#[tokio::test]
+async fn get_charts_names_the_callers_country_and_pins() {
+    let h = harness("", true).await;
+    choose(&h, "alice", "", &["jp"]);
+
+    let charts = top(&h, &format!("getCharts?{ALICE}")).await["charts"].clone();
+
+    assert_eq!(charts["country"], "us");
+    assert_eq!(charts["setting"], "auto");
+    assert_eq!(charts["pinned"], json!(["jp"]));
+    assert_eq!(charts["serverCountry"], "us");
+    assert_eq!(charts["maxPinned"], 3);
+    assert!(charts["countries"].as_array().unwrap().len() > 100);
+}
+
+#[tokio::test]
+async fn get_top_chart_follows_the_callers_country() {
+    let h = harness("", true).await;
+    pages_for(&h, "br").await;
+    choose(&h, "alice", "br", &[]);
+
+    let alice = top(&h, &format!("getTopChart?{ALICE}")).await;
+    let bob = top(&h, &format!("getTopChart?{BOB}")).await;
+
+    assert_eq!(alice["topSongs"]["country"], "br");
+    assert_eq!(bob["topSongs"]["country"], "us");
+    let charts = top(&h, &format!("getCharts?{ALICE}")).await;
+    assert_eq!(charts["charts"]["country"], "br");
+    assert_eq!(charts["charts"]["setting"], "br");
+}
+
+#[tokio::test]
+async fn a_country_param_reads_that_country() {
+    let h = harness("", true).await;
+    pages_for(&h, "jp").await;
+    get(
+        &h.app,
+        &format!("/rest/getPlaylist?{ALICE}&f=json&id={}", popular_id()),
+    )
+    .await;
+
+    let chart = top(&h, &format!("getTopChart?{ALICE}&country=JP")).await;
+    let charts = top(&h, &format!("getCharts?{ALICE}&country=jp")).await;
+
+    assert_eq!(chart["topSongs"]["country"], "jp");
+    assert_eq!(charts["charts"]["country"], "jp");
+    assert_eq!(charts["charts"]["setting"], "auto");
+    assert!(
+        charts["charts"]["chart"][0].get("playlist").is_none(),
+        "Japan is not one of Alice's countries"
+    );
+    let own = top(&h, &format!("getCharts?{ALICE}")).await;
+    assert_eq!(own["charts"]["chart"][0]["playlist"], popular_id().as_str());
+}
+
+#[tokio::test]
+async fn an_unknown_country_is_error_10() {
+    let h = harness("", true).await;
+    for call in ["getTopChart", "getCharts", "setChartCountry", "pinChartCountry"] {
+        let answer = top(&h, &format!("{call}?{ALICE}&country=zz&pinned=true")).await;
+        assert_eq!(answer["error"]["code"], 10, "{call}");
+    }
+    assert_eq!(
+        top(&h, &format!("getTopChart?{ALICE}&country=usa")).await["error"]["code"],
+        10
+    );
+    assert_eq!(
+        top(&h, &format!("setChartCountry?{ALICE}")).await["error"]["code"],
+        10,
+        "country is required"
+    );
+}
+
+/// An Apple that holds every page until `release` is given permits, noting each path asked.
+async fn held_apple() -> (
+    String,
+    std::sync::Arc<tokio::sync::Semaphore>,
+    std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+) {
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let asked: std::sync::Arc<parking_lot::Mutex<Vec<String>>> = std::sync::Arc::default();
+    let (gate, seen) = (std::sync::Arc::clone(&release), std::sync::Arc::clone(&asked));
+    let router = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let (gate, seen) = (std::sync::Arc::clone(&gate), std::sync::Arc::clone(&seen));
+        async move {
+            seen.lock().push(uri.path().to_string());
+            if let Ok(permit) = gate.acquire().await {
+                permit.forget();
+            }
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/html")],
+                fixture!("us_all"),
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a port");
+    let url = format!("http://{}", listener.local_addr().expect("an address"));
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    (url, release, asked)
+}
+
+#[tokio::test]
+async fn a_third_loading_country_is_told_to_try_again() {
+    let (url, release, asked) = held_apple().await;
+    let h = harness_over("", true, Some(url)).await;
+    let ask = |user: &str, country: &str| {
+        let app = h.app.clone();
+        let url = format!("/rest/getTopChart?u={user}&t=good&s=salt&v=1.16.1&c=test&country={country}");
+        tokio::spawn(async move { get(&app, &url).await.json()["subsonic-response"].clone() })
+    };
+
+    // Two other countries are loading: Apple is holding both pages.
+    let japan = ask("alice", "jp");
+    let brazil = ask("alice", "br");
+    for _ in 0..500 {
+        let seen = asked.lock().clone();
+        if seen.iter().any(|p| p.starts_with("/jp/")) && seen.iter().any(|p| p.starts_with("/br/")) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let refused = top(&h, &format!("getTopChart?{ALICE}&country=de")).await;
+
+    assert_eq!(refused["error"]["code"], 0);
+    assert_eq!(
+        refused["error"]["message"],
+        "Still loading your other countries. Try again in a moment."
+    );
+    assert!(
+        !asked.lock().iter().any(|p| p.starts_with("/de/")),
+        "the refused country was never asked of Apple"
+    );
+
+    // When they finish the place is free again.
+    release.add_permits(100);
+    assert_eq!(japan.await.unwrap()["status"], "ok");
+    assert_eq!(brazil.await.unwrap()["status"], "ok");
+    assert_eq!(
+        top(&h, &format!("getTopChart?{ALICE}&country=de")).await["status"],
+        "ok"
+    );
+    assert_eq!(top(&h, &format!("getTopChart?{ALICE}")).await["status"], "ok");
+}
+
+#[tokio::test]
+async fn an_unnamed_caller_counts_by_credential() {
+    let named = who_of(" Alice ", Some("key"), "t", "s");
+    assert_eq!(named, "alice");
+
+    let one = who_of("", Some("key-one"), "", "");
+    let two = who_of("", Some("key-two"), "", "");
+    assert_eq!(one.len(), 16);
+    assert!(one.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_ne!(one, two);
+    assert_eq!(one, who_of("", Some("key-one"), "ignored", "ignored"));
+    let by_token = who_of("", None, "token", "salt");
+    assert_ne!(by_token, who_of("", None, "token", "other-salt"));
+    assert_eq!(by_token, who_of("", Some(""), "token", "salt"));
+
+    // Each credential has its own two places.
+    let h = harness("", true).await;
+    let service = &h._state.top_songs;
+    let key = |country: &str| TopSongsService::chart_work(country, "34");
+    let _first = service.begin_other_work(&one, "jp", &key("jp")).unwrap();
+    let _second = service.begin_other_work(&one, "br", &key("br")).unwrap();
+    assert!(service.begin_other_work(&one, "de", &key("de")).is_none());
+    assert!(service.begin_other_work(&two, "de", &key("de")).is_some());
+}
+
+#[tokio::test]
+async fn set_chart_country_saves_and_answers_the_charts() {
+    let h = harness("", true).await;
+    pages_for(&h, "br").await;
+    choose(&h, "alice", "", &["br", "jp"]);
+
+    let answer = top(&h, &format!("setChartCountry?{ALICE}&country=BR")).await;
+
+    let charts = &answer["charts"];
+    assert_eq!(charts["setting"], "br");
+    assert_eq!(charts["country"], "br");
+    assert_eq!(
+        charts["pinned"],
+        json!(["jp"]),
+        "her own country is no longer pinned"
+    );
+    let saved = h._state.top_songs.listeners().get("alice");
+    assert_eq!(saved.country, "br");
+    assert_eq!(
+        top(&h, &format!("getCharts?{BOB}")).await["charts"]["setting"],
+        "auto"
+    );
+}
+
+#[tokio::test]
+async fn set_chart_country_auto_follows_the_server() {
+    let h = harness("", true).await;
+    choose(&h, "alice", "br", &["us", "jp"]);
+
+    let answer = top(&h, &format!("setChartCountry?{ALICE}&country=auto")).await;
+
+    assert_eq!(answer["charts"]["setting"], "auto");
+    assert_eq!(answer["charts"]["country"], "us");
+    assert_eq!(answer["charts"]["pinned"], json!(["jp"]));
+    assert_eq!(h._state.top_songs.listeners().get("alice").country, "");
+}
+
+#[tokio::test]
+async fn pin_and_unpin_one_country_at_a_time() {
+    let h = harness("", true).await;
+
+    let pin = |code: &'static str, pinned: bool| {
+        let query = format!("pinChartCountry?{ALICE}&country={code}&pinned={pinned}");
+        let h = &h;
+        async move { top(h, &query).await["charts"]["pinned"].clone() }
+    };
+
+    assert_eq!(pin("jp", true).await, json!(["jp"]));
+    assert_eq!(pin("KR", true).await, json!(["jp", "kr"]));
+    assert_eq!(
+        pin("jp", true).await,
+        json!(["jp", "kr"]),
+        "pinning twice keeps one"
+    );
+    assert_eq!(pin("jp", false).await, json!(["kr"]));
+    assert_eq!(
+        pin("de", false).await,
+        json!(["kr"]),
+        "unpinning one not pinned is fine"
+    );
+    assert_eq!(
+        top(&h, &format!("pinChartCountry?{ALICE}&country=jp")).await["error"]["code"],
+        10,
+        "pinned is required"
+    );
+}
+
+#[tokio::test]
+async fn a_fourth_pin_is_error_10() {
+    let h = harness("", true).await;
+    choose(&h, "alice", "", &["jp", "kr", "de"]);
+
+    let answer = top(&h, &format!("pinChartCountry?{ALICE}&country=gb&pinned=true")).await;
+
+    assert_eq!(answer["error"]["code"], 10);
+    assert_eq!(answer["error"]["message"], "You can pin at most 3 countries.");
+    assert_eq!(h._state.top_songs.listeners().get("alice").pinned.len(), 3);
+}
+
+#[tokio::test]
+async fn pins_never_hold_the_home_country() {
+    let h = harness("", true).await;
+
+    let server = top(&h, &format!("pinChartCountry?{ALICE}&country=us&pinned=true")).await;
+    choose(&h, "alice", "br", &[]);
+    let own = top(&h, &format!("pinChartCountry?{ALICE}&country=br&pinned=true")).await;
+
+    assert_eq!(server["error"]["message"], "That is already your chart country.");
+    assert_eq!(own["error"]["code"], 10);
+    assert!(h._state.top_songs.listeners().get("alice").pinned.is_empty());
+}
+
+#[tokio::test]
+async fn saves_work_with_search_discovery_off() {
+    let h = harness("", false).await;
+
+    let answer = top(&h, &format!("setChartCountry?{ALICE}&country=jp")).await;
+
+    assert_eq!(answer["status"], "ok");
+    assert!(answer["charts"]["chart"].as_array().unwrap().is_empty());
+    assert_eq!(h._state.top_songs.listeners().get("alice").country, "jp");
+}
+
+#[tokio::test]
+async fn extensions_list_top_songs_three() {
+    let h = harness("", true).await;
+
+    let answer = top(&h, &format!("getOpenSubsonicExtensions?{ALICE}&f=json")).await;
+
+    let top_songs = answer["openSubsonicExtensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "octoTopSongs")
+        .cloned()
+        .unwrap();
+    assert_eq!(top_songs["versions"], json!([1, 2, 3]));
+}
+
+#[tokio::test]
+async fn a_pinned_list_row_names_its_country() {
+    let h = harness("18", true).await;
+    pages_for(&h, "jp").await;
+    choose(&h, "alice", "", &["jp"]);
+    let pinned_id = octo_core::library::generated_playlist_service::playlist_id("alice", "chart:popular@jp");
+    let opened = top(&h, &format!("getPlaylist?{ALICE}&f=json&id={pinned_id}")).await;
+    assert_eq!(opened["playlist"]["name"], "Popular right now · Japan");
+    assert!(!opened["playlist"]["entry"].as_array().unwrap().is_empty());
+
+    let answer = top(&h, &format!("getPlaylists?{ALICE}&f=json")).await;
+
+    let rows = answer["playlists"]["playlist"].as_array().unwrap();
+    let row = |name: &str| rows.iter().find(|r| r["name"] == name).cloned().unwrap();
+    let popular = row("Popular right now · Japan");
+    assert_eq!(popular["id"], pinned_id.as_str());
+    assert_eq!(popular["octoCoverTitle"], "Popular · Japan");
+    assert_eq!(
+        popular["comment"],
+        "The most played songs right now in Japan, made by Octo. Songs you have play from your library."
+    );
+    let genre = row("Top Hip-Hop/Rap · Japan");
+    assert_eq!(genre["octoCoverTitle"], "Top Hip-Hop/Rap · Japan");
+    assert_eq!(
+        genre["comment"],
+        "The most played Hip-Hop/Rap songs right now in Japan, made by Octo. Songs you have play from your library."
+    );
+    // The listener's own lists are as they were.
+    let home = row("Popular right now");
+    assert_eq!(home["octoCoverTitle"], "Popular");
+    assert_eq!(
+        home["comment"],
+        octo_subsonic::subsonic_response_builder::POPULAR_COMMENT
+    );
+
+    let cover_id = popular["coverArt"].as_str().expect("a cover id");
+    let cover = get(
+        &h.app,
+        &format!("/rest/getCoverArt?{ALICE}&id={cover_id}&size=300"),
+    )
+    .await;
+    assert!(cover.status.is_success(), "{}", cover.status);
+    assert_eq!(cover.media_type().as_deref(), Some("image/jpeg"));
+}
+
+#[tokio::test]
+async fn country_auto_on_a_read_is_the_callers_own() {
+    let h = harness("", true).await;
+    pages_for(&h, "br").await;
+    choose(&h, "alice", "br", &[]);
+
+    let chart = top(&h, &format!("getTopChart?{ALICE}&country=auto")).await;
+    let charts = top(&h, &format!("getCharts?{ALICE}&country=AUTO")).await;
+
+    assert_eq!(chart["topSongs"]["country"], "br");
+    assert_eq!(charts["charts"]["country"], "br");
+}
+
+#[tokio::test]
+async fn pinned_takes_one_and_zero_too() {
+    let h = harness("", true).await;
+
+    let pinned = top(&h, &format!("pinChartCountry?{ALICE}&country=jp&pinned=1")).await;
+    let unpinned = top(&h, &format!("pinChartCountry?{ALICE}&country=jp&pinned=0")).await;
+    let neither = top(&h, &format!("pinChartCountry?{ALICE}&country=jp&pinned=yes")).await;
+
+    assert_eq!(pinned["charts"]["pinned"], json!(["jp"]));
+    assert_eq!(unpinned["charts"]["pinned"], json!([]));
+    assert_eq!(neither["error"]["code"], 10);
 }

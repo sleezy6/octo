@@ -2,7 +2,7 @@
 //! sources is tested with the tagging code; the query builders are tested in
 //! `octo_core::fingerprint::music_brainz_client`.
 
-use wiremock::matchers::any;
+use wiremock::matchers::{any, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
@@ -279,4 +279,543 @@ fn the_kept_answers_are_dropped_before_they_outgrow_their_bound() {
     make_room(&mut map, 2, 4);
     assert!(map.is_empty(), "no room for two: the old answers go");
     assert_eq!(KNOWN_MAX, 10_000);
+}
+
+// ---- codes ---------------------------------------------------------------------------------
+
+fn recorded(name: &str) -> String {
+    std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/musicbrainz/").to_owned() + name,
+    )
+    .expect("a recorded MusicBrainz answer")
+}
+
+fn json_answer(body: String) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_raw(body, "application/json")
+}
+
+/// A server answering the search by code and the code lookup for one code.
+async fn code_server(
+    code: &str,
+    search: ResponseTemplate,
+    lookup: ResponseTemplate,
+) -> (MusicBrainzClient, MockServer) {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/recording"))
+        .and(query_param("query", format!("isrc:{code}")))
+        .respond_with(search)
+        .mount(&server)
+        .await;
+    Mock::given(path(format!("/ws/2/isrc/{code}")))
+        .respond_with(lookup)
+        .mount(&server)
+        .await;
+    let base = Url::parse(&format!("{}/ws/2/", server.uri())).expect("parses");
+    (MusicBrainzClient::with_base_url(base), server)
+}
+
+fn ids(doc: &serde_json::Value) -> Vec<String> {
+    doc["recordings"]
+        .as_array()
+        .expect("recordings")
+        .iter()
+        .map(|r| r["id"].as_str().expect("an id").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn lookup_isrc_asks_a_search_by_code_and_reads_releases_and_their_groups() {
+    let (client, server) = code_server(
+        "GBA077700130",
+        json_answer(recorded("isrc-search-GBA077700130.json")),
+        ResponseTemplate::new(500),
+    )
+    .await;
+
+    let IsrcLookup::Found(doc) = client.lookup_isrc("gb-a07-77-00130").await.expect("no timeout") else {
+        panic!("found");
+    };
+    assert_eq!(doc["isrc"], "GBA077700130");
+    assert_eq!(doc["recordings"].as_array().map(Vec::len), Some(3));
+    let candidates = octo_core::tagging::candidate_sources::CandidateSources::from_isrc_lookup(&doc);
+    assert!(
+        candidates
+            .iter()
+            .any(|c| c.release_group_id.is_some() && c.primary_type.is_some() && c.track_number.is_some()),
+        "{candidates:?}"
+    );
+    // Remembered: a second ask goes nowhere.
+    client.lookup_isrc("GBA077700130").await.expect("no timeout");
+    let asked = calls(&server).await;
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(
+        asked[0].ends_with("/ws/2/recording?query=isrc:GBA077700130&limit=100&fmt=json"),
+        "{asked:?}"
+    );
+    assert!(!asked[0].contains("release-groups"));
+}
+
+#[tokio::test]
+async fn lookup_isrc_leaves_out_recordings_the_search_lists_without_the_code() {
+    let answer = serde_json::json!({"recordings": [
+        {"id": "with", "title": "Song", "isrcs": ["GBA077700130"]},
+        {"id": "without", "title": "Song", "isrcs": ["USXXX0000001"]},
+        {"id": "none", "title": "Song"}
+    ]});
+    let (client, _server) = code_server(
+        "GBA077700130",
+        json_answer(answer.to_string()),
+        ResponseTemplate::new(500),
+    )
+    .await;
+    let IsrcLookup::Found(doc) = client.lookup_isrc("GBA077700130").await.expect("no timeout") else {
+        panic!("found");
+    };
+    assert_eq!(ids(&doc), ["with"]);
+}
+
+#[tokio::test]
+async fn the_tagger_asks_a_code_once_and_a_code_nobody_knows_is_not_known_and_not_remembered() {
+    let (client, server) = code_server(
+        "ZZZZZ0000001",
+        json_answer(recorded("search-empty.json")),
+        ResponseTemplate::new(404).set_body_raw(recorded("isrc-not-found.json"), "application/json"),
+    )
+    .await;
+    assert_eq!(
+        client.lookup_isrc("ZZZZZ0000001").await.expect("no timeout"),
+        IsrcLookup::NotKnown
+    );
+    assert_eq!(calls(&server).await.len(), 1, "the tagger asks the search only");
+    assert_eq!(
+        client.lookup_isrc("ZZZZZ0000001").await.expect("no timeout"),
+        IsrcLookup::NotKnown
+    );
+    assert_eq!(calls(&server).await.len(), 2, "not known is not remembered");
+}
+
+#[tokio::test]
+async fn a_code_answer_keeps_at_most_25_releases_per_recording_and_the_same_candidates() {
+    let raw: serde_json::Value =
+        serde_json::from_str(&recorded("isrc-search-USSM16401419.json")).expect("JSON");
+    assert!(
+        raw["recordings"][0]["releases"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0)
+            > 25
+    );
+    let (client, _server) = code_server(
+        "USSM16401419",
+        json_answer(recorded("isrc-search-USSM16401419.json")),
+        ResponseTemplate::new(500),
+    )
+    .await;
+    let IsrcLookup::Found(doc) = client.lookup_isrc("USSM16401419").await.expect("no timeout") else {
+        panic!("found");
+    };
+    for recording in doc["recordings"].as_array().expect("recordings") {
+        assert!(recording["releases"].as_array().map(Vec::len).unwrap_or(0) <= 25);
+    }
+    let mut whole = raw.clone();
+    whole
+        .as_object_mut()
+        .expect("an object")
+        .insert("isrc".into(), serde_json::Value::String("USSM16401419".into()));
+    use octo_core::tagging::candidate_sources::CandidateSources;
+    assert_eq!(
+        CandidateSources::from_isrc_lookup(&doc),
+        CandidateSources::from_isrc_lookup(&whole)
+    );
+}
+
+#[tokio::test]
+async fn a_dj_mix_segment_the_code_lists_is_left_out() {
+    let (client, server) = code_server(
+        "USSM19803320",
+        json_answer(recorded("search-empty.json")),
+        json_answer(recorded("isrc-lookup-USSM19803320.json")),
+    )
+    .await;
+    let IsrcLookup::Found(doc) = client
+        .isrc_recordings_in_background("USSM19803320")
+        .await
+        .expect("no timeout")
+    else {
+        panic!("found");
+    };
+    assert_eq!(ids(&doc), ["384f304d-5539-4cbf-920b-cfa8e69f795e"]);
+    // The code lookup alone: the search is not asked for the matcher.
+    let asked = calls(&server).await;
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(
+        asked[0].ends_with("/ws/2/isrc/USSM19803320?inc=artist-credits&fmt=json"),
+        "{asked:?}"
+    );
+}
+
+#[test]
+fn a_dj_mix_segment_is_read_however_its_hyphen_is_written() {
+    let said = |text: &str| serde_json::json!({ "disambiguation": text });
+    for segment in [
+        "part of \u{201c}NOW 80s\u{201d} DJ\u{2010}mix",
+        "part of X DJ-mix",
+        "part of X DJ mix",
+        "dj mix",
+    ] {
+        assert!(is_dj_mix_segment(&said(segment)), "{segment}");
+    }
+    for take in [
+        "2015 stereo mix",
+        "remix",
+        "original acoustic version, stereo mix",
+        "",
+    ] {
+        assert!(!is_dj_mix_segment(&said(take)), "{take}");
+    }
+}
+
+#[tokio::test]
+async fn the_matcher_gets_every_recording_the_code_lookup_lists() {
+    let lookup = serde_json::json!({"isrc": "GBA077700130", "recordings": [
+        {"id": "a", "title": "Song"},
+        {"id": "b", "title": "Song"}
+    ]});
+    let (client, server) = code_server(
+        "GBA077700130",
+        ResponseTemplate::new(500),
+        json_answer(lookup.to_string()),
+    )
+    .await;
+    let IsrcLookup::Found(doc) = client
+        .isrc_recordings_in_background("GBA077700130")
+        .await
+        .expect("no timeout")
+    else {
+        panic!("found");
+    };
+    assert_eq!(ids(&doc), ["a", "b"]);
+    // Remembered: asked once.
+    client
+        .isrc_recordings_in_background("GBA077700130")
+        .await
+        .expect("no timeout");
+    let asked = calls(&server).await;
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(
+        asked[0].ends_with("/ws/2/isrc/GBA077700130?inc=artist-credits&fmt=json"),
+        "{asked:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_matchers_code_lookup_tells_each_kind_of_answer() {
+    let (busy, _a) = code_server(
+        "GBA077700130",
+        ResponseTemplate::new(500),
+        ResponseTemplate::new(503),
+    )
+    .await;
+    assert_eq!(
+        busy.isrc_recordings_in_background("GBA077700130")
+            .await
+            .expect("no timeout"),
+        IsrcLookup::Unanswered
+    );
+    let (refused, _b) = code_server(
+        "GBA077700130",
+        ResponseTemplate::new(500),
+        ResponseTemplate::new(400).set_body_raw(recorded("isrc-refused.json"), "application/json"),
+    )
+    .await;
+    assert_eq!(
+        refused
+            .isrc_recordings_in_background("GBA077700130")
+            .await
+            .expect("no timeout"),
+        IsrcLookup::Refused
+    );
+    let (unknown, _c) = code_server(
+        "ZZZZZ0000001",
+        ResponseTemplate::new(500),
+        ResponseTemplate::new(404).set_body_raw(recorded("isrc-not-found.json"), "application/json"),
+    )
+    .await;
+    assert_eq!(
+        unknown
+            .isrc_recordings_in_background("ZZZZZ0000001")
+            .await
+            .expect("no timeout"),
+        IsrcLookup::NotKnown
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_question_musicbrainz_refuses_is_refused_and_logged_as_a_warning() {
+    let (logs, _guard) = crate::services::test_support::LogCapture::start();
+    let (client, server) = code_server(
+        "GBA077700130",
+        ResponseTemplate::new(400).set_body_raw(recorded("isrc-refused.json"), "application/json"),
+        ResponseTemplate::new(500),
+    )
+    .await;
+    assert_eq!(
+        client.lookup_isrc("GBA077700130").await.expect("no timeout"),
+        IsrcLookup::Refused
+    );
+    assert_eq!(calls(&server).await.len(), 1);
+    let warnings = logs.at(tracing::Level::WARN);
+    assert!(
+        warnings
+            .iter()
+            .any(|line| line.contains("refused the code search question")
+                && line.contains("not a valid inc parameter")),
+        "{warnings:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_id_musicbrainz_calls_invalid_is_nothing_and_never_warned() {
+    let (logs, _guard) = crate::services::test_support::LogCapture::start();
+    let (client, _server) = client(
+        ResponseTemplate::new(400).set_body_raw(recorded("release-invalid-mbid.json"), "application/json"),
+    )
+    .await;
+    assert!(
+        client
+            .lookup_release("not-an-mbid")
+            .await
+            .expect("no timeout")
+            .is_none()
+    );
+    assert!(
+        logs.at(tracing::Level::WARN).is_empty(),
+        "{:?}",
+        logs.at(tracing::Level::WARN)
+    );
+}
+
+#[tokio::test]
+async fn a_busy_musicbrainz_is_unanswered_and_asked_again_next_time() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/recording"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/ws/2/recording"))
+        .respond_with(json_answer(recorded("isrc-search-GBA077700130.json")))
+        .mount(&server)
+        .await;
+    let base = Url::parse(&format!("{}/ws/2/", server.uri())).expect("parses");
+    let client = MusicBrainzClient::with_base_url(base);
+    assert_eq!(
+        client.lookup_isrc("GBA077700130").await.expect("no timeout"),
+        IsrcLookup::Unanswered
+    );
+    assert!(matches!(
+        client.lookup_isrc("GBA077700130").await.expect("no timeout"),
+        IsrcLookup::Found(_)
+    ));
+}
+
+#[tokio::test]
+async fn the_matchers_code_questions_step_aside_so_a_download_check_waits_one_gap_at_most() {
+    let (client, _server) = client(json_answer(recorded("search-empty.json"))).await;
+    let client = Arc::new(client);
+    // A download check has just asked: the gate's last call is a foreground one.
+    client
+        .fetch_isrcs("11111111-1111-4111-8111-111111111111")
+        .await
+        .expect("no timeout");
+    let background = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            for i in 0..20 {
+                let _ = client
+                    .isrc_recordings_in_background(&format!("ZZZZZ00000{i:02}"))
+                    .await;
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let started = std::time::Instant::now();
+    client
+        .fetch_isrcs("22222222-2222-4222-8222-222222222222")
+        .await
+        .expect("no timeout");
+    let waited = started.elapsed();
+    background.abort();
+
+    let gap = MusicBrainzClient::MINIMUM_GAP;
+    assert!(waited < gap + Duration::from_millis(400), "waited {waited:?}");
+}
+
+#[tokio::test]
+async fn the_tagger_hears_each_kind_of_code_answer() {
+    use octo_core::tagging::ReleaseLookup;
+
+    let (busy, _a) = code_server(
+        "GBA077700130",
+        ResponseTemplate::new(503),
+        ResponseTemplate::new(500),
+    )
+    .await;
+    assert!(ReleaseLookup::lookup_isrc(&busy, "GBA077700130").await.is_err());
+
+    let (refused, _b) = code_server(
+        "GBA077700130",
+        ResponseTemplate::new(400).set_body_raw(recorded("isrc-refused.json"), "application/json"),
+        ResponseTemplate::new(500),
+    )
+    .await;
+    assert!(
+        ReleaseLookup::lookup_isrc(&refused, "GBA077700130")
+            .await
+            .is_err()
+    );
+
+    let (unknown, server) = code_server(
+        "ZZZZZ0000001",
+        json_answer(recorded("search-empty.json")),
+        ResponseTemplate::new(500),
+    )
+    .await;
+    assert_eq!(
+        ReleaseLookup::lookup_isrc(&unknown, "ZZZZZ0000001")
+            .await
+            .expect("an answer"),
+        None
+    );
+    assert_eq!(calls(&server).await.len(), 1);
+
+    let (known, _c) = code_server(
+        "GBA077700130",
+        json_answer(recorded("isrc-search-GBA077700130.json")),
+        ResponseTemplate::new(500),
+    )
+    .await;
+    assert!(
+        ReleaseLookup::lookup_isrc(&known, "GBA077700130")
+            .await
+            .expect("an answer")
+            .is_some()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn each_kind_of_answer_is_read_and_only_a_refused_question_is_warned() {
+    let (logs, _guard) = crate::services::test_support::LogCapture::start();
+    let cases: [(ResponseTemplate, &str); 7] = [
+        (
+            ResponseTemplate::new(404).set_body_raw(recorded("isrc-not-found.json"), "application/json"),
+            "not known",
+        ),
+        (
+            ResponseTemplate::new(400)
+                .set_body_raw(recorded("release-invalid-mbid.json"), "application/json"),
+            "not known",
+        ),
+        (ResponseTemplate::new(429), "busy"),
+        (
+            ResponseTemplate::new(400).set_body_raw(recorded("isrc-refused.json"), "application/json"),
+            "refused",
+        ),
+        (ResponseTemplate::new(500), "busy"),
+        (
+            ResponseTemplate::new(200).set_body_raw("<html>not json</html>", "text/html"),
+            "busy",
+        ),
+        (json_answer(recorded("search-empty.json")), "answer"),
+    ];
+    for (answer, expected) in cases {
+        let (client, _server) = client(answer).await;
+        let asked = client
+            .ask(
+                "recording?query=isrc:GBA077700130&limit=100&fmt=json",
+                "code search",
+            )
+            .await
+            .expect("no timeout");
+        let kind = match asked {
+            Asked::Answer(_) => "answer",
+            Asked::NotKnown => "not known",
+            Asked::Refused => "refused",
+            Asked::Busy => "busy",
+        };
+        assert_eq!(kind, expected);
+    }
+    assert_eq!(
+        logs.at(tracing::Level::WARN).len(),
+        1,
+        "{:?}",
+        logs.at(tracing::Level::WARN)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_lookup_by_an_id_that_is_not_a_musicbrainz_id_is_nothing_whatever_musicbrainz_says() {
+    let (logs, _guard) = crate::services::test_support::LogCapture::start();
+    let (client, _server) = client(
+        ResponseTemplate::new(400)
+            .set_body_raw(r#"{"error":"Something else entirely."}"#, "application/json"),
+    )
+    .await;
+    assert!(
+        client
+            .lookup_release("not-an-mbid")
+            .await
+            .expect("no timeout")
+            .is_none()
+    );
+    assert!(asks_by_a_non_mbid("release/not-an-mbid?inc=labels&fmt=json"));
+    assert!(!asks_by_a_non_mbid(
+        "release/5e5c5a1c-b4fc-4ba2-9d1e-5f0e1bd1b9a2?inc=labels&fmt=json"
+    ));
+    assert!(!asks_by_a_non_mbid(
+        "recording?query=isrc:GBA077700130&limit=100&fmt=json"
+    ));
+    assert!(!asks_by_a_non_mbid(
+        "isrc/GBA077700130?inc=artist-credits&fmt=json"
+    ));
+    assert!(
+        logs.at(tracing::Level::WARN).is_empty(),
+        "{:?}",
+        logs.at(tracing::Level::WARN)
+    );
+}
+
+#[tokio::test]
+async fn a_big_code_answer_keeps_25_releases_a_recording_and_drops_its_dj_mix_segment() {
+    let raw: serde_json::Value =
+        serde_json::from_str(&recorded("isrc-search-USSM19803320.json")).expect("JSON");
+    let (client, _server) = code_server(
+        "USSM19803320",
+        json_answer(recorded("isrc-search-USSM19803320.json")),
+        ResponseTemplate::new(500),
+    )
+    .await;
+    let IsrcLookup::Found(doc) = client.lookup_isrc("USSM19803320").await.expect("no timeout") else {
+        panic!("found");
+    };
+    assert_eq!(ids(&doc), ["384f304d-5539-4cbf-920b-cfa8e69f795e"]);
+    assert_eq!(
+        doc["recordings"][0]["releases"].as_array().map(Vec::len),
+        Some(25)
+    );
+
+    // The candidates are those of the whole answer without the segment: the reader takes 25.
+    let mut whole = raw.clone();
+    let recordings = whole["recordings"].as_array_mut().expect("recordings");
+    recordings.retain(|r| r["id"] != "4f6bae05-b451-4117-8703-f4fffa07322c");
+    whole
+        .as_object_mut()
+        .expect("an object")
+        .insert("isrc".into(), serde_json::Value::String("USSM19803320".into()));
+    use octo_core::tagging::candidate_sources::CandidateSources;
+    assert_eq!(
+        CandidateSources::from_isrc_lookup(&doc),
+        CandidateSources::from_isrc_lookup(&whole)
+    );
 }

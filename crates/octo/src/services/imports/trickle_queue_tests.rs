@@ -159,11 +159,234 @@ fn a_restart_keeps_the_queue_and_the_pause_and_a_running_song_goes_again() {
 }
 
 #[test]
+fn a_song_put_back_gives_its_turn_back_and_waits_behind_the_others() {
+    let (now, clock) = moving_clock();
+    let queue = TrickleQueue::default();
+    queue.set_clock(clock);
+    queue.add("alice", &[song("a"), song("b"), song("c")]);
+    // A real fetch first, so the slot given back is a real one.
+    assert_eq!(queue.take_next().expect("a song").key, "a");
+    assert!(queue.begin_attempt("alice", "a"));
+    queue.update("alice", "a", |job| {
+        job.state = import_track_states::DONE.to_string()
+    });
+    let before = queue.last_start_utc();
+    assert!(before.is_some());
+    *now.lock() += TimeDelta::seconds(1);
+    assert_eq!(queue.take_next().expect("a song").key, "b");
+    *now.lock() += TimeDelta::seconds(1);
+    queue.put_back("alice", "b", "Waiting for MusicBrainz to answer", true);
+    assert_eq!(
+        queue.last_start_utc(),
+        before,
+        "the slot is given back, not erased"
+    );
+    let job = queue.get("alice", "b").expect("the job");
+    assert_eq!(job.state, import_track_states::QUEUED);
+    assert_eq!(job.attempts, 0);
+    assert_eq!(job.detail.as_deref(), Some("Waiting for MusicBrainz to answer"));
+    assert_eq!(
+        queue.take_next().expect("the next").key,
+        "c",
+        "it waits behind the others"
+    );
+}
+
+#[test]
 fn canceling_takes_back_only_what_has_not_run() {
     let queue = TrickleQueue::default();
     queue.add("alice", &[song("a"), song("b"), song("c")]);
     queue.take_next();
+    queue.begin_attempt("alice", "a");
     assert_eq!(queue.cancel_queued("alice", Some(&["b".to_string()])), 1);
     assert_eq!(queue.cancel_queued("alice", None), 1);
     assert_eq!(queue.snapshot(Some("alice")).len(), 1);
+}
+
+#[test]
+fn only_the_song_just_taken_is_put_back_and_one_that_keeps_its_turn_stays_paced() {
+    let (now, clock) = moving_clock();
+    let queue = TrickleQueue::default();
+    queue.set_clock(clock);
+    queue.add("alice", &[song("a"), song("b")]);
+    let taken = queue.take_next().expect("a song");
+    let slot = queue.last_start_utc();
+    *now.lock() += TimeDelta::seconds(1);
+    queue.put_back("alice", "b", "Never taken", true);
+    assert_eq!(
+        queue.get("alice", "b").expect("b").detail,
+        None,
+        "a song that was not taken is left as it is"
+    );
+    queue.put_back("alice", &taken.key, "Waiting to read your library", false);
+    assert_eq!(queue.last_start_utc(), slot, "its turn stays used");
+    assert_eq!(
+        queue.get("alice", &taken.key).expect("a").state,
+        import_track_states::QUEUED
+    );
+    queue.put_back("alice", &taken.key, "Again", true);
+    assert_eq!(
+        queue.get("alice", &taken.key).expect("a").detail.as_deref(),
+        Some("Waiting to read your library"),
+        "a second put-back does nothing"
+    );
+}
+
+#[test]
+fn songs_a_filter_holds_wait_and_an_attempt_counts_once_begun() {
+    let queue = TrickleQueue::default();
+    queue.add("alice", &[song("a"), song("b")]);
+    let taken = queue.take_next_where(|job| job.key != "a").expect("a song");
+    assert_eq!(taken.key, "b");
+    assert_eq!(taken.attempts, 0, "taking a song is not an attempt");
+    assert!(queue.begin_attempt("alice", "b"));
+    assert_eq!(queue.get("alice", "b").expect("b").attempts, 1);
+    assert!(queue.take_next_where(|job| job.key != "a").is_none());
+    assert_eq!(
+        queue.get("alice", "a").expect("a").state,
+        import_track_states::QUEUED
+    );
+}
+
+#[test]
+fn canceling_takes_back_a_song_still_being_checked_with_its_turn() {
+    let (now, clock) = moving_clock();
+    let queue = TrickleQueue::default();
+    queue.set_clock(clock);
+    queue.add("alice", &[song("a"), song("b")]);
+    queue.take_next().expect("a");
+    assert!(queue.begin_attempt("alice", "a"));
+    let a_start = queue.last_start_utc();
+    *now.lock() += TimeDelta::seconds(1);
+    assert_eq!(queue.take_next().expect("b").key, "b");
+    assert_eq!(queue.cancel_queued("alice", None), 1);
+    assert!(
+        queue.get("alice", "b").is_none(),
+        "taken back while it was checked"
+    );
+    assert_eq!(
+        queue.get("alice", "a").expect("a").state,
+        import_track_states::DOWNLOADING,
+        "one that began runs to its end"
+    );
+    assert_eq!(queue.last_start_utc(), a_start, "its turn is given back");
+    assert!(!queue.begin_attempt("alice", "b"), "nothing may start");
+    queue.put_back("alice", "b", "Waiting for MusicBrainz to answer", true);
+    assert!(
+        queue.get("alice", "b").is_none(),
+        "a put-back brings nothing back"
+    );
+}
+
+#[test]
+fn skipping_a_song_being_checked_keeps_it_from_starting() {
+    let queue = TrickleQueue::default();
+    queue.add("alice", &[song("a")]);
+    queue.take_next().expect("a");
+    assert_eq!(queue.skip("alice", &["a"]), 1);
+    assert_eq!(
+        queue.get("alice", "a").expect("a").state,
+        import_track_states::SKIPPED
+    );
+    assert!(!queue.begin_attempt("alice", "a"));
+    queue.put_back("alice", "a", "Waiting for MusicBrainz to answer", true);
+    assert_eq!(
+        queue.get("alice", "a").expect("a").state,
+        import_track_states::SKIPPED,
+        "it stays skipped"
+    );
+}
+
+#[test]
+fn words_go_on_queued_songs_only_and_open_songs_name_their_isrcs() {
+    let queue = TrickleQueue::default();
+    let mut coded = song("a");
+    coded.isrc = Some("GBAAA9400010".into());
+    queue.add("alice", &[coded, song("b")]);
+    queue.take_next_where(|job| job.key == "b").expect("b");
+    queue.set_queued_details(&[
+        (
+            "alice".into(),
+            "a".into(),
+            Some("Waiting for MusicBrainz to answer".into()),
+        ),
+        ("alice".into(), "b".into(), Some("Not for a running song".into())),
+    ]);
+    assert_eq!(
+        queue.get("alice", "a").expect("a").detail.as_deref(),
+        Some("Waiting for MusicBrainz to answer")
+    );
+    assert_eq!(queue.get("alice", "b").expect("b").detail, None);
+    queue.set_queued_details(&[("alice".into(), "a".into(), None)]);
+    assert_eq!(queue.get("alice", "a").expect("a").detail, None);
+    assert_eq!(queue.open_isrcs(), HashSet::from(["GBAAA9400010".to_string()]));
+}
+
+#[test]
+fn skipping_the_song_being_checked_gives_its_turn_back() {
+    let (now, clock) = moving_clock();
+    let queue = TrickleQueue::default();
+    queue.set_clock(clock);
+    queue.add("alice", &[song("a"), song("b")]);
+    assert_eq!(queue.take_next().expect("a").key, "a");
+    assert!(queue.begin_attempt("alice", "a"));
+    let a_start = queue.last_start_utc();
+    *now.lock() += TimeDelta::seconds(1);
+    assert_eq!(queue.take_next().expect("b").key, "b");
+    assert_eq!(queue.skip("alice", &["b"]), 1);
+    assert_eq!(queue.last_start_utc(), a_start, "its turn is given back");
+}
+
+#[test]
+fn a_song_that_ended_its_check_is_left_alone_by_cancel_and_skip() {
+    let queue = TrickleQueue::default();
+    queue.add("alice", &[song("a")]);
+    queue.take_next().expect("a");
+    queue.end_check("alice", "a");
+    queue.update("alice", "a", |job| {
+        job.state = import_track_states::DONE.to_string()
+    });
+    assert_eq!(queue.cancel_queued("alice", None), 0);
+    assert_eq!(queue.skip("alice", &["a"]), 0);
+    assert_eq!(
+        queue.get("alice", "a").expect("a").state,
+        import_track_states::DONE
+    );
+}
+
+#[test]
+fn checking_words_go_only_on_a_song_still_running() {
+    let queue = TrickleQueue::default();
+    queue.add("alice", &[song("a")]);
+    queue.take_next().expect("a");
+    queue.say_while_running("alice", "a", "Checking against the music database");
+    assert_eq!(
+        queue.get("alice", "a").expect("a").detail.as_deref(),
+        Some("Checking against the music database")
+    );
+    assert_eq!(queue.skip("alice", &["a"]), 1);
+    queue.say_while_running("alice", "a", "Checking against the music database");
+    assert_eq!(
+        queue.get("alice", "a").expect("a").detail.as_deref(),
+        Some("Skipped"),
+        "a skipped song keeps its own words"
+    );
+}
+
+#[test]
+fn a_song_whose_check_failed_is_left_alone_by_cancel_and_skip() {
+    let queue = TrickleQueue::default();
+    queue.add("alice", &[song("a")]);
+    queue.take_next().expect("a");
+    let slot = queue.last_start_utc();
+    queue.update("alice", "a", |job| {
+        job.state = import_track_states::NOT_FOUND.to_string()
+    });
+    assert_eq!(queue.cancel_queued("alice", None), 0);
+    assert_eq!(queue.skip("alice", &["a"]), 0);
+    assert_eq!(queue.last_start_utc(), slot, "its turn stays used");
+    assert_eq!(
+        queue.get("alice", "a").expect("a").state,
+        import_track_states::NOT_FOUND
+    );
 }

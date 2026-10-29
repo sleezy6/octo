@@ -32,6 +32,8 @@ struct FakeDatabase {
     search: Option<Value>,
     delay: Duration,
     fail: bool,
+    isrc_error: Option<&'static str>,
+    isrc_delay: Duration,
     calls: Mutex<Vec<String>>,
 }
 
@@ -75,6 +77,15 @@ impl ReleaseLookup for FakeDatabase {
     }
 
     async fn lookup_isrc(&self, isrc: &str) -> anyhow::Result<Option<Value>> {
+        if !self.isrc_delay.is_zero() {
+            self.calls.lock().push(format!("isrc:{isrc}"));
+            tokio::time::sleep(self.isrc_delay).await;
+            return Ok(self.isrc.clone());
+        }
+        if let Some(error) = self.isrc_error {
+            self.calls.lock().push(format!("isrc:{isrc}"));
+            anyhow::bail!(error);
+        }
         self.answer(format!("isrc:{isrc}"), self.isrc.clone()).await
     }
 }
@@ -367,7 +378,13 @@ async fn a_slow_database_costs_its_candidates_and_says_so() {
 
     let plan = identify(&identifier, &song).await.expect("identified");
 
-    assert_eq!(plan.notes, ["the music database did not answer in 15 s"]);
+    assert_eq!(
+        plan.notes,
+        [
+            "the music database did not answer the code lookup in 8 s",
+            "the music database did not answer in 15 s"
+        ]
+    );
     assert_eq!(plan.confidence, TagConfidence::None);
     assert_eq!(plan.stage_seconds["database"].round(), 15.0);
 }
@@ -835,4 +852,311 @@ fn an_album_naming_the_take_the_audio_is_stays() {
     let kept = ReleaseIdentifier::without_contradicted_album(request, Some(&identity), &mut notes);
     assert_eq!(kept.album.as_deref(), Some("The Black Parade (instrumentals)"));
     assert!(notes.is_empty());
+}
+
+// ---- recorded code answers ------------------------------------------------------------
+
+/// A recorded MusicBrainz answer for one code, as the client hands it on: the code added.
+fn recorded_code(file: &str, code: &str) -> Value {
+    let text = std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/musicbrainz/").to_owned() + file,
+    )
+    .expect("a recorded MusicBrainz answer");
+    let mut doc: Value = serde_json::from_str(&text).expect("JSON");
+    doc.as_object_mut()
+        .expect("an object")
+        .insert("isrc".into(), Value::String(code.into()));
+    doc
+}
+
+fn coded_song(artist: &str, title: &str, code: &str, seconds: i32) -> Song {
+    Song {
+        artist: artist.into(),
+        title: title.into(),
+        isrc: Some(code.into()),
+        duration: Some(seconds),
+        ..Default::default()
+    }
+}
+
+fn file_of(seconds: i32) -> FileFacts {
+    FileFacts {
+        duration_seconds: seconds,
+        ..FileFacts::unknown(".flac")
+    }
+}
+
+/// As a heart's download is identified: the catalog's row is a candidate and names the album.
+async fn identify_as_downloaded(
+    database: Arc<FakeDatabase>,
+    song: &Song,
+    album: &str,
+    album_id: &str,
+    track_id: &str,
+) -> TagPlan {
+    let catalog = Arc::new(FakeCatalog {
+        answer: CatalogCandidates {
+            hits: vec![FullTrackMeta {
+                title: Some(song.title.clone()),
+                artist_name: Some(song.artist.clone()),
+                album_title: Some(album.into()),
+                album_id: Some(album_id.into()),
+                track_id: Some(track_id.into()),
+                duration: song.duration,
+                isrc: song.isrc.clone(),
+                ..Default::default()
+            }],
+            did_not_answer: false,
+        },
+        ..Default::default()
+    });
+    let identifier = identifier(
+        AppSettings::default(),
+        Some(database),
+        Some(catalog),
+        file_of(song.duration.unwrap_or(0)),
+    );
+    let request = ReleaseIdentifier::request_for(song, &song.artist, &song.title, Some(album), None);
+    identifier
+        .identify::<()>(song, request, "/m/x.flac", true, None, &CancellationToken::new())
+        .await
+        .expect("identified")
+}
+
+#[tokio::test]
+async fn recorded_code_answers_tag_the_take_the_code_names() {
+    let cases = [
+        (
+            "Simon & Garfunkel",
+            "Mrs. Robinson (Live at Central Park, New York, NY - September 19, 1981)",
+            "USQX91402189",
+            241,
+            "The Concert in Central Park (Live)",
+            "9163759",
+            "90409373",
+            "fd3c1e53-20f2-39fd-bd53-e206d7f79c93",
+        ),
+        (
+            "The Rolling Stones",
+            "Paint It Black (Live / Remastered 2009)",
+            "GBUM70912198",
+            242,
+            "Flashpoint (2009 Re-Mastered Digital Version)",
+            "424890",
+            "4619091",
+            "036c628c-38a6-3192-9087-60233fe27ddd",
+        ),
+        (
+            "Bryan Adams",
+            "(Everything I Do) I Do It For You (Live)",
+            "GBUM71027929",
+            321,
+            "Bare Bones (Live)",
+            "623343211",
+            "2928423011",
+            "14680ed2-6a75-4f1b-b40d-90476e20cafc",
+        ),
+        (
+            "Simon & Garfunkel",
+            "The Sound of Silence (Acoustic Version)",
+            "USSM16401419",
+            185,
+            "Wednesday Morning, 3 A.M.",
+            "1408383",
+            "15275985",
+            "6c21abaf-2962-3037-836f-842431587949",
+        ),
+    ];
+    for (artist, title, code, seconds, album, album_id, track_id, group) in cases {
+        let song = coded_song(artist, title, code, seconds);
+
+        // With the code answered: the same album, from the music database, with its ids.
+        let database = Arc::new(FakeDatabase {
+            isrc: Some(recorded_code(&format!("isrc-search-{code}.json"), code)),
+            ..Default::default()
+        });
+        let plan = identify_as_downloaded(database.clone(), &song, album, album_id, track_id).await;
+        let chosen = plan.chosen.as_ref().map(|c| &c.candidate).expect("a pick");
+        assert_eq!(chosen.source, TagSource::Database, "{title}");
+        assert_eq!(chosen.release_group_id.as_deref(), Some(group), "{title}");
+        assert_eq!(plan.confidence, TagConfidence::Strong, "{title}");
+        assert!(
+            !database.calls().iter().any(|call| call.starts_with("search:")),
+            "{title}: the code settled it, {:?}",
+            database.calls()
+        );
+
+        // With no code answer, as before: the catalog's own album entry.
+        let before = Arc::new(FakeDatabase::default());
+        let plan = identify_as_downloaded(before, &song, album, album_id, track_id).await;
+        let chosen = plan.chosen.as_ref().map(|c| &c.candidate).expect("a pick");
+        assert_eq!(chosen.source, TagSource::Catalog, "{title}");
+        assert_eq!(chosen.group_title.as_deref(), Some(album), "{title}");
+    }
+}
+
+#[tokio::test]
+async fn a_code_answer_without_releases_still_asks_by_name() {
+    let database = Arc::new(FakeDatabase {
+        isrc: Some(recorded_code("isrc-lookup-GBA077700130.json", "GBA077700130")),
+        ..Default::default()
+    });
+    let identifier = identifier(AppSettings::default(), Some(database.clone()), None, file_of(93));
+    identify(
+        &identifier,
+        &coded_song("Bee Gees", "Stayin' Alive", "GBA077700130", 93),
+    )
+    .await
+    .expect("identified");
+    assert_eq!(
+        database.calls(),
+        ["isrc:GBA077700130", "search:Bee Gees|Stayin' Alive|93"]
+    );
+}
+
+#[tokio::test]
+async fn a_code_answer_whose_takes_miss_the_files_length_still_asks_by_name() {
+    let database = Arc::new(FakeDatabase {
+        isrc: Some(recorded_code("isrc-search-GBA077700130.json", "GBA077700130")),
+        ..Default::default()
+    });
+    let identifier = identifier(AppSettings::default(), Some(database.clone()), None, file_of(285));
+    identify(
+        &identifier,
+        &coded_song("Bee Gees", "Stayin' Alive", "GBA077700130", 285),
+    )
+    .await
+    .expect("identified");
+    assert!(
+        database
+            .calls()
+            .iter()
+            .any(|call| call == "search:Bee Gees|Stayin' Alive|285"),
+        "{:?}",
+        database.calls()
+    );
+}
+
+#[tokio::test]
+async fn a_code_answer_that_fits_the_file_is_not_asked_again_by_name() {
+    let database = Arc::new(FakeDatabase {
+        isrc: Some(recorded_code("isrc-search-GBA077700130.json", "GBA077700130")),
+        ..Default::default()
+    });
+    let identifier = identifier(AppSettings::default(), Some(database.clone()), None, file_of(93));
+    identify(
+        &identifier,
+        &coded_song("Bee Gees", "Stayin' Alive", "GBA077700130", 93),
+    )
+    .await
+    .expect("identified");
+    assert!(
+        !database.calls().iter().any(|call| call.starts_with("search:")),
+        "{:?}",
+        database.calls()
+    );
+}
+
+#[tokio::test]
+async fn a_code_answer_of_another_song_still_asks_by_name() {
+    let database = Arc::new(FakeDatabase {
+        isrc: Some(recorded_code("isrc-search-GBA077700130.json", "GBA077700130")),
+        ..Default::default()
+    });
+    let identifier = identifier(AppSettings::default(), Some(database.clone()), None, file_of(93));
+    identify(
+        &identifier,
+        &coded_song("Bee Gees", "Night Fever", "GBA077700130", 93),
+    )
+    .await
+    .expect("identified");
+    assert!(
+        database
+            .calls()
+            .iter()
+            .any(|call| call == "search:Bee Gees|Night Fever|93"),
+        "{:?}",
+        database.calls()
+    );
+}
+
+#[tokio::test]
+async fn a_code_lookup_that_could_not_be_asked_still_asks_by_name() {
+    for error in [
+        "MusicBrainz could not be asked about the code",
+        "No answer came within 10 seconds, so Octo stopped waiting.",
+    ] {
+        let database = Arc::new(FakeDatabase {
+            isrc_error: Some(error),
+            ..Default::default()
+        });
+        let identifier = identifier(AppSettings::default(), Some(database.clone()), None, file_of(93));
+        let plan = identify(
+            &identifier,
+            &coded_song("Bee Gees", "Stayin' Alive", "GBA077700130", 93),
+        )
+        .await
+        .expect("identified");
+        assert_eq!(
+            database.calls(),
+            ["isrc:GBA077700130", "search:Bee Gees|Stayin' Alive|93"],
+            "{error}"
+        );
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note == "the music database could not be asked the code lookup"),
+            "{error}: {:?}",
+            plan.notes
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_code_the_search_does_not_find_says_so() {
+    let database = Arc::new(FakeDatabase::default());
+    let identifier = identifier(AppSettings::default(), Some(database.clone()), None, file_of(93));
+    let plan = identify(
+        &identifier,
+        &coded_song("Bee Gees", "Stayin' Alive", "GBA077700130", 93),
+    )
+    .await
+    .expect("identified");
+    assert!(
+        plan.notes
+            .iter()
+            .any(|note| note == "the music database's search found no recording with the code"),
+        "{:?}",
+        plan.notes
+    );
+}
+
+#[tokio::test]
+async fn a_slow_code_question_leaves_the_search_by_name_its_time() {
+    let database = Arc::new(FakeDatabase {
+        isrc: Some(recorded_code("isrc-search-GBA077700130.json", "GBA077700130")),
+        isrc_delay: Duration::from_millis(400),
+        search: Some(recorded_code("isrc-search-GBA077700130.json", "GBA077700130")),
+        ..Default::default()
+    });
+    let identifier = identifier(AppSettings::default(), Some(database.clone()), None, file_of(93))
+        .with_code_budget(Duration::from_millis(100));
+    let plan = identify(
+        &identifier,
+        &coded_song("Bee Gees", "Stayin' Alive", "GBA077700130", 93),
+    )
+    .await
+    .expect("identified");
+    assert_eq!(
+        database.calls()[..2],
+        ["isrc:GBA077700130", "search:Bee Gees|Stayin' Alive|93"]
+    );
+    assert!(plan.chosen.is_some(), "the search's recordings were weighed");
+    assert!(
+        plan.notes
+            .iter()
+            .any(|note| note == "the music database did not answer the code lookup in 0 s"),
+        "{:?}",
+        plan.notes
+    );
 }

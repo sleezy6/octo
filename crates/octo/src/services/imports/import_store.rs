@@ -3,10 +3,11 @@
 //! get copies, so a list never changes under them.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use octo_core::common::dotnet::{eq_ignore_case, to_lower_invariant};
+use octo_core::common::song_identity::SongIdentity;
 use octo_core::soulseek::SoulseekRouting;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -89,6 +90,16 @@ impl ImportStore {
     /// Everyone's lists, for the work that runs for all of them.
     pub fn all(&self) -> Vec<ImportList> {
         self.lists.lock().clone()
+    }
+
+    /// The ISRCs some list holds.
+    pub fn held_isrcs(&self) -> HashSet<String> {
+        self.lists
+            .lock()
+            .iter()
+            .flat_map(|list| list.tracks.iter())
+            .flat_map(|track| SongIdentity::isrcs(track.isrc.iter()))
+            .collect()
     }
 
     pub fn streaming_owners(&self) -> Vec<String> {

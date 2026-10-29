@@ -1611,6 +1611,72 @@ async fn get_song_an_unknown_length_is_looked_up_at_once_even_with_the_prewarm_l
 }
 
 #[tokio::test]
+async fn a_lookup_never_takes_a_refused_video() {
+    let fixture = LengthFixture::new().await;
+    fixture.video("Nobody Nothing", 211);
+    let row = fixture.search("Nobody", "Nothing").await;
+    assert!(fixture.registry.refuse_video(&row.id, "vid-Nobody Nothing"));
+    let mut song = fixture
+        .service
+        .get_song("SOULSEEK", &row.id)
+        .await
+        .expect("registered");
+
+    fixture.service.resolve_song_length(&mut song).await;
+
+    assert_eq!(song.duration, None);
+    let routing = fixture.routing(&row);
+    assert_eq!(routing.you_tube_id, None);
+    assert_ne!(fixture.shown(&row).1, LengthSource::Video);
+    assert!(
+        fixture.requests().iter().any(|r| r.starts_with("shim/meta?")),
+        "{:?}",
+        fixture.requests()
+    );
+}
+
+#[tokio::test]
+async fn prewarm_skips_a_refused_video() {
+    let fixture = LengthFixture::new().await;
+    let songs = vec![fixture.search("Daft Punk", "Emotion").await];
+    assert!(fixture.registry.refuse_video(&songs[0].id, "bad-video"));
+
+    fixture.service.prewarm_you_tube_ids(&songs, 12).await;
+
+    assert!(
+        fixture
+            .requests()
+            .iter()
+            .any(|url| url.starts_with("shim/search") && url.contains("skip=bad-video")),
+        "{:?}",
+        fixture.requests()
+    );
+}
+
+#[tokio::test]
+async fn a_length_lookup_ignores_a_refused_video() {
+    let fixture = LengthFixture::new().await;
+    fixture.video("Kavinsky Prelude", 120);
+    let mut songs = vec![fixture.search("Kavinsky", "Prelude").await];
+    assert!(
+        fixture
+            .registry
+            .refuse_video(&songs[0].id, "vid-Kavinsky Prelude")
+    );
+
+    fixture.service.enrich_external_songs(&mut songs).await;
+    fixture.service.last_length_warm().await;
+
+    assert_eq!(songs[0].duration, None);
+    assert_ne!(fixture.shown(&songs[0]).1, LengthSource::Video);
+    assert!(
+        fixture.requests().iter().any(|r| r.starts_with("shim/meta?")),
+        "{:?}",
+        fixture.requests()
+    );
+}
+
+#[tokio::test]
 async fn get_song_an_unknown_length_keeps_the_video_a_play_pinned() {
     let fixture = LengthFixture::new().await;
     fixture.video("Nobody Nothing", 211);

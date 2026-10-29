@@ -45,7 +45,7 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 - **Lyrics Octo did not write can be replaced.** Off by default; switch **Replace lyrics Octo did not write** on under the lyrics settings and better lyrics, or lyrics you pick, replace a song's own `.lrc`, `.txt` or embedded lyrics, each kept in the undo journal.
 - **Starter Radio can be turned off.** `LASTFM_ENABLE_STARTER_RADIO=false` gives a new listener no mix of their own until enough plays were learned from.
 - **Deezer radio and more varied song radio.** Deezer's own song and artist radios join radio's sources (no account needed; **Deezer** under Radio sources, `RADIO_DEEZER`), and song radio is drawn from every source's list rather than cut from the top, with fewer repeats of what a listener heard lately. Both ported from [am-yy/octo](https://github.com/am-yy/octo).
-- **SpotiFLAC for Better quality too.** Upstream's SpotiFLAC source rides on Soulseek's turn for hearts; here it also does for Better quality, and that turn stays available while Soulseek is off or not logged in, so a server without Soulseek can still upgrade songs through SpotiFLAC. When neither slskd nor SpotiFLAC answers, upgrades wait as they do for a Soulseek outage, and a SpotiFLAC outage mid-search moves on to the next source rather than failing the song.
+- **Mornye (SpotiFLAC) for Better quality too.** Upstream's Mornye source rides on Soulseek's turn for hearts; here it also does for Better quality, and that turn stays available while Soulseek is off or not logged in, so a server without Soulseek can still upgrade songs through Mornye. When neither slskd nor Mornye answers, upgrades wait as they do for a Soulseek outage, and a Mornye outage mid-search moves on to the next source rather than failing the song.
 - **The cover badge is on by default now.** This fork used to ship outside covers plain; since the 2026.10.21 merge it uses upstream's switch, which is on. Set `COVER_BADGE=false` in `.env` (or turn off **Mark outside covers** under Search and discovery) to keep them plain; an old `BADGE_OUTSIDE_COVERS` line does nothing.
 - **Bring your own Navidrome.** The built-in installer and bundled Navidrome are gone; Octo runs beside the Navidrome you already have.
 
@@ -236,7 +236,7 @@ scripts/updater/install-updater.sh --remove
 Without the helper, **About** shows the command for the new release. From the Octo folder:
 
 ```bash
-git fetch --tags && git checkout --detach 2026.10.22.1
+git fetch --tags && git checkout --detach 2026.10.28
 docker compose pull octo yt-dlp-shim octo-sonic || docker compose --profile source build octo-source yt-dlp-shim-source octo-sonic-source
 docker compose up -d
 ```
@@ -401,7 +401,7 @@ On a small disk, mind the cover copies: Octo keeps each library cover it has sho
 
 ### What if I don't want to use Soulseek?
 
-You can use your Deezer account, YouTube, an existing Lidarr server or a SpotiFLAC server of your own (see [Your own SpotiFLAC](#your-own-spotiflac)), or disable automatic acquisition entirely.
+You can use your Deezer account, YouTube, an existing Lidarr server or a Mornye server of your own, formerly SpotiFLAC (see [Your own Mornye (SpotiFLAC)](#your-own-mornye-spotiflac)), or disable automatic acquisition entirely.
 
 YouTube is optional the same way: `YOUTUBE_ENABLED=false` (or **Use YouTube** on Streams & hearts) and a restart, and Octo never asks the yt-dlp shim or YouTube Music. Outside songs then play from your Deezer account whatever the stream source says (without a Deezer ARL they do not play at all), hearts skip YouTube, and YouTube Music leaves radio. The `yt-dlp-shim` service still starts with the bundled compose file; delete it and octo's `- yt-dlp-shim` `depends_on` line to not run it.
 
@@ -650,7 +650,12 @@ followed by one Navidrome scan a few seconds later (a normal scan, never a full 
 
 `LIBRARY_ACTIONS_REVIEW` gives each allowed user a Review playlist, where Octo asks about the
 downloads a person can settle by listening: AcoustID had never heard the recording, was not
-sure of it, or heard a different one in a YouTube download. A download is asked about in the
+sure of it, or heard another take of the song in a YouTube download. A YouTube
+download AcoustID firmly hears as another recording (another song, a cover by another artist,
+another version, or a live or other take nobody asked for) is not kept: the file is thrown away,
+that video is never used for the song again, and Octo tries the next video, up to three. Names in
+another script, an AcoustID link that does not hold up, or a same-artist or same-title recording
+at the song's own length are kept and asked about instead. A download is asked about in the
 playlist of the person who requested it when they are on the allowlist, and of every allowed
 user otherwise. Answer by adding the track to an action playlist, by Keep (a fifth action that
 removes nothing, on five stars by default), or by removing it from Review, which means "fine,
@@ -675,6 +680,34 @@ of its questions wait for an answer, and a Keep on one sends nothing to AcoustID
 tags were never confirmed. Octo's own downloads are skipped, since each was checked when it
 arrived if verification was on at the time; `LIBRARY_ACTIONS_REVIEW_SWEEP_OCTO_DOWNLOADS` checks
 them too.
+
+A sound AcoustID has never heard, or one only one person ever linked to the song in AcoustID, is
+not left to you while its song's YouTube preview can say, the same question a new download is
+asked. If the file sounds like a YouTube Music row with the song's title, artist and length from
+the file's own album, it is counted as fine and nothing is asked. If it sounds nothing like such a
+preview, Review gets a question that says so ("it sounds nothing like its YouTube preview, 47% of
+its bits differ"). Anything the preview cannot settle (another version, a preview that may not be
+the song, no preview) stays the question it was, so Review still decides those. When the YouTube
+shim does not answer, or is busy with plays, the song waits instead of becoming a question. When
+it finds the video but does not send it, the song is tried three times in all, then it becomes
+the question it was. By default nothing is replaced because of the preview, not even with the
+sweep's replacing on.
+
+`LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PREVIEW` (off by default) lets the sweep replace such a
+song through Wrong song instead of asking, for when there are too many questions to go through by
+hand. It acts only on the clearest case: the preview is a YouTube Music row with the song's title,
+artist and length, from the same album as the file's album tag and not a live album, and at least
+42% of the file's bits differ from it (from 38% to 42% it is still asked about). It never acts on a
+song with no tags, an ISRC tag, a star or a rating, on anything the preview cannot settle, or on the
+re-check of Octo's own downloads; those stay questions. It needs what the replacing below needs
+(Wrong song on, dry run off, the keeper on the allowlist), a download source other than YouTube
+alone (`DOWNLOAD_SOURCE` Soulseek, Lidarr, or SoulseekThenYouTube, whose replacement then comes
+from Soulseek only, never the YouTube fallback), so the replacement is held to the song's YouTube
+preview like any download, and `LIBRARY_ACTIONS_KEEP_REPLACED` on, so the old file can be put back from
+Recently removed for `LIBRARY_ACTIONS_TRASH_DAYS` days. It counts toward the same
+`LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PER_DAY` and the same stop after three failures as the
+replacing below. Review keeps a note of each replacement ("Octo replaced this: it
+sounded nothing like its YouTube preview, 47% of its bits differ").
 
 `LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE` (off by default) lets the check replace a song that
 clearly is another one instead of asking: AcoustID names a different song, by another title, at
@@ -702,6 +735,19 @@ per song and "Fix all sure ones" for songs whose recording the length or a singl
 Fixes are written in place and can be undone. Stray spaces in titles and albums are taken off by
 the check itself when library actions may change files. Needs the AcoustID key; its place is kept
 in `identity-sweep.json` beside the settings, so a restart carries on where it was.
+
+"Check every song against YouTube" (Library actions, Review) compares each song already in the
+library with its YouTube preview, once, the way a new download is compared when AcoustID cannot
+place it. Songs downloaded before that check, or kept from before Octo, never had it. A song
+AcoustID vouches for (by the tag check's last answer, or a lookup of its own) is passed over
+quickly. A song that sounds nothing like a preview whose title, artist and length are the song's
+becomes a Review question, or is added to an open question AcoustID could not settle, whose
+fingerprint is then never sent to AcoustID; one that may be another version, or has no preview, is
+left alone. Nothing is changed or removed. It compares `LIBRARY_ACTIONS_YOUTUBE_CHECK_PER_HOUR`
+(default 30, 0 is off) songs an hour, one at a time and only while nothing is downloading, pauses while 50 library questions wait in Review,
+and rests an hour when the shim stops answering. It needs library actions and Review on and
+someone on the allowed list to ask. Where it is is kept in `youtube-check.json` beside the
+settings, so a restart carries on; pressing the button again starts over.
 
 `LIBRARY_ACTIONS_DUPLICATES` adds a Duplicates playlist per allowed user: recordings the
 library holds more than once, side by side, the copy worth keeping first (lossless before
@@ -734,7 +780,10 @@ accepts everything. A song asked for with an ISRC (an album track Deezer listed)
 to that code: a file whose own tags carry it is confirmed even with no AcoustID key or entry,
 and a fingerprint that names a recording spelled differently (a title in its own script, or
 translated) is confirmed when MusicBrainz lists the ISRC on it. A different ISRC never rejects
-a file, since re-releases are often given new codes.
+a file, since re-releases are often given new codes. A recording only one person ever linked to
+the sound is not proof on its own: it is confirmed when the song's YouTube preview sounds like
+the file, refused when a preview that can be believed sounds nothing like it, and asked about
+otherwise.
 
 "Catch fake lossless files" on the Soulseek admin page (on by default) checks every download
 that claims to be lossless for a lossy file converted to it. Octo decodes a few seconds from
@@ -874,6 +923,10 @@ They are on by default, whether or not the mixes are. The dashboard's Mixes page
 `trending` and Apple genre numbers, default `new,trending,18,14,6`; empty for none);
 `CHART_COUNTRY` is `auto` or a two-letter country such as `gb`.
 
+Each listener can pick their own chart country and pin up to three more in the Octo apps' Charts
+page; the dashboard's Charts card sets them for anyone. A pinned country adds every chart list
+that is on, named after its country, such as `Popular right now · Japan`.
+
 ### Importing your music
 
 To listen before downloading, import a list and turn on **Stream without downloading** on the
@@ -893,7 +946,7 @@ arrive; its missing songs can go to the trickle, which fetches them a few an hou
 same chain a heart uses (your library first, then each heart download source in order,
 Soulseek's outage hold, Lidarr). It never starts a song while anyone's own download runs, and
 waits out a Soulseek outage instead of taking a YouTube copy. Lists and the trickle live in
-`/app/config/imports.json` and `imports-trickle.json`, so a restart carries on.
+`/app/config/imports.json` and `imports-trickle.json` (and the recordings the music database named for each list's ISRCs in `imports-isrc.json`), so a restart carries on.
 
 No account, app or key is needed. For Spotify, Apple Music, YouTube Music, Amazon Music, TIDAL,
 Deezer, Qobuz, SoundCloud, Pandora and YouTube, the page walks you through TuneMyMusic's free
@@ -946,32 +999,36 @@ Setting it up, on the dashboard's **Deezer** page or in `.env`:
 
 The Status page shows whether the account signs in. Octo signs in with your cookie outside Deezer's own apps and decrypts the songs the way the web player does, which Deezer's terms of use do not allow; the account you use carries that risk. The Deezer code is ported from [am-yy/octo](https://github.com/am-yy/octo), which adapted it from [V1ck3s/octo-fiesta](https://github.com/V1ck3s/octo-fiesta).
 
-### Your own SpotiFLAC
+### Your own Mornye (SpotiFLAC)
 
-For songs Soulseek does not have, Octo can ask a SpotiFLAC server you run yourself. It is off by default. Octo includes no SpotiFLAC, no extensions and no places to download from: SpotiFLAC (its Python module, `pip install SpotiFLAC`, or its Docker image) loads the extension registry you choose, and what it can find depends on the extensions you install in it. Octo finds the song in SpotiFLAC's catalog (by ISRC first, then by artist, title, version and length), asks SpotiFLAC to save it into a hidden folder of the music folder, and checks the file like a Soulseek download: its length, the version its own title names, AcoustID and the spectrum. A file that fails is thrown away and the next source is asked. A file that passes is tagged by Octo, never by SpotiFLAC's tags alone.
+For songs Soulseek does not have, Octo can ask a Mornye server you run yourself. Mornye is the SpotiFLAC Python module under its new name (since October 2026), and an older SpotiFLAC (5.x) still works the same way. It is off by default. Octo includes no Mornye, no extensions and no places to download from: Mornye (its Python module, `pip install mornye`, or its Docker image) loads the extension registry you choose, it installs every extension your registry lists by itself, and what it can find depends on them. Octo finds the song in Mornye's catalog (by ISRC first, then by artist, title, version and length), asks Mornye to save it into a hidden folder of the music folder, and checks the file like a Soulseek download: its length, the version its own title names, AcoustID and the spectrum. A file that fails is thrown away and the next source is asked. A file that passes is tagged by Octo, never by Mornye's tags alone.
 
-1. In `.env`, add `spotiflac` to `COMPOSE_PROFILES` (comma-separated, for example `COMPOSE_PROFILES=spotiflac`), set `SPOTIFLAC_REGISTRIES` to your registry's address and `SPOTIFLAC_WEB_TOKEN` to a long random string, then run `docker compose up -d`. This starts SpotiFLAC's own image beside Octo, with the music folder mounted at the same path.
-2. Open SpotiFLAC's page on port 8010 (`SPOTIFLAC_PORT`) with `?token=` and your token, and install at least one extension.
-3. In Octo's dashboard, open **SpotiFLAC**, set the address to `http://spotiflac:8000` and the same token, press **Test connection**, turn on **Download with SpotiFLAC** and save. (Or set `SPOTIFLAC_ENABLED=true` and `SPOTIFLAC_URL=http://spotiflac:8000` in `.env`.)
+1. In `.env`, add `spotiflac` to `COMPOSE_PROFILES` (comma-separated, for example `COMPOSE_PROFILES=spotiflac`), set `SPOTIFLAC_REGISTRIES` to your registry's address and `SPOTIFLAC_WEB_TOKEN` to a long random string, then run `docker compose up -d`. This builds Mornye from its own repository at a pinned commit (a few minutes and about 2 GB the first time, cached afterwards) and starts it beside Octo, with the music folder mounted at the same path.
+2. Mornye installs every extension your registry lists by itself, when it starts and again every hour. Its page on port 8010 (`SPOTIFLAC_PORT`, opened with `?token=` and your token) shows them.
+3. In Octo's dashboard, open **Mornye (SpotiFLAC)**, set the address to `http://spotiflac:8000` and the same token, press **Test connection**, turn on **Download with Mornye** and save. (Or set `SPOTIFLAC_ENABLED=true` and `SPOTIFLAC_URL=http://spotiflac:8000` in `.env`.)
 
-SpotiFLAC takes Soulseek's place in **Heart download priority**: after Soulseek finds nothing (the default), before it, or before it only for songs written in Chinese, Japanese, Korean or Thai script. With Soulseek off, SpotiFLAC is asked alone. A SpotiFLAC running elsewhere works too (`spotiflac --web --host 0.0.0.0 --web-token <token>`): it must see Octo's music folder, and **Music folder in SpotiFLAC** says where when its path differs. Multi-user mode (`--web-multiuser`) is not supported, since it saves into each account's own folder.
+Mornye takes Soulseek's place in **Heart download priority**: after Soulseek finds nothing (the default), before it, or before it only for songs written in Chinese, Japanese, Korean or Thai script. With Soulseek off, Mornye is asked alone. A Mornye running elsewhere works too (`mornye --web --host 0.0.0.0 --web-token <token>`): it must see Octo's music folder, and **Music folder in Mornye** says where when its path differs. Multi-user mode (`--web-multiuser`) is not supported, since it saves into each account's own folder.
+
+**Coming from SpotiFLAC:** the `spotiflac` service now runs Mornye, at the same address, with your `.env` unchanged. Mornye keeps its own settings folder (`spotiflac-data/mornye`) and installs your registry's extensions into it by itself on its first start. Your old SpotiFLAC folder is left as it was.
+
+Mornye is not part of Octo, so it never holds Octo back: when it can't be built, `install.sh` and **Update now** start Octo without it and say so. A plain `docker compose pull` leaves it alone, since it is never pulled.
 
 | `.env` | Default | What it does |
 | --- | --- | --- |
-| `SPOTIFLAC_ENABLED` | `false` | Downloads ask SpotiFLAC |
-| `SPOTIFLAC_URL` | blank | SpotiFLAC's address, as Octo's container reaches it |
-| `SPOTIFLAC_WEB_TOKEN` | blank | SpotiFLAC's web token; the `spotiflac` service starts with the same one |
+| `SPOTIFLAC_ENABLED` | `false` | Downloads ask Mornye |
+| `SPOTIFLAC_URL` | blank | Mornye's address, as Octo's container reaches it |
+| `SPOTIFLAC_WEB_TOKEN` | blank | Mornye's web token; the `spotiflac` service starts with the same one |
 | `SPOTIFLAC_PLACEMENT` | `AfterSoulseek` | `AfterSoulseek`, `BeforeSoulseek` or `BeforeSoulseekForAsianScripts` |
 | `SPOTIFLAC_QUALITY` | `LOSSLESS` | `LOSSLESS`, or `HI_RES_LOSSLESS` for hi-res where there is one |
-| `SPOTIFLAC_SERVICES` | blank | Your extension ids to try, in order, separated by commas; blank leaves the order to SpotiFLAC |
-| `SPOTIFLAC_FOLDER` | blank | Octo's music folder as SpotiFLAC sees it, when that path differs |
+| `SPOTIFLAC_SERVICES` | blank | Your extension ids to try, in order, separated by commas; blank leaves the order to Mornye |
+| `SPOTIFLAC_FOLDER` | blank | Octo's music folder as Mornye sees it, when that path differs |
 | `SPOTIFLAC_TIMEOUT_SECONDS` | `600` | How long one song may take (60 to 3600) |
-| `SPOTIFLAC_AT_ONCE` | `2` | Songs SpotiFLAC is asked for at once (1 to 4) |
+| `SPOTIFLAC_AT_ONCE` | `2` | Songs Mornye is asked for at once (1 to 4) |
 | `SPOTIFLAC_REGISTRIES` | blank | For the `spotiflac` service: your extension registry addresses, separated by commas |
-| `SPOTIFLAC_PORT` | `8010` | For the `spotiflac` service: the port of SpotiFLAC's page |
-| `SPOTIFLAC_IMAGE_TAG` | `latest` | For the `spotiflac` service: the SpotiFLAC image tag |
-| `SPOTIFLAC_DATA_DIR` | `./spotiflac-data` | For the `spotiflac` service: SpotiFLAC's own settings and extensions |
-| `SPOTIFLAC_PUID`, `SPOTIFLAC_PGID` | `1000` | For the `spotiflac` service: the user SpotiFLAC runs as |
+| `SPOTIFLAC_PORT` | `8010` | For the `spotiflac` service: the port of Mornye's page |
+| `SPOTIFLAC_BUILD_REF` | `5660533b…` (Mornye 1.0.3) | For the `spotiflac` service: the Mornye commit or tag Compose builds |
+| `SPOTIFLAC_DATA_DIR` | `./spotiflac-data` | For the `spotiflac` service: Mornye's settings and the extensions it installed, in its `mornye` folder |
+| `SPOTIFLAC_PUID`, `SPOTIFLAC_PGID` | `1000` | For the `spotiflac` service: the user Mornye runs as |
 
 ### Playback and acquisition
 
@@ -1052,10 +1109,11 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | `findSongs`, `getFoundSongs`, `pickFoundSong` | `octoAcquisitions` 2: a song's search run again on the caller's download sources, every copy found, and fetching the one picked |
 | `getImports`, `getImport`, `importAction` | the `octoImports` extension: the caller's imported lists with what the library has of each, and the trickle |
 | `getTopSongs` | the standard top songs of an artist (by name, or by id as Navidrome's `topSongsByArtistId`), for every app: ranked as `getArtistTopSongs` ranks them, songs you have as your library's own and the rest as outside songs (only yours while search discovery is off); Navidrome's answer when Octo has none |
-| `getArtistTopSongs`, `getTopChart` | the `octoTopSongs` extension: an artist's most played songs and the chart of the moment, each marked in the caller's library or playable from outside it |
+| `getArtistTopSongs`, `getTopChart`, `getCharts` | the `octoTopSongs` extension: an artist's most played songs and the chart of the moment, each marked in the caller's library or playable from outside it, and the charts a country has; `getTopChart` and `getCharts` take `country` (any Apple Music country, the caller's own when not sent or `auto`; error 10 for one Apple does not have, error 0 "Still loading your other countries. Try again in a moment." while two other countries are already loading for the caller; it frees as they finish) |
+| `setChartCountry`, `pinChartCountry` | `octoTopSongs` 3: the caller's own chart country (`country`, or `auto` to follow the server's), and pinning (`pinned=true` or `1`) or unpinning (`pinned=false` or `0`) one more `country`, at most 3; error 10 for a country Apple does not have, error 0 while two other countries are already loading for the caller, which frees as they finish; each answers like `getCharts`, which then says the caller's `setting`, `pinned`, the `serverCountry`, Apple's `countries` and `maxPinned` |
 | `getPlace` | the `octoPlaces` extension, for the apps' Live radio near you: a postal code (`code` and `country`, any case or spacing, `UK` for `GB`; a full UK, Canadian or Dutch code finds the part GeoNames keeps, and a ZIP+4 its five digits), a city (`name`, optional `state` by name or code, and `country`; of the towns with that name, and that state when one is sent, the one with the most postal codes, at the postal code nearest its others) or a coordinate (`latitude` and `longitude` in decimal degrees: the nearest place within 30 km), in that order when several are sent, answered as `place` with `code`, `name`, `state` (when known), `country`, `latitude` and `longitude` (2 decimals). Error 70 for a place Octo does not know, error 10 for missing parameters or coordinates that are not decimal degrees. Answered from GeoNames' postal codes, built into the image; nothing is sent anywhere |
 | `/api/artist/{id}`, `/api/album?artist_id=` | Navidrome's own API, for clients that use it (Feishin): an outside artist's page and its albums |
-| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 and 2, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` (while search discovery is on), `octoImports`, `octoRadioSources` (while radio can answer: radio songs carry `octoSuggestedBy`), `octoPlaces` (while the place data can be read, so an app without it keeps to its own lookup) and `songLyrics` 1 and 2 |
+| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 and 2, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` 1 to 3 (while search discovery is on), `octoImports`, `octoRadioSources` (while radio can answer: radio songs carry `octoSuggestedBy`), `octoPlaces` (while the place data can be read, so an app without it keeps to its own lookup) and `songLyrics` 1 and 2 |
 
 ### Soulseek download details
 

@@ -712,15 +712,21 @@ function renderRestartPending() {
 // ── Unsaved changes ─────────────────────────────────────────────────────────
 // A form's fingerprint is what its visible controls hold. Heart rows carry their source name,
 // because reordering them changes no value, only the order.
+// A row marked data-own-save saves itself the moment it changes, so it never makes its card
+// unsaved and Undo changes leaves it alone.
+function formControls(form, selector) {
+  return Array.from(form.querySelectorAll(selector)).filter(el => !el.closest('[data-own-save]'));
+}
+
 function formFingerprint(form) {
-  return JSON.stringify(Array.from(form.querySelectorAll('input:not([type="hidden"]), select, textarea'))
+  return JSON.stringify(formControls(form, 'input:not([type="hidden"]), select, textarea')
     .map(el => `${el.closest('.source-priority-row')?.querySelector('.source-title')?.textContent ?? ''}|${el.name || el.id}|${el.type === 'checkbox' ? el.checked : el.value}`));
 }
 
 function markClean(form) {
   form.dataset.saved = formFingerprint(form);
   // What every control held when saved, for Undo changes.
-  form._snapshot = Array.from(form.querySelectorAll('input, select, textarea'))
+  form._snapshot = formControls(form, 'input, select, textarea')
     .map(el => ({ el, value: el.value, checked: el.checked }));
   updateDirty(form);
 }
@@ -1072,7 +1078,7 @@ function renderHeartSourceOrder(steps = heartSourceSteps) {
         <span class="source-copy">
           <span class="source-title">${icon(meta.mark)}${meta.title}</span>
           <span class="source-detail">${step.Source === 'Soulseek' && currentSettings?.Spotiflac?.Enabled
-            ? `${meta.detail}, with SpotiFLAC` : meta.detail}</span>
+            ? `${meta.detail}, with Mornye` : meta.detail}</span>
         </span>
         <span class="source-heart-controls" role="group" aria-label="${meta.title} heart types">
           <span class="source-heart-choice">
@@ -2996,6 +3002,68 @@ ready.then(loadReviewSweep);
 // Not while the sign-in screen is up: every refused poll would wait behind it and fire at once after.
 setInterval(() => { if (document.visibilityState === 'visible' && !gatePromise) loadReviewSweep(); }, 30000);
 
+// ---- Review: the one-time YouTube check ----
+const youtubeCheckStates = { Idle: 'Not started', Off: 'Off', Paused: 'Paused', Waiting: 'Waiting', Running: 'Checking' };
+
+async function loadYoutubeCheck() {
+  const status = document.getElementById('youtube-check-status');
+  if (!status) return;
+  try {
+    const response = await api('/api/admin/youtube-check', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const s = await response.json();
+    const parts = [];
+    if (s.running) {
+      parts.push(`${youtubeCheckStates[s.state] || s.state}.`);
+      parts.push(`Looked at ${s.position} of ${s.total} songs: AcoustID vouches for ${s.known}, ${s.asked} asked about, ${s.open} waiting for an answer.`);
+      if (s.keeper) parts.push(`Asking ${s.keeper}.`);
+    } else if (s.finishedUtc) {
+      parts.push(`Done: looked at ${s.done} songs. AcoustID vouches for ${s.known}; of the rest, ${s.asked} asked about, ${s.unsure} left alone as unclear, ${s.noCopy} with no preview to compare.`);
+    } else {
+      parts.push('Compares the songs AcoustID cannot vouch for with their YouTube preview, once.');
+    }
+    if (s.running && s.reason && s.state !== 'Running') parts.push(s.reason);
+    status.textContent = parts.join(' ');
+    const start = document.getElementById('youtube-check-start');
+    const pause = document.getElementById('youtube-check-pause');
+    start.querySelector('span').textContent = s.running || s.finishedUtc ? 'Start over' : 'Check';
+    start.disabled = s.perHour === 0;
+    pause.hidden = !s.running;
+    pause.dataset.paused = s.paused ? 'true' : 'false';
+    pause.querySelector('span').textContent = s.paused ? 'Carry on' : 'Pause';
+  } catch (error) {
+    status.textContent = `Could not read the YouTube check: ${error.message}`;
+  }
+}
+
+async function youtubeCheckPost(button, path, message) {
+  button.disabled = true;
+  try {
+    const response = await api(path, { method: 'POST' });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    note(button, message);
+  } catch (error) {
+    note(button, error.message, 'error');
+  } finally {
+    button.disabled = false;
+    await loadYoutubeCheck();
+  }
+}
+
+document.getElementById('youtube-check-start')?.addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  if (!(await askConfirm('Compare every song with YouTube?', 'Songs AcoustID cannot vouch for are compared with their YouTube preview, a few an hour. A song that sounds nothing like it becomes a question in Review. Nothing is changed or removed. Earlier answers are forgotten.', 'Check'))) return;
+  youtubeCheckPost(button, '/api/admin/youtube-check/start', 'Checking.');
+});
+document.getElementById('youtube-check-pause')?.addEventListener('click', (event) => {
+  const button = event.currentTarget;
+  const resume = button.dataset.paused === 'true';
+  youtubeCheckPost(button, `/api/admin/youtube-check/${resume ? 'resume' : 'pause'}`, resume ? 'Carrying on.' : 'Paused.');
+});
+ready.then(loadYoutubeCheck);
+setInterval(() => { if (document.visibilityState === 'visible' && !gatePromise) loadYoutubeCheck(); }, 30000);
+
 // ---- Tags against the audio: the library tag check ----
 // Its line, found and fixed counts, and a Pause that becomes Start while it is paused.
 // On Library health itself, `here` leaves out where the findings are.
@@ -3235,7 +3303,7 @@ document.getElementById('spotiflac-test-connection')?.addEventListener('click', 
     if (!r.ok) throw new Error(result.error || `HTTP ${r.status}`);
     renderSpotiflacTest(result.checks || []);
     // What is missing is in the list; the bar only confirms a pass.
-    saveStatus(form, result.ok ? (result.message || 'SpotiFLAC is ready.') : '', 'ok');
+    saveStatus(form, result.ok ? (result.message || 'Mornye is ready.') : '', 'ok');
   } catch (err) {
     renderSpotiflacTest([]);
     saveStatus(form, `Test failed: ${err.message}`, 'error');
@@ -5407,6 +5475,7 @@ async function loadCharts() {
   renderChartStatus();
   const form = document.querySelector('form[data-section="generated-playlists-charts"]');
   if (form) markClean(form);
+  loadChartPeople();
 }
 
 function regionName(code) {
@@ -5484,11 +5553,187 @@ function renderChartStatus() {
     }
     return line;
   });
+  const chosen = (chartsInfo.listenerCountries || []).map(code => regionName(code));
+  if (chosen.length) {
+    const line = document.createElement('div');
+    line.textContent = `Also read for ${chosen.join(', ')}, which people chose.`;
+    lines.push(line);
+  }
   const note = document.createElement('div');
   note.className = 'chart-status-note';
   note.textContent = "Read from Apple Music's public web pages.";
   box.replaceChildren(...lines, note);
 }
+
+// Each person's charts: their own chart country and up to three pinned countries, from
+// /api/admin/charts/listeners. Saved on every change with their own PUT, one at a time, outside
+// the settings form.
+let chartPeople = null;
+let chartPeopleUser = null;
+let chartPeopleSaving = Promise.resolve();
+// Saves sent and not answered yet. The row is drawn again from an answer only when no later
+// save is waiting, so a quick second change is never undone on screen by the first answer.
+let chartPeoplePending = 0;
+// Per person, how many times a save was refused because their row had changed. A save queued
+// before a refusal is dropped, not sent on top of the newer row.
+const chartPeopleEpoch = {};
+
+async function loadChartPeople() {
+  const row = document.getElementById('charts-people');
+  if (!row) return;
+  // What is saving goes first, so the rows read back hold it.
+  await chartPeopleSaving;
+  let r;
+  try {
+    r = await api('/api/admin/charts/listeners', { cache: 'no-store' });
+  } catch {
+    row.hidden = true;
+    return;
+  }
+  if (!r.ok) {
+    row.hidden = true;
+    return;
+  }
+  const body = await r.json();
+  if (chartPeoplePending) return;
+  chartPeople = body;
+  row.hidden = false;
+  renderChartPeople();
+}
+
+// Options for a country select: `first` leads, then Apple Music's countries by name. A saved
+// country Apple no longer has stays listed, marked, so it can be seen and changed.
+function fillChartCountries(select, first, saved, missing) {
+  const codes = (chartsInfo?.countries || [])
+    .map(code => [code, regionName(code)])
+    .sort((a, b) => a[1].localeCompare(b[1]));
+  const options = [first].concat(codes);
+  if (saved && !options.some(([value]) => value === saved)) {
+    options.push([saved, `${regionName(saved)} (not on Apple Music)`]);
+  } else if (saved && missing.includes(saved)) {
+    const at = options.findIndex(([value]) => value === saved);
+    options[at] = [saved, `${regionName(saved)} (not on Apple Music)`];
+  }
+  select.replaceChildren(...options.map(([value, label]) => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    return option;
+  }));
+  select.value = saved || first[0];
+}
+
+function renderChartPeople() {
+  const people = chartPeople?.people || [];
+  const person = document.getElementById('charts-person');
+  const country = document.getElementById('charts-person-country');
+  const pinsBox = document.querySelector('#charts-people .charts-pins');
+  const pins = Array.from(document.querySelectorAll('#charts-people .charts-pin'));
+  const empty = document.getElementById('charts-people-note');
+  const labels = document.querySelectorAll('#charts-people .charts-people-label');
+  if (!person || !country || !pinsBox || !empty) return;
+  if (!people.length) {
+    [person, country, pinsBox, ...labels].forEach(el => { el.hidden = true; });
+    chartPeopleNote('People show up here once someone has played something.', 'info');
+    return;
+  }
+  [country, pinsBox, ...labels].forEach(el => { el.hidden = false; });
+  if (!people.some(p => p.user === chartPeopleUser)) chartPeopleUser = people[0].user;
+  person.replaceChildren(...people.map(p => {
+    const option = document.createElement('option');
+    option.value = p.user;
+    option.textContent = p.user;
+    return option;
+  }));
+  person.value = chartPeopleUser;
+  person.hidden = people.length < 2;
+  document.getElementById('charts-person-label').hidden = person.hidden;
+  const mine = people.find(p => p.user === chartPeopleUser);
+  const missing = mine.notOnAppleMusic || [];
+  const used = chartsInfo?.country?.used;
+  const server = used ? `Same as the server (${regionName(used)})` : 'Same as the server';
+  fillChartCountries(country, ['auto', server], mine.country === 'auto' ? '' : mine.country, missing);
+  pins.forEach((select, i) => fillChartCountries(select, ['', 'None'], mine.pinned?.[i] || '', missing));
+}
+
+function saveChartPeople() {
+  const user = chartPeopleUser;
+  const country = document.getElementById('charts-person-country')?.value || 'auto';
+  const pinned = Array.from(document.querySelectorAll('#charts-people .charts-pin'))
+    .map(select => select.value)
+    .filter(Boolean);
+  const epoch = chartPeopleEpoch[user] || 0;
+  chartPeoplePending += 1;
+  chartPeopleSaving = chartPeopleSaving.then(async () => {
+    try {
+      // A conflict since this save was queued means it was based on a row that is gone.
+      if ((chartPeopleEpoch[user] || 0) !== epoch) return;
+      // The row as the last answer left it, so a quick second save builds on the first.
+      const current = (chartPeople?.people || []).find(p => p.user.toLowerCase() === user.toLowerCase());
+      const revision = current?.revision || 0;
+      const r = await api('/api/admin/charts/listeners', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user, country, pinned, revision }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.status === 409 && body.people) {
+        chartPeopleEpoch[user] = epoch + 1;
+        chartPeople = body;
+        chartPeopleNote(body.error || 'Changed elsewhere just now; showing the latest.', 'error');
+        return;
+      }
+      if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+      chartPeople = body;
+      chartPeopleNote('Saved.');
+      refreshChartCountries();
+    } catch (error) {
+      chartPeopleNote(`Could not save: ${error.message}`, 'error');
+    } finally {
+      chartPeoplePending -= 1;
+      if (!chartPeoplePending && chartPeopleUser === user) renderChartPeople();
+    }
+  });
+}
+
+// What a save did, on the row's own line, which keeps its height whether it says something or
+// not. Good news fades after a while, as `note` does; a problem stays.
+let chartPeopleNoteTimer = 0;
+function chartPeopleNote(message, kind = 'ok') {
+  const holder = document.getElementById('charts-people-note');
+  if (!holder) return;
+  clearTimeout(chartPeopleNoteTimer);
+  const glyph = { ok: 'i-check-circle-fill', error: 'i-x-circle-fill', info: 'i-info-fill' }[kind] ?? 'i-info-fill';
+  holder.className = `charts-people-note inline-note ${kind}`;
+  holder.innerHTML = `${icon(glyph)}<span>${esc(message)}</span>`;
+  if (kind === 'error' && srAlert) {
+    srAlert.textContent = '';
+    setTimeout(() => { srAlert.textContent = message; }, 50);
+  }
+  if (kind === 'ok') chartPeopleNoteTimer = setTimeout(() => { holder.replaceChildren(); }, 8000);
+}
+
+// The countries people chose, read again after a save so the status line under the card is
+// current, without drawing the rest of the card again.
+async function refreshChartCountries() {
+  try {
+    const r = await api('/api/admin/charts', { cache: 'no-store' });
+    if (!r.ok || !chartsInfo) return;
+    chartsInfo.listenerCountries = (await r.json()).listenerCountries || [];
+    renderChartStatus();
+  } catch {
+    // The status line stays as it was until the card loads again.
+  }
+}
+
+document.getElementById('charts-person')?.addEventListener('change', event => {
+  chartPeopleUser = event.currentTarget.value;
+  renderChartPeople();
+});
+document.getElementById('charts-person-country')?.addEventListener('change', saveChartPeople);
+document.querySelectorAll('#charts-people .charts-pin').forEach(select => {
+  select.addEventListener('change', saveChartPeople);
+});
 
 function relativeTime(iso) {
   const seconds = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
@@ -6655,11 +6900,11 @@ function renderLossy() {
   if (view?.source) parts.push(`Copies come from ${view.source}.`);
   if (view) parts.push(`${view.why}`);
   // Soulseek's state matters only while Soulseek is one of the sources, and with another source
-  // beside it an outage just means the others are asked without it. With SpotiFLAC on, it
+  // beside it an outage just means the others are asked without it. With Mornye on, it
   // takes Soulseek's turn meanwhile, so nothing waits.
   const plan = view?.plan || ['Soulseek'];
-  const spotiflac = /SpotiFLAC/.test(view?.source || '');
-  const others = plan.filter(source => source !== 'Soulseek').concat(spotiflac ? ['SpotiFLAC'] : []);
+  const spotiflac = /Mornye/.test(view?.source || '');
+  const others = plan.filter(source => source !== 'Soulseek').concat(spotiflac ? ['Mornye'] : []);
   if (view?.soulseek?.warning && plan.includes('Soulseek'))
     parts.push(others.length ? `${view.soulseek.detail} ${others.join(' and ')} ${others.length > 1 ? 'are' : 'is'} asked without it until it is back.` : view.soulseek.detail);
   document.getElementById('lossy-status').textContent = parts.join(' ');
@@ -7462,7 +7707,7 @@ document.getElementById('share-rescan')?.addEventListener('click', async event =
 const imp = { view: null, user: null, open: null, detail: null, picked: new Set(), timer: null, services: null, choice: null, busy: false, people: null, forUser: null };
 const impEl = id => document.getElementById(id);
 const impStateWords = {
-  have: 'In your library', missing: 'Missing', queued: 'Queued', downloading: 'Fetching',
+  have: 'In your library', missing: 'Missing', queued: 'Waiting', downloading: 'Fetching',
   done: 'Fetched', notFound: 'Not found', skipped: 'Skipped',
 };
 const impStateTone = { have: 'good', done: 'good', missing: 'state', queued: 'state', downloading: 'state', notFound: 'warn', skipped: 'warn' };
@@ -8022,16 +8267,18 @@ function renderTrickle() {
     off: 'Off',
     yielding: 'Waiting for other downloads',
     waitingForSoulseek: 'Waiting for Soulseek',
+    waitingForMusicDatabase: 'Waiting for MusicBrainz',
   };
-  impEl('imp-trickle-title').textContent = words[t.state] ?? t.state;
+  impEl('imp-trickle-title').textContent = t.label || words[t.state] || t.state;
   const parts = [];
-  if (t.state === 'off') parts.push('Songs an hour is 0, so nothing starts. Change it above.');
-  else parts.push(`Up to ${t.perHour} ${t.perHour === 1 ? 'song' : 'songs'} an hour.`);
-  if (t.state === 'running' && t.nextUtc && !t.downloading) parts.push(`Next song at ${impWhen(t.nextUtc)}.`);
   if (t.state === 'yielding') parts.push('Someone\'s own downloads come first; it goes on once they finish.');
   if (t.state === 'waitingForSoulseek') parts.push('slskd is not logged in to Soulseek; it goes on once it is back.');
+  if (t.state === 'waitingForMusicDatabase') parts.push('MusicBrainz is not answering; songs it has to check go on once it is back.');
+  if (t.state === 'off') parts.push('Songs an hour is 0, so nothing starts. Change it above.');
+  else parts.push(`Up to ${t.perHour}\u00a0${t.perHour === 1 ? 'song' : 'songs'} an hour.`);
+  if (t.state === 'running' && t.nextUtc && !t.downloading) parts.push(`Next song at ${impWhen(t.nextUtc)}.`);
   const tally = [[t.queued, 'waiting'], [t.downloading, 'fetching'], [t.done, 'fetched'], [t.notFound, 'not found'], [t.skipped, 'skipped']]
-    .filter(([count]) => count > 0).map(([count, label]) => `${count} ${label}`);
+    .filter(([count]) => count > 0).map(([count, label]) => `${count}\u00a0${label}`);
   if (tally.length) parts.push(`${tally.join(', ')}.`);
   impEl('imp-trickle-line').textContent = parts.join(' ');
 

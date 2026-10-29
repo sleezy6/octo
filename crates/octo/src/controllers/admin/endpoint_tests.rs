@@ -993,7 +993,7 @@ async fn the_refusals_match_the_baseline() {
     let state = AppState::for_tests(settings);
     let app = app(&state);
     let token = state.browse_sessions.create("admin");
-    let cases: [(Method, &str, Option<Value>, StatusCode, &str); 10] = [
+    let cases: [(Method, &str, Option<Value>, StatusCode, &str); 11] = [
         (
             Method::POST,
             "/api/admin/covers/upgrade",
@@ -1038,6 +1038,13 @@ async fn the_refusals_match_the_baseline() {
         ),
         (
             Method::POST,
+            "/api/admin/youtube-check/start",
+            None,
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"Turn on library actions and Review, set how many songs an hour to check, and put someone on the allowed list, first."}"#,
+        ),
+        (
+            Method::POST,
             "/api/admin/genre/backfill/resume",
             None,
             StatusCode::BAD_REQUEST,
@@ -1073,6 +1080,8 @@ async fn the_refusals_match_the_baseline() {
     for (uri, expected) in [
         ("/api/admin/review-sweep/pause", r#"{"ok":true}"#),
         ("/api/admin/review-sweep/reset", r#"{"ok":true}"#),
+        ("/api/admin/youtube-check/pause", r#"{"ok":true}"#),
+        ("/api/admin/youtube-check/resume", r#"{"ok":true}"#),
         ("/api/admin/genre/backfill/cancel", r#"{"cancelling":true}"#),
         ("/api/admin/covers/upgrade/cancel", r#"{"cancelling":true}"#),
         ("/api/admin/lyrics/library/cancel", r#"{"cancelling":true}"#),
@@ -1351,4 +1360,32 @@ async fn the_list_carries_what_the_page_filters_on() {
         json!({ "state": "unchecked", "score": null, "by": null })
     );
     assert_eq!(by_id("nd-plain")["fromYouTube"], json!(false));
+}
+
+/// The YouTube check's status is counts only, and idle until a person starts it.
+#[tokio::test]
+async fn the_youtube_check_is_idle_until_started_and_shows_counts_only() {
+    let state = AppState::for_tests(AppSettings::default());
+    let app = app(&state);
+
+    let token = state.browse_sessions.create("admin");
+    let reply = send(
+        &app,
+        request(Method::GET, "/api/admin/youtube-check", Some(&token), None),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let body = reply.json();
+    assert_eq!(body["state"], "Idle");
+    assert_eq!(body["running"], false);
+    assert_eq!(body["total"], 0);
+    assert_eq!(body["asked"], 0);
+    assert_eq!(body["perHour"], 30);
+    // Nothing that names a file or a song.
+    for key in body.as_object().expect("an object").keys() {
+        assert!(
+            !key.to_lowercase().contains("path") && !key.to_lowercase().contains("title"),
+            "{key}"
+        );
+    }
 }

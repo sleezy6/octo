@@ -1407,3 +1407,293 @@ async fn an_octo_app_play_served_its_lossless_copy_keeps_it_on_the_next_range() 
     assert_eq!(later.body.as_ref(), [6]);
     assert!(downloads.stream_calls().is_empty(), "never the preview");
 }
+
+#[test]
+fn a_pinned_chart_cover_says_its_country() {
+    use super::media::chart_cover_words;
+    assert_eq!(
+        chart_cover_words("34", Some("jp"), "Popular right now · Japan").as_deref(),
+        Some("Popular · Japan")
+    );
+    assert_eq!(
+        chart_cover_words("34", Some("ae"), "Popular right now · United Arab Emirates").as_deref(),
+        Some("Popular · United Arab Emirates")
+    );
+    assert_eq!(
+        chart_cover_words("15", Some("jp"), "Top R&B/Soul · Japan").as_deref(),
+        Some("Top R&B/Soul · Japan")
+    );
+    // The listener's own lists say what they always said.
+    assert_eq!(
+        chart_cover_words("34", None, "Popular right now").as_deref(),
+        Some("Popular")
+    );
+    assert_eq!(chart_cover_words("18", None, "Top Hip-Hop/Rap"), None);
+}
+
+// ---- Chart lists for an app that signs in with an API key ----------------------------------
+
+mod api_key_charts {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use octo_core::common::Clock;
+    use octo_core::settings::GeneratedPlaylistSettings;
+    use octo_subsonic::subsonic_request_parser::Parameters;
+    use wiremock::matchers::{method, path, query_param_is_missing};
+
+    use super::*;
+    use crate::services::charts::ChartCountryStore;
+    use crate::services::charts::apple_music_pages::AppleMusicPages;
+    use crate::services::common::TopSongsService;
+    use crate::services::common::test_fakes::FakeMetadata;
+    use crate::services::cover_art::ArtworkHints;
+    use crate::services::library::ChartPlaylistService;
+    use crate::services::metadata::deezer_metadata_service::DeezerMetadataService;
+    use crate::services::metadata::deezer_rate_limit_handler::DeezerRateLimitHandler;
+    use crate::services::metadata::deezer_rate_limiter::DeezerRateLimiter;
+    use crate::services::subsonic::SubsonicProxyService;
+
+    const US_ALL: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/rust-migration/fixtures/apple-music/us_all.html"
+    ));
+
+    /// Navidrome with one API key, "alice-key", that tokenInfo names alice; a normal sign-in
+    /// with the token "good" is accepted too. Every library search finds nothing.
+    struct ChartNavidrome;
+
+    impl Respond for ChartNavidrome {
+        fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+            let query = query_of(request);
+            let path = request.url.path();
+            let key_ok = query.get("apiKey").map(String::as_str) == Some("alice-key");
+            if path.ends_with("/rest/ping") {
+                let ok = key_ok || query.get("t").map(String::as_str) == Some("good");
+                return navidrome_json(if ok {
+                    NAVIDROME_OK
+                } else {
+                    NAVIDROME_WRONG_PASSWORD
+                });
+            }
+            if path.ends_with("/rest/tokenInfo") {
+                return navidrome_json(if key_ok {
+                    r#"{"subsonic-response":{"status":"ok","version":"1.16.1","tokenInfo":{"username":"alice"}}}"#
+                } else {
+                    r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":44,"message":"Invalid API key"}}}"#
+                });
+            }
+            if path.ends_with("/rest/getPlaylists") {
+                return navidrome_json(
+                    r#"{"subsonic-response":{"status":"ok","version":"1.16.1","playlists":{"playlist":[]}}}"#,
+                );
+            }
+            if path.ends_with("/rest/search3") {
+                return navidrome_json(
+                    r#"{"subsonic-response":{"status":"ok","version":"1.16.1","searchResult3":{}}}"#,
+                );
+            }
+            ResponseTemplate::new(404)
+        }
+    }
+
+    struct Fixture {
+        navidrome: MockServer,
+        state: crate::app::AppState,
+        _apple: MockServer,
+    }
+
+    impl Fixture {
+        async fn new() -> Fixture {
+            let navidrome = MockServer::builder().start().await;
+            Mock::given(any())
+                .respond_with(ChartNavidrome)
+                .mount(&navidrome)
+                .await;
+            let apple = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/us/new/top-charts/songs"))
+                .and(query_param_is_missing("genreId"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(US_ALL.as_bytes().to_vec(), "text/html"),
+                )
+                .mount(&apple)
+                .await;
+            let mut settings = settings(&navidrome.uri());
+            settings.subsonic.enable_search_discovery = true;
+            settings.generated_playlists = GeneratedPlaylistSettings {
+                charts: String::new(),
+                chart_country: "us".to_string(),
+                ..Default::default()
+            };
+            let apple_url = apple.uri();
+            let state = state_with(settings, |inner| {
+                let settings = Arc::clone(&inner.settings);
+                let registry = Arc::clone(&inner.external_id_registry);
+                let http = Arc::new(DeezerRateLimitHandler::new(Arc::new(DeezerRateLimiter::new())));
+                let deezer = DeezerMetadataService::with_base_url(
+                    http,
+                    Arc::clone(&settings),
+                    format!("http://{}", crate::services::test_support::refused_address()),
+                );
+                let top_songs = TopSongsService::new(
+                    deezer,
+                    None,
+                    Arc::new(FakeMetadata::default()),
+                    Arc::clone(&registry),
+                    Arc::new(AppleMusicPages::with_base_url(&apple_url, Duration::ZERO)),
+                    Arc::new(ArtworkHints::new()),
+                    Arc::clone(&settings),
+                )
+                .with_listeners(Arc::new(ChartCountryStore::new(None)));
+                inner.chart_playlists = Arc::new(ChartPlaylistService::new(
+                    top_songs.clone(),
+                    Arc::clone(&inner.subsonic_response_builder),
+                    registry,
+                    SubsonicProxyService::new(Arc::clone(&settings)),
+                    settings,
+                    Clock::system(),
+                ));
+                inner.top_songs = top_songs;
+            });
+            Fixture {
+                navidrome,
+                state,
+                _apple: apple,
+            }
+        }
+
+        async fn token_infos(&self) -> usize {
+            received_paths(&self.navidrome)
+                .await
+                .iter()
+                .filter(|p| p.ends_with("/rest/tokenInfo"))
+                .count()
+        }
+
+        /// alice's chart list id, with the list made for her.
+        async fn alices_list(&self) -> String {
+            let sign_in: Parameters = [
+                ("u", "alice"),
+                ("t", "good"),
+                ("s", "salt"),
+                ("v", "1.16.1"),
+                ("c", "test"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            self.state
+                .chart_playlists
+                .songs("alice", octo_core::charts::chart_settings::OVERALL, &sign_in)
+                .await;
+            let lists = self.state.chart_playlists.list("alice", &sign_in).await;
+            assert_eq!(lists.len(), 1, "one chart list is made");
+            lists[0].id.clone()
+        }
+    }
+
+    const KEY: &str = "apiKey=alice-key&v=1.16.1&c=test&f=json";
+
+    #[tokio::test]
+    async fn an_api_key_app_lists_its_chart_lists_and_mixes() {
+        let fixture = Fixture::new().await;
+        let id = fixture.alices_list().await;
+
+        let reply = get(&app(&fixture.state), &format!("/rest/getPlaylists.view?{KEY}")).await;
+
+        let text = reply.text();
+        assert!(text.contains("Popular right now"), "{text}");
+        assert!(text.contains(&id), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_api_key_app_opens_a_chart_list() {
+        let fixture = Fixture::new().await;
+        let id = fixture.alices_list().await;
+
+        let reply = get(
+            &app(&fixture.state),
+            &format!("/rest/getPlaylist.view?id={id}&{KEY}"),
+        )
+        .await;
+
+        let envelope = reply.envelope();
+        assert_eq!(envelope["status"], "ok", "{}", reply.text());
+        assert_eq!(
+            envelope["playlist"]["name"],
+            "Popular right now",
+            "{}",
+            reply.text()
+        );
+        assert!(
+            !envelope["playlist"]["entry"]
+                .as_array()
+                .expect("songs")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_api_key_app_gets_a_chart_cover() {
+        let fixture = Fixture::new().await;
+        let id = fixture.alices_list().await;
+
+        let reply = get(
+            &app(&fixture.state),
+            &format!("/rest/getCoverArt.view?id={id}&size=64&{KEY}"),
+        )
+        .await;
+
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.header("content-type"), Some("image/jpeg"));
+        assert!(
+            !received_paths(&fixture.navidrome)
+                .await
+                .iter()
+                .any(|p| p.ends_with("/rest/getCoverArt")),
+            "the chart cover is Octo's own"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_cover_request_never_asks_token_info() {
+        let fixture = Fixture::new().await;
+        let id = fixture.alices_list().await;
+        let before = fixture.token_infos().await;
+
+        get(
+            &app(&fixture.state),
+            &format!("/rest/getCoverArt.view?id={id}&apiKey=wrong-key&v=1.16.1&c=test"),
+        )
+        .await;
+        get(
+            &app(&fixture.state),
+            &format!("/rest/getCoverArt.view?id={id}&v=1.16.1&c=test"),
+        )
+        .await;
+
+        assert_eq!(fixture.token_infos().await, before, "tokenInfo was never asked");
+    }
+
+    #[tokio::test]
+    async fn a_normal_sign_in_never_asks_token_info() {
+        let fixture = Fixture::new().await;
+        let id = fixture.alices_list().await;
+
+        let lists = get(
+            &app(&fixture.state),
+            "/rest/getPlaylists.view?u=alice&t=good&s=salt&v=1.16.1&c=test&f=json",
+        )
+        .await;
+        let cover = get(
+            &app(&fixture.state),
+            &format!("/rest/getCoverArt.view?id={id}&size=64&u=alice&t=good&s=salt&v=1.16.1&c=test"),
+        )
+        .await;
+
+        assert!(lists.text().contains("Popular right now"), "{}", lists.text());
+        assert_eq!(cover.header("content-type"), Some("image/jpeg"));
+        assert_eq!(fixture.token_infos().await, 0);
+    }
+}

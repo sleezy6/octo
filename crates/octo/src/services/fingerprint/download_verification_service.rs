@@ -136,6 +136,8 @@ impl DownloadVerificationService {
     /// Whether a download sounds like the song's YouTube preview, for a verdict that leaves the
     /// question to it ([`preview_check::wanted`]). Unavailable, and no work, while Octo is not
     /// policing downloads or the verdict settled the file.
+    /// A `background` request fetches the preview in the shim's background lane, for work nobody
+    /// waits on.
     pub async fn hear_against_preview(
         &self,
         source: &dyn PreviewSource,
@@ -282,7 +284,8 @@ impl DownloadVerificationService {
     /// A confident fingerprint of something else is not overruled by a tag, since tags are
     /// copied and audio is not, and neither is a fingerprint that named a recording whose ISRCs
     /// were not found, or the right recording at a length far from the file's (those go to a
-    /// person).
+    /// person). Neither is a link only one person's submissions stand behind: a tag is copied with
+    /// the file, so it is no second word on what the sound is.
     pub fn with_tagged_isrc(
         verdict: VerificationResult,
         isrc: Option<&str>,
@@ -292,6 +295,7 @@ impl DownloadVerificationService {
             || verdict.verdict != VerificationVerdict::Inconclusive
             || verdict.reason == InconclusiveReason::SourceDisagreed
             || verdict.reason == InconclusiveReason::LengthOff
+            || verdict.reason == InconclusiveReason::LoneLink
         {
             return verdict;
         }
@@ -340,7 +344,9 @@ impl DownloadVerificationService {
         Self::settle_by_tagged_recording(verdict, requested_title, &facts)
     }
 
-    /// [`Self::with_tagged_recording`]'s decision, apart from the I/O.
+    /// [`Self::with_tagged_recording`]'s decision, apart from the I/O. A link one person's
+    /// submissions tie to the song asked for, against tags that name another version, is two
+    /// single words that disagree: a question, never a refusal.
     pub fn settle_by_tagged_recording(
         verdict: VerificationResult,
         requested_title: &str,
@@ -352,6 +358,18 @@ impl DownloadVerificationService {
         let Some(gap) = version_gap::version_gap(requested_title, &tagged.title, Against::Recording) else {
             return verdict;
         };
+        let evidence = format!(
+            "the file's own tags name the MusicBrainz recording '{}'",
+            tagged.title
+        );
+        if verdict.reason == InconclusiveReason::LoneLink && verdict.recording_id.is_some() {
+            return VerificationResult {
+                verdict: VerificationVerdict::Inconclusive,
+                reason: InconclusiveReason::SourceDisagreed,
+                evidence: Some(evidence),
+                ..verdict
+            };
+        }
         let kind = recording_identity::kind_of(
             &AcoustIdRecording::new(
                 &tagged.recording_id,
@@ -371,10 +389,7 @@ impl DownloadVerificationService {
                 tagged.title,
                 gap.words()
             ),
-            evidence: Some(format!(
-                "the file's own tags name the MusicBrainz recording '{}'",
-                tagged.title
-            )),
+            evidence: Some(evidence),
             kind: Some(kind),
             ..verdict
         }
@@ -563,9 +578,9 @@ impl DownloadVerificationService {
 
         // A recording whose name reads differently from the request may still be it: a title in
         // its own script, or translated. Its ISRCs settle that when the request carried one.
-        if let (VerificationVerdict::Mismatch, Some(isrc), Some(music_brainz)) =
-            (verdict.verdict, isrc, &self.music_brainz)
-        {
+        let named_otherwise =
+            verdict.verdict == VerificationVerdict::Mismatch || is_lone_link_elsewhere(&verdict);
+        if let (true, Some(isrc), Some(music_brainz)) = (named_otherwise, isrc, &self.music_brainz) {
             let recording_isrcs = Self::recording_isrcs(
                 music_brainz,
                 &lookup,
@@ -600,6 +615,15 @@ impl DownloadVerificationService {
         }
 
         if verdict.verdict == VerificationVerdict::Inconclusive
+            && verdict.reason == InconclusiveReason::LoneLink
+        {
+            info!(
+                "AcoustID ties '{path}' to '{} - {}' through one person's submissions only; the song's \
+                 YouTube preview decides",
+                verdict.matched_artist.as_deref().unwrap_or(""),
+                verdict.matched_title.as_deref().unwrap_or("")
+            );
+        } else if verdict.verdict == VerificationVerdict::Inconclusive
             && verdict.reason == InconclusiveReason::SourceDisagreed
         {
             info!(
@@ -770,6 +794,11 @@ impl DownloadVerificationService {
     /// while the file's own tags carry the requested one, is a disagreement between two sources
     /// a person can settle, so the file is kept and asked about rather than deleted. Recordings
     /// that list other ISRCs change nothing: the verdict stays as it was.
+    ///
+    /// A recording that lists the ISRC names the song, but the sound is tied to it only as firmly
+    /// as its submissions: fewer than `MIN_SOURCES_TO_CONFIRM` over every recording listing the
+    /// code leave a lone link carrying that recording, for the song's YouTube preview to settle.
+    /// A lone link to another song is settled the same way as a mismatch.
     pub fn settle_by_isrc(
         verdict: VerificationResult,
         lookup: &AcoustIdLookup,
@@ -779,7 +808,7 @@ impl DownloadVerificationService {
         recording_isrcs: &RecordingIsrcs,
         tagged_match: bool,
     ) -> VerificationResult {
-        if verdict.verdict != VerificationVerdict::Mismatch {
+        if verdict.verdict != VerificationVerdict::Mismatch && !is_lone_link_elsewhere(&verdict) {
             return verdict;
         }
         let Some(best) = best_qualifying(lookup, threshold) else {
@@ -788,12 +817,25 @@ impl DownloadVerificationService {
 
         // A stray link is not believed on its ISRC either: the request's ISRC belongs to the
         // song asked for, so it names the stray as surely as its title did.
-        let agreed = best.recordings.iter().find(|recording| {
-            get_ignore_case(recording_isrcs, &recording.recording_id)
-                .is_some_and(|isrcs| isrcs.iter().any(|code| code == isrc))
-                && trustworthy(recording, best, verdict.duration_seconds)
-        });
-        if let Some(agreed) = agreed {
+        let listing: Vec<&AcoustIdRecording> = best
+            .recordings
+            .iter()
+            .filter(|recording| {
+                get_ignore_case(recording_isrcs, &recording.recording_id)
+                    .is_some_and(|isrcs| isrcs.iter().any(|code| code == isrc))
+                    && trustworthy(recording, best, verdict.duration_seconds)
+            })
+            .collect();
+        if let Some(agreed) = listing.first().copied() {
+            if submissions(listing.iter().copied()) < MIN_SOURCES_TO_CONFIRM {
+                return VerificationResult {
+                    fingerprint: verdict.fingerprint,
+                    duration_seconds: verdict.duration_seconds,
+                    lookup: Some(lookup.clone()),
+                    threshold: verdict.threshold,
+                    ..lone_link(best, agreed, tags_authoritative)
+                };
+            }
             return VerificationResult {
                 fingerprint: verdict.fingerprint,
                 duration_seconds: verdict.duration_seconds,
@@ -942,6 +984,25 @@ impl DownloadVerificationService {
         }
         (ids.len() == 1).then(|| ids[0].to_string())
     }
+
+    /// A lone link to the recording asked for, backed by a believed YouTube preview: two words
+    /// that agree, so the file is confirmed as that recording. Every other verdict, a lone link to
+    /// another song among them (there is no recording to confirm it as), is returned unchanged.
+    pub(crate) fn confirmed_by_preview(verdict: VerificationResult) -> VerificationResult {
+        let names_recording = verdict.recording_id.as_deref().is_some_and(|id| !id.is_empty());
+        if verdict.verdict != VerificationVerdict::Inconclusive
+            || verdict.reason != InconclusiveReason::LoneLink
+            || !names_recording
+        {
+            return verdict;
+        }
+        VerificationResult {
+            verdict: VerificationVerdict::Confirmed,
+            reason: InconclusiveReason::None,
+            evidence: Some("the song's YouTube preview agrees".into()),
+            ..verdict
+        }
+    }
 }
 
 #[async_trait]
@@ -994,8 +1055,8 @@ const LENGTH_SLACK: f64 = 0.07;
 /// Whether an agreeing recording can be believed: not dwarfed by a recording of another song
 /// in the same result, and not far from the file's length. The comparison is only with other
 /// songs, since the same audio is often tied to several versions of one song (album, single,
-/// radio edit) with very different counts. A lone weak link still counts, and so does a
-/// length nobody knows.
+/// radio edit) with very different counts. A lone weak link is still believed here (whether it
+/// confirms on its own is [`MIN_SOURCES_TO_CONFIRM`]'s to say), and so is a length nobody knows.
 pub(crate) fn trustworthy(agreed: &AcoustIdRecording, result: &AcoustIdResult, file_seconds: i32) -> bool {
     !is_stray(agreed, result) && !length_off(agreed, file_seconds)
 }
@@ -1162,9 +1223,14 @@ fn decide_core(
         kind_certain,
     }) = chosen
     {
+        // A refusal of a take one person's submissions name is that person's word alone.
+        let lone = song_submissions(best, agreed) < MIN_SOURCES_TO_CONFIRM;
         // The right song and artist, but a take the request never asked for: the same title and
         // nearly the same length, so only its exact length and what it is on tell it apart.
         if let Some(missing) = asked_take_missing(&asked, kind, agreed, facts) {
+            if lone {
+                return lone_link_elsewhere(best, agreed);
+            }
             return VerificationResult {
                 verdict: VerificationVerdict::Mismatch,
                 score: best.score,
@@ -1182,6 +1248,9 @@ fn decide_core(
             };
         }
         if takes.refuses(kind) {
+            if lone {
+                return lone_link_elsewhere(best, agreed);
+            }
             let album = recording_album(agreed, kind);
             return VerificationResult {
                 verdict: VerificationVerdict::Mismatch,
@@ -1200,6 +1269,17 @@ fn decide_core(
                 kind_certain,
                 sole,
                 ..Default::default()
+            };
+        }
+        // One person's submissions are not proof on their own: the song's YouTube preview has
+        // to back them.
+        if submissions(agreeing.iter().copied()) < MIN_SOURCES_TO_CONFIRM {
+            return VerificationResult {
+                kind: Some(kind),
+                by_length,
+                kind_certain,
+                sole,
+                ..lone_link(best, agreed, tags_authoritative)
             };
         }
         return VerificationResult {
@@ -1235,6 +1315,9 @@ fn decide_core(
 
     // The same song in another version: never the file asked for, however alike the rest reads.
     if let Some(other) = other_version_in(best, requested_artist, requested_title, duration_seconds) {
+        if song_submissions(best, other) < MIN_SOURCES_TO_CONFIRM {
+            return lone_link_elsewhere(best, other);
+        }
         let kind = kind_with(other, facts);
         let gap = version_gap::version_gap(requested_title, &other.title, Against::Recording)
             .map(|gap| gap.words())
@@ -1264,6 +1347,9 @@ fn decide_core(
         .rev()
         .max_by_key(|r| r.sources)
         .unwrap_or(&best.recordings[0]);
+    if song_submissions(best, actual) < MIN_SOURCES_TO_CONFIRM {
+        return lone_link_elsewhere(best, actual);
+    }
     VerificationResult {
         verdict: VerificationVerdict::Mismatch,
         score: best.score,
@@ -1295,6 +1381,60 @@ fn confirm(
         r#match: Some(recording.clone()),
         ..Default::default()
     }
+}
+
+/// A link that this many submissions or more stand behind confirms a file on its own; fewer is one
+/// person's word, which the song's YouTube preview has to back.
+const MIN_SOURCES_TO_CONFIRM: i32 = 2;
+
+/// How many submissions tie the fingerprint to these recordings, together.
+fn submissions<'a>(recordings: impl IntoIterator<Item = &'a AcoustIdRecording>) -> i32 {
+    recordings
+        .into_iter()
+        .fold(0i32, |total, r| total.saturating_add(r.sources.max(0)))
+}
+
+/// How many submissions tie the fingerprint to the song `named` is, over every recording of the
+/// result with its title and artist.
+fn song_submissions(result: &AcoustIdResult, named: &AcoustIdRecording) -> i32 {
+    let key = |r: &AcoustIdRecording| (SongIdentity::key(&r.title), SongIdentity::key(&r.artist_credit()));
+    let song = key(named);
+    submissions(result.recordings.iter().filter(|r| key(r) == song))
+}
+
+/// The recording asked for, tied to the sound by one person's submissions only: everything a
+/// confirmation would carry, and the recording a person's Keep sends AcoustID a second link to.
+fn lone_link(
+    result: &AcoustIdResult,
+    recording: &AcoustIdRecording,
+    tags_authoritative: bool,
+) -> VerificationResult {
+    VerificationResult {
+        verdict: VerificationVerdict::Inconclusive,
+        reason: InconclusiveReason::LoneLink,
+        candidate_recording_id: Some(recording.recording_id.clone()),
+        ..confirm(result, recording, tags_authoritative)
+    }
+}
+
+/// A sound one person's submissions tie to another song or take than the one asked for: named for
+/// the words, never refused on that alone and never tagged from, since no recording is believed.
+fn lone_link_elsewhere(result: &AcoustIdResult, named: &AcoustIdRecording) -> VerificationResult {
+    VerificationResult {
+        verdict: VerificationVerdict::Inconclusive,
+        reason: InconclusiveReason::LoneLink,
+        score: result.score,
+        matched_title: Some(named.title.clone()),
+        matched_artist: Some(named.artist_credit()),
+        ..Default::default()
+    }
+}
+
+/// Whether a verdict is [`lone_link_elsewhere`]'s: a lone link that names no recording.
+fn is_lone_link_elsewhere(verdict: &VerificationResult) -> bool {
+    verdict.verdict == VerificationVerdict::Inconclusive
+        && verdict.reason == InconclusiveReason::LoneLink
+        && verdict.recording_id.as_deref().is_none_or(str::is_empty)
 }
 
 /// The release a take is best named by: one whose title says what the take is (the promo of
@@ -1372,6 +1512,18 @@ impl crate::services::library::library_review_sweep_worker::SweepVerification
 
     async fn verify(&self, path: &str, artist: Option<&str>, title: Option<&str>) -> VerificationResult {
         DownloadVerificationService::verify_in_background(self, path, artist, title).await
+    }
+
+    /// The same question a new download is asked of a sound AcoustID has never heard.
+    async fn hear_preview(
+        &self,
+        source: &dyn PreviewSource,
+        path: &str,
+        request: &PreviewRequest<'_>,
+        question: &VerificationResult,
+    ) -> PreviewOutcome {
+        self.hear_against_preview(source, path, request, question, true)
+            .await
     }
 
     /// The codes AcoustID's own answer carried for the recordings of its best result, else the

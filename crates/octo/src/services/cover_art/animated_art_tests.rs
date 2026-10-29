@@ -490,3 +490,48 @@ async fn a_relayed_playlist_is_fetched_once_and_served_from_memory() {
     }
     assert_eq!(Apple::asked(&video, SQUARE).await, 1);
 }
+
+#[tokio::test]
+async fn a_request_joining_a_sweep_lookup_turns_it_urgent() {
+    let apple = Apple::new().await;
+    // The match is slow to answer, so the lookup is still running when the request arrives.
+    Mock::given(path("/search"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(search_answer("Lorde", "Melodrama", 1))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&apple.itunes)
+        .await;
+    let covers = apple.covers("direct", None);
+    let key = album_key("Lorde", "Melodrama");
+
+    // The background lookup, as the sweep and getAlbum start it.
+    assert!(covers.peek("Lorde", "Melodrama", None).is_none());
+    let background = covers
+        .urgent
+        .lock()
+        .get(&key)
+        .cloned()
+        .expect("a lane is recorded");
+    assert!(!background.is_now());
+
+    // The same album asked for by a request.
+    let lookup = covers
+        .find_on(
+            "Lorde",
+            "Melodrama",
+            None,
+            Duration::from_millis(100),
+            &LaneCell::now(),
+        )
+        .await;
+
+    assert_eq!(
+        lookup,
+        ArtLookup::Unavailable,
+        "still running, so the request gave up waiting"
+    );
+    assert!(background.is_now(), "the running lookup reads interactively now");
+    assert_eq!(covers.urgent.lock().len(), 1, "one lookup, one lane");
+}

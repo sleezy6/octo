@@ -21,9 +21,12 @@ pub struct ServerInfo {
 }
 
 impl ServerInfo {
-    /// Whether the answer is SpotiFLAC's own: its name, or at least its API version.
+    /// Whether the answer is SpotiFLAC's own, or Mornye's (its name since the rename): the
+    /// name, or at least the API version.
     pub fn is_spotiflac(&self) -> bool {
-        self.name.eq_ignore_ascii_case("SpotiFLAC") || self.api_version == "v1"
+        self.name.eq_ignore_ascii_case("SpotiFLAC")
+            || self.name.eq_ignore_ascii_case("Mornye")
+            || self.api_version == "v1"
     }
 }
 
@@ -213,6 +216,24 @@ pub fn search_queries(want: &Wanted<'_>) -> Vec<String> {
     queries
 }
 
+/// Mornye's catalog search leaves `isrc` empty even when the query was `isrc:XXXX`, so a track
+/// found by that query is taken as having the ISRC asked for. Tracks that already name an ISRC
+/// keep their own.
+pub fn with_query_isrc(mut tracks: Vec<CatalogTrack>, query: &str) -> Vec<CatalogTrack> {
+    if let Some(isrc) = query
+        .strip_prefix("isrc:")
+        .map(str::trim)
+        .filter(|isrc| !isrc.is_empty())
+    {
+        for track in &mut tracks {
+            if track.isrc.trim().is_empty() {
+                track.isrc = isrc.to_string();
+            }
+        }
+    }
+    tracks
+}
+
 /// The catalog track a search answer offers for the song, and in words why it fits; or why
 /// none does.
 #[derive(Debug, Clone, PartialEq)]
@@ -295,7 +316,7 @@ pub fn pick_track(tracks: &[CatalogTrack], want: &Wanted<'_>) -> Pick {
         }
         None => Pick::None {
             why: match (tracks.is_empty(), last_refusal) {
-                (true, _) | (false, None) => "SpotiFLAC's search found nothing".into(),
+                (true, _) | (false, None) => "Mornye's search found nothing".into(),
                 (false, Some(refusal)) => format!("Nothing fits; for example {refusal}"),
             },
         },
@@ -427,9 +448,24 @@ mod tests {
         assert_eq!(
             pick_track(&[], &want("IU", "Blueming", None, None)),
             Pick::None {
-                why: "SpotiFLAC's search found nothing".into()
+                why: "Mornye's search found nothing".into()
             }
         );
+    }
+
+    #[test]
+    fn an_isrc_query_fills_empty_isrcs_only() {
+        let tracks = vec![
+            track("Blueming", "IU", 217, ""),
+            track("Blueming", "IU", 217, " "),
+            track("Blueming", "IU", 217, "OTHER"),
+        ];
+        let filled = with_query_isrc(tracks.clone(), "isrc:USUM71703861");
+        assert_eq!(filled[0].isrc, "USUM71703861");
+        assert_eq!(filled[1].isrc, "USUM71703861");
+        assert_eq!(filled[2].isrc, "OTHER");
+        assert_eq!(with_query_isrc(tracks.clone(), "IU Blueming"), tracks);
+        assert_eq!(with_query_isrc(tracks.clone(), "isrc: "), tracks);
     }
 
     #[test]
@@ -444,6 +480,17 @@ mod tests {
         t.external_url = "javascript:alert(1)".into();
         t.id = "../etc".into();
         assert_eq!(t.link(), None);
+    }
+
+    #[test]
+    fn mornye_answers_as_the_same_web_api() {
+        let info: ServerInfo = serde_json::from_str(
+            r#"{"name":"Mornye","version":"1.0.3","multiuser":false,"authenticated":true}"#,
+        )
+        .unwrap();
+        assert!(info.is_spotiflac());
+        let other: ServerInfo = serde_json::from_str(r#"{"name":"Something else"}"#).unwrap();
+        assert!(!other.is_spotiflac());
     }
 
     #[test]

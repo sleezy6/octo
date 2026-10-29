@@ -44,8 +44,8 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
     // Subsonic spec: getSimilarSongs.view → key "similarSongs"; getSimilarSongs2.view →
     // "similarSongs2". Clients (Arpeggi) parse the v2 key strictly and ignore v1-shaped
     // responses when they called v2: that's why the radio queue showed up empty.
-    let path = call.path();
-    let is_v2_request = dotnet::to_lower_invariant(&path).contains("getsimilarsongs2");
+    let endpoint = call.endpoint();
+    let is_v2_request = dotnet::to_lower_invariant(&endpoint).contains("getsimilarsongs2");
     let response_key = if is_v2_request {
         "similarSongs2"
     } else {
@@ -60,10 +60,12 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
 
     // Check if radio is configured and enabled
     if !state.song_radio.enabled() {
+        // Navidrome has never seen an outside id, so it would only answer "not found".
+        if state.local_library.parse_song_id(&id).0 {
+            return builder.create_response(format, response_key).into_response();
+        }
         debug!("Last.fm radio not configured, relaying to upstream server");
-        // The path keeps its leading slash, so the upstream URL has a double slash after the
-        // server's address.
-        return match call.proxy.relay(&path, &call.parameters).await {
+        return match call.proxy.relay(&endpoint, &call.parameters).await {
             Ok(result) => call.file(&result.body, result.content_type.as_deref()),
             Err(_) => builder.create_response(format, response_key).into_response(),
         };
@@ -205,8 +207,9 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
         // Nothing from Octo's sources (no Last.fm key, say, and an artist none of the others
         // knows): Navidrome's own agents may still answer, as they did before Octo's radio.
         if !is_external
-            && let Some(upstream) = call.proxy.relay_safe(&path, &call.parameters).await
+            && let Some(upstream) = call.proxy.relay_safe(&endpoint, &call.parameters).await
             && !upstream.body.is_empty()
+            && is_successful_subsonic_response(&upstream.body, format)
         {
             return call.file(&upstream.body, upstream.content_type.as_deref());
         }

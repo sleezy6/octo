@@ -120,15 +120,17 @@ pub fn routes() -> RouteSet {
 /// `deleteFamilyPlaylistCover`).
 pub const FAMILY_EXTENSION: (&str, i32) = ("octoFamily", 2);
 
-/// Adds `octoFamily` to a `getOpenSubsonicExtensions` answer (an ok one; a failed or unreadable
-/// answer goes out as it came).
-pub fn with_family_extension(reply: SubsonicReply, format: &str) -> SubsonicReply {
-    with_extension(reply, format, FAMILY_EXTENSION)
-}
+/// The family playlists extension: rows say who made a family playlist and who may rename or
+/// delete it, and `updatePlaylist` takes `octoSongToRemove`.
+pub const FAMILY_PLAYLISTS_EXTENSION: (&str, i64) = ("octoFamilyPlaylists", 1);
 
-/// Adds the extension `(name, version)` to a `getOpenSubsonicExtensions` answer (an ok one; a
-/// failed or unreadable answer goes out as it came).
-pub fn with_extension(reply: SubsonicReply, format: &str, (name, version): (&str, i32)) -> SubsonicReply {
+/// Adds `octoFamily` and `octoFamilyPlaylists` to a `getOpenSubsonicExtensions` answer (an ok
+/// one; a failed or unreadable answer goes out as it came).
+pub fn with_family_extension(reply: SubsonicReply, format: &str) -> SubsonicReply {
+    let extensions = [
+        (FAMILY_EXTENSION.0, i64::from(FAMILY_EXTENSION.1)),
+        FAMILY_PLAYLISTS_EXTENSION,
+    ];
     if format.eq_ignore_ascii_case("json") {
         let Some(mut value) = reply.json_value() else {
             return reply;
@@ -145,11 +147,13 @@ pub fn with_extension(reply: SubsonicReply, format: &str, (name, version): (&str
         let Some(list) = list.as_array_mut() else {
             return reply;
         };
-        if !list
-            .iter()
-            .any(|item| item.get("name").and_then(Value::as_str) == Some(name))
-        {
-            list.push(json!({ "name": name, "versions": [version] }));
+        for (name, version) in extensions {
+            if !list
+                .iter()
+                .any(|item| item.get("name").and_then(Value::as_str) == Some(name))
+            {
+                list.push(json!({ "name": name, "versions": [version] }));
+            }
         }
         return SubsonicReply::json(&value);
     }
@@ -160,15 +164,17 @@ pub fn with_extension(reply: SubsonicReply, format: &str, (name, version): (&str
         return reply;
     }
     let ns = response.namespace.clone();
-    let listed = response
-        .elements_named(ns.as_deref(), "openSubsonicExtensions")
-        .any(|e| e.attribute("name") == Some(name));
-    if !listed {
-        response.push(
-            XElement::in_namespace(ns.as_deref(), "openSubsonicExtensions")
-                .attr("name", name)
-                .child(XElement::in_namespace(ns.as_deref(), "versions").text(version.to_string())),
-        );
+    for (name, version) in extensions {
+        let listed = response
+            .elements_named(ns.as_deref(), "openSubsonicExtensions")
+            .any(|e| e.attribute("name") == Some(name));
+        if !listed {
+            response.push(
+                XElement::in_namespace(ns.as_deref(), "openSubsonicExtensions")
+                    .attr("name", name)
+                    .child(XElement::in_namespace(ns.as_deref(), "versions").text(version.to_string())),
+            );
+        }
     }
     SubsonicReply::content(response.to_xml_string(), &reply.content_type)
 }

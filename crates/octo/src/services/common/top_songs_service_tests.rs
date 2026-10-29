@@ -9,6 +9,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use octo_core::soulseek::soulseek_metadata_service::SoulseekRouting;
 
 use super::*;
+use crate::services::charts::ListenerCharts;
 use crate::services::common::test_fakes::FakeMetadata;
 use crate::services::metadata::deezer_rate_limit_handler::DeezerRateLimitHandler;
 use crate::services::metadata::deezer_rate_limiter::DeezerRateLimiter;
@@ -38,10 +39,44 @@ struct Charts {
     _deezer: MockServer,
     deezer_routes: Routes,
     hints: Arc<ArtworkHints>,
+    listeners: Arc<ChartCountryStore>,
+    settings: Arc<SettingsStore>,
+    metadata: Arc<FakeMetadata>,
 }
 
+/// Last.fm's names for two countries, in place of the generated table.
+const GEO_FIXTURE: &[(&str, &str)] = &[("jp", "Japan"), ("us", "United States")];
+
 impl Charts {
+    /// The service reading Last.fm's country names from [`GEO_FIXTURE`].
+    fn with_geo_fixture(mut self) -> Charts {
+        self.service = self.service.with_geo_names(GEO_FIXTURE);
+        self
+    }
+
+    /// The catalog knows these songs, so a Last.fm row for one of them is listed.
+    fn knows(&self, artist: &str, title: &str) {
+        self.metadata.hits.lock().insert(
+            (artist.to_string(), title.to_string()),
+            Song {
+                artist: artist.to_string(),
+                title: title.to_string(),
+                ..Default::default()
+            },
+        );
+    }
+
     async fn new(country: &str, deezer_chart: Option<&str>, last_fm: Option<&MockServer>) -> Charts {
+        Charts::with_gap(country, deezer_chart, last_fm, Duration::ZERO).await
+    }
+
+    /// [`Charts::new`], with `gap` between two reads of Apple.
+    async fn with_gap(
+        country: &str,
+        deezer_chart: Option<&str>,
+        last_fm: Option<&MockServer>,
+        gap: Duration,
+    ) -> Charts {
         let apple = MockServer::builder().start().await;
         let deezer_routes = Routes::new(
             deezer_chart
@@ -74,22 +109,61 @@ impl Charts {
             ))
         });
         let hints = Arc::new(ArtworkHints::new());
+        let listeners = Arc::new(ChartCountryStore::new(None));
+        let metadata = Arc::new(FakeMetadata::default());
         let service = TopSongsService::new(
             deezer,
             last_fm,
-            Arc::new(FakeMetadata::default()),
+            metadata.clone(),
             Arc::new(ExternalIdRegistry::in_memory()),
-            Arc::new(AppleMusicPages::with_base_url(&apple.uri(), Duration::ZERO)),
+            Arc::new(AppleMusicPages::with_base_url(&apple.uri(), gap).with_genres_base_url(&apple.uri())),
             Arc::clone(&hints),
-            settings,
-        );
+            Arc::clone(&settings),
+        )
+        .with_listeners(Arc::clone(&listeners));
         Charts {
             service,
             apple,
             _deezer: deezer_server,
             deezer_routes,
             hints,
+            listeners,
+            settings,
+            metadata,
         }
+    }
+
+    fn choose(&self, user: &str, country: &str, pinned: &[&str]) {
+        self.listeners.set(
+            user,
+            ListenerCharts {
+                country: country.to_string(),
+                pinned: pinned.iter().map(|c| (*c).to_string()).collect(),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// The US overall chart as another country's: the same songs, that country's storefront.
+    async fn overall_for(&self, country: &str) {
+        let body =
+            fixture!("us_all").replace("\"storefront\":\"us\"", &format!("\"storefront\":\"{country}\""));
+        self.serve(&format!("/{country}/new/top-charts/songs"), None, &body)
+            .await;
+        let genre =
+            fixture!("us_18").replace("\"storefront\":\"us\"", &format!("\"storefront\":\"{country}\""));
+        self.serve(&format!("/{country}/new/top-charts/songs/"), Some("18"), &genre)
+            .await;
+    }
+
+    async fn asked_for(&self, at: &str) -> usize {
+        self.apple
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == at)
+            .count()
     }
 
     async fn serve(&self, at: &str, genre: Option<&str>, body: &str) {
@@ -387,6 +461,518 @@ async fn a_fixed_country_is_asked_for() {
 }
 
 #[tokio::test]
+async fn a_listener_country_reads_that_country() {
+    let charts = Charts::new("us", None, None).await;
+    charts.us_pages().await;
+    charts.overall_for("br").await;
+    charts.choose("anna", "br", &[]);
+
+    let country = charts.service.country_of("anna").await;
+    let list = charts.service.chart_in(country, "34").await;
+
+    assert_eq!(list.country.as_deref(), Some("br"));
+    assert_eq!(list.songs[0].song.title, "Solar Eclipse");
+    assert!(charts.asked_for("/br/new/top-charts/songs").await >= 1);
+    assert_eq!(charts.service.country_of("bob").await.as_deref(), Some("us"));
+}
+
+#[tokio::test]
+async fn a_saved_country_apple_lacks_follows_the_server() {
+    let charts = Charts::new("us", None, None).await;
+    charts.choose("anna", "zz", &[]);
+
+    assert_eq!(charts.service.country_of("anna").await.as_deref(), Some("us"));
+}
+
+#[tokio::test]
+async fn two_listeners_on_one_country_share_one_fetch() {
+    let charts = Charts::new("us", None, None).await;
+    charts.overall_for("br").await;
+    charts.choose("anna", "br", &[]);
+    charts.choose("bob", "br", &["jp"]);
+    charts.service.learn_in(Some("br".into())).await;
+
+    let (anna, bob) = (
+        charts.service.country_of("anna").await,
+        charts.service.country_of("bob").await,
+    );
+    let (a, b) = tokio::join!(
+        charts.service.chart_in(anna, "18"),
+        charts.service.chart_in(bob, "18")
+    );
+
+    assert_eq!(a.songs[0].song.title, "Janice STFU");
+    assert_eq!(a.songs.len(), b.songs.len());
+    assert_eq!(charts.asked_for("/br/new/top-charts/songs/").await, 1);
+}
+
+#[tokio::test]
+async fn no_deezer_stand_in_for_another_country() {
+    let charts = Charts::new("us", Some(DEEZER_CHART), None).await;
+    charts.apple_down().await;
+
+    let japan = charts.service.chart_in(Some("jp".into()), "34").await;
+
+    assert!(japan.songs.is_empty());
+    assert_eq!(japan.source, "");
+    assert_eq!(charts.deezer_routes.calls("/chart/0/tracks"), 0);
+    let fetch = charts
+        .service
+        .fetches()
+        .into_iter()
+        .find(|f| f.asked.as_deref() == Some("jp"))
+        .unwrap();
+    assert!(fetch.error.is_some());
+
+    let home = charts.service.chart("34").await;
+    assert_eq!(home.source, "deezer");
+    assert_eq!(charts.service.fetches().len(), 2, "one fetch per country");
+}
+
+fn last_fm_tracks(artist: &str, title: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_string(
+        json!({"tracks": {"track": [{"name": title, "playcount": "10", "artist": {"name": artist}}]}})
+            .to_string(),
+    )
+}
+
+async fn last_fm_answers(
+    server: &MockServer,
+    method_name: &str,
+    country: Option<&str>,
+    answer: ResponseTemplate,
+) {
+    let mock = Mock::given(method("GET")).and(query_param("method", method_name));
+    let mock = match country {
+        Some(country) => mock.and(query_param("country", country)),
+        None => mock,
+    };
+    mock.respond_with(answer).mount(server).await;
+}
+
+async fn last_fm_asked(server: &MockServer, method_name: &str) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            r.url
+                .query_pairs()
+                .any(|(k, v)| k == "method" && v == method_name)
+        })
+        .map(|r| r.url.query().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_other_country_with_apple_down_and_nothing_made_uses_last_fm_geo() {
+    let last_fm = MockServer::start().await;
+    last_fm_answers(
+        &last_fm,
+        "geo.gettoptracks",
+        Some("Japan"),
+        last_fm_tracks("Tame Impala", "Dracula"),
+    )
+    .await;
+    let charts = Charts::new("us", Some(DEEZER_CHART), Some(&last_fm))
+        .await
+        .with_geo_fixture();
+    charts.knows("Tame Impala", "Dracula");
+    charts.apple_down().await;
+
+    let japan = charts.service.chart_in(Some("jp".into()), "34").await;
+
+    assert_eq!(japan.source, "lastfm");
+    assert_eq!(titles(&japan), vec!["Dracula"]);
+    assert_eq!(
+        charts.deezer_routes.calls("/chart/0/tracks"),
+        0,
+        "Deezer follows the server's address, not Japan"
+    );
+    assert!(
+        last_fm_asked(&last_fm, "chart.gettoptracks").await.is_empty(),
+        "the global chart is for the server's own country"
+    );
+    let fetch = charts
+        .service
+        .fetches()
+        .into_iter()
+        .find(|f| f.asked.as_deref() == Some("jp"))
+        .unwrap();
+    assert!(fetch.error.is_some(), "Apple's failure is still shown");
+}
+
+#[tokio::test]
+async fn the_server_country_tries_deezer_then_geo_then_global() {
+    // Deezer first.
+    let last_fm = MockServer::start().await;
+    last_fm_answers(
+        &last_fm,
+        "geo.gettoptracks",
+        Some("United States"),
+        last_fm_tracks("Geo Artist", "Geo Song"),
+    )
+    .await;
+    last_fm_answers(
+        &last_fm,
+        "chart.gettoptracks",
+        None,
+        last_fm_tracks("Global Artist", "Global Song"),
+    )
+    .await;
+    let charts = Charts::new("us", Some(DEEZER_CHART), Some(&last_fm))
+        .await
+        .with_geo_fixture();
+    charts.knows("Geo Artist", "Geo Song");
+    charts.knows("Global Artist", "Global Song");
+    charts.apple_down().await;
+    assert_eq!(charts.service.chart("34").await.source, "deezer");
+    assert!(last_fm_asked(&last_fm, "geo.gettoptracks").await.is_empty());
+
+    // No Deezer chart: the country's own chart.
+    let charts = Charts::new("us", None, Some(&last_fm)).await.with_geo_fixture();
+    charts.knows("Geo Artist", "Geo Song");
+    charts.knows("Global Artist", "Global Song");
+    charts.apple_down().await;
+    let list = charts.service.chart("34").await;
+    assert_eq!(list.source, "lastfm");
+    assert_eq!(titles(&list), vec!["Geo Song"]);
+    assert!(last_fm_asked(&last_fm, "chart.gettoptracks").await.is_empty());
+
+    // Last.fm has no such country (error 6): the global chart.
+    let no_country = MockServer::start().await;
+    last_fm_answers(
+        &no_country,
+        "geo.gettoptracks",
+        None,
+        ResponseTemplate::new(200).set_body_string(r#"{"error":6,"message":"country param invalid"}"#),
+    )
+    .await;
+    last_fm_answers(
+        &no_country,
+        "chart.gettoptracks",
+        None,
+        last_fm_tracks("Global Artist", "Global Song"),
+    )
+    .await;
+    let charts = Charts::new("us", None, Some(&no_country))
+        .await
+        .with_geo_fixture();
+    charts.knows("Global Artist", "Global Song");
+    charts.apple_down().await;
+    let list = charts.service.chart("34").await;
+    assert_eq!(list.source, "lastfm");
+    assert_eq!(titles(&list), vec!["Global Song"]);
+    assert_eq!(last_fm_asked(&no_country, "geo.gettoptracks").await.len(), 1);
+    assert_eq!(last_fm_asked(&no_country, "chart.gettoptracks").await.len(), 1);
+}
+
+#[tokio::test]
+async fn geo_asks_the_table_name() {
+    let last_fm = MockServer::start().await;
+    last_fm_answers(
+        &last_fm,
+        "geo.gettoptracks",
+        None,
+        last_fm_tracks("Tame Impala", "Dracula"),
+    )
+    .await;
+    let charts = Charts::new("gb", None, Some(&last_fm)).await.with_geo_fixture();
+    charts.knows("Tame Impala", "Dracula");
+    charts.apple_down().await;
+
+    charts.service.chart_in(Some("jp".into()), "34").await;
+    charts.service.chart_in(Some("fr".into()), "34").await;
+
+    let asked = last_fm_asked(&last_fm, "geo.gettoptracks").await;
+    assert_eq!(asked.len(), 1, "France is not in the table: {asked:?}");
+    assert!(asked[0].contains("country=Japan"), "{}", asked[0]);
+}
+
+#[tokio::test]
+async fn a_fixed_country_unlike_the_ip_skips_deezer() {
+    let last_fm = MockServer::start().await;
+    last_fm_answers(
+        &last_fm,
+        "geo.gettoptracks",
+        Some("United States"),
+        last_fm_tracks("Geo Artist", "Geo Song"),
+    )
+    .await;
+    let charts = Charts::new("us", Some(DEEZER_CHART), Some(&last_fm))
+        .await
+        .with_geo_fixture();
+    charts.knows("Geo Artist", "Geo Song");
+    // Apple puts this server in Great Britain.
+    let gb = fixture!("us_all").replace("\"storefront\":\"us\"", "\"storefront\":\"gb\"");
+    charts.serve("/new/top-charts/songs", None, &gb).await;
+    assert_eq!(
+        charts
+            .service
+            .apple()
+            .detected_country_on(&crate::services::charts::apple_music_pages::LaneCell::behind())
+            .await
+            .as_deref(),
+        Some("gb")
+    );
+
+    let list = charts.service.chart("34").await;
+
+    assert_eq!(charts.deezer_routes.calls("/chart/0/tracks"), 0);
+    assert_eq!(list.source, "lastfm");
+    assert_eq!(titles(&list), vec!["Geo Song"]);
+}
+
+#[tokio::test]
+async fn menus_are_learned_per_country() {
+    let charts = Charts::new("us", None, None).await;
+    charts.us_pages().await;
+    charts
+        .serve("/jp/new/top-charts/songs", None, fixture!("jp_all"))
+        .await;
+
+    // Both start learning behind the answer; one country's learning does not hold up the other's.
+    charts.service.menu_in(Some("jp".into())).await;
+    charts.service.menu_in(Some("us".into())).await;
+    let menus = &charts.service.inner.menus;
+    for _ in 0..100 {
+        if menus.get("jp").is_some() && menus.get("us").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let (_, japan) = charts.service.menu_in(Some("jp".into())).await;
+    let (_, home) = charts.service.menu().await;
+    assert!(japan.iter().any(|g| g.id == "27"), "J-Pop is Japan's");
+    assert!(!home.iter().any(|g| g.id == "27"));
+    assert!(home.iter().any(|g| g.id == "18"));
+}
+
+/// How many other countries `who` has loading now.
+fn counted(charts: &Charts, who: &str) -> usize {
+    charts
+        .service
+        .inner
+        .others_working
+        .lock()
+        .get(who)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Starts counting `country`'s chart `34` for `who`, expecting it to count.
+fn count_chart(charts: &Charts, who: &str, country: &str) -> OtherWork {
+    let work = charts
+        .service
+        .begin_other_work(who, country, &TopSongsService::chart_work(country, "34"))
+        .unwrap_or_else(|| panic!("{country} is refused for {who}"));
+    assert!(matches!(work, OtherWork::Counted(_)), "{country} counts");
+    work
+}
+
+#[tokio::test]
+async fn a_third_other_country_waits_for_the_first_two() {
+    let charts = Charts::new("us", None, None).await;
+    let first = count_chart(&charts, "anna", "jp");
+    let _second = count_chart(&charts, "anna", "br");
+
+    assert!(
+        charts
+            .service
+            .begin_other_work("anna", "de", &TopSongsService::chart_work("de", "34"))
+            .is_none()
+    );
+    assert!(
+        charts
+            .service
+            .begin_other_work("bob", "de", &TopSongsService::chart_work("de", "34"))
+            .is_some(),
+        "the limit is per listener"
+    );
+
+    drop(first);
+
+    assert_eq!(counted(&charts, "anna"), 1);
+    count_chart(&charts, "anna", "de");
+}
+
+#[tokio::test]
+async fn a_dropped_request_keeps_its_place_until_the_build_ends() {
+    let charts = Charts::new("us", None, None).await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let key = TopSongsService::chart_work("jp", "34");
+    let hold = |service: TopSongsService, work: OtherWork| {
+        let release = Arc::clone(&release);
+        let key = key.clone();
+        async move {
+            service
+                .cached(
+                    Kept::Other,
+                    key,
+                    CHART_TTL,
+                    CHART_BUILD_TIMEOUT,
+                    &LaneCell::behind(),
+                    work,
+                    async move {
+                        release.notified().await;
+                        (TopList::default(), true)
+                    },
+                )
+                .await
+        }
+    };
+
+    // The request that started the build goes away while the build is held open.
+    let work = count_chart(&charts, "anna", "jp");
+    let request = tokio::spawn(hold(charts.service.clone(), work));
+    tokio::task::yield_now().await;
+    request.abort();
+    let _ = request.await;
+    let _second = count_chart(&charts, "anna", "br");
+
+    assert!(
+        charts
+            .service
+            .begin_other_work("anna", "de", &TopSongsService::chart_work("de", "34"))
+            .is_none(),
+        "the dropped request's build still counts"
+    );
+
+    // Another request joins the build; when it ends the place is free.
+    let joined = tokio::spawn(hold(charts.service.clone(), OtherWork::Free));
+    tokio::task::yield_now().await;
+    release.notify_one();
+    joined.await.unwrap();
+
+    assert_eq!(counted(&charts, "anna"), 1);
+    count_chart(&charts, "anna", "de");
+}
+
+#[tokio::test]
+async fn get_charts_counts_the_menu_it_learns() {
+    let charts = Charts::new("us", None, None).await;
+    charts
+        .serve("/jp/new/top-charts/songs", None, fixture!("jp_all"))
+        .await;
+    let work = charts
+        .service
+        .begin_other_work("anna", "jp", &TopSongsService::menu_work("jp"))
+        .expect("allowed");
+    assert!(matches!(work, OtherWork::Counted(_)));
+    assert_eq!(counted(&charts, "anna"), 1);
+
+    charts.service.menu_in_counted(Some("jp".into()), work).await;
+
+    // The learning is still going, or just ended: the count ends with it, not before.
+    let freed = {
+        let mut freed = false;
+        for _ in 0..200 {
+            if counted(&charts, "anna") == 0 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        freed
+    };
+    assert!(freed, "the learning ended and released its place");
+    assert!(charts.service.inner.menus.get("jp").is_some());
+
+    // A menu already held starts nothing, so a counted request drops its place at once.
+    let work = charts
+        .service
+        .begin_other_work("anna", "de", &TopSongsService::menu_work("de"))
+        .expect("allowed");
+    charts.service.set_menu("de", english_menu());
+    charts.service.menu_in_counted(Some("de".into()), work).await;
+    assert_eq!(counted(&charts, "anna"), 0);
+}
+
+#[tokio::test]
+async fn a_joined_build_is_free() {
+    let charts = Charts::new("us", None, None).await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let key = TopSongsService::chart_work("jp", "34");
+    let work = count_chart(&charts, "anna", "jp");
+    let building = {
+        let (service, release, key) = (charts.service.clone(), Arc::clone(&release), key.clone());
+        tokio::spawn(async move {
+            service
+                .cached(
+                    Kept::Other,
+                    key,
+                    CHART_TTL,
+                    CHART_BUILD_TIMEOUT,
+                    &LaneCell::behind(),
+                    work,
+                    async move {
+                        release.notified().await;
+                        (TopList::default(), true)
+                    },
+                )
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    let _second = count_chart(&charts, "anna", "br");
+
+    // A third country is refused for anna, but a build already running for jp is free for anyone.
+    assert!(
+        charts
+            .service
+            .begin_other_work("anna", "de", &TopSongsService::chart_work("de", "34"))
+            .is_none()
+    );
+    assert!(matches!(
+        charts.service.begin_other_work("anna", "jp", &key),
+        Some(OtherWork::Free)
+    ));
+    assert!(matches!(
+        charts.service.begin_other_work("bob", "jp", &key),
+        Some(OtherWork::Free)
+    ));
+
+    release.notify_one();
+    building.await.unwrap();
+}
+
+#[tokio::test]
+async fn held_own_pinned_and_server_countries_are_never_counted() {
+    let charts = Charts::new("us", None, None).await;
+    charts.choose("anna", "br", &["kr"]);
+    let _first = count_chart(&charts, "anna", "jp");
+    let _second = count_chart(&charts, "anna", "de");
+    // A chart already held.
+    charts
+        .service
+        .cached(
+            Kept::Other,
+            TopSongsService::chart_work("fr", "34"),
+            CHART_TTL,
+            CHART_BUILD_TIMEOUT,
+            &LaneCell::behind(),
+            OtherWork::Free,
+            async { (TopList::default(), true) },
+        )
+        .await;
+
+    for code in ["br", "kr", "us", "fr"] {
+        assert!(
+            matches!(
+                charts
+                    .service
+                    .begin_other_work("ANNA", code, &TopSongsService::chart_work(code, "34")),
+                Some(OtherWork::Free)
+            ),
+            "{code}"
+        );
+    }
+    assert_eq!(counted(&charts, "anna"), 2);
+}
+
+#[tokio::test]
 async fn names_give_the_playlist_and_the_chip() {
     let menu = english_menu();
     assert_eq!(
@@ -402,6 +988,57 @@ async fn names_give_the_playlist_and_the_chip() {
         Some(("Top Hip-Hop/Rap".into(), "Hip-Hop/Rap".into()))
     );
     assert_eq!(TopSongsService::names(&menu, "99999"), None);
+}
+
+#[tokio::test]
+async fn an_unknown_non_latin_genre_is_hidden_until_named() {
+    let charts = Charts::new("us", None, None).await;
+    let genre = |id: &str, name: &str| ChartGenre {
+        id: id.into(),
+        name: name.into(),
+    };
+    charts.service.set_menu(
+        "us",
+        vec![
+            genre("34", "All Genres"),
+            genre("99998", "Música Mexicana"),
+            genre("99999", "ロック"),
+        ],
+    );
+    Mock::given(method("GET"))
+        .and(path("/WebObjects/MZStoreServices.woa/ws/genres"))
+        .and(query_param("id", "99999"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"99999":{"name":"Rock Test","id":"99999"}}"#),
+        )
+        .mount(&charts.apple)
+        .await;
+
+    let (_, menu) = charts.service.menu_in(Some("us".into())).await;
+    let ids: Vec<&str> = menu.iter().map(|g| g.id.as_str()).collect();
+    assert_eq!(ids, vec!["34", "99998"], "the foreign-script genre is left out");
+    assert!(
+        charts
+            .service
+            .chart_in(Some("us".into()), "99999")
+            .await
+            .songs
+            .is_empty()
+    );
+
+    charts.service.learn_names(vec!["99999".into()]).await;
+
+    let (_, menu) = charts.service.menu_in(Some("us".into())).await;
+    assert_eq!(
+        genre_name(&menu, "99999").as_deref(),
+        Some("Rock Test"),
+        "{:?}",
+        menu
+    );
+    assert_eq!(
+        TopSongsService::names(&menu, "99999"),
+        Some(("Top Rock Test".into(), "Rock Test".into()))
+    );
 }
 
 fn top(rank: usize, artist: &str, title: &str) -> TopSong {
@@ -500,4 +1137,129 @@ async fn match_library_never_searches_more_than_four_at_once() {
     })
     .await;
     assert!(most.load(Ordering::SeqCst) <= LIBRARY_SEARCHES_AT_ONCE);
+}
+
+#[tokio::test]
+async fn another_countrys_failed_chart_never_stands_in_for_the_servers() {
+    let charts = Charts::new("gb", Some(DEEZER_CHART), None).await;
+    charts.apple_down().await;
+    let us = charts.service.chart_in(Some("us".into()), "34").await;
+    assert!(us.songs.is_empty(), "no stand-in for another country");
+
+    let mut moved = (*charts.settings.current()).clone();
+    moved.generated_playlists.chart_country = "us".into();
+    charts.settings.set(moved);
+    let home = charts.service.chart("34").await;
+
+    assert_eq!(home.source, "deezer", "the server's own chart has its stand-in");
+    assert_eq!(titles(&home), vec!["Dracula (with JENNIE)", "Choosin' Texas"]);
+}
+
+#[tokio::test]
+async fn another_countrys_chart_is_found_without_building_it_again() {
+    let charts = Charts::new("us", None, None).await;
+    charts.overall_for("br").await;
+    charts.service.chart_in(Some("br".into()), "34").await;
+    let asked = charts.apple_asked().await;
+
+    let again = charts.service.chart_in(Some("br".into()), "34").await;
+
+    assert_eq!(again.country.as_deref(), Some("br"));
+    assert_eq!(charts.apple_asked().await, asked);
+    assert!(
+        charts
+            .service
+            .peek_chart_in(Some("br".into()), "34")
+            .await
+            .is_some()
+    );
+    assert!(
+        charts.service.peek_chart("34").await.is_none(),
+        "not the server's"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_joined_background_build_turns_urgent() {
+    let charts = Charts::with_gap("us", None, None, Duration::from_secs(1)).await;
+    let apple = Arc::clone(charts.service.apple());
+    let log: Arc<Mutex<Vec<String>>> = Arc::default();
+    let settle = || tokio::time::sleep(Duration::from_millis(1));
+
+    // Older background reads hold the gate's queue.
+    for i in 1..=3 {
+        let (apple, log) = (Arc::clone(&apple), Arc::clone(&log));
+        tokio::spawn(async move {
+            apple.gate().wait_in(&LaneCell::behind(), || false).await;
+            log.lock().push(format!("old{i}"));
+        });
+        settle().await;
+    }
+
+    // A background build of one list waits behind them.
+    let background = LaneCell::behind();
+    let build = {
+        let (service, apple, log, lane) = (
+            charts.service.clone(),
+            Arc::clone(&apple),
+            Arc::clone(&log),
+            background.clone(),
+        );
+        tokio::spawn(async move {
+            let reads_in = lane.clone();
+            service
+                .cached(
+                    Kept::Server,
+                    "chart|us|34".into(),
+                    CHART_TTL,
+                    CHART_BUILD_TIMEOUT,
+                    &lane,
+                    OtherWork::Free,
+                    async move {
+                        apple.gate().wait_in(&reads_in, || false).await;
+                        log.lock().push("build".into());
+                        (TopList::default(), true)
+                    },
+                )
+                .await
+        })
+    };
+    settle().await;
+    assert!(!background.is_now());
+
+    // An interactive request for the same list joins it.
+    let started_again = Arc::new(AtomicUsize::new(0));
+    let asked = {
+        let (service, counted) = (charts.service.clone(), Arc::clone(&started_again));
+        tokio::spawn(async move {
+            service
+                .cached(
+                    Kept::Server,
+                    "chart|us|34".into(),
+                    CHART_TTL,
+                    CHART_BUILD_TIMEOUT,
+                    &LaneCell::now(),
+                    OtherWork::Free,
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        (TopList::default(), true)
+                    },
+                )
+                .await
+        })
+    };
+    settle().await;
+    assert!(background.is_now(), "the joined build reads interactively");
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    assert_eq!(log.lock().clone(), ["old1", "old2", "build", "old3"]);
+    assert_eq!(
+        started_again.load(Ordering::SeqCst),
+        0,
+        "it joined, never started"
+    );
+    assert!(build.await.is_ok());
+    assert!(asked.await.is_ok());
+    assert!(charts.service.inner.urgent.lock().is_empty());
 }

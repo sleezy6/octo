@@ -72,6 +72,8 @@ pub enum PlaylistError {
     NotAllowed(&'static str),
     /// A name that is blank.
     BlankName,
+    /// The playlist changed while its songs were read.
+    Changed,
 }
 
 impl PlaylistError {
@@ -80,6 +82,9 @@ impl PlaylistError {
             PlaylistError::NotFound => "Playlist not found",
             PlaylistError::NotAllowed(message) => message,
             PlaylistError::BlankName => "A playlist needs a name.",
+            PlaylistError::Changed => {
+                "This family playlist changed while Octo read it, so nothing was taken out. Try again."
+            }
         }
     }
 }
@@ -384,6 +389,62 @@ pub fn remove_shown(
     Ok(stored.len())
 }
 
+/// The stored places of the songs these (id, occurrence) pairs name in the list `viewer` is
+/// shown: the `n`th (1-based) shown entry that answers to `id`, by its library id or its
+/// outside id. A pair that names nothing is left out (the song is already gone).
+pub fn stored_places_of(
+    playlist: &FamilyPlaylist,
+    viewer: &FamilyCaller,
+    songs: &[(String, usize)],
+) -> Vec<usize> {
+    let shown = shown_entries(playlist, viewer);
+    let mut places: Vec<usize> = songs
+        .iter()
+        .filter_map(|(id, n)| {
+            shown
+                .iter()
+                .filter(|entry| match &entry.serve {
+                    Serve::Library { id: library, outside } => {
+                        library == id || outside.as_deref() == Some(id)
+                    }
+                    Serve::Outside(outside) => outside == id,
+                })
+                .nth(n.checked_sub(1)?)
+                .map(|entry| entry.stored)
+        })
+        .collect();
+    places.sort_unstable();
+    places.dedup();
+    places
+}
+
+/// Removes the entries at these places of the stored playlist (places past its end are left
+/// alone), only while the playlist's entries are still `expected` (the ones the places were
+/// worked out from). Answers how many went.
+pub fn remove_stored(
+    store: &FamilyPlaylistStore,
+    caller: &FamilyCaller,
+    id: &str,
+    expected: &[FamilyPlaylistEntry],
+    stored: &[usize],
+) -> Result<usize, PlaylistError> {
+    let playlist = find(store, caller, id).ok_or(PlaylistError::NotFound)?;
+    if !may_edit(caller) {
+        return Err(PlaylistError::NotAllowed(CANNOT_EDIT));
+    }
+    let mut places: Vec<usize> = stored
+        .iter()
+        .copied()
+        .filter(|at| *at < playlist.entries.len())
+        .collect();
+    places.sort_unstable();
+    places.dedup();
+    if !places.is_empty() && !store.remove_indexes_if(id, expected, &places) {
+        return Err(PlaylistError::Changed);
+    }
+    Ok(places.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,6 +718,126 @@ mod tests {
             .map(|e| e.library_id.or(e.outside_id))
             .collect();
         assert_eq!(left, vec![Some("a1".into()), Some("o1".into())]);
+    }
+
+    #[test]
+    fn removal_by_stored_place_ignores_repeats_and_places_past_the_end() {
+        let store = FamilyPlaylistStore::in_memory();
+        let list = create(&store, &owner(), "Road trip", false, now()).expect("made");
+        let alex = caller("alex", Preset::Member);
+        add(
+            &store,
+            &NoPlaylistAddRequests,
+            &alex,
+            &list.id,
+            vec![outside("o0"), outside("o1"), outside("o2")],
+            now(),
+        )
+        .expect("added");
+        let kid = caller("kid", Preset::Kid);
+        let current = store.get(&list.id).expect("there").entries;
+        assert_eq!(
+            remove_stored(&store, &kid, &list.id, &current, &[0]),
+            Err(PlaylistError::NotAllowed(CANNOT_EDIT))
+        );
+        assert_eq!(
+            remove_stored(&store, &alex, &list.id, &current, &[2, 2, 9]),
+            Ok(1)
+        );
+        let left: Vec<Option<String>> = store
+            .get(&list.id)
+            .expect("there")
+            .entries
+            .into_iter()
+            .map(|e| e.outside_id)
+            .collect();
+        assert_eq!(left, vec![Some("o0".into()), Some("o1".into())]);
+    }
+
+    #[test]
+    fn removal_by_stored_place_refuses_a_changed_playlist() {
+        let store = FamilyPlaylistStore::in_memory();
+        let list = create(&store, &owner(), "Road trip", false, now()).expect("made");
+        let alex = caller("alex", Preset::Member);
+        add(
+            &store,
+            &NoPlaylistAddRequests,
+            &alex,
+            &list.id,
+            vec![outside("o0"), outside("o1")],
+            now(),
+        )
+        .expect("added");
+        let before = store.get(&list.id).expect("there").entries;
+        add(
+            &store,
+            &NoPlaylistAddRequests,
+            &alex,
+            &list.id,
+            vec![outside("o2")],
+            now(),
+        )
+        .expect("added");
+        assert_eq!(
+            remove_stored(&store, &alex, &list.id, &before, &[0]),
+            Err(PlaylistError::Changed)
+        );
+        assert_eq!(store.get(&list.id).expect("there").entries.len(), 3);
+    }
+
+    #[test]
+    fn songs_named_by_id_and_occurrence_find_their_stored_places() {
+        let store = FamilyPlaylistStore::in_memory();
+        let list = create(&store, &owner(), "Road trip", true, now()).expect("made");
+        let alex = caller("alex", Preset::Member);
+        let sam = caller("sam", Preset::Listener);
+        add(
+            &store,
+            &NoPlaylistAddRequests,
+            &alex,
+            &list.id,
+            vec![
+                library("a", SHARED_SCOPE, None),
+                library("b", SHARED_SCOPE, Some("ext-b")),
+                library("a", SHARED_SCOPE, None),
+                outside("o1"),
+            ],
+            now(),
+        )
+        .expect("added");
+        // Sam's addition waits, so alex does not see it.
+        add(
+            &store,
+            &NoPlaylistAddRequests,
+            &sam,
+            &list.id,
+            vec![library("a", SHARED_SCOPE, None)],
+            now(),
+        )
+        .expect("added");
+        let list = store.get(&list.id).expect("there");
+        let pair = |id: &str, n: usize| (id.to_string(), n);
+        assert_eq!(stored_places_of(&list, &alex, &[pair("a", 2)]), vec![2]);
+        assert_eq!(
+            stored_places_of(&list, &alex, &[pair("a", 1), pair("a", 2)]),
+            vec![0, 2]
+        );
+        assert_eq!(
+            stored_places_of(&list, &alex, &[pair("ext-b", 1), pair("o1", 1)]),
+            vec![1, 3],
+            "an outside id answers too"
+        );
+        assert_eq!(
+            stored_places_of(&list, &alex, &[pair("zzz", 1), pair("a", 9)]),
+            Vec::<usize>::new(),
+            "a song that is not there is left out"
+        );
+        assert_eq!(
+            stored_places_of(&list, &alex, &[pair("a", 3)]),
+            Vec::<usize>::new(),
+            "a waiting entry alex cannot see is not counted"
+        );
+        assert_eq!(stored_places_of(&list, &owner(), &[pair("a", 3)]), vec![4]);
     }
 
     #[test]

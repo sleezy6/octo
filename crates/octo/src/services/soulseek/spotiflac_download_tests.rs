@@ -1,7 +1,7 @@
-//! SpotiFLAC as a download source, end to end through the download service, against a stand-in
-//! SpotiFLAC that writes a FLAC into the folder it is asked to and a stand-in slskd that finds
+//! Mornye as a download source, end to end through the download service, against a stand-in
+//! Mornye that writes a FLAC into the folder it is asked to and a stand-in slskd that finds
 //! nothing: off by default, a found file checked and placed, a wrong file refused, a job that
-//! fails or never ends, and where SpotiFLAC sits against Soulseek.
+//! fails or never ends, and where Mornye sits against Soulseek.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,7 +54,7 @@ fn json_answer(body: &Value, status: u16) -> ResponseTemplate {
 /// What happened, across both stand-ins, in order.
 type Events = Arc<Mutex<Vec<String>>>;
 
-/// SpotiFLAC as far as one song needs.
+/// Mornye as far as one song needs.
 #[derive(Clone)]
 struct FakeSpotiflac {
     tracks: Arc<dyn Fn(&str) -> Vec<Value> + Send + Sync>,
@@ -63,6 +63,10 @@ struct FakeSpotiflac {
     /// The state every look at the job answers, and its error.
     status: &'static str,
     error: Option<&'static str>,
+    /// The state the job's item answers when it is not the job's own.
+    item_status: Option<&'static str>,
+    /// The folder the last download was asked to write into.
+    job_folder: Arc<Mutex<String>>,
     events: Events,
 }
 
@@ -87,6 +91,7 @@ impl Respond for FakeSpotiflac {
                 "spotiflac download {}",
                 body["url"].as_str().unwrap_or_default()
             ));
+            *self.job_folder.lock() = folder.clone();
             if let Some((name, bytes)) = &self.file {
                 std::fs::write(std::path::Path::new(&folder).join(name), bytes).expect("written");
             }
@@ -96,6 +101,14 @@ impl Respond for FakeSpotiflac {
             );
         }
         if path == "/api/v1/downloads/job-1" {
+            if let Some(item_status) = self.item_status {
+                let result = format!("{}/song.flac", self.job_folder.lock());
+                return json_answer(
+                    &json!({"id": "job-1", "status": self.status, "created_at": 1.0,
+                        "payload": {"items_detail": [{"status": item_status, "result": result}]}}),
+                    200,
+                );
+            }
             return json_answer(
                 &json!({"id": "job-1", "status": self.status, "created_at": 1.0, "error": self.error,
                     "payload": {"items_detail": [{"status": self.status.to_uppercase(), "error": self.error}]}}),
@@ -200,6 +213,8 @@ impl Setup {
                 file: Some(("Drake - Take Care.flac".into(), flac(277))),
                 status: "done",
                 error: None,
+                item_status: None,
+                job_folder: Arc::default(),
                 events: events.clone(),
             },
             artist: "Drake",
@@ -373,7 +388,7 @@ impl Fetch {
             .collect()
     }
 
-    /// Every file left in SpotiFLAC's job folders.
+    /// Every file left in Mornye's job folders.
     fn left_in_job_folders(&self) -> Vec<String> {
         let jobs = self.root.path().join(".octo-incoming/spotiflac");
         if !jobs.is_dir() {
@@ -404,7 +419,7 @@ async fn a_found_file_passes_the_checks_and_lands_in_the_library() {
     let events: Events = Arc::default();
     let fetch = Setup::new(&events).build(events).await;
 
-    let path = fetch.acquire().await.expect("SpotiFLAC's copy is taken");
+    let path = fetch.acquire().await.expect("Mornye's copy is taken");
 
     assert!(path.ends_with(".flac"), "{path}");
     assert!(
@@ -420,7 +435,44 @@ async fn a_found_file_passes_the_checks_and_lands_in_the_library() {
         ]
     );
     let history = std::fs::read_to_string(fetch.root.path().join("history.json")).expect("history");
-    assert!(history.contains("\"SpotiFLAC\""), "{history}");
+    assert!(history.contains("\"Mornye\""), "{history}");
+}
+
+#[tokio::test]
+async fn a_skipped_item_lands_like_a_done_one() {
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.fake.file = Some(("song.flac".into(), flac(277)));
+    setup.fake.item_status = Some("SKIPPED");
+    let fetch = setup.build(events).await;
+
+    let path = fetch.acquire().await.expect("a skipped song is taken");
+
+    assert!(path.ends_with(".flac"), "{path}");
+    assert!(
+        !path.contains(".octo-incoming"),
+        "placed out of the job folder: {path}"
+    );
+    assert!(std::path::Path::new(&path).is_file());
+    assert!(fetch.left_in_job_folders().is_empty());
+}
+
+#[tokio::test]
+async fn an_isrc_answer_without_isrcs_is_picked_on_the_isrc_query() {
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.fake.tracks = Arc::new(|_| vec![take_care("Take Care", 277, "")]);
+    let fetch = setup.build(events).await;
+
+    fetch.acquire().await.expect("the ISRC search answer is taken");
+
+    assert_eq!(
+        fetch.spotiflac_events(),
+        [
+            format!("spotiflac search isrc:{ISRC}"),
+            "spotiflac download https://open.spotify.com/track/6LxSe8YmdPxy095Ux6znaQ".to_string(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -479,7 +531,7 @@ async fn another_version_in_the_catalog_is_never_asked_for() {
 
     let error = fetch.acquire().await.expect_err("nothing fits");
 
-    assert!(error.to_string().contains("SpotiFLAC has no copy"), "{error}");
+    assert!(error.to_string().contains("Mornye has no copy"), "{error}");
     assert!(
         !fetch
             .spotiflac_events()
@@ -545,7 +597,7 @@ async fn a_spotiflac_that_does_not_answer_fails_the_song_plainly() {
 
     let error = fetch.acquire().await.expect_err("unreachable");
 
-    assert!(error.to_string().contains("could not reach SpotiFLAC"), "{error}");
+    assert!(error.to_string().contains("could not reach Mornye"), "{error}");
 }
 
 #[tokio::test]
@@ -555,7 +607,7 @@ async fn after_soulseek_spotiflac_is_asked_once_soulseek_finds_nothing() {
     setup.soulseek_on = true;
     let fetch = setup.build(events).await;
 
-    fetch.acquire().await.expect("SpotiFLAC's copy is taken");
+    fetch.acquire().await.expect("Mornye's copy is taken");
 
     let events = fetch.events();
     let first_slskd = events
@@ -565,7 +617,7 @@ async fn after_soulseek_spotiflac_is_asked_once_soulseek_finds_nothing() {
     let first_spotiflac = events
         .iter()
         .position(|e| e.starts_with("spotiflac"))
-        .expect("SpotiFLAC asked");
+        .expect("Mornye asked");
     assert!(first_slskd < first_spotiflac, "{events:?}");
 }
 
@@ -577,7 +629,7 @@ async fn before_soulseek_spotiflac_is_asked_first_and_soulseek_not_at_all_when_i
     setup.spotiflac.placement = SpotiflacPlacement::BeforeSoulseek;
     let fetch = setup.build(events).await;
 
-    fetch.acquire().await.expect("SpotiFLAC's copy is taken");
+    fetch.acquire().await.expect("Mornye's copy is taken");
 
     assert!(
         !fetch.events().iter().any(|e| e.starts_with("slskd")),
@@ -605,7 +657,7 @@ async fn songs_in_asian_scripts_go_to_spotiflac_first_and_others_to_soulseek() {
     setup.fake.file = Some(("밤편지.flac".into(), flac(253)));
     let fetch = setup.build(events).await;
 
-    fetch.acquire().await.expect("SpotiFLAC's copy is taken");
+    fetch.acquire().await.expect("Mornye's copy is taken");
 
     assert!(
         !fetch.events().iter().any(|e| e.starts_with("slskd")),
@@ -622,7 +674,7 @@ async fn songs_in_asian_scripts_go_to_spotiflac_first_and_others_to_soulseek() {
     fetch
         .acquire()
         .await
-        .expect("SpotiFLAC's copy is taken after Soulseek");
+        .expect("Mornye's copy is taken after Soulseek");
 
     let events = fetch.events();
     assert!(events[0].starts_with("slskd"), "{events:?}");

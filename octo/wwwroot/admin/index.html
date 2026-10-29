@@ -88,7 +88,7 @@
           </button>
           <button class="sidebar-nav-item" data-tab="spotiflac">
             <svg class="icon" aria-hidden="true"><use href="#i-plugs-connected"/></svg>
-            <span>SpotiFLAC</span>
+            <span>Mornye (SpotiFLAC)</span>
           </button>
           <button class="sidebar-nav-item" data-tab="notifications">
             <svg class="icon" aria-hidden="true"><use href="#i-bell"/></svg>
@@ -1858,6 +1858,22 @@
               <div class="chart-choices" id="charts-choices" role="group" aria-label="More lists"></div>
               <input type="hidden" id="f-charts" name="GeneratedPlaylists.Charts" />
             </div>
+            <div class="set-row set-row-stack charts-detail charts-people" id="charts-people" data-own-save hidden>
+              <div class="set-info"><div class="set-info-t">Each person's charts</div><div class="set-info-d">A person's own chart country, and up to three more countries whose charts they get as playlists too, such as Popular right now · Japan. They can also change these in the Octo apps.</div></div>
+              <div class="charts-people-ctrl">
+                <label class="charts-people-label" id="charts-person-label" for="charts-person">Person</label>
+                <select class="set-input" id="charts-person"></select>
+                <label class="charts-people-label" for="charts-person-country">Chart country</label>
+                <select class="set-input" id="charts-person-country"></select>
+                <span class="charts-people-label" id="charts-pins-label">Also their charts</span>
+                <div class="charts-pins" role="group" aria-labelledby="charts-pins-label">
+                  <select class="set-input charts-pin" aria-label="Also, first country"></select>
+                  <select class="set-input charts-pin" aria-label="Also, second country"></select>
+                  <select class="set-input charts-pin" aria-label="Also, third country"></select>
+                </div>
+                <div class="charts-people-note" id="charts-people-note" role="status" aria-live="polite"></div>
+              </div>
+            </div>
             <div class="chart-status charts-detail" id="charts-status" hidden></div>
           </form>
         </div>
@@ -2541,7 +2557,7 @@
             <p class="set-desc">One song at a time, the way a heart does: your library is checked first, then each download source in its order.</p>
           </div>
           <div class="set-card imp-card">
-            <div class="set-row">
+            <div class="set-row imp-trickle-head">
               <div class="set-info">
                 <div class="set-info-t" id="imp-trickle-title">Nothing to fetch</div>
                 <div class="set-info-d" id="imp-trickle-line"></div>
@@ -2639,7 +2655,7 @@
             </div>
             <details class="cover-how">
               <summary>How it works</summary>
-              <p>Each song goes through Better quality, exactly as the action playlist does it: a lossless copy is looked for, checked to be the same recording and really lossless, and put in the original's place, so the song keeps its plays, favorites and playlist places. The original waits in quarantine until its replacement passes. A song with no lossless copy on any of them stays as it is and is not looked for again by the weekly upgrade for 4 weeks. Copies come from the sources named above, Deezer first, then Soulseek (and SpotiFLAC, when it is on), then Lidarr; while every one of them is out, songs wait.</p>
+              <p>Each song goes through Better quality, exactly as the action playlist does it: a lossless copy is looked for, checked to be the same recording and really lossless, and put in the original's place, so the song keeps its plays, favorites and playlist places. The original waits in quarantine until its replacement passes. A song with no lossless copy on any of them stays as it is and is not looked for again by the weekly upgrade for 4 weeks. Copies come from the sources named above, Deezer first, then Soulseek (and Mornye, when it is on), then Lidarr; while every one of them is out, songs wait.</p>
               <p>Narrow the list with the filters, then Select picks the first songs it shows, up to 2,000 a press; Find higher quality queues them and they run as many at a time as Parallel downloads allows. Press Select again for the next ones. An unsure AcoustID match is a song whose download Octo could not confirm as the recording asked for, or one the library tag check could not pin down. From any other app, add songs to the Better quality action playlist or give them its rating (4 stars unless you changed it).</p>
             </details>
           </div>
@@ -2769,13 +2785,30 @@
               <input class="set-input" name="LibraryActions.ReviewSweepAutoReplacePerDay" type="number" min="1" max="100" data-number="true" />
             </div>
             <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Also replace a song that sounds nothing like its YouTube preview</div><div class="set-info-d">For a sound AcoustID has never heard. Octo fetches the right song through Wrong song instead of asking. Off by default.</div><div class="set-info-more"><p>Only when the preview is a YouTube Music row with the song's title, artist and length, from the same album as the file and not a live album, and at least 42% of the file differs from it. A song with no tags, an ISRC tag, a star or a rating, anything the preview cannot settle, anything AcoustID does hear and the re-check of Octo's own downloads stay questions in Review.</p><p>Needs Wrong song on, dry run off, Keep the original after a replacement on and a download source other than YouTube alone (with Soulseek then YouTube, the replacement comes from Soulseek only), and counts toward the same limit a day as the replacing above. The new file is checked like any download, against the song's YouTube preview, and Review keeps a note of what was replaced.</p></div></div>
+              <label class="switch"><input type="checkbox" name="LibraryActions.ReviewSweepAutoReplacePreview" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
               <div class="set-info"><div class="set-info-t">Library check</div><div class="set-info-d" id="review-sweep-status">Not loaded yet.</div></div>
-              <button class="btn btn-ghost" type="button" id="review-sweep-toggle"><span>Pause</span></button>
-              <button class="btn btn-ghost" type="button" id="review-sweep-reset"><svg class="icon" aria-hidden="true"><use href="#i-arrow-counter-clockwise"/></svg><span>Start over</span></button>
+              <div class="set-buttons">
+                <button class="btn btn-ghost" type="button" id="review-sweep-toggle"><span>Pause</span></button>
+                <button class="btn btn-ghost" type="button" id="review-sweep-reset"><svg class="icon" aria-hidden="true"><use href="#i-arrow-counter-clockwise"/></svg><span>Start over</span></button>
+              </div>
             </div>
             <div class="set-row">
               <div class="set-info"><div class="set-info-t">Re-check Octo's downloads</div><div class="set-info-d" id="review-sweep-recheck-status">Checks every song Octo downloaded once more, then stops. Useful after changing the minimum match score.</div><div class="set-info-more">At least 60 songs an hour, even with the library check at 0. Songs already answered in Review are not asked about again.</div></div>
               <button class="btn btn-ghost" type="button" id="review-sweep-recheck" data-recheck-octo><span>Re-check</span></button>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">YouTube check <span class="set-opt">songs an hour</span></div><div class="set-info-d">Songs compared with YouTube. 0 is off. Only while nothing is downloading.</div></div>
+              <input class="set-input" name="LibraryActions.YoutubeCheckPerHour" type="number" min="0" max="360" data-number="true" />
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Check every song against YouTube</div><div class="set-info-d" id="youtube-check-status">Compares the songs AcoustID cannot vouch for with their YouTube preview, once.</div><div class="set-info-more"><p>The same comparison a new download gets: songs AcoustID already vouches for are passed over quickly, and the rest are compared with their YouTube preview. A song that sounds nothing like a preview with its title, artist and length becomes a question in Review, or is added to a question AcoustID left open. Nothing is changed or removed, and nothing is uploaded.</p><p>Songs with no preview, or one that may be another version, are left alone, and a song is never asked twice. If the YouTube shim stops answering, the check rests an hour and carries on. Press the button again to forget the answers and compare everything anew.</p></div></div>
+              <div class="set-buttons">
+                <button class="btn btn-ghost" type="button" id="youtube-check-pause" hidden><span>Pause</span></button>
+                <button class="btn btn-ghost" type="button" id="youtube-check-start"><span>Check</span></button>
+              </div>
             </div>
             <details class="set-more">
               <summary>Playlist name and size</summary>
@@ -2883,7 +2916,7 @@
               <input class="set-input" name="LibraryActions.UpgradePerWeek" type="number" min="0" max="500" data-number="true" aria-label="Songs to upgrade a week" />
             </div>
             <div class="set-row stack">
-              <div class="set-info"><div class="set-info-t">Where to look for a higher quality copy</div><div class="set-info-d"><strong>Automatic</strong> asks Deezer first, then Soulseek, then Lidarr, each for what the one before cannot find, using whichever of them is set up. With SpotiFLAC on, Soulseek's turn asks SpotiFLAC too, in the order the SpotiFLAC page gives, and is there even while Soulseek is off. Deezer is asked for a FLAC and nothing less, so an account whose plan gives no FLAC is passed over.</div><div class="set-info-more">Lidarr fetches whole albums, so Octo borrows the album: it copies out the one song, deletes the other files that search brought in, and puts the album's monitoring back as it was. A song Lidarr already manages is left to Lidarr. While Soulseek is offline, the others are asked without it (SpotiFLAC still takes Soulseek's turn while it answers).</div></div>
+              <div class="set-info"><div class="set-info-t">Where to look for a higher quality copy</div><div class="set-info-d"><strong>Automatic</strong> asks Deezer first, then Soulseek, then Lidarr, each for what the one before cannot find, using whichever of them is set up. With Mornye on, Soulseek's turn asks Mornye too, in the order the Mornye page gives, and is there even while Soulseek is off. Deezer is asked for a FLAC and nothing less, so an account whose plan gives no FLAC is passed over.</div><div class="set-info-more">Lidarr fetches whole albums, so Octo borrows the album: it copies out the one song, deletes the other files that search brought in, and puts the album's monitoring back as it was. A song Lidarr already manages is left to Lidarr. While Soulseek is offline, the others are asked without it (Mornye still takes Soulseek's turn while it answers).</div></div>
               <select class="set-input" name="LibraryActions.UpgradeSource">
                 <option value="Auto">Automatic</option>
                 <option value="Soulseek">Soulseek only</option>
@@ -3215,26 +3248,26 @@
       <section data-pane="spotiflac">
         <header class="page-header">
           <div>
-            <h1>SpotiFLAC</h1>
-            <p>Downloads through your own SpotiFLAC server, for songs Soulseek does not have.</p>
+            <h1>Mornye (SpotiFLAC)</h1>
+            <p>Downloads through your own Mornye server, the SpotiFLAC module under its new name, for songs Soulseek does not have.</p>
           </div>
         </header>
 
         <div class="notice">
-          <strong>Octo works with a SpotiFLAC you run yourself.</strong> It includes no SpotiFLAC, no extensions and no places to download from. What SpotiFLAC can find depends on the extensions you install in it. Every file it brings is checked like a Soulseek download (its length, the version it names, AcoustID), and a file that fails is thrown away.
+          <strong>Octo works with a Mornye you run yourself.</strong> It includes no Mornye, no extensions and no places to download from. What Mornye can find depends on the extensions your registry gives it. Every file it brings is checked like a Soulseek download (its length, the version it names, AcoustID), and a file that fails is thrown away.
         </div>
 
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title">What you bring</h3>
-            <p class="set-desc">Set these up in SpotiFLAC first, then test the connection below.</p>
+            <p class="set-desc">Set these up in Mornye first, then test the connection below.</p>
           </div>
           <div class="set-card">
             <ol class="bring-list">
-              <li><span class="bring-t">SpotiFLAC with its web page on</span><span class="bring-d">Started with <code>spotiflac --web --host 0.0.0.0</code>, or the optional <code>spotiflac</code> service in Octo's <code>docker-compose.yml</code>.</span></li>
-              <li><span class="bring-t">Your extension registry and an extension</span><span class="bring-d">SpotiFLAC has none of its own. Give it the registry you choose in <code>SPOTIFLAC_REGISTRIES</code>, then install at least one extension on SpotiFLAC's page.</span></li>
-              <li><span class="bring-t">A web token</span><span class="bring-d">Set <code>SPOTIFLAC_WEB_TOKEN</code> on SpotiFLAC and type the same token here, so nobody else can use it.</span></li>
-              <li><span class="bring-t">Octo's music folder, shared</span><span class="bring-d">SpotiFLAC saves into a hidden folder inside Octo's music folder, so it needs that folder mounted. If its path differs in SpotiFLAC, set it under More settings.</span></li>
+              <li><span class="bring-t">Mornye with its web page on</span><span class="bring-d">Started with <code>mornye --web --host 0.0.0.0</code>, or the optional <code>spotiflac</code> service in Octo's <code>docker-compose.yml</code>, which builds and runs Mornye. An older SpotiFLAC works too.</span></li>
+              <li><span class="bring-t">Your extension registry and an extension</span><span class="bring-d">Mornye has none of its own. Give it the registry you choose in <code>SPOTIFLAC_REGISTRIES</code>. Mornye installs every extension it lists by itself, when it starts and again every hour.</span></li>
+              <li><span class="bring-t">A web token</span><span class="bring-d">Set <code>SPOTIFLAC_WEB_TOKEN</code> (Mornye's own name: <code>MORNYE_WEB_TOKEN</code>) and type the same token here, so nobody else can use it.</span></li>
+              <li><span class="bring-t">Octo's music folder, shared</span><span class="bring-d">Mornye saves into a hidden folder inside Octo's music folder, so it needs that folder mounted. If its path differs in Mornye, set it under More settings.</span></li>
             </ol>
           </div>
         </div>
@@ -3242,13 +3275,13 @@
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title">Connection</h3>
-            <p class="set-desc">How Octo reaches SpotiFLAC. Test it before you save.</p>
+            <p class="set-desc">How Octo reaches Mornye. Test it before you save.</p>
           </div>
           <form data-section="spotiflac-connection" class="set-card" id="spotiflac-connection-form">
             <div class="set-row">
               <div class="set-info">
-                <label class="set-info-t" for="f-spotiflac-enabled">Download with SpotiFLAC</label>
-                <div class="set-info-d">Asks SpotiFLAC for songs beside Soulseek, in the order set below.</div>
+                <label class="set-info-t" for="f-spotiflac-enabled">Download with Mornye</label>
+                <div class="set-info-d">Asks Mornye for songs beside Soulseek, in the order set below.</div>
               </div>
               <label class="switch"><input type="checkbox" id="f-spotiflac-enabled" name="Spotiflac.Enabled" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
@@ -3262,7 +3295,7 @@
             <div class="set-row stack">
               <div class="set-info">
                 <label class="set-info-t" for="f-spotiflac-token">Web token</label>
-                <div class="set-info-d">The <code>SPOTIFLAC_WEB_TOKEN</code> SpotiFLAC was started with.</div>
+                <div class="set-info-d">The token Mornye was started with: <code>SPOTIFLAC_WEB_TOKEN</code> with Octo's compose, otherwise <code>MORNYE_WEB_TOKEN</code>.</div>
               </div>
               <input class="set-input" id="f-spotiflac-token" name="Spotiflac.Token" type="password" autocomplete="new-password" />
             </div>
@@ -3275,14 +3308,14 @@
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title">Downloads</h3>
-            <p class="set-desc">When SpotiFLAC is asked, and for what.</p>
+            <p class="set-desc">When Mornye is asked, and for what.</p>
           </div>
           <form data-section="spotiflac-downloads" class="set-card" id="spotiflac-downloads-form">
             <div class="set-row stack">
               <div class="set-info">
                 <label class="set-info-t" for="f-spotiflac-placement">When to ask</label>
-                <div class="set-info-d">SpotiFLAC takes Soulseek's place in Heart download priority. With Soulseek off, SpotiFLAC is asked alone.</div>
-                <div class="set-info-more">Asian scripts are Chinese, Japanese, Korean and Thai: a song whose title, artist or album is written in one goes to SpotiFLAC first, every other song to Soulseek first.</div>
+                <div class="set-info-d">Mornye takes Soulseek's place in Heart download priority. With Soulseek off, Mornye is asked alone.</div>
+                <div class="set-info-more">Asian scripts are Chinese, Japanese, Korean and Thai: a song whose title, artist or album is written in one goes to Mornye first, every other song to Soulseek first.</div>
               </div>
               <select class="set-input" id="f-spotiflac-placement" name="Spotiflac.Placement">
                 <option value="AfterSoulseek">After Soulseek finds nothing</option>
@@ -3293,7 +3326,7 @@
             <div class="set-row stack">
               <div class="set-info">
                 <label class="set-info-t" for="f-spotiflac-quality">Quality</label>
-                <div class="set-info-d">What SpotiFLAC is asked for. Hi-res falls back to CD quality when a song has none.</div>
+                <div class="set-info-d">What Mornye is asked for. Hi-res falls back to CD quality when a song has none.</div>
               </div>
               <select class="set-input" id="f-spotiflac-quality" name="Spotiflac.Quality">
                 <option value="LOSSLESS">Lossless, CD quality</option>
@@ -3303,7 +3336,7 @@
             <div class="set-row stack">
               <div class="set-info">
                 <label class="set-info-t" for="f-spotiflac-services">Extensions to try <span class="set-opt">optional</span></label>
-                <div class="set-info-d">Your extension ids in the order to try, separated by commas. Blank leaves the order to SpotiFLAC.</div>
+                <div class="set-info-d">Your extension ids in the order to try, separated by commas. Blank leaves the order to Mornye.</div>
               </div>
               <input class="set-input" id="f-spotiflac-services" name="Spotiflac.Services" placeholder="ext:your-extension" />
             </div>
@@ -3311,8 +3344,8 @@
               <summary>More settings</summary>
               <div class="set-row stack">
                 <div class="set-info">
-                  <label class="set-info-t" for="f-spotiflac-folder">Music folder in SpotiFLAC <span class="set-opt">optional</span></label>
-                  <div class="set-info-d">Where Octo's music folder is mounted in SpotiFLAC, when that is another path. Blank means the same path as in Octo.</div>
+                  <label class="set-info-t" for="f-spotiflac-folder">Music folder in Mornye <span class="set-opt">optional</span></label>
+                  <div class="set-info-d">Where Octo's music folder is mounted in Mornye, when that is another path. Blank means the same path as in Octo.</div>
                 </div>
                 <input class="set-input" id="f-spotiflac-folder" name="Spotiflac.Folder" placeholder="/music" />
               </div>
@@ -3326,7 +3359,7 @@
               <div class="set-row">
                 <div class="set-info">
                   <label class="set-info-t" for="f-spotiflac-at-once">Songs at once <span class="set-opt">1 to 4</span></label>
-                  <div class="set-info-d">How many songs SpotiFLAC is asked for at the same time.</div>
+                  <div class="set-info-d">How many songs Mornye is asked for at the same time.</div>
                 </div>
                 <input class="set-input" id="f-spotiflac-at-once" name="Spotiflac.AtOnce" type="number" min="1" max="4" value="2" />
               </div>

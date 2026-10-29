@@ -659,8 +659,12 @@ impl Inner {
             }
             return;
         }
+        let refused = self
+            .lookup(&song.id)
+            .map(|r| r.lock().refused_videos.clone())
+            .unwrap_or_default();
         let Some(hit) = self
-            .find_video(&song.artist, &song.title, song.duration, background)
+            .find_video(&song.artist, &song.title, song.duration, &refused, background)
             .await
         else {
             return;
@@ -674,15 +678,21 @@ impl Inner {
     /// for the song first, else the shim's metadata-only yt-dlp lookup (a flat search, no URL
     /// solve). `length` is the length known for the song: YouTube Music keeps to rows within a
     /// few seconds of it, and yt-dlp takes it as a hint for the closest-length video rather
-    /// than a long-form or compilation upload.
+    /// than a long-form or compilation upload. A video in `refused` is never the answer.
     async fn find_video(
         &self,
         artist: &str,
         title: &str,
         length: Option<i32>,
+        refused: &[String],
         background: bool,
     ) -> Option<YouTubeHit> {
-        if let Some(hit) = self.youtube.music_song(artist, title, length).await {
+        if let Some(hit) = self
+            .youtube
+            .music_song(artist, title, length, background)
+            .await
+            .filter(|h| !refused.contains(&h.video_id))
+        {
             debug!("'{artist} - {title}': video {} from YouTube Music", hit.video_id);
             return Some(hit);
         }
@@ -690,7 +700,7 @@ impl Inner {
             .youtube
             .meta(&format!("{artist} {title}"), length, background)
             .await
-            .filter(|h| !h.video_id.is_empty())?;
+            .filter(|h| !h.video_id.is_empty() && !refused.contains(&h.video_id))?;
         debug!("'{artist} - {title}': video {} from yt-dlp", hit.video_id);
         Some(hit)
     }
@@ -702,9 +712,17 @@ impl Inner {
     /// row has). `background`: the row is already with the client, so a video a play pinned
     /// meanwhile is kept, since the next Range request has to get the same video. getSong
     /// builds its answer from the routing's duration, so it gets this length either way.
+    /// Nothing is kept for a video the song refuses.
     fn keep_video(&self, song_id: &str, hit: &YouTubeHit, background: bool) -> Option<i32> {
         let d = hit.duration.filter(|&d| d > 0)?;
+        if self
+            .lookup(song_id)
+            .is_some_and(|r| r.lock().refuses_video(&hit.video_id))
+        {
+            return None;
+        }
         if self.id_registry.pin_video(song_id, &hit.video_id, !background) {
+            self.id_registry.remember_pick(song_id, &hit.video_id, hit.pick);
             if let Some(routing) = self.lookup(song_id) {
                 routing.lock().duration = Some(d);
             }
@@ -725,15 +743,21 @@ impl Inner {
     /// the shim's facts, else the shim's yt-dlp search, which resolves the stream in the same
     /// run. Either way a play of the video starts from the shim's cache. Background work.
     async fn pick_and_warm_video(&self, id: &str, routing: &SharedRouting) {
-        let (artist, title, length) = {
+        let (artist, title, length, refused) = {
             let r = routing.lock();
             (
                 r.artist.clone().unwrap_or_default(),
                 r.title.clone().unwrap_or_default(),
                 r.duration,
+                r.refused_videos.clone(),
             )
         };
-        if let Some(hit) = self.youtube.music_song(&artist, &title, length).await {
+        if let Some(hit) = self
+            .youtube
+            .music_song(&artist, &title, length, true)
+            .await
+            .filter(|h| !refused.contains(&h.video_id))
+        {
             debug!("'{artist} - {title}': video {} from YouTube Music", hit.video_id);
             if !self.keep_prewarmed_video(id, routing, &hit) {
                 return;
@@ -745,7 +769,7 @@ impl Inner {
         }
         let Some(hit) = self
             .youtube
-            .search(&format!("{artist} {title}"), length, true)
+            .search_skipping(&format!("{artist} {title}"), length, true, &refused)
             .await
             .filter(|h| !h.video_id.is_empty())
         else {
@@ -760,9 +784,13 @@ impl Inner {
     /// Pins a prewarmed video and remembers its length as the video's. False when a play
     /// pinned another video meanwhile, which keeps it.
     fn keep_prewarmed_video(&self, id: &str, routing: &SharedRouting, hit: &YouTubeHit) -> bool {
+        if routing.lock().refuses_video(&hit.video_id) {
+            return false;
+        }
         if !self.id_registry.pin_video(id, &hit.video_id, false) {
             return false;
         }
+        self.id_registry.remember_pick(id, &hit.video_id, hit.pick);
         if let Some(d) = hit.duration {
             routing.lock().duration = Some(d);
         }
@@ -998,6 +1026,11 @@ impl Inner {
         // Length only. The video is not pinned for playback, so which video plays and
         // what a download is checked against both stay as they were.
         let hit = self.youtube.meta(&format!("{artist} {title}"), None, true).await;
+        let hit = hit.filter(|h| {
+            !self
+                .lookup(id)
+                .is_some_and(|r| r.lock().refuses_video(&h.video_id))
+        });
         self.id_registry
             .remember_length(id, hit.and_then(|h| h.duration), LengthSource::Video);
     }
@@ -1579,8 +1612,12 @@ impl IMusicMetadataService for SoulseekMetadataService {
                         }
                         return;
                     }
+                    let refused = inner
+                        .lookup(&song.id)
+                        .map(|r| r.lock().refused_videos.clone())
+                        .unwrap_or_default();
                     let Some(hit) = inner
-                        .find_video(&song.artist, &song.title, song.duration, late)
+                        .find_video(&song.artist, &song.title, song.duration, &refused, late)
                         .await
                     else {
                         return;

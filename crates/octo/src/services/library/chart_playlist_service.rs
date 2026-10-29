@@ -10,11 +10,12 @@
 //! time that listener's app lists playlists. A source or library that does not answer never
 //! empties a list that was made. Nothing is written to Navidrome, and nothing to disk.
 //!
-//! A listener's lists are made one after another (six lists searched at once would ask Navidrome
-//! two dozen searches at a time), a song on two lists is searched once, a list is listed as soon
-//! as its chart is known while search discovery is on (the warm worker fetches the charts at
-//! start, so an app's first look after a restart has them), and a list's change time moves only
-//! when its songs do.
+//! A listener's lists are those of their own chart country, then the same lists for each country
+//! they pinned (`Popular right now · Japan`). They are made one after another (six lists searched
+//! at once would ask Navidrome two dozen searches at a time), only those that are due, a song on
+//! two lists is searched once, a list is listed as soon as its chart is known while search
+//! discovery is on (the warm worker fetches the charts at start, so an app's first look after a
+//! restart has them), and a list's change time moves only when its songs do.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -23,8 +24,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use octo_core::charts::chart_settings::{self, ChartKind, OVERALL};
-use octo_core::charts::top_songs::{library_hit, library_query, one_row_per_library_song};
+use octo_core::charts::apple_pages::ChartGenre;
+use octo_core::charts::chart_settings::{self, ChartKind, OVERALL, list_id, list_key, split_list};
+use octo_core::charts::top_songs::{APPLE_SOURCE, library_hit, library_query, one_row_per_library_song};
 use octo_core::common::{Clock, skipped_takes};
 use octo_core::library::generated_playlist_service::{period_index, playlist_id, user_key};
 use octo_core::models::domain::Song;
@@ -42,6 +44,7 @@ use crate::services::common::{TopSong, TopSongsService, top_songs_service::LIBRA
 use crate::services::family::{FamilyStore, kid_filter};
 use crate::services::framework::InFlight;
 use crate::services::library::GeneratedPlaylist;
+use crate::services::library::library_match_cache::{LibraryMatchCache, MatchSession};
 use crate::services::soulseek::external_id_registry::ExternalIdRegistry;
 use crate::services::subsonic::SubsonicProxyService;
 
@@ -73,6 +76,9 @@ struct Made {
     changed_utc: DateTime<Utc>,
     rule: String,
     whole: bool,
+    /// Where the chart came from (`apple`, `deezer`, `lastfm`); a list from anywhere but Apple
+    /// never replaces one that came from Apple.
+    source: String,
     name: String,
     hash: u64,
     entries: Vec<Value>,
@@ -83,7 +89,10 @@ struct Made {
 #[derive(Debug, Clone)]
 pub struct ChartCover {
     pub name: String,
+    /// The chart's id, without the pinned country.
     pub chart: String,
+    /// The pinned country, on a pinned country's list.
+    pub country: Option<String>,
     pub entries: Vec<Value>,
     pub outside: Vec<Song>,
 }
@@ -102,10 +111,14 @@ struct Inner {
     settings: Arc<SettingsStore>,
     clock: Clock,
     made: Mutex<HashMap<String, HashMap<String, Made>>>,
-    failed_at: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// When a listener's list last could not be made whole, by listener and list, with the rule
+    /// that build ran under: a new rule makes the list due at once.
+    failed_at: Mutex<HashMap<(String, String), (DateTime<Utc>, String)>>,
     builds: InFlight<bool>,
     /// The family, whose kid profiles get clean lists.
     family: Option<Arc<FamilyStore>>,
+    /// What each listener's library already said it lacks, so a build searches it once.
+    library_matches: Option<Arc<LibraryMatchCache>>,
 }
 
 impl ChartPlaylistService {
@@ -129,8 +142,18 @@ impl ChartPlaylistService {
                 failed_at: Mutex::new(HashMap::new()),
                 builds: InFlight::new(),
                 family: None,
+                library_matches: None,
             }),
         }
+    }
+
+    /// The service with a cache of library matches shared across builds. Call it before the
+    /// service is cloned.
+    pub fn with_library_matches(mut self, cache: Arc<LibraryMatchCache>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.library_matches = Some(cache);
+        }
+        self
     }
 
     /// The service with the family, so a kid profile's lists are clean. Call it before the
@@ -140,6 +163,17 @@ impl ChartPlaylistService {
             inner.family = Some(family);
         }
         self
+    }
+
+    /// Lets go of everything kept for a listener: their made lists, the times their lists
+    /// failed, and what their library was asked.
+    pub fn forget_person(&self, username: &str) {
+        let user = user_key(username);
+        self.inner.made.lock().remove(&user);
+        self.inner.failed_at.lock().retain(|(who, _), _| *who != user);
+        if let Some(cache) = &self.inner.library_matches {
+            cache.forget(username);
+        }
     }
 
     /// The explicit filter for one listener's lists: the server's, or clean only for a kid
@@ -164,9 +198,43 @@ impl ChartPlaylistService {
         on
     }
 
-    /// The lists that are on and the country has, with their names.
-    async fn charts_on(&self) -> Vec<(String, String)> {
-        let (_, menu) = self.inner.top_songs.menu().await;
+    /// Every list id a listener has while on: [`Self::lists_on`], then the same lists for each
+    /// country they pinned (`34@jp`). Genres are checked against each country's menu by
+    /// [`Self::list`].
+    pub fn lists_for(&self, username: &str) -> Vec<String> {
+        let on = self.lists_on();
+        let top = &self.inner.top_songs;
+        let home = top.home_of(username);
+        let mut out = on.clone();
+        for pin in &top.listeners().get(username).pinned {
+            if Some(pin) == home.as_ref() || !top.has_country(pin) {
+                continue;
+            }
+            out.extend(on.iter().map(|chart| list_id(chart, Some(pin))));
+        }
+        out
+    }
+
+    /// The listener's lists that are on and each country has, with their names: their own
+    /// country's first, then each pinned country's.
+    async fn charts_for(&self, username: &str) -> Vec<(String, String)> {
+        let top = &self.inner.top_songs;
+        let home = top.country_of(username).await;
+        let (_, menu) = top.menu_in(home.clone()).await;
+        let mut out = self.named(&menu, None);
+        for pin in top.listeners().get(username).pinned {
+            if Some(pin.as_str()) == home.as_deref() || !top.has_country(&pin) {
+                continue;
+            }
+            let (_, menu) = top.menu_in(Some(pin.clone())).await;
+            out.extend(self.named(&menu, Some(&pin)));
+        }
+        out
+    }
+
+    /// The lists that are on and the menu has, as list ids and names, for the listener's own
+    /// country or a pinned one.
+    fn named(&self, menu: &[ChartGenre], pinned: Option<&str>) -> Vec<(String, String)> {
         self.lists_on()
             .into_iter()
             .filter_map(|chart| {
@@ -175,10 +243,22 @@ impl ChartPlaylistService {
                 {
                     return None;
                 }
-                let (name, _) = TopSongsService::names(&menu, &chart)?;
-                Some((chart, name))
+                let (name, _) = TopSongsService::names(menu, &chart)?;
+                let name = match pinned {
+                    Some(country) => chart_settings::pinned_name(&name, country),
+                    None => name,
+                };
+                Some((list_id(&chart, pinned), name))
             })
             .collect()
+    }
+
+    /// The country a list is read for: its pinned country, else the listener's own.
+    async fn country_for(&self, username: &str, list: &str) -> Option<String> {
+        match split_list(list).1 {
+            Some(country) => Some(country.to_string()),
+            None => self.inner.top_songs.country_of(username).await,
+        }
     }
 
     /// The listener's lists, made again first when their period ended or the settings they were
@@ -194,50 +274,54 @@ impl ChartPlaylistService {
         }
         let discovery = self.inner.settings.current().subsonic.enable_search_discovery;
         let mut lists = Vec::new();
-        for (chart, name) in self.charts_on().await {
-            let made = self.current(username, &chart);
+        for (list, name) in self.charts_for(username).await {
+            let made = self.current(username, &list);
+            let chart = split_list(&list).0;
             let pool = match &made {
                 Some(made) if !made.entries.is_empty() => made.entries.len(),
-                _ if discovery => match self.inner.top_songs.peek_chart(&chart).await {
-                    Some(source) => source.songs.len().min(chart_settings::max_songs(&chart)),
-                    None => 0,
-                },
+                _ if discovery => {
+                    let country = self.country_for(username, &list).await;
+                    match self.inner.top_songs.peek_chart_in(country, chart).await {
+                        Some(source) => source.songs.len().min(chart_settings::max_songs(chart)),
+                        None => 0,
+                    }
+                }
                 _ => 0,
             };
             if pool > 0 {
-                lists.push(self.playlist(username, &chart, made.map_or(name, |m| m.name), pool));
+                lists.push(self.playlist(username, &list, made.map_or(name, |m| m.name), pool));
             }
         }
         lists
     }
 
-    /// Which chart a playlist id is, for this listener, while that list is on: an app that kept
+    /// Which list a playlist id is, for this listener, while that list is on: an app that kept
     /// the id across a restart still opens it.
     pub fn which(&self, username: &str, id: &str) -> Option<String> {
         if username.trim().is_empty() || id.is_empty() {
             return None;
         }
-        self.lists_on()
+        self.lists_for(username)
             .into_iter()
-            .find(|chart| playlist_id(username, &chart_settings::playlist_key(chart)) == id)
+            .find(|list| playlist_id(username, &list_key(list)) == id)
     }
 
-    /// The listener's playlist id for a chart, while the list is made and holds songs.
-    pub fn listed_id(&self, username: &str, chart: &str) -> Option<String> {
-        let made = self.current(username, chart)?;
-        (!made.entries.is_empty()).then(|| playlist_id(username, &chart_settings::playlist_key(chart)))
+    /// The listener's playlist id for a list, while the list is made and holds songs.
+    pub fn listed_id(&self, username: &str, list: &str) -> Option<String> {
+        let made = self.current(username, list)?;
+        (!made.entries.is_empty()).then(|| playlist_id(username, &list_key(list)))
     }
 
     /// The list as a playlist: its period, and `pool` songs.
-    pub fn playlist(&self, username: &str, chart: &str, name: String, pool: usize) -> GeneratedPlaylist {
-        let period = self.current(username, chart).map_or_else(
+    pub fn playlist(&self, username: &str, list: &str, name: String, pool: usize) -> GeneratedPlaylist {
+        let period = self.current(username, list).map_or_else(
             || period_index(self.inner.clock.now(), REFRESH_HOURS),
             |m| m.period,
         );
         let start = period_start(period);
         GeneratedPlaylist {
-            id: playlist_id(username, &chart_settings::playlist_key(chart)),
-            key: chart_settings::playlist_key(chart),
+            id: playlist_id(username, &list_key(list)),
+            key: list_key(list),
             kind: KIND.to_string(),
             label: name.clone(),
             name,
@@ -284,11 +368,13 @@ impl ChartPlaylistService {
 
     /// What the list's cover is drawn from, as last made. Never makes one.
     pub fn cover(&self, username: &str, id: &str) -> Option<ChartCover> {
-        let chart = self.which(username, id)?;
-        let made = self.current(username, &chart)?;
+        let list = self.which(username, id)?;
+        let made = self.current(username, &list)?;
+        let (chart, country) = split_list(&list);
         Some(ChartCover {
             name: made.name,
-            chart,
+            chart: chart.to_string(),
+            country: country.map(str::to_string),
             entries: made.entries,
             outside: made.outside,
         })
@@ -350,15 +436,15 @@ impl ChartPlaylistService {
     /// library to the device: it then holds these songs under the ids the playlist lists, so the
     /// playlist finds them there.
     pub fn as_sync_stations(&self, username: &str) -> Vec<LastFmRadioStation> {
-        let on = self.lists_on();
+        let on = self.lists_for(username);
         let user = user_key(username);
         let made = self.inner.made.lock().get(&user).cloned().unwrap_or_default();
         on.iter()
-            .filter_map(|chart| {
-                let made = made.get(chart).filter(|m| !m.outside.is_empty())?;
+            .filter_map(|list| {
+                let made = made.get(list).filter(|m| !m.outside.is_empty())?;
                 Some(LastFmRadioStation {
-                    id: playlist_id(username, &chart_settings::playlist_key(chart)),
-                    key: chart_settings::playlist_key(chart),
+                    id: playlist_id(username, &list_key(list)),
+                    key: list_key(list),
                     name: made.name.clone(),
                     owner: username.trim().to_string(),
                     created_utc: made.made_utc,
@@ -384,31 +470,26 @@ impl ChartPlaylistService {
             .collect()
     }
 
-    fn current(&self, username: &str, chart: &str) -> Option<Made> {
+    fn current(&self, username: &str, list: &str) -> Option<Made> {
         self.inner
             .made
             .lock()
             .get(&user_key(username))?
-            .get(chart)
+            .get(list)
             .cloned()
     }
 
     /// What decides whether a made list still holds: outside songs shown or not, which of them
-    /// the listener's explicit filter and Skip covers and instrumentals let through, and whose charts they
-    /// are.
-    async fn rule(&self, username: &str) -> String {
+    /// the listener's explicit filter and Skip covers and instrumentals let through, and whose
+    /// chart it is: the listener's own country for their own lists, so a new own country makes
+    /// those again, and the pinned country for a pinned one, which a new own country leaves be.
+    fn rule(&self, username: &str, list: &str, home: Option<&str>) -> String {
         let settings = self.inner.settings.current();
-        let subsonic = settings.subsonic.clone();
         let skip_covers_and_instrumentals = settings.soulseek.skip_covers_and_instrumentals;
-        let country = self
-            .inner
-            .top_songs
-            .country()
-            .await
-            .unwrap_or_else(|| "auto".into());
+        let country = split_list(list).1.or(home).unwrap_or("auto");
         format!(
-            "{}|{:?}|{country}{}",
-            subsonic.enable_search_discovery,
+            "{}|{:?}{}|{country}",
+            settings.subsonic.enable_search_discovery,
             self.explicit_filter_for(username),
             if skip_covers_and_instrumentals {
                 "|skip-covers-and-instrumentals"
@@ -418,7 +499,8 @@ impl ChartPlaylistService {
         )
     }
 
-    /// Whether any list is made, and the making of new ones when some are due.
+    /// Whether any list is made, and the making of the ones that are due. A list that could not
+    /// be made whole a moment ago waits a few minutes, without holding up the others.
     async fn ensure(
         &self,
         username: &str,
@@ -430,33 +512,55 @@ impl ChartPlaylistService {
         let user = user_key(username);
         let now = self.inner.clock.now();
         let period = period_index(now, REFRESH_HOURS);
-        let rule = self.rule(username).await;
-        // Only the lists the country has: a genre it lacks is never made, and must not make the
+        let home = self.inner.top_songs.country_of(username).await;
+        // Only the lists each country has: a genre it lacks is never made, and must not make the
         // others due on every request.
-        let on: Vec<String> = self
-            .charts_on()
-            .await
-            .into_iter()
-            .map(|(chart, _)| chart)
-            .collect();
-        let (any_made, due) = {
-            let made = self.inner.made.lock();
-            let mine = made.get(&user);
-            let any_made =
-                mine.is_some_and(|m| on.iter().any(|c| m.get(c).is_some_and(|x| !x.entries.is_empty())));
-            let due = on.iter().any(|chart| {
-                mine.and_then(|m| m.get(chart))
-                    .is_none_or(|m| m.period != period || m.rule != rule || !m.whole)
+        let on = self.charts_for(username).await;
+        // Every list that is on, whatever a country's menu says just now: a menu not known for a
+        // moment must not let a made list go.
+        let kept = self.lists_for(username);
+        // A list that could not be made whole waits, but only under the rule it failed under.
+        let waiting: Vec<(String, String)> = {
+            let mut failed = self.inner.failed_at.lock();
+            failed.retain(|(who, list), (at, _)| {
+                now - *at < RETRY_AFTER_FAILURE && (*who != user || kept.contains(list))
             });
+            failed
+                .iter()
+                .filter(|((who, _), _)| *who == user)
+                .map(|((_, list), (_, rule))| (list.clone(), rule.clone()))
+                .collect()
+        };
+        let (any_made, due) = {
+            let mut made = self.inner.made.lock();
+            // A list turned off, or a country unpinned, is let go; a list still on is kept even
+            // while it is due.
+            if let Some(mine) = made.get_mut(&user) {
+                mine.retain(|list, _| kept.contains(list));
+            }
+            let mine = made.get(&user);
+            let any_made = mine.is_some_and(|m| {
+                on.iter()
+                    .any(|(l, _)| m.get(l).is_some_and(|x| !x.entries.is_empty()))
+            });
+            let due: Vec<(String, String, String)> = on
+                .iter()
+                .map(|(list, name)| {
+                    (
+                        list.clone(),
+                        name.clone(),
+                        self.rule(username, list, home.as_deref()),
+                    )
+                })
+                .filter(|(list, _, rule)| !waiting.iter().any(|(l, r)| l == list && r == rule))
+                .filter(|(list, _, rule)| {
+                    mine.and_then(|m| m.get(list))
+                        .is_none_or(|m| m.period != period || m.rule != *rule || !m.whole)
+                })
+                .collect();
             (any_made, due)
         };
-        let failed_recently = self
-            .inner
-            .failed_at
-            .lock()
-            .get(&user)
-            .is_some_and(|at| now - *at < RETRY_AFTER_FAILURE);
-        if !due || failed_recently || on.is_empty() {
+        if due.is_empty() {
             return (any_made, None);
         }
         let sign_in: Parameters = auth
@@ -466,34 +570,48 @@ impl ChartPlaylistService {
             .collect();
         let this = self.clone();
         let name = username.to_string();
-        let building = self.inner.builds.run(
-            &user,
-            async move { this.make(&name, sign_in, period, rule).await },
-        );
+        let building = self
+            .inner
+            .builds
+            .run(&user, async move { this.make(&name, sign_in, period, due).await });
         (any_made, Some(building))
     }
 
-    /// Make the listener's lists, one after another: each chart, each song matched against their
-    /// library by the rule radio uses to play a library copy, the rest kept as outside songs when
-    /// they may be shown.
-    async fn make(&self, username: &str, auth: Parameters, period: i64, rule: String) -> bool {
+    /// Make these lists of the listener (id, name and the rule each is made under), one after
+    /// another: each chart, each song matched against their library by the rule radio uses to
+    /// play a library copy, the rest kept as outside songs when they may be shown. A list that
+    /// could not be made whole waits a few minutes before it is tried again, on its own.
+    async fn make(
+        &self,
+        username: &str,
+        auth: Parameters,
+        period: i64,
+        lists: Vec<(String, String, String)>,
+    ) -> bool {
         let user = user_key(username);
         let settings = self.inner.settings.current();
         let subsonic = settings.subsonic.clone();
         let skip_covers_and_instrumentals = settings.soulseek.skip_covers_and_instrumentals;
         let explicit_filter = self.explicit_filter_for(username);
         let mut searched: HashMap<String, Option<Vec<Value>>> = HashMap::new();
-        let mut trouble = false;
+        let session = match &self.inner.library_matches {
+            Some(cache) => cache.session(&self.inner.proxy, &auth, username).await,
+            None => MatchSession::none(),
+        };
         let mut any = false;
-        for (chart, name) in self.charts_on().await {
-            let list = self.inner.top_songs.chart(&chart).await;
+        let mut trouble_with: Vec<(String, String)> = Vec::new();
+        let mut whole: Vec<String> = Vec::new();
+        for (list_id, name, rule) in lists {
+            let chart = split_list(&list_id).0.to_string();
+            let country = self.country_for(username, &list_id).await;
+            let list = self.inner.top_songs.chart_in(country, &chart).await;
             let count = chart_settings::max_songs(&chart);
             // A row more for each outside take Skip covers, karaoke and instrumentals leaves out,
             // so the next rows take their places, as on getTopSongs.
             let rows: Vec<TopSong> =
                 TopSongsService::rows_to_match(&list.songs, count, skip_covers_and_instrumentals);
             if rows.is_empty() {
-                trouble = true;
+                trouble_with.push((list_id, rule));
                 info!("{name} for {username}: the chart did not answer, the last list stays");
                 continue;
             }
@@ -506,7 +624,13 @@ impl ChartPlaylistService {
             let missing: Vec<String> = {
                 let mut seen = Vec::new();
                 for q in &queries {
-                    if !searched.contains_key(q) && !seen.contains(q) {
+                    if searched.contains_key(q) || seen.contains(q) {
+                        continue;
+                    }
+                    if session.skips(q) {
+                        // The library already said it lacks this song.
+                        searched.insert(q.clone(), Some(Vec::new()));
+                    } else {
                         seen.push(q.clone());
                     }
                 }
@@ -530,7 +654,11 @@ impl ChartPlaylistService {
                 .iter()
                 .zip(&queries)
                 .map(|(row, query)| match searched.get(query).cloned().flatten() {
-                    Some(hits) => library_hit(&row.song.artist, &row.song.title, &hits).cloned(),
+                    Some(hits) => {
+                        let hit = library_hit(&row.song.artist, &row.song.title, &hits).cloned();
+                        session.record(query, hit.as_ref());
+                        hit
+                    }
                     None => {
                         unanswered += 1;
                         None
@@ -539,15 +667,24 @@ impl ChartPlaylistService {
                 .collect();
             one_row_per_library_song(&mut library);
 
-            let before = self.current(username, &chart);
+            let before = self.current(username, &list_id);
             // A library that answered nothing at all must not turn a list of the listener's own
             // songs into outside ones.
             if unanswered == rows.len() && before.as_ref().is_some_and(|b| !b.entries.is_empty()) {
-                trouble = true;
+                trouble_with.push((list_id, rule));
                 continue;
             }
-            if unanswered > 0 {
-                trouble = true;
+            let from_apple = list.source == APPLE_SOURCE;
+            // A stand-in for Apple's chart keeps the Apple list that was made, and asks Apple
+            // again soon.
+            if !from_apple && before.as_ref().is_some_and(|b| b.source == APPLE_SOURCE) {
+                trouble_with.push((list_id, rule));
+                continue;
+            }
+            if unanswered > 0 || !from_apple {
+                trouble_with.push((list_id.clone(), rule.clone()));
+            } else {
+                whole.push(list_id.clone());
             }
 
             let (entries, outside) = assemble(
@@ -579,8 +716,9 @@ impl ChartPlaylistService {
                 period,
                 made_utc: now,
                 changed_utc,
-                rule: rule.clone(),
-                whole: unanswered == 0,
+                rule,
+                whole: unanswered == 0 && from_apple,
+                source: list.source.clone(),
                 name,
                 hash,
                 entries,
@@ -591,14 +729,16 @@ impl ChartPlaylistService {
                 .lock()
                 .entry(user.clone())
                 .or_default()
-                .insert(chart, made);
+                .insert(list_id, made);
             any = true;
         }
+        let now = self.inner.clock.now();
         let mut failed = self.inner.failed_at.lock();
-        if trouble {
-            failed.insert(user, self.inner.clock.now());
-        } else {
-            failed.remove(&user);
+        for (list, rule) in trouble_with {
+            failed.insert((user.clone(), list), (now, rule));
+        }
+        for list in whole {
+            failed.remove(&(user.clone(), list));
         }
         if !any {
             debug!("chart lists for {username}: nothing could be made");

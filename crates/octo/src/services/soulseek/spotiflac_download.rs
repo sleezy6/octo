@@ -1,6 +1,6 @@
-//! The SpotiFLAC source of the download service. SpotiFLAC is asked beside Soulseek, in the
+//! The Mornye source of the download service. Mornye is asked beside Soulseek, in the
 //! order its settings give: it finds the song in its catalog, Octo picks the track that is the
-//! song (its ISRC, or its title, artist, version and length), SpotiFLAC saves it into a job
+//! song (its ISRC, or its title, artist, version and length), Mornye saves it into a job
 //! folder under the incoming dot folder, and the file meets the same checks as a Soulseek copy
 //! (the length, the version its own title names, AcoustID, the spectrum) before the base places
 //! and tags it. A file that fails a check is thrown away and the next source is asked.
@@ -8,27 +8,29 @@
 use std::time::Duration;
 
 use octo_core::common::version_gap::{Against, other_version};
+use octo_core::settings::SpotiflacSettings;
 use octo_core::spotiflac::{
     Job, JobState, Pick, Wanted, path_for_spotiflac, pick_audio_file, pick_track, search_queries,
+    with_query_isrc,
 };
 
 use super::*;
 use crate::services::spotiflac::{Connection, SPOTIFLAC_FOLDER, SpotiflacClient, make_shared_folder};
 
-/// The source's name, as the downloads log and the fetched-songs list show it.
-pub const SPOTIFLAC_SOURCE: &str = "SpotiFLAC";
+/// The source's name, as the downloads log and the fetched-songs list show it. Rows written before 2026.10.25 keep "SpotiFLAC".
+pub const SPOTIFLAC_SOURCE: &str = "Mornye";
 
 /// How many failed calls in a row end the wait for a job.
 const CALLS_THAT_MAY_FAIL: u32 = 5;
 
 impl SoulseekDownloadService {
-    /// SpotiFLAC's client, when SpotiFLAC is on.
+    /// Mornye's client, when Mornye is on.
     pub(super) fn spotiflac_on(&self) -> Option<Arc<SpotiflacClient>> {
         self.spotiflac.clone().filter(|client| client.is_on())
     }
 
-    /// The lossless sources, Soulseek and SpotiFLAC, in the order SpotiFLAC's placement gives.
-    /// With SpotiFLAC off this is Soulseek alone; with Soulseek off, SpotiFLAC alone.
+    /// The lossless sources, Soulseek and Mornye, in the order Mornye's placement gives.
+    /// With Mornye off this is Soulseek alone; with Soulseek off, Mornye alone.
     pub(super) async fn download_lossless(
         &self,
         base: &BaseDownloadService,
@@ -57,11 +59,11 @@ impl SoulseekDownloadService {
                 .await;
             return match first {
                 Err(e) if soulseek_on && !ct.is_cancelled() => {
-                    info!("SpotiFLAC brought nothing ({e}); asking Soulseek");
+                    info!("Mornye brought nothing ({e}); asking Soulseek");
                     base.log_step(
                         &track_key,
                         acquisition_event_kinds::NOTE,
-                        "SpotiFLAC brought no copy; asking Soulseek",
+                        "Mornye brought no copy; asking Soulseek",
                         user_safe(Some(&e.to_string())).as_deref(),
                     );
                     self.download_via_soulseek(base, routing, download, profile, ct)
@@ -75,11 +77,11 @@ impl SoulseekDownloadService {
             .await
         {
             Err(e) if !ct.is_cancelled() => {
-                info!("Soulseek brought nothing ({e}); asking SpotiFLAC");
+                info!("Soulseek brought nothing ({e}); asking Mornye");
                 base.log_step(
                     &track_key,
                     acquisition_event_kinds::NOTE,
-                    "Soulseek brought no copy; asking SpotiFLAC",
+                    "Soulseek brought no copy; asking Mornye",
                     user_safe(Some(&e.to_string())).as_deref(),
                 );
                 self.download_via_spotiflac(base, &client, routing, download, ct)
@@ -97,7 +99,7 @@ impl SoulseekDownloadService {
         }
     }
 
-    /// One song through SpotiFLAC, into a job folder of its own, checked like a Soulseek copy.
+    /// One song through Mornye, into a job folder of its own, checked like a Soulseek copy.
     pub(super) async fn download_via_spotiflac(
         &self,
         base: &BaseDownloadService,
@@ -115,6 +117,9 @@ impl SoulseekDownloadService {
         let (artist, title) = names(routing);
         let settings = client.settings();
         let connection = Connection::of(&settings);
+        if let Some(problem) = SpotiflacSettings::token_problem(&connection.token) {
+            return Err(file_not_found(format!("Mornye could not be asked: {problem}")));
+        }
         let provider = base.provider_name().to_string();
         let track_key = download.song.external_id.clone().unwrap_or_default();
         base.track(|t| {
@@ -137,21 +142,24 @@ impl SoulseekDownloadService {
             seconds: routing.duration,
         };
         let mut chosen = None;
-        let mut why_none = String::from("SpotiFLAC's search found nothing");
+        let mut why_none = String::from("Mornye's search found nothing");
         for query in search_queries(&want) {
             base.log_step(
                 &track_key,
                 acquisition_event_kinds::SEARCH,
-                &format!("Asking SpotiFLAC for \"{query}\""),
+                &format!("Asking Mornye for \"{query}\""),
                 None,
             );
-            let tracks = or_canceled(ct, async {
-                client
-                    .search(&connection, &query)
-                    .await
-                    .map_err(anyhow::Error::from)
-            })
-            .await?;
+            let tracks = with_query_isrc(
+                or_canceled(ct, async {
+                    client
+                        .search(&connection, &query)
+                        .await
+                        .map_err(anyhow::Error::from)
+                })
+                .await?,
+                &query,
+            );
             match pick_track(&tracks, &want) {
                 Pick::Track { index, why } => {
                     chosen = Some((tracks[index].clone(), why));
@@ -164,22 +172,22 @@ impl SoulseekDownloadService {
             base.log_step(
                 &track_key,
                 acquisition_event_kinds::SEARCH,
-                "SpotiFLAC has no copy that fits",
+                "Mornye has no copy that fits",
                 Some(&why_none),
             );
             return Err(file_not_found(format!(
-                "SpotiFLAC has no copy of '{artist} - {title}': {why_none}"
+                "Mornye has no copy of '{artist} - {title}': {why_none}"
             )));
         };
         let Some(link) = track.link() else {
             return Err(file_not_found(format!(
-                "SpotiFLAC's track for '{artist} - {title}' has no link"
+                "Mornye's track for '{artist} - {title}' has no link"
             )));
         };
         base.log_step(
             &track_key,
             acquisition_event_kinds::FOUND,
-            "Found it through SpotiFLAC",
+            "Found it through Mornye",
             Some(&why),
         );
 
@@ -204,7 +212,7 @@ impl SoulseekDownloadService {
         base.log_step(
             &track_key,
             acquisition_event_kinds::TRY,
-            "Asked SpotiFLAC to save it",
+            "Asked Mornye to save it",
             Some(&format!("Into {their_dir}, as {}", settings.effective_quality())),
         );
         let job = match client.queue(&connection, &link, &settings, &their_dir).await {
@@ -213,12 +221,12 @@ impl SoulseekDownloadService {
                 let _ = std::fs::remove_dir_all(&job_dir);
                 // The error itself stays underneath, so a caller can tell an outage from a
                 // refusal; the words still say both.
-                let said = format!("SpotiFLAC did not take the download: {e}");
+                let said = format!("Mornye did not take the download: {e}");
                 return Err(anyhow::Error::from(e).context(said));
             }
         };
         info!(
-            "SpotiFLAC job {} for '{artist} - {title}' into {their_dir}",
+            "Mornye job {} for '{artist} - {title}' into {their_dir}",
             if job.id.is_empty() { "(no id)" } else { &job.id }
         );
 
@@ -235,23 +243,23 @@ impl SoulseekDownloadService {
                 let words = match e {
                     Waited::Canceled => return Err(OperationCanceled.into()),
                     Waited::TimedOut(timeout) => format!(
-                        "SpotiFLAC took longer than {} seconds for '{artist} - {title}', so Octo stopped waiting",
+                        "Mornye took longer than {} seconds for '{artist} - {title}', so Octo stopped waiting",
                         timeout.as_secs()
                     ),
                     Waited::Failed(reason) => {
-                        format!("SpotiFLAC could not download '{artist} - {title}': {reason}")
+                        format!("Mornye could not download '{artist} - {title}': {reason}")
                     }
                     Waited::NoFile => format!(
-                        "SpotiFLAC said it saved '{artist} - {title}', but nothing arrived in {job_dir}. \
-                         SpotiFLAC must save into the same folder Octo reads; see the Music folder setting on the SpotiFLAC page"
+                        "Mornye said it saved '{artist} - {title}', but nothing arrived in {job_dir}. \
+                         Mornye must save into the same folder Octo reads; see the Music folder setting on the Mornye page"
                     ),
-                    Waited::Unreachable(reason) => format!("SpotiFLAC stopped answering: {reason}"),
+                    Waited::Unreachable(reason) => format!("Mornye stopped answering: {reason}"),
                 };
                 warn!("{words}");
                 base.log_step(
                     &track_key,
                     acquisition_event_kinds::NOTE,
-                    "SpotiFLAC brought no file",
+                    "Mornye brought no file",
                     user_safe(Some(&words)).as_deref(),
                 );
                 return Err(file_not_found(words));
@@ -261,7 +269,7 @@ impl SoulseekDownloadService {
         base.log_step(
             &track_key,
             acquisition_event_kinds::FOUND,
-            "SpotiFLAC brought a copy",
+            "Mornye brought a copy",
             quality.as_deref(),
         );
         match self
@@ -276,7 +284,7 @@ impl SoulseekDownloadService {
         }
     }
 
-    /// Waits for the job to end and finds its file in the job folder. A job SpotiFLAC cannot be
+    /// Waits for the job to end and finds its file in the job folder. A job Mornye cannot be
     /// asked about again is watched by its folder: a song file whose size held still for one
     /// look is the song.
     async fn wait_for_spotiflac(
@@ -313,19 +321,19 @@ impl SoulseekDownloadService {
                                 ));
                             }
                             JobState::Cancelled => {
-                                return Err(Waited::Failed("the job was cancelled in SpotiFLAC".to_string()));
+                                return Err(Waited::Failed("the job was cancelled in Mornye".to_string()));
                             }
                             JobState::Working => {}
                         }
                     }
-                    // SpotiFLAC forgot the job: the folder says when it is done.
+                    // Mornye forgot the job: the folder says when it is done.
                     Ok(None) => pollable = false,
                     Err(e) => {
                         failures += 1;
                         if failures >= CALLS_THAT_MAY_FAIL {
                             return Err(Waited::Unreachable(e.to_string()));
                         }
-                        debug!("SpotiFLAC job {}: {e}", job.id);
+                        debug!("Mornye job {}: {e}", job.id);
                     }
                 }
             } else {
@@ -343,7 +351,7 @@ impl SoulseekDownloadService {
         }
     }
 
-    /// The song file in the job folder, looked for again for a few seconds: SpotiFLAC can say a
+    /// The song file in the job folder, looked for again for a few seconds: Mornye can say a
     /// job is done a moment before the file is moved into place.
     async fn landed_file(&self, job_dir: &str, ct: &CancellationToken) -> Option<String> {
         retry_resolve(
@@ -355,7 +363,7 @@ impl SoulseekDownloadService {
         .await
     }
 
-    /// The checks a Soulseek copy meets, on SpotiFLAC's file: its length, the version its own
+    /// The checks a Soulseek copy meets, on Mornye's file: its length, the version its own
     /// title names, AcoustID and the spectrum. A file that fails one is thrown away.
     async fn check_spotiflac_file(
         &self,
@@ -379,7 +387,7 @@ impl SoulseekDownloadService {
                 Some("A FLAC copy was asked for; thrown away"),
             );
             return Err(file_not_found(format!(
-                "SpotiFLAC brought '{artist} - {title}' as {}, and a FLAC copy was asked for",
+                "Mornye brought '{artist} - {title}' as {}, and a FLAC copy was asked for",
                 file_name(path)
             )));
         }
@@ -388,7 +396,7 @@ impl SoulseekDownloadService {
         if !matches {
             let expected = display_option(routing.duration);
             warn!(
-                "SpotiFLAC delivered {actual_secs}s for '{artist} - {title}', expected {expected}s; discarding it"
+                "Mornye delivered {actual_secs}s for '{artist} - {title}', expected {expected}s; discarding it"
             );
             discard_rejected_download(path, started_utc);
             base.log_step(
@@ -402,15 +410,15 @@ impl SoulseekDownloadService {
                 Some("Thrown away"),
             );
             return Err(file_not_found(format!(
-                "SpotiFLAC brought a {actual_secs}s file for the {expected}s song '{artist} - {title}'"
+                "Mornye brought a {actual_secs}s file for the {expected}s song '{artist} - {title}'"
             )));
         }
 
-        // SpotiFLAC tags its files from its own catalog. Those tags are never taken as the song's
+        // Mornye tags its files from its own catalog. Those tags are never taken as the song's
         // identity, but a title naming another version is a reason to refuse the file.
         let own_title = TagFile::open(path).ok().and_then(|file| file.title());
         if let Some(own_title) = own_title.filter(|own| other_version(&title, own, Against::Title)) {
-            warn!("SpotiFLAC's file for '{artist} - {title}' is titled '{own_title}'; discarding it");
+            warn!("Mornye's file for '{artist} - {title}' is titled '{own_title}'; discarding it");
             discard_rejected_download(path, started_utc);
             base.log_step(
                 &track_key,
@@ -419,7 +427,7 @@ impl SoulseekDownloadService {
                 Some(&format!("The file calls itself '{own_title}'; thrown away")),
             );
             return Err(file_not_found(format!(
-                "SpotiFLAC's file for '{artist} - {title}' is '{own_title}', another version"
+                "Mornye's file for '{artist} - {title}' is '{own_title}', another version"
             )));
         }
 
@@ -443,7 +451,7 @@ impl SoulseekDownloadService {
         }
         if verdict.verdict == VerificationVerdict::Mismatch {
             warn!(
-                "SpotiFLAC brought {} for '{artist} - {title}' (AcoustID score {}); discarding it",
+                "Mornye brought {} for '{artist} - {title}' (AcoustID score {}); discarding it",
                 verdict.describe(),
                 percent(verdict.score)
             );
@@ -462,20 +470,23 @@ impl SoulseekDownloadService {
                 verdict.heard(),
             );
             return Err(file_not_found(format!(
-                "AcoustID identified SpotiFLAC's file as {}",
+                "AcoustID identified Mornye's file as {}",
                 verdict.describe()
             )));
         }
         let length_known = routing.duration.is_some_and(|s| s > 0) && actual_secs > 0;
-        if let Some(reason) = self
-            .refused_by_preview(base, routing, &track_key, path, &verdict, length_known)
+        let verdict = match self
+            .refused_by_preview(base, routing, &track_key, path, verdict, length_known)
             .await
         {
-            discard_rejected_download(path, started_utc);
-            return Err(file_not_found(format!(
-                "SpotiFLAC's file for '{artist} - {title}' {reason}"
-            )));
-        }
+            PreviewSays::Keep(kept) => kept,
+            PreviewSays::Refuse(reason) => {
+                discard_rejected_download(path, started_utc);
+                return Err(file_not_found(format!(
+                    "Mornye's file for '{artist} - {title}' {reason}"
+                )));
+            }
+        };
 
         let spectrum = self
             .verification
@@ -484,7 +495,7 @@ impl SoulseekDownloadService {
         let lossy = spectrum.is_likely_lossy();
         if lossy {
             warn!(
-                "SpotiFLAC's copy of '{artist} - {title}' is {}; keeping it, marked as a transcode",
+                "Mornye's copy of '{artist} - {title}' is {}; keeping it, marked as a transcode",
                 spectrum.describe()
             );
             base.log_step(
@@ -508,12 +519,12 @@ impl SoulseekDownloadService {
         );
         verdict.apply_tags_to(song);
         song.verification = Some(Box::new(verdict));
-        info!("SpotiFLAC download complete: {path}");
+        info!("Mornye download complete: {path}");
         Ok(path.to_string())
     }
 }
 
-/// How a wait for a SpotiFLAC job ended without a file.
+/// How a wait for a Mornye job ended without a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Waited {
     Canceled,
@@ -534,8 +545,8 @@ fn audio_in(job_dir: &str) -> Option<(String, u64)> {
     files.iter().find(|(path, _)| path == picked).cloned()
 }
 
-/// Removes SpotiFLAC job folders a placed or discarded download left empty, after half an hour,
-/// and any a day old. Only inside Octo's own SpotiFLAC folder.
+/// Removes Mornye job folders a placed or discarded download left empty, after half an hour,
+/// and any a day old. Only inside Octo's own Mornye folder.
 fn sweep_spotiflac_folders(download_path: &str) {
     let jobs = combine(download_path, SPOTIFLAC_FOLDER);
     let sweep = || -> std::io::Result<()> {
@@ -556,7 +567,7 @@ fn sweep_spotiflac_folders(download_path: &str) {
             };
             if !young {
                 std::fs::remove_dir_all(&dir)?;
-                debug!("Removed an old SpotiFLAC folder {}", dir.display());
+                debug!("Removed an old Mornye folder {}", dir.display());
             }
         }
         Ok(())

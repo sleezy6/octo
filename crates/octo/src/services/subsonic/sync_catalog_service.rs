@@ -544,9 +544,10 @@ impl SyncCatalogService {
         let handle = tokio::spawn(async move {
             let key = ordinal_ignore_case_key(&user);
             let previous = service.catalogs.lock().get(&key).cloned();
-            let outcome = AssertUnwindSafe(service.build(&stations, &auth, &build_fingerprint, previous))
-                .catch_unwind()
-                .await;
+            let outcome =
+                AssertUnwindSafe(service.build(&user, &stations, &auth, &build_fingerprint, previous))
+                    .catch_unwind()
+                    .await;
             let catalog = match outcome {
                 Ok(built) => {
                     let built = Arc::new(built);
@@ -640,6 +641,7 @@ impl SyncCatalogService {
 
     async fn build(
         &self,
+        username: &str,
         stations: &[LastFmRadioStation],
         auth: &IndexMap<String, String>,
         fingerprint: &str,
@@ -667,7 +669,7 @@ impl SyncCatalogService {
         let lookups: Vec<_> = tracks
             .iter()
             .filter(|track| seen_artists.insert(SongIdentity::key(&track.artist)))
-            .map(|track| self.lookup_keyed(auth, track.artist.clone()))
+            .map(|track| self.lookup_keyed(username, auth, track.artist.clone()))
             .collect();
         let library: HashMap<String, Option<LibraryArtist>> = futures::stream::iter(lookups)
             .buffer_unordered(LOOKUP_CONCURRENCY)
@@ -863,16 +865,24 @@ impl SyncCatalogService {
     /// One artist's lookup, under the key the build reads it by.
     async fn lookup_keyed(
         &self,
+        username: &str,
         auth: &IndexMap<String, String>,
         artist: String,
     ) -> (String, Option<LibraryArtist>) {
         (
             SongIdentity::key(&artist),
-            self.lookup_artist(auth, &artist).await,
+            self.lookup_artist(username, auth, &artist).await,
         )
     }
 
-    async fn lookup_artist(&self, auth: &IndexMap<String, String>, artist: &str) -> Option<LibraryArtist> {
+    /// One artist's library lookup, scoped to the listener the catalog is built for. The name
+    /// is the listener the request resolved, which an API-key app has no `u` parameter to say.
+    async fn lookup_artist(
+        &self,
+        username: &str,
+        auth: &IndexMap<String, String>,
+        artist: &str,
+    ) -> Option<LibraryArtist> {
         let mut parameters = auth.clone();
         parameters.insert("query".into(), artist.to_string());
         parameters.insert("artistCount".into(), "10".into());
@@ -886,7 +896,7 @@ impl SyncCatalogService {
         if result.body.is_empty() {
             return None;
         }
-        let scoped = self.scoped_answer(parameters.get("u").map(String::as_str), &result.body);
+        let scoped = self.scoped_answer(Some(username), &result.body);
         let body = scoped.as_deref().unwrap_or(&result.body);
         match Self::parse_library_artist(body, artist) {
             Ok(owned) => owned,
@@ -1100,6 +1110,80 @@ mod family_scope_tests {
         let sam = service.scoped_answer(Some("sam"), &answer()).expect("scoped");
         assert_eq!(ids(&sam, "song"), ["shared-1", "sam-1"]);
         assert_eq!(ids(&sam, "album"), ["al-shared", "al-sam"]);
+    }
+
+    /// The lookup answer as a Navidrome would send it, with each song's artist and title.
+    fn lookup_answer() -> String {
+        json!({"subsonic-response": {"status": "ok", "searchResult3": {
+            "artist": [{"id": "ar-shared", "name": "Portishead"}],
+            "album": [{"id": "al-shared", "name": "Dummy", "artistId": "ar-shared"}],
+            "song": [
+                {"id": "shared-1", "albumId": "al-shared", "artistId": "ar-shared",
+                 "artist": "Portishead", "title": "Glory Box"},
+                {"id": "sam-1", "albumId": "al-shared", "artistId": "ar-shared",
+                 "artist": "Portishead", "title": "Sam Only"}
+            ]
+        }}})
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_api_key_lookup_is_scoped_to_its_listener() {
+        let world = World::new(None);
+        let members = world.members();
+        let family = navidrome_with_songs(json!([
+            song_row("shared-1", 1, "/music", "a.flac", 1),
+            song_row("sam-1", 4, &format!("{members}/sam"), "b.flac", 1),
+        ]))
+        .await;
+        world.point_at(&family.uri());
+        world.index.refresh().await.expect("read");
+        let scope = ScopeResolver::new(world.settings.clone(), world.family.clone(), world.index.clone());
+
+        let search = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(lookup_answer()),
+            )
+            .mount(&search)
+            .await;
+        let settings = Arc::new(SettingsStore::for_tests(octo_core::settings::AppSettings {
+            subsonic: octo_core::settings::SubsonicSettings {
+                url: Some(search.uri()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let service = SyncCatalogService::new(
+            SubsonicProxyService::new(settings.clone()),
+            Arc::new(FakeMetadata::default()),
+            Arc::new(ExternalIdRegistry::new(None::<&str>)),
+            settings,
+            Clock::system(),
+        );
+        service.use_library_scope(scope);
+
+        // An API-key app sends no `u`.
+        let api_key: IndexMap<String, String> = [("apiKey", "key"), ("c", "Symfonium")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let owner = service
+            .lookup_artist("winters", &api_key, "Portishead")
+            .await
+            .expect("an answer");
+        assert!(owner.owns("Portishead", "Glory Box"));
+        assert!(
+            !owner.owns("Portishead", "Sam Only"),
+            "another member's song is not the owner's"
+        );
+        let sam = service
+            .lookup_artist("sam", &api_key, "Portishead")
+            .await
+            .expect("an answer");
+        assert!(sam.owns("Portishead", "Sam Only"));
     }
 
     #[test]

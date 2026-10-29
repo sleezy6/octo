@@ -706,13 +706,10 @@ fn lookup(title: &str) -> AcoustIdLookup {
         None,
         vec![AcoustIdResult::new(
             0.98,
-            vec![AcoustIdRecording::new(
-                "rec",
-                title,
-                ["Next"],
-                Some("Rated Next"),
-                Some(1997),
-            )],
+            vec![AcoustIdRecording {
+                sources: 2,
+                ..AcoustIdRecording::new("rec", title, ["Next"], Some("Rated Next"), Some(1997))
+            }],
         )],
     )
 }
@@ -1430,13 +1427,10 @@ fn take_care_lookup(score: f64) -> AcoustIdLookup {
         None,
         vec![AcoustIdResult::new(
             score,
-            vec![AcoustIdRecording::new(
-                "mbid-take-care",
-                "Take Care",
-                ["Drake"],
-                None,
-                None,
-            )],
+            vec![AcoustIdRecording {
+                sources: 2,
+                ..AcoustIdRecording::new("mbid-take-care", "Take Care", ["Drake"], None, None)
+            }],
         )],
     )
 }
@@ -1486,13 +1480,10 @@ fn a_log_names_what_acoust_id_heard_when_it_throws_a_file_away() {
         None,
         vec![AcoustIdResult::new(
             0.97,
-            vec![AcoustIdRecording::new(
-                "mbid-marvins",
-                "Marvins Room",
-                ["Drake"],
-                None,
-                None,
-            )],
+            vec![AcoustIdRecording {
+                sources: 2,
+                ..AcoustIdRecording::new("mbid-marvins", "Marvins Room", ["Drake"], None, None)
+            }],
         )],
     );
     let verdict = take_care_verdict(&lookup);

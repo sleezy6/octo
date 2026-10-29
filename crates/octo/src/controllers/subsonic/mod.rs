@@ -154,7 +154,7 @@ pub fn routes() -> RouteSet {
         )
         .subsonic(
             "getArtistInfo",
-            get(info::get_artist_info2).post(info::get_artist_info2),
+            get(info::get_artist_info).post(info::get_artist_info),
         )
         .merge(browsing::routes())
         .merge(media::routes())

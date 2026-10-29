@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 
 use super::duplicate_fixer::DuplicateFixer;
 use super::library_action_journal::{
-    LibraryActionEntry, LibraryActionJournal, LibraryActionState, action_name,
+    DeniedSource, LibraryActionEntry, LibraryActionJournal, LibraryActionState, action_name,
 };
 use super::library_action_quarantine::LibraryActionQuarantine;
 use super::navidrome_song_path_resolver::get_full_path;
@@ -65,8 +65,9 @@ pub struct LibraryActionRequest {
     /// A Delete of one copy of a song the library keeps another of (Library health's
     /// duplicates). The song is still wanted, so it is not refused when asked for again.
     pub only_a_copy: bool,
-    /// The one source to fetch the replacement from, for a copy someone picked in Find songs; no
-    /// other source is tried after it.
+    /// The one source to fetch the replacement from, for a copy someone picked in Find songs or a
+    /// Wrong song replacement the sweep holds to a source its preview checks; no other source is
+    /// tried after it.
     pub only_source: Option<DownloadSource>,
     /// Better quality for a copy someone picked and said to take whatever its quality: the song
     /// the replacement is held to, and no quality check on it.
@@ -705,10 +706,15 @@ impl LibraryActionExecutor {
         // Better quality with every source out could only fail, and before this it was journaled
         // as "no FLAC found" every sweep. Not consumed, so the request stays and runs once slskd
         // is back. Nothing is written and no file is touched. With Lidarr also set up, a Soulseek
-        // outage just means Lidarr alone is asked.
-        if request.action == LibraryAction::BetterQuality {
+        // outage just means Lidarr alone is asked. Wrong song and Wrong version have no source to
+        // try only when a picked Soulseek is out, and wait the same way.
+        if matches!(
+            request.action,
+            LibraryAction::BetterQuality | LibraryAction::WrongSong | LibraryAction::WrongVersion
+        ) {
             let sources = self.sources_for(request.action, request.only_source).await;
-            if sources.is_empty() && self.waiting_for_soulseek().await {
+            let replacing = request.action != LibraryAction::BetterQuality;
+            if sources.is_empty() && (replacing || self.waiting_for_soulseek().await) {
                 return Ok(LibraryActionOutcome::coded(
                     LibraryActionState::Failed,
                     OFFLINE_TEXT,
@@ -1189,8 +1195,11 @@ impl LibraryActionExecutor {
         key: &str,
         music_root: &str,
     ) -> Replaced {
-        if request.action == LibraryAction::WrongSong {
-            self.blacklist_source(original, request).await;
+        if request.action == LibraryAction::WrongSong
+            && let Some(denied) = self.blacklist_source(original, request).await
+        {
+            // Kept on the action's entry, so Put back lifts exactly this denial.
+            self.journal.set_denied_source(key, denied);
         }
 
         // Read while the original is in place: Navidrome built this song's ids from these tags.
@@ -1626,13 +1635,17 @@ impl LibraryActionExecutor {
     /// refuses anyway), and searches the slow way, because nobody is waiting (#70). Wrong song and
     /// wrong version use the download source, except that Lidarr there means Lidarr too: before,
     /// those replacements went to Soulseek whatever was configured. A None entry is the default.
+    /// A source picked by the request (`only`) is the one tried for any of the three, and none
+    /// when it is Soulseek and Soulseek is out.
     pub async fn sources_for(
         &self,
         action: LibraryAction,
         only: Option<DownloadSource>,
     ) -> Vec<Option<DownloadSource>> {
-        if action == LibraryAction::BetterQuality
-            && let Some(picked) = only
+        if matches!(
+            action,
+            LibraryAction::BetterQuality | LibraryAction::WrongSong | LibraryAction::WrongVersion
+        ) && let Some(picked) = only
         {
             return if picked == DownloadSource::Soulseek && self.soulseek_out().await {
                 Vec::new()
@@ -1780,9 +1793,15 @@ impl LibraryActionExecutor {
     /// Only possible when the download recorded who sent it, which Octo started doing alongside
     /// this feature. For a file downloaded before that, or one Octo never downloaded, there is
     /// nothing to blacklist and the re-acquire is an ordinary search.
-    async fn blacklist_source(&self, original: &ResolvedSongFile, request: &LibraryActionRequest) {
+    /// Denies the Soulseek file the original came from, when Octo knows who sent it, and says
+    /// which one it denied.
+    async fn blacklist_source(
+        &self,
+        original: &ResolvedSongFile,
+        request: &LibraryActionRequest,
+    ) -> Option<DeniedSource> {
         if !self.settings.current().soulseek.verify_downloads {
-            return;
+            return None;
         }
 
         let mapping = self
@@ -1807,15 +1826,21 @@ impl LibraryActionExecutor {
                 "Library action Wrong song: no record of who sent '{} - {}', so the search runs again without a blacklist",
                 original.artist, original.title
             );
-            return;
+            return None;
         };
 
+        // A file denied already was not denied by this action, so Put back leaves it denied.
+        let already = self.rejected_peers.is_denied(Some(&peer), Some(&file));
         self.rejected_peers.deny(
             Some(&peer),
             Some(&file),
             &format!("reported as the wrong song by {}", request.username),
             &format!("{} - {}", original.artist, original.title),
         );
+        (!already).then_some(DeniedSource {
+            username: peer,
+            filename: file,
+        })
     }
 
     fn entry(
@@ -1852,6 +1877,7 @@ impl LibraryActionExecutor {
             revealed_path: None,
             copy: request.only_a_copy,
             download_allowed: false,
+            denied_source: None,
         }
     }
 }

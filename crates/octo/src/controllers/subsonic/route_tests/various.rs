@@ -856,7 +856,7 @@ async fn info_for_outside_ids_carries_the_catalog_picture_in_both_formats() {
         .body;
     assert_eq!(
         json,
-        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","artistInfo2":{"biography":"","smallImageUrl":"","mediumImageUrl":"","largeImageUrl":""}}}"#
+        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","artistInfo":{"biography":"","smallImageUrl":"","mediumImageUrl":"","largeImageUrl":""}}}"#
     );
     // A local id with Navidrome out of reach: the empty ok.
     let local = get(&app, "/rest/getArtistInfo2?id=ar-1&f=json").await.body;
@@ -867,11 +867,39 @@ async fn info_for_outside_ids_carries_the_catalog_picture_in_both_formats() {
     let _ = Album::default();
 }
 
+/// Navidrome as the radio-off relay meets it: its own envelope in the asked format on one
+/// slash, its web app on a doubled one.
+fn navidrome_similar(request: &wiremock::Request) -> ResponseTemplate {
+    let path = request.url.path();
+    if path.starts_with("//") {
+        return ResponseTemplate::new(200).set_body_raw("<!DOCTYPE html>", "text/html");
+    }
+    let key = if path.to_ascii_lowercase().contains("getsimilarsongs2") {
+        "similarSongs2"
+    } else {
+        "similarSongs"
+    };
+    let json = request
+        .url
+        .query_pairs()
+        .any(|(name, value)| name == "f" && value == "json");
+    if json {
+        json_reply(ok_json(&format!(r#""{key}":{{"song":[{{"id":"nd-1"}}]}}"#)))
+    } else {
+        ResponseTemplate::new(200).set_body_raw(
+            format!(
+                "<subsonic-response xmlns=\"http://subsonic.org/restapi\" status=\"ok\" version=\"1.16.1\"><{key}><song id=\"nd-1\"></song></{key}></subsonic-response>"
+            ),
+            "application/xml",
+        )
+    }
+}
+
 #[tokio::test]
-async fn similar_songs_need_an_id_and_relay_their_own_path_with_radio_off() {
+async fn similar_songs_need_an_id_and_relay_their_own_endpoint_with_radio_off() {
     let server = MockServer::builder().start().await;
     Mock::given(any())
-        .respond_with(json_reply(ok_json(r#""similarSongs2":{}"#)))
+        .respond_with(navidrome_similar)
         .mount(&server)
         .await;
     // Radio is on by default, and since 2026.10.05 it answers without a Last.fm key (ListenBrainz
@@ -894,11 +922,55 @@ async fn similar_songs_need_an_id_and_relay_their_own_path_with_radio_off() {
         "Missing id parameter"
     );
 
-    get(&app, "/rest/GetSimilarSongs2.view?id=x&f=json").await;
-    let asked = server.received_requests().await.unwrap();
-    assert_eq!(asked.len(), 1);
-    // The path's own leading slash after the server's: `{Url}//rest/...`, as the client spelled it.
-    assert_eq!(asked[0].url.path(), "//rest/GetSimilarSongs2.view");
+    // v1 in JSON: Navidrome's own similarSongs, not its web app.
+    let v1_json = get(&app, "/rest/getSimilarSongs?id=x&f=json").await;
+    assert_eq!(v1_json.status, StatusCode::OK);
+    assert!(
+        v1_json
+            .header("content-type")
+            .unwrap_or("")
+            .starts_with("application/json"),
+        "{:?}",
+        v1_json.header("content-type")
+    );
+    assert_eq!(
+        v1_json.json()["subsonic-response"]["similarSongs"]["song"][0]["id"],
+        "nd-1"
+    );
+    // v1 in XML.
+    let v1_xml = get(&app, "/rest/getSimilarSongs.view?id=x").await.body;
+    assert!(v1_xml.contains("<similarSongs>"), "{v1_xml}");
+    assert!(!v1_xml.contains("<!DOCTYPE"), "{v1_xml}");
+    // v2, spelled as a client may spell it.
+    let v2 = get(&app, "/rest/GetSimilarSongs2.view?id=x&f=json").await.json();
+    assert_eq!(v2["subsonic-response"]["similarSongs2"]["song"][0]["id"], "nd-1");
+
+    let asked: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .collect();
+    // One slash after the server's address, the endpoint as the client spelled it.
+    assert_eq!(
+        asked,
+        [
+            "/rest/getSimilarSongs",
+            "/rest/getSimilarSongs.view",
+            "/rest/GetSimilarSongs2.view"
+        ]
+    );
+
+    // An outside song: Navidrome never saw it, so Octo answers the empty radio itself.
+    let outside = get(&app, "/rest/getSimilarSongs2?id=ext-deezer-song-1&f=json")
+        .await
+        .json();
+    assert_eq!(outside["subsonic-response"]["status"], "ok");
+    let outside_xml = get(&app, "/rest/getSimilarSongs?id=ext-deezer-song-1").await.body;
+    assert!(outside_xml.contains("<similarSongs"), "{outside_xml}");
+    assert!(!outside_xml.contains("similarSongs2"), "{outside_xml}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -1106,4 +1178,124 @@ async fn get_artist_info2_a_biography_last_fm_gives_for_another_name_is_left_out
     let info = &body["subsonic-response"]["artistInfo2"];
     assert_eq!(info["biography"], "", "{body}");
     assert_eq!(info["similarArtist"].as_array().map(Vec::len), Some(2));
+}
+
+#[tokio::test]
+async fn get_artist_info_v1_answers_artist_info_for_an_outside_artist_in_both_formats() {
+    let fixture = length_fixture().await;
+    justice_upstream(&fixture, "Justice");
+    let id = outside_artist(&fixture, "Justice");
+
+    let body = get(
+        &fixture.app,
+        &format!("/rest/getArtistInfo?id={id}&u=alice&t=token&s=salt&f=json"),
+    )
+    .await
+    .json();
+    let response = &body["subsonic-response"];
+    assert!(response.get("artistInfo2").is_none(), "{body}");
+    let info = &response["artistInfo"];
+    assert_eq!(info["biography"], "French electronic duo.", "{body}");
+    let names: Vec<&str> = info["similarArtist"]
+        .as_array()
+        .expect("related artists")
+        .iter()
+        .map(|a| a["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Daft Punk", "Kavinsky"]);
+
+    let xml = get(
+        &fixture.app,
+        &format!("/rest/getArtistInfo.view?id={id}&u=alice&t=token&s=salt"),
+    )
+    .await
+    .body;
+    assert!(xml.contains("<artistInfo>"), "{xml}");
+    assert!(!xml.contains("artistInfo2"), "{xml}");
+    assert!(
+        xml.contains("<biography>French electronic duo.</biography>"),
+        "{xml}"
+    );
+    assert_eq!(xml.matches("<similarArtist ").count(), 2, "{xml}");
+}
+
+/// Navidrome's artist info, each version under its own element, in the asked format.
+fn navidrome_artist_info(request: &wiremock::Request) -> ResponseTemplate {
+    let key = if request.url.path().ends_with("getArtistInfo2") {
+        "artistInfo2"
+    } else {
+        "artistInfo"
+    };
+    let json = request
+        .url
+        .query_pairs()
+        .any(|(name, value)| name == "f" && value == "json");
+    if json {
+        json_reply(ok_json(&format!(r#""{key}":{{"biography":"From Navidrome"}}"#)))
+    } else {
+        ResponseTemplate::new(200).set_body_raw(
+            format!(
+                "<subsonic-response xmlns=\"http://subsonic.org/restapi\" status=\"ok\" version=\"1.16.1\"><{key}><biography>From Navidrome</biography></{key}></subsonic-response>"
+            ),
+            "application/xml",
+        )
+    }
+}
+
+#[tokio::test]
+async fn get_artist_info_asks_navidrome_for_the_version_the_client_called() {
+    let server = MockServer::builder().start().await;
+    Mock::given(any())
+        .respond_with(navidrome_artist_info)
+        .mount(&server)
+        .await;
+    let app = app(AppState::for_tests(AppSettings {
+        subsonic: SubsonicSettings {
+            url: Some(server.uri()),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+
+    let v1_json = get(&app, "/rest/getArtistInfo?id=ar-1&f=json").await.json();
+    assert_eq!(
+        v1_json["subsonic-response"]["artistInfo"]["biography"],
+        "From Navidrome"
+    );
+    assert!(v1_json["subsonic-response"].get("artistInfo2").is_none());
+    let v1_xml = get(&app, "/rest/getArtistInfo.view?id=ar-1").await.body;
+    assert!(
+        v1_xml.contains("<artistInfo><biography>From Navidrome"),
+        "{v1_xml}"
+    );
+    let v2_json = get(&app, "/rest/getArtistInfo2?id=ar-1&f=json").await.json();
+    assert_eq!(
+        v2_json["subsonic-response"]["artistInfo2"]["biography"],
+        "From Navidrome"
+    );
+
+    let asked: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            "/rest/getArtistInfo",
+            "/rest/getArtistInfo",
+            "/rest/getArtistInfo2"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn get_artist_info_v1_with_navidrome_out_of_reach_is_the_empty_artist_info() {
+    // No Navidrome address at all: the relay fails at once.
+    let app = app(AppState::for_tests(AppSettings::default()));
+    let xml = get(&app, "/rest/getArtistInfo.view?id=ar-1").await.body;
+    assert!(xml.contains("artistInfo"), "{xml}");
+    assert!(!xml.contains("artistInfo2"), "{xml}");
 }

@@ -622,7 +622,7 @@ impl KeepReadySources for AppKeepReadySources {
                 songs,
             });
         }
-        for chart in self.charts.lists_on() {
+        for chart in self.charts.lists_for(user) {
             let Some(list) = self.charts.made_playlist(user, &chart) else {
                 continue;
             };

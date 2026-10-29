@@ -22,6 +22,7 @@ use super::action_helpers::{
     RequestAborted, SubsonicCall, bootstrap_radio_profile, is_successful_subsonic_response, pairs,
     queue_refresh_if_stale, stream_stations,
 };
+use super::caller_checks::listener_name_of;
 use super::playlists::{merge_json, merge_xml};
 use crate::app::AppState;
 use crate::services::last_fm::LastFmRadioStreamSession;
@@ -60,7 +61,7 @@ async fn stations_inner(state: &AppState, req: Request, aborted: &RequestAborted
         }
     };
 
-    let username = call.param_or("u", "").to_string();
+    let username = listener_name_of(state, &call.parameters, &call.proxy, &call.parts.headers).await;
     bootstrap_radio_profile(state, &call.proxy, &username, &call.parameters).await;
     let stations = stream_stations(state, &username);
     info!(

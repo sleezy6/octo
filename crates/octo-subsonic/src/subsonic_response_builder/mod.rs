@@ -46,8 +46,8 @@ pub use lyrics::{CueLineOut, CueWord, LYRICS_EXTENSION, LYRICS_EXTENSION_VERSION
 pub use places::{PLACES_EXTENSION, PLACES_EXTENSION_VERSION};
 pub use reply::{ReplyKind, SubsonicReply};
 pub use top_songs::{
-    ChartChoiceRow, POPULAR_COMMENT, RankedRow, TopSongRow, TopSongsHeader, chart_playlist_comment,
-    json_as_xml, library_song_xml,
+    ChartChoiceRow, ChartsHeader, POPULAR_COMMENT, RankedRow, TopSongRow, TopSongsHeader,
+    chart_playlist_comment, json_as_xml, library_song_xml,
 };
 
 /// Response fields, in insertion order.
@@ -64,9 +64,11 @@ pub const ACQUISITIONS_EXTENSION: &str = "octoAcquisitions";
 pub const ACQUISITIONS_EXTENSION_VERSION: i32 = 3;
 
 /// getArtistTopSongs and getTopChart. Version 2: getTopChart takes `chart` (Best New Songs,
-/// Trending Songs, a genre) and getCharts lists the charts.
+/// Trending Songs, a genre) and getCharts lists the charts. Version 3: getCharts and getTopChart
+/// take `country`, getCharts says the caller's `setting`, `pinned`, the `serverCountry`, Apple's
+/// `countries` and `maxPinned`, and setChartCountry and pinChartCountry save the caller's own.
 pub const TOP_SONGS_EXTENSION: &str = "octoTopSongs";
-pub const TOP_SONGS_EXTENSION_VERSION: i32 = 2;
+pub const TOP_SONGS_EXTENSION_VERSION: i32 = 3;
 
 /// The extensions Octo answers itself, with their versions. songLyrics is here because Octo
 /// answers getLyricsBySongId for every song, and for the ones it answers itself it honors
@@ -81,7 +83,7 @@ pub const OWN_EXTENSIONS: &[(&str, &[i32])] = &[
     ),
     ("songLyrics", &[1, 2]),
     // Listed after songLyrics.
-    (TOP_SONGS_EXTENSION, &[1, TOP_SONGS_EXTENSION_VERSION]),
+    (TOP_SONGS_EXTENSION, &[1, 2, TOP_SONGS_EXTENSION_VERSION]),
     (IMPORTS_EXTENSION, &[1, IMPORTS_EXTENSION_VERSION]),
     (RADIO_SOURCES_EXTENSION, &[RADIO_SOURCES_EXTENSION_VERSION]),
     (LISTS_EXTENSION, &[1, LISTS_EXTENSION_VERSION]),

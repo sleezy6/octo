@@ -28,7 +28,9 @@ use super::test_app::*;
 use crate::app::{AppState, TestServices};
 use crate::http::pipeline::App;
 use crate::services::cover_art::{AlbumCoverQuery, FoundCover, IAlbumCoverFinder};
+use crate::services::library::library_action_test_support::slash_root;
 use crate::services::library::library_tag_edits::{self as tag_edits, TagValues};
+use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::library::{LibraryActionState, QuarantineManifest};
 
 #[derive(Clone)]
@@ -131,7 +133,7 @@ impl Factory {
         let root = dir.path().join("music");
         std::fs::create_dir_all(&root).expect("the music folder");
         let navidrome = Arc::new(FakeNavidrome {
-            library_path: root.to_string_lossy().into_owned(),
+            library_path: slash_root(&root),
             admin: AtomicBool::new(true),
             songs: Mutex::new(HashMap::new()),
         });
@@ -175,7 +177,7 @@ impl Factory {
             settings,
             TestServices {
                 config_dir: Some(dir.path().join("config")),
-                raw_settings: vec![("Library:DownloadPath".into(), root.to_string_lossy().into_owned())],
+                raw_settings: vec![("Library:DownloadPath".into(), slash_root(&root))],
                 album_cover_finder: Some(finder.clone() as Arc<dyn IAlbumCoverFinder>),
                 ..Default::default()
             },
@@ -437,7 +439,7 @@ async fn put_back_links_the_outside_song_to_the_file_again() {
                 source_peer: Some("peer1".into()),
                 ..Song::default()
             },
-            &path.to_string_lossy(),
+            &slash_root(&path),
         )
         .await
         .expect("registered");
@@ -467,7 +469,7 @@ async fn put_back_links_the_outside_song_to_the_file_again() {
             .get_local_path_for_external_song("soulseek", "4H0vAhIr2YJ67Riz3Uv6wG")
             .await
             .as_deref(),
-        Some(path.to_string_lossy().as_ref())
+        Some(get_full_path(&slash_root(&path)).as_str())
     );
     let mappings = library.get_mappings().await;
     assert_eq!(mappings.len(), 1);
@@ -547,7 +549,7 @@ async fn restore_never_puts_a_file_outside_the_music_folder_whatever_its_manifes
     let trashed = f.removals()[0].quarantine_path.clone().expect("in the trash");
     let elsewhere = f._dir.path().join("elsewhere").join("Song.flac");
     let note = QuarantineManifest {
-        original_path: elsewhere.to_string_lossy().into_owned(),
+        original_path: slash_root(&elsewhere),
         navidrome_id: "s1".into(),
         action: "Delete".into(),
         username: "alice".into(),

@@ -9,6 +9,7 @@ use octo_core::settings::SettingsStore;
 use reqwest::{Method, StatusCode};
 use serde_json::{Map, Value, json};
 
+use crate::services::charts::chart_country_store::user_key;
 use crate::services::subsonic::NavidromeIdentityService;
 
 /// Why an admin call did not happen.
@@ -195,6 +196,25 @@ impl NavidromeAdmin {
     /// Every Navidrome user.
     pub async fn list_users(&self) -> Result<Vec<NdUser>, AdminError> {
         Ok(Self::users_from(self.call(Method::GET, "/api/user", None).await?))
+    }
+
+    /// Every Navidrome user, but only when the answer can be trusted as the whole list: a 2xx
+    /// answer that is a non-empty JSON array holding Octo's own admin. Anything else, or an
+    /// error, is none.
+    pub async fn verified_users(&self) -> Option<Vec<NdUser>> {
+        let value = self
+            .call(Method::GET, "/api/user?_start=0&_end=100000", None)
+            .await
+            .ok()?;
+        if !value.is_array() {
+            return None;
+        }
+        let users = Self::users_from(value);
+        let admin = user_key(&self.admin_user_name()?);
+        users
+            .iter()
+            .any(|user| user_key(user.user_name()) == admin)
+            .then_some(users)
     }
 
     /// One user, whole.
@@ -419,7 +439,8 @@ pub(crate) mod tests {
 
     /// A Navidrome that signs `admin` in with `jwt-1`, then `jwt-2`, and so on.
     pub(crate) async fn navidrome() -> MockServer {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
+        crate::services::library::library_action_playlist_provisioner::forget_claims(&server.uri());
         Mock::given(method("POST"))
             .and(path("/auth/login"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -711,5 +732,60 @@ pub(crate) mod tests {
             .await;
         let (admin, _, _) = admin_for(&server.uri());
         admin.delete_user("u-alex").await.expect("deleted");
+    }
+
+    async fn users_answer(template: ResponseTemplate) -> (MockServer, NavidromeAdmin) {
+        let server = navidrome().await;
+        Mock::given(method("GET"))
+            .and(path("/api/user"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        let (admin, _, _) = admin_for(&server.uri());
+        (server, admin)
+    }
+
+    #[tokio::test]
+    async fn verified_users_are_the_list_that_holds_the_admin() {
+        let (server, admin) = users_answer(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": "u1", "userName": "Admin", "isAdmin": true},
+            {"id": "u2", "userName": "alex", "isAdmin": false}
+        ])))
+        .await;
+
+        let users = admin.verified_users().await.expect("a trusted list");
+
+        assert_eq!(users.len(), 2);
+        let asked = server.received_requests().await.expect("recorded");
+        let list = asked.iter().find(|r| r.url.path() == "/api/user").expect("asked");
+        assert_eq!(list.url.query(), Some("_start=0&_end=100000"));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_user_list_gives_none() {
+        let (_server, admin) = users_answer(ResponseTemplate::new(500)).await;
+        assert!(admin.verified_users().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_ok_answer_that_is_no_list_gives_none() {
+        for template in [
+            ResponseTemplate::new(200).set_body_json(json!({"error": "nope"})),
+            ResponseTemplate::new(200).set_body_json(json!([])),
+            ResponseTemplate::new(200).set_body_string("<html>login</html>"),
+            ResponseTemplate::new(200),
+        ] {
+            let (_server, admin) = users_answer(template).await;
+            assert!(admin.verified_users().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_list_without_the_admin_gives_none() {
+        let (_server, admin) = users_answer(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": "u2", "userName": "alex", "isAdmin": false}
+        ])))
+        .await;
+        assert!(admin.verified_users().await.is_none());
     }
 }

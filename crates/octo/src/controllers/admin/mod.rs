@@ -113,6 +113,10 @@ pub fn admin_controller_routes() -> RouteSet {
         // Status and process control.
         .route("/api/admin/status", get(system::get_status))
         .route("/api/admin/charts", get(charts::get_charts))
+        .route(
+            "/api/admin/charts/listeners",
+            get(charts::get_listeners).put(charts::put_listeners),
+        )
         .route("/api/admin/lidarr/options", get(system::get_lidarr_options))
         .route("/api/admin/lidarr/test", post(system::test_lidarr_connection))
         .route("/api/admin/deezer/account", get(system::get_deezer_account))

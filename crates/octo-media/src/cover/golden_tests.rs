@@ -354,25 +354,61 @@ fn inter_only(text: &str) -> bool {
         .all(|c| c.is_whitespace() || cover_fonts::has(&inter, c))
 }
 
-/// Whether a reference layout can be compared here: always when only Inter sets it, else only
-/// with the same system fonts as the reference's.
+/// Whether the reference renderer cut any of the layout's words. This renderer never cuts a
+/// name, so such a layout is checked on its own, not against the reference.
+fn reference_cut(layout: &Value) -> bool {
+    layout["words"]
+        .as_array()
+        .expect("words")
+        .iter()
+        .any(|w| w["cut"].as_bool() == Some(true))
+}
+
+/// Whether a reference layout can be compared here: never when the reference cut a word, else
+/// always when only Inter sets it, else only with the same system fonts as the reference's.
 fn comparable(layout: &Value) -> bool {
-    same_fonts_as_reference()
-        || layout["words"]
-            .as_array()
-            .expect("words")
-            .iter()
-            .all(|w| inter_only(w["text"].as_str().unwrap_or_default()))
+    !reference_cut(layout)
+        && (same_fonts_as_reference()
+            || layout["words"]
+                .as_array()
+                .expect("words")
+                .iter()
+                .all(|w| inter_only(w["text"].as_str().unwrap_or_default())))
 }
 
 fn report_skipped(skipped: usize) {
     if skipped > 0 {
         println!(
-            "skipped {skipped} cases set in system fonts other than the reference's {}; installed: {:?}",
+            "skipped {skipped} cases the reference cut or set in system fonts other than the reference's {}; installed: {:?}",
             REFERENCE["fallbacks"],
             cover_fonts::fallbacks()
         );
     }
+}
+
+/// A name the reference renderer cut is set whole here, or the cover is its artwork only.
+#[test]
+fn names_the_reference_cut_are_set_whole_or_left_to_the_artwork() {
+    let mut checked = 0;
+    for layout in layouts().iter().filter(|l| reference_cut(l)) {
+        let art = reference_art(layout);
+        let case = format!("{} at {}", text(layout, "id").unwrap_or_default(), art.side);
+        for words in &art.words {
+            assert!(!words.measured.cut, "{case}: {:?} is cut", words.role);
+            let (lines, cut) = CoverTypesetter.lines(&words.text, &words.type_, words.width);
+            assert!(!cut, "{case}: {:?} is cut", words.role);
+            let joined: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+            assert_eq!(joined.join(" "), words.text, "{case}: {:?}", words.role);
+        }
+        if let Some(title) = art.words.iter().find(|w| w.role == WordsRole::Title) {
+            assert!(
+                title.measured.lines <= book().layout.title.max_lines,
+                "{case}: lines"
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "the reference has cut names to check");
 }
 
 /// Every layout the reference renderer made (the goldens, long, cut, right-to-left and foreign

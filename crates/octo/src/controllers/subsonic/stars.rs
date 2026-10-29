@@ -24,7 +24,7 @@ use tracing::{debug, info};
 
 use super::caller_checks::{
     MAX_REQUEST_BODY, SubsonicCall, favorite_credential, file, is_successful_subsonic_response, is_true,
-    refuse_unless_signed_in, requester_for, signed_in_user,
+    listener_name, refuse_unless_signed_in, requester_for, signed_in_user,
 };
 use crate::app::AppState;
 use crate::http::error::{AppError, AppResult};
@@ -1068,9 +1068,7 @@ pub async fn set_rating(State(state): State<AppState>, req: Request) -> AppResul
     // An external id is not a Navidrome song, and relaying one errors "data not found".
     if !item_id.is_empty() && state.local_library.parse_song_id(&item_id).0 {
         // Nothing to relay, so a ping is the auth check before the listener's radio changes.
-        if let Some(external_stars) = try_parse_int(&rating_text)
-            && let Some(external_rater) = call.param_opt("u").filter(|u| !u.is_empty())
-        {
+        if let Some(external_stars) = try_parse_int(&rating_text) {
             let mut auth = call.parameters.clone();
             auth.shift_remove("id");
             auth.shift_remove("rating");
@@ -1080,11 +1078,15 @@ pub async fn set_rating(State(state): State<AppState>, req: Request) -> AppResul
                 .await
                 .is_some_and(|check| is_successful_subsonic_response(&check.body, &format))
             {
-                record_radio_ban(&state, &call, external_rater, &item_id, external_stars).await;
-                if external_stars == TOP_RATING {
-                    state
-                        .listening
-                        .heart(external_rater, std::slice::from_ref(&item_id), Utc::now());
+                let external_rater = listener_name(&state, &call).await;
+                if !external_rater.is_empty() {
+                    let external_rater = external_rater.as_str();
+                    record_radio_ban(&state, &call, external_rater, &item_id, external_stars).await;
+                    if external_stars == TOP_RATING {
+                        state
+                            .listening
+                            .heart(external_rater, std::slice::from_ref(&item_id), Utc::now());
+                    }
                 }
             }
         }

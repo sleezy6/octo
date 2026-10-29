@@ -54,6 +54,8 @@ fn library_song(id: &str) -> Option<Value> {
         ),
         "wide" => song("wide", "Wide", "Wide Artist", "Wides", "al-wides", "Trip-Hop"),
         "hello" => song("hello", "Hello", "Adele", "25", "al-25", "Pop"),
+        "quiet" => song("quiet", "Quiet", "Nobody Known", "Quiet", "al-quiet", "Ambient"),
+        "hush" => song("hush", "Hush", "Nobody Known", "Hush", "al-hush", "Ambient"),
         "blend" => song(
             "blend",
             "Blend",
@@ -195,6 +197,8 @@ fn last_fm(query: &HashMap<String, String>) -> Value {
         "artist.getsimilar" => match artist {
             "Massive Attack" => json!({"similarartists": {"artist": [{"name": "Portishead"}]}}),
             "Drake" => json!({"similarartists": {"artist": [{"name": "Future"}]}}),
+            // Nobody on Last.fm sounds like them, so the radio finds nothing at all.
+            "Nobody Known" => json!({"similarartists": {"artist": []}}),
             _ => json!({"similarartists": {"artist": [{"name": "The Year"}]}}),
         },
         "artist.gettoptracks" => match artist {
@@ -230,6 +234,10 @@ impl Respond for Upstream {
             .push(format!("{}?{}", path, request.url.query().unwrap_or("")));
         let query: HashMap<String, String> = request.url.query_pairs().into_owned().collect();
         let json = |body: String| ResponseTemplate::new(200).set_body_raw(body, "application/json");
+        // Navidrome answers a doubled slash with its web app, as a 200.
+        if path.starts_with("//") {
+            return ResponseTemplate::new(200).set_body_raw("<!DOCTYPE html>", "text/html");
+        }
         if path == "/2.0/" {
             return json(last_fm(&query).to_string());
         }
@@ -317,6 +325,9 @@ impl Respond for Upstream {
                 Some(found) => json!({"searchResult3": {"song": [found]}}),
                 None => json!({"searchResult3": {}}),
             })
+        } else if path.ends_with("/rest/getSimilarSongs2") && id == "quiet" {
+            // Navidrome's agents know nothing of it either: its "not found" error.
+            None
         } else if path.ends_with("/rest/getSimilarSongs2") {
             // Navidrome's own agents, for when Octo's sources have nothing.
             Some(json!({"similarSongs2": {"song": [
@@ -944,6 +955,49 @@ async fn every_app_may_ask_for_100_songs() {
 async fn nothing_from_octos_sources_lets_navidrome_answer() {
     let f = fixture(|s| s.last_fm.api_key = String::new()).await;
     assert_eq!(radio_ids(&f, "teardrop").await, ["nd-1"]);
+    let calls = f.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("/rest/getSimilarSongs2?")),
+        "{calls:?}"
+    );
+}
+
+// Octo's radio is on but finds nothing, and Navidrome's own agents failing too is still the
+// empty radio, not an error.
+#[tokio::test]
+async fn navidromes_own_error_on_the_fallback_is_the_empty_radio() {
+    let f = fixture(|_| {}).await;
+    let body = get_string(
+        &f.app,
+        "/rest/getSimilarSongs2?id=quiet&u=alice&t=token&s=salt&f=json&count=20",
+    )
+    .await;
+    let doc: Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(doc["subsonic-response"]["status"], "ok", "{body}");
+    assert!(
+        f.calls()
+            .iter()
+            .any(|call| call.starts_with("/rest/getSimilarSongs2?id=quiet")),
+        "{:?}",
+        f.calls()
+    );
+}
+
+// Octo's radio is on but finds nothing, and Navidrome's own agents answer: that answer is the
+// radio.
+#[tokio::test]
+async fn navidromes_own_answer_on_the_fallback_reaches_the_client() {
+    let f = fixture(|_| {}).await;
+    assert_eq!(radio_ids(&f, "hush").await, ["nd-1"]);
+    assert!(
+        f.calls()
+            .iter()
+            .any(|call| call.starts_with("/rest/getSimilarSongs2?") && call.contains("id=hush")),
+        "{:?}",
+        f.calls()
+    );
 }
 
 // An outside artist (an artist row of a search) is a radio of the artists like them, as a

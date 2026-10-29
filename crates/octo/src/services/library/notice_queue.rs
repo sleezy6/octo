@@ -10,7 +10,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::common::{PathHelper, dotnet};
 use octo_core::fingerprint::verification::{
-    InconclusiveReason, VerificationResult, threshold_percent, whole_percent,
+    InconclusiveReason, VerificationResult, VerificationVerdict, threshold_percent, whole_percent,
 };
 use octo_core::json::datetime;
 use octo_core::models::domain::Song;
@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::duplicate_scan_worker::{DuplicateGroup, LibraryTrack};
+use super::navidrome_song_path_resolver::get_full_path;
 use crate::services::framework::DotnetDictionary;
 use crate::services::state_file;
 
@@ -219,6 +220,10 @@ pub struct NoticeEntry {
     /// closest without counting as a match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closest: Option<String>,
+    /// The words a replacement's note carried before Put back reworded it, kept so the note can
+    /// read as replaced again when the replacement is brought back. Left out of the file when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_reason: Option<String>,
 }
 
 impl Default for NoticeEntry {
@@ -252,6 +257,7 @@ impl Default for NoticeEntry {
             threshold: None,
             matched: None,
             closest: None,
+            replaced_reason: None,
         }
     }
 }
@@ -397,34 +403,79 @@ impl NoticeQueue {
         verdict: &VerificationResult,
         origin: NoticeOrigin,
     ) -> bool {
+        let reason = match verdict.reason {
+            InconclusiveReason::NoEntry => "AcoustID has never heard this recording".to_string(),
+            InconclusiveReason::BelowThreshold => "AcoustID was not sure what this is".to_string(),
+            InconclusiveReason::SourceDisagreed => {
+                format!("AcoustID thinks this is {}", verdict.describe())
+            }
+            InconclusiveReason::SoundsLikeAnother => {
+                format!("Sounds like {}, not what its tags say", verdict.describe())
+            }
+            InconclusiveReason::LengthOff => format!(
+                "It runs {}, but the recording it matched runs {}",
+                clock(verdict.duration_seconds),
+                clock(
+                    verdict
+                        .r#match
+                        .as_ref()
+                        .and_then(|m| m.duration_seconds)
+                        .unwrap_or(0)
+                )
+            ),
+            InconclusiveReason::DiffersFromYouTube => format!(
+                "AcoustID has never heard this recording, and it sounds nothing like its YouTube preview ({})",
+                verdict.evidence.as_deref().unwrap_or("not the same song")
+            ),
+            InconclusiveReason::LoneLink => {
+                let told = format!(
+                    "Only one person ever told AcoustID this is {}",
+                    verdict.describe()
+                );
+                match verdict.evidence.as_deref().filter(|e| !e.is_empty()) {
+                    Some(evidence) => format!("{told}, and {evidence}"),
+                    None => told,
+                }
+            }
+            _ => "Octo could not check this download".to_string(),
+        };
+        self.insert_review(username, local_path, song, verdict, origin, reason)
+    }
+
+    /// Ask `keeper` about a library file a check heard as another song than its tags say, in that
+    /// check's own words. Stored as [`InconclusiveReason::SoundsLikeAnother`], a cause every
+    /// earlier release reads, so going back a release never sets the queue aside.
+    pub fn add_library_question(&self, keeper: &str, local_path: &str, song: &Song, reason: &str) -> bool {
+        let question = VerificationResult {
+            verdict: VerificationVerdict::Inconclusive,
+            reason: InconclusiveReason::SoundsLikeAnother,
+            ..Default::default()
+        };
+        self.insert_review(
+            keeper,
+            local_path,
+            song,
+            &question,
+            NoticeOrigin::LibrarySweep,
+            reason.to_string(),
+        )
+    }
+
+    fn insert_review(
+        &self,
+        username: &str,
+        local_path: &str,
+        song: &Song,
+        verdict: &VerificationResult,
+        origin: NoticeOrigin,
+        reason: String,
+    ) -> bool {
         let key = Self::review_key(username, local_path);
         {
             let mut entries = self.entries.lock();
             if entries.contains_key(&key) {
                 return false;
             }
-            let reason = match verdict.reason {
-                InconclusiveReason::NoEntry => "AcoustID has never heard this recording".to_string(),
-                InconclusiveReason::BelowThreshold => "AcoustID was not sure what this is".to_string(),
-                InconclusiveReason::SourceDisagreed => {
-                    format!("AcoustID thinks this is {}", verdict.describe())
-                }
-                InconclusiveReason::SoundsLikeAnother => {
-                    format!("Sounds like {}, not what its tags say", verdict.describe())
-                }
-                InconclusiveReason::LengthOff => format!(
-                    "It runs {}, but the recording it matched runs {}",
-                    clock(verdict.duration_seconds),
-                    clock(
-                        verdict
-                            .r#match
-                            .as_ref()
-                            .and_then(|m| m.duration_seconds)
-                            .unwrap_or(0)
-                    )
-                ),
-                _ => "Octo could not check this download".to_string(),
-            };
             let sweep = origin == NoticeOrigin::LibrarySweep;
             let score = verdict.shown_score().map(whole_percent);
             entries.set(
@@ -439,7 +490,7 @@ impl NoticeQueue {
                     album: Some(song.album.clone()),
                     state: NoticeState::Waiting,
                     reason,
-                    cause: verdict.reason,
+                    cause: Self::stored_cause(verdict.reason),
                     origin,
                     // Dropped for a library question, so a Keep on one can never be submitted.
                     fingerprint: if sweep { None } else { verdict.fingerprint.clone() },
@@ -467,6 +518,19 @@ impl NoticeQueue {
         true
     }
 
+    /// The cause written with an entry. A file its YouTube preview says is another song is stored
+    /// as one that sounds like another, which every earlier release reads; its reason carries the
+    /// preview's words. A link only one person's submissions make is stored as a match AcoustID
+    /// was not sure of, which every earlier release reads too, and a Keep on it sends AcoustID a
+    /// second link.
+    fn stored_cause(reason: InconclusiveReason) -> InconclusiveReason {
+        match reason {
+            InconclusiveReason::DiffersFromYouTube => InconclusiveReason::SoundsLikeAnother,
+            InconclusiveReason::LoneLink => InconclusiveReason::BelowThreshold,
+            other => other,
+        }
+    }
+
     /// What a replaced file's note says: "Octo replaced this: AcoustID heard Artist - Title, 97%
     /// sure (needs 85%)".
     pub fn replaced_reason(verdict: &VerificationResult, needs: i32) -> String {
@@ -492,6 +556,30 @@ impl NoticeQueue {
         navidrome_id: &str,
         needs: i32,
     ) -> bool {
+        self.add_replaced_because(
+            username,
+            local_path,
+            song,
+            verdict,
+            navidrome_id,
+            Self::replaced_reason(verdict, needs),
+            Some(needs),
+        )
+    }
+
+    /// [`Self::add_replaced`] with the note's own words. `threshold` is the score a heard
+    /// recording needed, None where no score decided it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_replaced_because(
+        &self,
+        username: &str,
+        local_path: &str,
+        song: &Song,
+        verdict: &VerificationResult,
+        navidrome_id: &str,
+        reason: String,
+        threshold: Option<i32>,
+    ) -> bool {
         let key = Self::review_key(username, local_path);
         {
             let mut entries = self.entries.lock();
@@ -511,16 +599,16 @@ impl NoticeQueue {
                     album: Some(song.album.clone()),
                     navidrome_id: Some(navidrome_id.to_string()),
                     state: NoticeState::Acted,
-                    reason: Self::replaced_reason(verdict, needs),
-                    cause: verdict.reason,
+                    reason,
+                    cause: Self::stored_cause(verdict.reason),
                     origin: NoticeOrigin::LibrarySweep,
                     duration_seconds: verdict.duration_seconds,
                     file_format: Some(dotnet::to_lower_invariant(&extension(local_path))),
                     next_lookup_utc: now,
                     created_utc: now,
                     resolved_utc: Some(now),
-                    acoust_id_score: Some(whole_percent(verdict.score)),
-                    threshold: Some(needs),
+                    acoust_id_score: threshold.map(|_| whole_percent(verdict.score)),
+                    threshold,
                     matched: verdict.matched_text(),
                     ..Default::default()
                 },
@@ -539,6 +627,58 @@ impl NoticeQueue {
             .filter(|entry| entry.kind == NoticeKind::Review)
             .map(|entry| entry.local_path.clone())
             .collect()
+    }
+
+    /// Files a second opinion has nothing to add to: a Review question someone answered, or an
+    /// open one about something other than a sound AcoustID could not place. Full paths.
+    pub fn settled_paths(&self) -> HashSet<String> {
+        self.entries
+            .lock()
+            .values()
+            .filter(|entry| entry.kind == NoticeKind::Review)
+            .filter(|entry| !entry.is_open() || !Self::awaits_second_opinion(entry.cause))
+            .map(|entry| get_full_path(&entry.local_path))
+            .collect()
+    }
+
+    /// AcoustID could not place the sound, so another check may still say what it is.
+    fn awaits_second_opinion(cause: InconclusiveReason) -> bool {
+        matches!(
+            cause,
+            InconclusiveReason::NoEntry | InconclusiveReason::BelowThreshold
+        )
+    }
+
+    /// Adds `finding` to every open question about the file at `full_path` that AcoustID could
+    /// not place, and forgets its fingerprint, so a Keep never tells AcoustID that a sound another
+    /// check heard as a different song is this one. True when a question took it.
+    pub fn add_finding(&self, full_path: &str, finding: &str) -> bool {
+        let mut added = false;
+        {
+            let mut entries = self.entries.lock();
+            let keys: Vec<String> = entries.keys().cloned().collect();
+            for key in keys {
+                let Some(entry) = entries.get(&key) else {
+                    continue;
+                };
+                if entry.kind != NoticeKind::Review
+                    || !entry.is_open()
+                    || !Self::awaits_second_opinion(entry.cause)
+                    || get_full_path(&entry.local_path) != full_path
+                {
+                    continue;
+                }
+                let mut entry = entry.clone();
+                entry.reason = format!("{}, and {finding}", entry.reason);
+                entry.fingerprint = None;
+                entries.set(key, entry);
+                added = true;
+            }
+        }
+        if added {
+            self.mark_dirty();
+        }
+        added
     }
 
     pub fn open_count(&self, origin: NoticeOrigin) -> usize {
@@ -714,6 +854,66 @@ impl NoticeQueue {
             }
         }
         self.mark_dirty();
+    }
+
+    /// How every note of a replacement the library sweep made begins.
+    pub const REPLACED_PREFIX: &'static str = "Octo replaced this";
+
+    /// The words a library sweep note carries once its replacement was put back.
+    pub const PUT_BACK_REASON: &'static str = "Put back: the original was kept";
+
+    /// The replacement the library sweep made of song `navidrome_id` was put back: its note
+    /// says so. The note stays answered, so the sweep never asks about that file again. True
+    /// when a note took the words.
+    pub fn mark_put_back(&self, navidrome_id: &str) -> bool {
+        let mut changed = false;
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.values_mut() {
+                if entry.kind == NoticeKind::Review
+                    && entry.origin == NoticeOrigin::LibrarySweep
+                    && entry.state == NoticeState::Acted
+                    && entry.navidrome_id.as_deref() == Some(navidrome_id)
+                    && entry.reason.starts_with(Self::REPLACED_PREFIX)
+                {
+                    entry.replaced_reason = Some(std::mem::replace(
+                        &mut entry.reason,
+                        Self::PUT_BACK_REASON.to_string(),
+                    ));
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    /// The replacement the library sweep made of song `navidrome_id` was brought back after a
+    /// Put back: its note reads as replaced again, in the words the sweep first gave it, and
+    /// stays answered. True when a note took the words.
+    pub fn mark_replaced_again(&self, navidrome_id: &str) -> bool {
+        let mut changed = false;
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.values_mut() {
+                if entry.kind == NoticeKind::Review
+                    && entry.origin == NoticeOrigin::LibrarySweep
+                    && entry.state == NoticeState::Acted
+                    && entry.navidrome_id.as_deref() == Some(navidrome_id)
+                    && entry.reason == Self::PUT_BACK_REASON
+                    && let Some(replaced) = entry.replaced_reason.clone()
+                {
+                    entry.reason = replaced;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.mark_dirty();
+        }
+        changed
     }
 
     pub fn duplicate_key(username: &str, group_key: &str, track_id: &str) -> String {

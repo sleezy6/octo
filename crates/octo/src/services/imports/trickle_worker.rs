@@ -1,5 +1,6 @@
 //! The trickle worker: fetches an import's missing songs a few an hour.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::BoxFuture;
 use octo_core::common::Clock;
 use octo_core::common::acquisition_tracker::user_safe;
-use octo_core::common::dotnet::eq_ignore_case;
+use octo_core::common::dotnet::{eq_ignore_case, to_lower_invariant};
 use octo_core::settings::{HeartDownloadSource, SettingsStore};
 use octo_core::soulseek::soulseek_link::SoulseekLinkState;
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
@@ -32,6 +33,26 @@ use crate::services::soulseek::{ExternalIdRegistry, ISoulseekLink, SoulseekMetad
 #[error("{0}")]
 pub struct TrickleHeld(pub String);
 
+/// A job whose song could not be checked yet (the music database did not answer, or the
+/// library could not be read): put back with these words, to be checked again on a later turn.
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+pub struct TrickleCheckLater {
+    pub detail: String,
+    /// Whether it gives its turn back, so the next song may start at once: when only songs like
+    /// it wait, not when every song would wait the same way.
+    pub turn_back: bool,
+}
+
+/// What a job says while its song is checked against the music database.
+const CHECKING: &str = "Checking against the music database";
+
+/// What a job says while the library cannot be read for its last look.
+const READING_LIBRARY: &str = "Waiting to read your library";
+
+/// What a job says while MusicBrainz, which has to check its song, is not answering.
+const WAITING_FOR_ANSWER: &str = "Waiting for MusicBrainz to answer";
+
 /// What the trickle is doing, in a word the dashboard and the apps know, and when it starts its
 /// next song.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +76,24 @@ pub mod trickle_states {
     pub const YIELDING: &str = "yielding";
     /// Soulseek is out and nothing else can fetch.
     pub const WAITING_FOR_SOULSEEK: &str = "waitingForSoulseek";
+    /// MusicBrainz is not answering and every waiting song has an ISRC it has to check.
+    pub const WAITING_FOR_MUSIC_DATABASE: &str = "waitingForMusicDatabase";
+
+    /// The trickle's state in the words a person reads, the dashboard and the apps alike.
+    /// Running reads "Fetching" while a song downloads.
+    pub fn label(state: &str, downloading: bool) -> &'static str {
+        match state {
+            IDLE => "Nothing to fetch",
+            RUNNING if downloading => "Fetching",
+            RUNNING => "Waiting for the next turn",
+            PAUSED => "Paused",
+            OFF => "Off",
+            YIELDING => "Waiting for other downloads",
+            WAITING_FOR_SOULSEEK => "Waiting for Soulseek",
+            WAITING_FOR_MUSIC_DATABASE => "Waiting for MusicBrainz",
+            _ => "Working on it",
+        }
+    }
 }
 
 /// A song the library already has: its id there, when Navidrome said.
@@ -68,6 +107,9 @@ pub type RowSeam = Arc<dyn Fn(&str) -> Option<AcquisitionSnapshot> + Send + Sync
 pub type BusySeam = Arc<dyn Fn() -> bool + Send + Sync>;
 pub type SoulseekOutSeam = Arc<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>;
 pub type FinishedListener = Arc<dyn Fn(&TrickleJob) + Send + Sync>;
+/// The places, in the jobs it is given, of the queued songs that wait for MusicBrainz to answer.
+pub type HeldSeam = Arc<dyn Fn(Vec<TrickleJob>) -> BoxFuture<'static, HashSet<usize>> + Send + Sync>;
+pub type HeldListener = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Seams, so the pace and the outcomes can be tested without downloading anything.
 #[derive(Clone)]
@@ -77,6 +119,8 @@ pub struct TrickleSeams {
     pub row: RowSeam,
     pub people_downloading: BusySeam,
     pub soulseek_out: SoulseekOutSeam,
+    /// The places, in the jobs it is given, of the queued songs that wait for MusicBrainz to answer.
+    pub held: HeldSeam,
     pub clock: Clock,
 }
 
@@ -91,6 +135,7 @@ impl Default for TrickleSeams {
             row: Arc::new(|_| None),
             people_downloading: Arc::new(|| false),
             soulseek_out: Arc::new(|| Box::pin(async { false })),
+            held: Arc::new(|_| Box::pin(async { HashSet::new() })),
             clock: Clock::system(),
         }
     }
@@ -115,11 +160,16 @@ pub struct TrickleWorker {
     current: Mutex<Option<(String, String)>>,
     waiting_for: Mutex<&'static str>,
     finished: Mutex<Vec<FinishedListener>>,
+    /// The queued songs held for MusicBrainz at the latest tick, by owner and key.
+    held: Mutex<HashSet<String>>,
+    held_listeners: Mutex<Vec<HeldListener>>,
 }
 
 /// The services the real trickle fetches with.
 pub struct TrickleServices {
     pub owned: Arc<LibraryOwnership>,
+    /// The import matcher, for a last look through a song's ISRC before it is fetched.
+    pub matcher: Option<Arc<super::ImportMatcher>>,
     pub ids: Arc<ExternalIdRegistry>,
     pub hearts: Arc<HeartAcquisitionCoordinator>,
     pub downloads: Arc<TrackAcquisitionQueue>,
@@ -143,6 +193,8 @@ impl TrickleWorker {
             current: Mutex::new(None),
             waiting_for: Mutex::new(trickle_states::IDLE),
             finished: Mutex::new(Vec::new()),
+            held: Mutex::new(HashSet::new()),
+            held_listeners: Mutex::new(Vec::new()),
         })
     }
 
@@ -154,6 +206,7 @@ impl TrickleWorker {
     ) -> Arc<Self> {
         let TrickleServices {
             owned,
+            matcher,
             ids,
             hearts,
             downloads,
@@ -161,14 +214,16 @@ impl TrickleWorker {
             soulseek,
         } = services;
         let start_queue = queue.clone();
+        let look_queue = queue.clone();
         let start_tracker = tracker.clone();
         let row_tracker = tracker.clone();
         let out_settings = settings.clone();
+        let held_matcher = matcher.clone();
         let seams = TrickleSeams {
             owned: Arc::new(move |job| {
-                let owned = owned.clone();
+                let (owned, matcher, queue) = (owned.clone(), matcher.clone(), look_queue.clone());
                 Box::pin(async move {
-                    Ok(owned
+                    let by_name = owned
                         .find(
                             Some(&job.artist),
                             Some(&job.title),
@@ -176,7 +231,15 @@ impl TrickleWorker {
                             job.album.as_deref(),
                         )
                         .await
-                        .map(|copy| OwnedSong(copy.navidrome_id)))
+                        .map(|copy| OwnedSong(copy.navidrome_id));
+                    if by_name.is_none()
+                        && matcher.as_ref().is_some_and(|matcher| {
+                            matcher.has_pending_isrcs(std::slice::from_ref(&job.as_track()))
+                        })
+                    {
+                        queue.say_while_running(&job.owner, &job.key, CHECKING);
+                    }
+                    last_look(by_name, matcher.as_deref(), &job).await
                 })
             }),
             start: Arc::new(move |job| {
@@ -251,6 +314,7 @@ impl TrickleWorker {
                         .is_some_and(|reading| reading.link == SoulseekLinkState::NotLoggedIn)
                 })
             }),
+            held: held_by(held_matcher),
             clock: Clock::system(),
         };
         let worker = Self::new(queue, settings, seams);
@@ -281,6 +345,11 @@ impl TrickleWorker {
         self.finished.lock().push(listener);
     }
 
+    /// Someone has songs held for MusicBrainz: told their name on each tick that holds one.
+    pub fn on_held(&self, listener: HeldListener) {
+        self.held_listeners.lock().push(listener);
+    }
+
     /// What the trickle is doing for this person.
     pub fn status_for(&self, owner: &str) -> TrickleStatus {
         let per_hour = self.settings.current().imports.effective_songs_per_hour();
@@ -308,6 +377,25 @@ impl TrickleWorker {
             };
         }
         if jobs.iter().any(|job| job.state == import_track_states::QUEUED) {
+            // Every waiting song held: nothing goes when someone's downloads end or Soulseek is
+            // back, so that is what it waits for.
+            let all_held = {
+                let held = self.held.lock();
+                !jobs
+                    .iter()
+                    .any(|job| job.state == import_track_states::DOWNLOADING)
+                    && jobs
+                        .iter()
+                        .filter(|job| job.state == import_track_states::QUEUED)
+                        .all(|job| held.contains(&held_id(&job.owner, &job.key)))
+            };
+            if all_held {
+                return TrickleStatus {
+                    state: trickle_states::WAITING_FOR_MUSIC_DATABASE,
+                    next_utc: None,
+                    per_hour,
+                };
+            }
             let waiting = *self.waiting_for.lock();
             if waiting == trickle_states::YIELDING || waiting == trickle_states::WAITING_FOR_SOULSEEK {
                 return TrickleStatus {
@@ -340,11 +428,21 @@ impl TrickleWorker {
     /// started.
     pub async fn tick(self: &Arc<Self>) -> bool {
         self.settle_hand_offs();
-        if self
+        let seams = self.seams();
+        // A song running when the tick began keeps the turn, even if it ends while the hold is
+        // worked out: a song it put back is not taken again in the same tick.
+        let was_running = self
             .running
             .lock()
             .as_ref()
-            .is_some_and(|task| !task.is_finished())
+            .is_some_and(|task| !task.is_finished());
+        let (held, seen) = self.hold_for_music_database(&seams).await;
+        if was_running
+            || self
+                .running
+                .lock()
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
         {
             return false;
         }
@@ -355,7 +453,6 @@ impl TrickleWorker {
         if self.next_start(per_hour).is_some_and(|next| next > self.now()) {
             return false;
         }
-        let seams = self.seams();
         if (seams.people_downloading)() {
             *self.waiting_for.lock() = trickle_states::YIELDING;
             return false;
@@ -365,14 +462,79 @@ impl TrickleWorker {
             return false;
         }
         *self.waiting_for.lock() = trickle_states::RUNNING;
-        let Some(job) = self.queue.take_next() else {
-            *self.waiting_for.lock() = trickle_states::IDLE;
-            return false;
+        // A song queued since the hold was worked out is asked about when it comes up; one that
+        // waits too goes back with its turn, and the next is taken.
+        let mut passed: HashSet<String> = HashSet::new();
+        let job = loop {
+            let Some(job) = self.queue.take_next_where(|job| {
+                let id = held_id(&job.owner, &job.key);
+                !held.contains(&id) && !passed.contains(&id)
+            }) else {
+                *self.waiting_for.lock() = trickle_states::IDLE;
+                return false;
+            };
+            let id = held_id(&job.owner, &job.key);
+            if seen.contains(&id) || (seams.held)(vec![job.clone()]).await.is_empty() {
+                break job;
+            }
+            self.queue
+                .put_back(&job.owner, &job.key, WAITING_FOR_ANSWER, true);
+            passed.insert(id);
         };
         *self.current.lock() = Some((job.owner.clone(), job.key.clone()));
         let worker = self.clone();
         *self.running.lock() = Some(tokio::spawn(async move { worker.run(job).await }));
         true
+    }
+
+    /// The queued songs that wait for MusicBrainz to answer, and every queued song seen, by owner
+    /// and key, as the seam names them by place. Each says so, a
+    /// song no longer held loses the words, and everyone with one held is told, so their ISRCs
+    /// are asked about. A held song is not taken, so nothing here asks MusicBrainz; its next
+    /// answer to anyone ends the hold.
+    async fn hold_for_music_database(&self, seams: &TrickleSeams) -> (HashSet<String>, HashSet<String>) {
+        let queued: Vec<TrickleJob> = self
+            .queue
+            .snapshot(None)
+            .into_iter()
+            .filter(|job| job.state == import_track_states::QUEUED)
+            .collect();
+        let places = if queued.is_empty() {
+            HashSet::new()
+        } else {
+            (seams.held)(queued.clone()).await
+        };
+        let mut held = HashSet::new();
+        let seen: HashSet<String> = queued.iter().map(|job| held_id(&job.owner, &job.key)).collect();
+        let mut owners: Vec<String> = Vec::new();
+        let mut words: Vec<(String, String, Option<String>)> = Vec::new();
+        for (at, job) in queued.iter().enumerate() {
+            let says = job.detail.as_deref() == Some(WAITING_FOR_ANSWER);
+            if places.contains(&at) {
+                held.insert(held_id(&job.owner, &job.key));
+                if !owners.iter().any(|owner| eq_ignore_case(owner, &job.owner)) {
+                    owners.push(job.owner.clone());
+                }
+                if !says {
+                    words.push((
+                        job.owner.clone(),
+                        job.key.clone(),
+                        Some(WAITING_FOR_ANSWER.to_string()),
+                    ));
+                }
+            } else if says {
+                words.push((job.owner.clone(), job.key.clone(), None));
+            }
+        }
+        self.queue.set_queued_details(&words);
+        *self.held.lock() = held.clone();
+        let listeners = self.held_listeners.lock().clone();
+        for owner in &owners {
+            for listener in &listeners {
+                listener(owner);
+            }
+        }
+        (held, seen)
     }
 
     /// Waits for the song started last. Only tests need it.
@@ -387,12 +549,17 @@ impl TrickleWorker {
         let seams = self.seams();
         let outcome: anyhow::Result<()> = async {
             if let Some(owned) = (seams.owned)(job.clone()).await? {
+                self.queue.end_check(&job.owner, &job.key);
                 self.finish(
                     &job,
                     import_track_states::DONE,
                     Some("Already in your library"),
                     owned.0,
                 );
+                return Ok(());
+            }
+            // Taken back or skipped while it was checked: nothing starts.
+            if !self.queue.begin_attempt(&job.owner, &job.key) {
                 return Ok(());
             }
             let key = (seams.start)(job.clone()).await?;
@@ -404,6 +571,12 @@ impl TrickleWorker {
         }
         .await;
         if let Err(e) = outcome {
+            if let Some(later) = e.downcast_ref::<TrickleCheckLater>() {
+                self.queue
+                    .put_back(&job.owner, &job.key, &later.detail, later.turn_back);
+                *self.current.lock() = None;
+                return;
+            }
             if let Some(held) = e.downcast_ref::<TrickleHeld>() {
                 info!(
                     "Trickle for '{} - {}' ({}) skipped: {held}",
@@ -563,6 +736,57 @@ impl TrickleWorker {
         }
         Ok(())
     }
+}
+
+/// The library's copy of a job's song: the name check's, else the one the recordings its ISRC
+/// names lead to. While the music database could not be asked, or the library could not be read,
+/// the job is put back to be checked again on its next turn.
+async fn last_look(
+    by_name: Option<OwnedSong>,
+    matcher: Option<&super::ImportMatcher>,
+    job: &TrickleJob,
+) -> anyhow::Result<Option<OwnedSong>> {
+    if by_name.is_some() {
+        return Ok(by_name);
+    }
+    let Some(matcher) = matcher else {
+        return Ok(None);
+    };
+    let track = job.as_track();
+    match matcher.owned_by_isrc(&job.owner, &track).await {
+        super::import_matcher::IsrcOwnership::Owned(id) => Ok(Some(OwnedSong(Some(id)))),
+        super::import_matcher::IsrcOwnership::Missing => Ok(None),
+        super::import_matcher::IsrcOwnership::Unanswered => Err(TrickleCheckLater {
+            detail: WAITING_FOR_ANSWER.to_string(),
+            turn_back: true,
+        }
+        .into()),
+        super::import_matcher::IsrcOwnership::LibraryUnread => Err(TrickleCheckLater {
+            detail: READING_LIBRARY.to_string(),
+            turn_back: false,
+        }
+        .into()),
+    }
+}
+
+/// A job's name among the held songs: its owner, ignoring case, and its key.
+fn held_id(owner: &str, key: &str) -> String {
+    format!("{}\n{key}", to_lower_invariant(owner))
+}
+
+/// The held seam over the import matcher: the jobs whose ISRC MusicBrainz still has to answer
+/// while it is out. None without a matcher.
+pub fn held_by(matcher: Option<Arc<super::ImportMatcher>>) -> HeldSeam {
+    Arc::new(move |jobs| {
+        let matcher = matcher.clone();
+        Box::pin(async move {
+            let Some(matcher) = matcher else {
+                return HashSet::new();
+            };
+            let tracks: Vec<super::ImportTrack> = jobs.iter().map(TrickleJob::as_track).collect();
+            matcher.waiting_on_music_database(&tracks)
+        })
+    })
 }
 
 #[cfg(test)]

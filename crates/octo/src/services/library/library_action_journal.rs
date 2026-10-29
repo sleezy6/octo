@@ -124,6 +124,18 @@ pub struct LibraryActionEntry {
     /// once more, while its file stays in the trash.
     #[serde(default)]
     pub download_allowed: bool,
+    /// The Soulseek user and file a Wrong song denied as the wrong song, so Put back lifts
+    /// exactly that denial. None when nothing was denied.
+    #[serde(default)]
+    pub denied_source: Option<DeniedSource>,
+}
+
+/// One Soulseek user's file, as the rejected peer registry keys it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct DeniedSource {
+    pub username: String,
+    pub filename: String,
 }
 
 impl LibraryActionEntry {
@@ -164,6 +176,8 @@ impl Serialize for LibraryActionEntry {
             copy: bool,
             download_allowed: bool,
             blocks_downloads: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            denied_source: &'a Option<DeniedSource>,
         }
         Written {
             key: &self.key,
@@ -185,6 +199,7 @@ impl Serialize for LibraryActionEntry {
             copy: self.copy,
             download_allowed: self.download_allowed,
             blocks_downloads: self.blocks_downloads(),
+            denied_source: &self.denied_source,
         }
         .serialize(serializer)
     }
@@ -424,6 +439,17 @@ impl LibraryActionJournal {
                 .map(str::to_string)
                 .or(existing.revealed_path.clone()),
             at_utc: Utc::now(),
+            ..existing
+        });
+    }
+
+    /// Notes the Soulseek file the action at `key` denied, leaving everything else as it is.
+    pub fn set_denied_source(&self, key: &str, denied: DeniedSource) {
+        let Some(existing) = self.entries.lock().by_key.get(key).cloned() else {
+            return;
+        };
+        self.record(LibraryActionEntry {
+            denied_source: Some(denied),
             ..existing
         });
     }

@@ -6,11 +6,13 @@
 //! A song that could not be found is tried again after two weeks, since what Soulseek has
 //! changes; one someone skipped stays skipped until they ask for it again.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::common::Clock;
 use octo_core::common::dotnet::{eq_ignore_case, ordinal_ignore_case_key, to_lower_invariant};
+use octo_core::common::song_identity::SongIdentity;
 use octo_core::json::datetime;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -73,6 +75,11 @@ struct State {
     /// The people who paused theirs, by name ignoring case.
     paused: DotnetDictionary<String>,
     last_start: Option<DateTime<Utc>>,
+    /// `last_start` before the latest `take_next`, so a song put back gives its turn back.
+    start_before: Option<DateTime<Utc>>,
+    /// The song `take_next` handed out that has not begun its attempt yet: it is still being
+    /// checked, so taking back its list, or skipping it, takes it back too.
+    checking: Option<String>,
 }
 
 /// The queue itself.
@@ -99,6 +106,8 @@ impl TrickleQueue {
             jobs: DotnetDictionary::new(),
             paused: DotnetDictionary::new(),
             last_start: None,
+            start_before: None,
+            checking: None,
         };
         if let Some(path) = path.as_deref().filter(|p| p.exists()) {
             let file = load(path);
@@ -228,6 +237,12 @@ impl TrickleQueue {
     /// longest ago goes next, so one long list cannot keep everyone else waiting. Paused people
     /// are passed over.
     pub fn take_next(&self) -> Option<TrickleJob> {
+        self.take_next_where(|_| true)
+    }
+
+    /// [`Self::take_next`] among the songs `may_go` lets through; the rest wait their turn. The
+    /// song is not an attempt yet: [`Self::begin_attempt`] makes it one.
+    pub fn take_next_where(&self, may_go: impl Fn(&TrickleJob) -> bool) -> Option<TrickleJob> {
         let now = self.now();
         let mut state = self.state.lock();
         let last_by_owner = |state: &State, owner: &str| -> DateTime<Utc> {
@@ -245,6 +260,7 @@ impl TrickleQueue {
             .filter(|(_, job)| {
                 job.state == import_track_states::QUEUED
                     && !state.paused.contains_key(&ordinal_ignore_case_key(&job.owner))
+                    && may_go(job)
             })
             .map(|(key, job)| (last_by_owner(&state, &job.owner), job.queued_utc, key.clone()))
             .collect();
@@ -256,11 +272,127 @@ impl TrickleQueue {
         job.detail = None;
         job.started_utc = Some(now);
         job.updated_utc = now;
-        job.attempts += 1;
         let next = job.clone();
+        state.start_before = state.last_start;
         state.last_start = Some(now);
+        state.checking = Some(key);
         self.write(&state);
         Some(next)
+    }
+
+    /// The song just taken begins its attempt: counted, its words cleared, and no longer one a
+    /// cancel takes back. False when it was taken back or skipped while it was checked, so
+    /// nothing may start.
+    pub fn begin_attempt(&self, owner: &str, key: &str) -> bool {
+        let now = self.now();
+        let mut state = self.state.lock();
+        let id = key_of(owner, key);
+        if state.checking.as_deref() == Some(id.as_str()) {
+            state.checking = None;
+        }
+        let Some(job) = state
+            .jobs
+            .get_mut(&id)
+            .filter(|job| job.state == import_track_states::DOWNLOADING)
+        else {
+            return false;
+        };
+        job.attempts += 1;
+        job.detail = None;
+        job.updated_utc = now;
+        self.write(&state);
+        true
+    }
+
+    /// The song just taken needs no attempt (the library has it): it is no longer being checked,
+    /// and its turn stays used.
+    pub fn end_check(&self, owner: &str, key: &str) {
+        let mut state = self.state.lock();
+        if state.checking.as_deref() == Some(key_of(owner, key).as_str()) {
+            state.checking = None;
+            state.start_before = None;
+        }
+    }
+
+    /// Puts these words on a song while it is still running, for while it is checked; a song
+    /// skipped or taken back meanwhile keeps its own.
+    pub fn say_while_running(&self, owner: &str, key: &str, detail: &str) {
+        let now = self.now();
+        let mut state = self.state.lock();
+        let Some(job) = state
+            .jobs
+            .get_mut(&key_of(owner, key))
+            .filter(|job| job.state == import_track_states::DOWNLOADING)
+        else {
+            return;
+        };
+        job.detail = Some(detail.to_string());
+        job.updated_utc = now;
+        self.write(&state);
+    }
+
+    /// Gives back the song `take_next` just handed out, while it is still being checked: queued
+    /// again behind the owner's other songs, with these words. With `turn_back` the trickle's
+    /// pacing is as it was before, so the next song may start at once (only songs like this one
+    /// wait); without it the turn stays used (every song would wait the same way). Any other
+    /// song is left as it is. For a song that waits on something outside Octo.
+    pub fn put_back(&self, owner: &str, key: &str, detail: &str, turn_back: bool) {
+        let now = self.now();
+        let mut state = self.state.lock();
+        let id = key_of(owner, key);
+        if state.checking.as_deref() != Some(id.as_str()) {
+            return;
+        }
+        state.checking = None;
+        let restored = state.start_before.take();
+        let Some(job) = state.jobs.get_mut(&id) else {
+            return;
+        };
+        job.state = import_track_states::QUEUED.to_string();
+        job.detail = Some(detail.to_string());
+        job.queued_utc = now;
+        job.updated_utc = now;
+        if turn_back {
+            state.last_start = restored;
+        }
+        self.write(&state);
+    }
+
+    /// Sets the words on queued songs, each named by its owner and key, with one write: None
+    /// clears them. A song no longer queued is left as it is.
+    pub fn set_queued_details(&self, details: &[(String, String, Option<String>)]) {
+        if details.is_empty() {
+            return;
+        }
+        let now = self.now();
+        let mut state = self.state.lock();
+        let mut changed = false;
+        for (owner, key, detail) in details {
+            let Some(job) = state
+                .jobs
+                .get_mut(&key_of(owner, key))
+                .filter(|job| job.state == import_track_states::QUEUED)
+            else {
+                continue;
+            };
+            job.detail = detail.clone();
+            job.updated_utc = now;
+            changed = true;
+        }
+        if changed {
+            self.write(&state);
+        }
+    }
+
+    /// The ISRCs of the songs still queued or running.
+    pub fn open_isrcs(&self) -> HashSet<String> {
+        self.state
+            .lock()
+            .jobs
+            .values()
+            .filter(|job| import_track_states::open(&job.state))
+            .flat_map(|job| SongIdentity::isrcs(job.isrc.iter()))
+            .collect()
     }
 
     pub fn update(&self, owner: &str, key: &str, change: impl FnOnce(&mut TrickleJob)) {
@@ -296,7 +428,7 @@ impl TrickleQueue {
         self.change(
             owner,
             keys,
-            |job| job.state == import_track_states::NOT_FOUND || job.state == import_track_states::SKIPPED,
+            |job, _| job.state == import_track_states::NOT_FOUND || job.state == import_track_states::SKIPPED,
             |job| {
                 job.state = import_track_states::QUEUED.to_string();
                 job.detail = None;
@@ -306,12 +438,13 @@ impl TrickleQueue {
         )
     }
 
-    /// Queued songs set aside. A running one runs to its end. Answers how many.
+    /// Queued songs set aside, and the one being checked before it starts. A song whose download
+    /// began runs to its end. Answers how many.
     pub fn skip<S: AsRef<str>>(&self, owner: &str, keys: &[S]) -> i32 {
         self.change(
             owner,
             keys,
-            |job| job.state == import_track_states::QUEUED,
+            |job, checking| job.state == import_track_states::QUEUED || checking,
             |job| {
                 job.state = import_track_states::SKIPPED.to_string();
                 job.detail = Some("Skipped".to_string());
@@ -319,15 +452,18 @@ impl TrickleQueue {
         )
     }
 
+    /// Changes the named songs `when` allows, told whether each is the song being checked; the
+    /// song being checked, once changed, gives its turn back.
     fn change<S: AsRef<str>>(
         &self,
         owner: &str,
         keys: &[S],
-        when: impl Fn(&TrickleJob) -> bool,
+        when: impl Fn(&TrickleJob, bool) -> bool,
         change: impl Fn(&mut TrickleJob),
     ) -> i32 {
         let now = self.now();
         let mut state = self.state.lock();
+        let checking = state.checking.clone();
         let mut changed = 0;
         let mut seen: Vec<&str> = Vec::new();
         for key in keys {
@@ -336,15 +472,23 @@ impl TrickleQueue {
                 continue;
             }
             seen.push(key);
-            let Some(job) = state.jobs.get_mut(&key_of(owner, key)) else {
+            let id = key_of(owner, key);
+            let Some(job) = state.jobs.get_mut(&id) else {
                 continue;
             };
-            if !when(job) {
+            let is_checking =
+                checking.as_deref() == Some(id.as_str()) && job.state == import_track_states::DOWNLOADING;
+            if !when(job, is_checking) {
                 continue;
             }
             change(job);
             job.updated_utc = now;
             changed += 1;
+            if is_checking {
+                state.checking = None;
+                let restored = state.start_before.take();
+                state.last_start = restored;
+            }
         }
         if changed > 0 {
             self.write(&state);
@@ -370,26 +514,35 @@ impl TrickleQueue {
         finished.len() as i32
     }
 
-    /// Takes back one person's queued songs, leaving what already ran. Answers how many.
+    /// Takes back one person's queued songs, and the one being checked before it starts (its
+    /// turn given back), leaving what already began. Answers how many.
     pub fn cancel_queued(&self, owner: &str, keys: Option<&[String]>) -> i32 {
         let mut state = self.state.lock();
-        let queued: Vec<String> = state
+        let checking = state.checking.clone();
+        let taken: Vec<String> = state
             .jobs
             .iter()
-            .filter(|(_, job)| {
+            .filter(|(id, job)| {
                 eq_ignore_case(&job.owner, owner)
-                    && job.state == import_track_states::QUEUED
+                    && (job.state == import_track_states::QUEUED
+                        || (job.state == import_track_states::DOWNLOADING
+                            && checking.as_deref() == Some(id.as_str())))
                     && keys.is_none_or(|only| only.contains(&job.key))
             })
-            .map(|(key, _)| key.clone())
+            .map(|(id, _)| id.clone())
             .collect();
-        for key in &queued {
-            state.jobs.remove(key);
+        for id in &taken {
+            state.jobs.remove(id);
         }
-        if !queued.is_empty() {
+        if checking.as_ref().is_some_and(|id| taken.contains(id)) {
+            state.checking = None;
+            let restored = state.start_before.take();
+            state.last_start = restored;
+        }
+        if !taken.is_empty() {
             self.write(&state);
         }
-        queued.len() as i32
+        taken.len() as i32
     }
 
     // Called with the lock held.

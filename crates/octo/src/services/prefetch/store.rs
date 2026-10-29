@@ -123,7 +123,14 @@ impl VerificationMirror {
     pub fn of(result: &VerificationResult) -> Self {
         VerificationMirror {
             verdict: result.verdict.name().to_string(),
-            reason: result.reason.name().to_string(),
+            // A link one person's submissions make is kept as a match AcoustID was unsure of,
+            // which every earlier release reads.
+            reason: match result.reason {
+                InconclusiveReason::LoneLink => InconclusiveReason::BelowThreshold,
+                other => other,
+            }
+            .name()
+            .to_string(),
             score: result.score,
             threshold: result.threshold,
             matched_title: result.matched_title.clone(),
@@ -779,6 +786,21 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("staging");
             dir.join(name)
         }
+    }
+
+    #[test]
+    fn a_lone_link_is_kept_as_a_match_acoust_id_was_unsure_of() {
+        let lone = VerificationResult {
+            reason: InconclusiveReason::LoneLink,
+            recording_id: Some("rec-1".into()),
+            candidate_recording_id: Some("rec-1".into()),
+            ..Default::default()
+        };
+        let mirror = VerificationMirror::of(&lone);
+        assert_eq!(mirror.reason, "BelowThreshold");
+        let back = mirror.to_result();
+        assert_eq!(back.reason, InconclusiveReason::BelowThreshold);
+        assert_eq!(back.candidate_recording_id.as_deref(), Some("rec-1"));
     }
 
     #[test]

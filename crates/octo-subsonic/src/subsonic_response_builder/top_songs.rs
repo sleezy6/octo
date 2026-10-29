@@ -49,6 +49,20 @@ pub struct ChartChoiceRow {
     pub on: bool,
 }
 
+/// What getCharts says besides the charts: the country they are for, and the caller's own choices.
+#[derive(Debug, Clone, Default)]
+pub struct ChartsHeader<'a> {
+    pub country: Option<&'a str>,
+    /// The caller's own country, `auto` while they follow the server.
+    pub setting: &'a str,
+    pub pinned: &'a [String],
+    /// The server's chart country, which `auto` follows.
+    pub server: Option<&'a str>,
+    /// Apple Music's countries.
+    pub countries: &'a [String],
+    pub max_pinned: usize,
+}
+
 impl SubsonicResponseBuilder {
     /// getArtistTopSongs and getTopChart: a ranked list, each entry a song with its rank, the
     /// Last.fm counts when there are any, and whether the caller's library has it. A library song
@@ -105,10 +119,15 @@ impl SubsonicResponseBuilder {
         }))
     }
 
-    /// getCharts: every chart the server's country has, Popular right now first, then Best New
-    /// Songs and Trending Songs, then the genres in Apple's order; `playlist` is the chart's
-    /// playlist for this listener while it is one. Always JSON.
-    pub fn create_charts_response(&self, country: Option<&str>, charts: &[ChartChoiceRow]) -> SubsonicReply {
+    /// getCharts: every chart the country has, Popular right now first, then Best New Songs and
+    /// Trending Songs, then the genres in Apple's order; `playlist` is the chart's playlist for
+    /// this listener while it is one. The header says the listener's own country and pinned
+    /// ones, the server's, and Apple's countries to pick from. Always JSON.
+    pub fn create_charts_response(
+        &self,
+        header: &ChartsHeader<'_>,
+        charts: &[ChartChoiceRow],
+    ) -> SubsonicReply {
         let rows: Vec<Value> = charts
             .iter()
             .map(|chart| {
@@ -130,7 +149,12 @@ impl SubsonicResponseBuilder {
             "type": "octo",
             "openSubsonic": true,
             "charts": {
-                "country": country,
+                "country": header.country,
+                "setting": header.setting,
+                "pinned": header.pinned,
+                "serverCountry": header.server,
+                "countries": header.countries,
+                "maxPinned": header.max_pinned,
                 "chart": rows,
             },
         }))
@@ -174,13 +198,16 @@ pub const POPULAR_COMMENT: &str =
     "The most played songs right now, made by Octo. Songs you have play from your library.";
 
 /// What a chart list says it is: Popular right now's words, and the same for the others.
-/// `kind` is `overall`, `new`, `trending` or `genre`; `genre` names the genre.
-pub fn chart_playlist_comment(kind: &str, genre: &str) -> String {
+/// `kind` is `overall`, `new`, `trending` or `genre`; `genre` names the genre; `country` names a
+/// pinned country's list's country.
+pub fn chart_playlist_comment(kind: &str, genre: &str, country: Option<&str>) -> String {
     const TAIL: &str = ", made by Octo. Songs you have play from your library.";
+    let place = country.map_or_else(String::new, |c| format!(" in {}", c.trim()));
     match kind {
-        "new" => format!("The best new songs of the week{TAIL}"),
-        "trending" => format!("The songs catching on this week{TAIL}"),
-        "genre" => format!("The most played {} songs right now{TAIL}", genre.trim()),
+        "new" => format!("The best new songs of the week{place}{TAIL}"),
+        "trending" => format!("The songs catching on this week{place}{TAIL}"),
+        "genre" => format!("The most played {} songs right now{place}{TAIL}", genre.trim()),
+        _ if country.is_some() => format!("The most played songs right now{place}{TAIL}"),
         _ => POPULAR_COMMENT.to_string(),
     }
 }

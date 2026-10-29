@@ -95,6 +95,43 @@ async fn relay_builds_correct_url() {
     assert_eq!(requests[0].url.query(), Some("u=admin&p=secret"));
 }
 
+#[tokio::test]
+async fn relay_joins_a_slash_led_endpoint_with_one_slash() {
+    let server = MockServer::builder().start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Last-Modified", "Wed, 21 Oct 2026 07:28:00 GMT")
+                .set_body_raw(vec![1, 2, 3], "image/jpeg"),
+        )
+        .mount(&server)
+        .await;
+
+    // A path as a request spells it, and an address saved with its slash.
+    service(&server.uri())
+        .relay("/rest/getSimilarSongs2.view", &params(&[("id", "1")]))
+        .await
+        .expect("relayed");
+    service(&format!("{}/", server.uri()))
+        .relay_safe("/rest/ping", &params(&[]))
+        .await
+        .expect("relayed");
+    service(&server.uri())
+        .relay_dated_image("/rest/getCoverArt", &params(&[("id", "1")]))
+        .await
+        .expect("relayed");
+
+    let paths: Vec<String> = received(&server)
+        .await
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert_eq!(
+        paths,
+        ["/rest/getSimilarSongs2.view", "/rest/ping", "/rest/getCoverArt"]
+    );
+}
+
 /// Regression for the admin UI applying nothing until a restart. These services are
 /// singletons, so capturing the settings in the constructor froze them at startup while the
 /// admin UI, reading the live settings, happily showed the new value as if it had taken effect.

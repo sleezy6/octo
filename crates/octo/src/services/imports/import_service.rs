@@ -59,6 +59,14 @@ pub struct ImportService {
     gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// People whose lists need matching again: the trickle brought them something.
     rematch: Mutex<Vec<String>>,
+    /// People whose lists hold ISRCs the music database has not answered yet: asked about in a
+    /// round beside the loop.
+    learning: Mutex<Vec<String>>,
+    /// The round of learning running beside the loop, if one is.
+    learner: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Whether this run has looked for people to learn about yet: the first pass after a start
+    /// picks up every list that still waits for answers.
+    learning_seeded: AtomicBool,
     /// A song a streaming list misses landed: the next open or pass reads the library again.
     reread_library: AtomicBool,
     /// Library songs as Navidrome described them to each listener for a streaming list, by
@@ -73,6 +81,9 @@ pub struct ImportService {
     /// Family's write gate and requests: a member who must ask first asks for a list's missing
     /// songs instead of fetching them. Unset, or with Family off, everyone fetches as always.
     family: std::sync::OnceLock<ImportFamily>,
+    /// Runs between the held look and the forget in `forget_unheld_answers`. Only tests set it.
+    #[cfg(test)]
+    after_held_look: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// What imports use for family members.
@@ -130,17 +141,30 @@ impl ImportService {
             tracker: parts.tracker,
             gates: Mutex::new(HashMap::new()),
             rematch: Mutex::new(Vec::new()),
+            learning: Mutex::new(Vec::new()),
+            learner: Mutex::new(None),
+            learning_seeded: AtomicBool::new(false),
             reread_library: AtomicBool::new(false),
             songs: Mutex::new(HashMap::new()),
             dirty_playlists: Mutex::new(Vec::new()),
             playlist_retries: Mutex::new(HashMap::new()),
             clock: Mutex::new(Clock::system()),
             family: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            after_held_look: Mutex::new(None),
         });
         let weak = Arc::downgrade(&service);
         service.trickle.on_finished(Arc::new(move |job| {
             if let Some(service) = weak.upgrade() {
                 service.on_fetched(job);
+            }
+        }));
+        // A song held for MusicBrainz puts its owner in the next learning round, whose first
+        // answer ends the hold.
+        let weak = Arc::downgrade(&service);
+        service.trickle.on_held(Arc::new(move |owner| {
+            if let Some(service) = weak.upgrade() {
+                service.learn_later(owner);
             }
         }));
         // A heart can bring a song a streaming list is missing. Once Navidrome shows it, the
@@ -392,6 +416,11 @@ impl ImportService {
             .collect();
         TrickleView {
             state: status.state.to_string(),
+            label: super::trickle_worker::trickle_states::label(
+                status.state,
+                count(import_track_states::DOWNLOADING) > 0,
+            )
+            .to_string(),
             next_utc: status.next_utc,
             per_hour: status.per_hour,
             queued: count(import_track_states::QUEUED),
@@ -455,6 +484,7 @@ impl ImportService {
             }),
             ..Default::default()
         });
+        self.forget_unheld_answers();
         self.match_and_follow(user).await;
         Ok(
             ImportActionResult::ok(format!("Added {}, {count} songs.", read.name))
@@ -568,6 +598,7 @@ impl ImportService {
                 ..Default::default()
             });
         }
+        self.forget_unheld_answers();
         self.match_and_follow(user).await;
         ImportActionResult::ok(if count == 1 {
             format!("Added {first_name}, {songs} songs.")
@@ -800,6 +831,7 @@ impl ImportService {
             self.set_get_missing(user, id, false);
         }
         self.store.remove(user, id);
+        self.forget_unheld_answers();
         ImportActionResult::ok(if list.playlist_id.is_none() {
             format!("Removed {}.", list.name)
         } else {
@@ -893,6 +925,9 @@ impl ImportService {
             }
             list.matched_utc = Some(now);
         });
+        if self.matcher.has_pending_isrcs(&tracks) {
+            self.learn_later(user);
+        }
         for list in self.store.lists_of(user) {
             if list.get_missing {
                 self.queue.add(
@@ -905,6 +940,22 @@ impl ImportService {
             }
         }
         self.write_dirty_playlists().await;
+    }
+
+    /// Asks about this person's waiting ISRCs in the loop's next pass.
+    fn learn_later(&self, user: &str) {
+        let mut learning = self.learning.lock();
+        if !learning.iter().any(|u| eq_ignore_case(u, user)) {
+            learning.push(user.to_string());
+        }
+    }
+
+    /// Matches this person again in the loop's next pass.
+    fn rematch_later(&self, user: &str) {
+        let mut rematch = self.rematch.lock();
+        if !rematch.iter().any(|u| eq_ignore_case(u, user)) {
+            rematch.push(user.to_string());
+        }
     }
 
     fn mark_dirty(&self, entry: String) {
@@ -1018,11 +1069,107 @@ impl ImportService {
             .clone()
     }
 
+    /// Forgets what the music database said about ISRCs no list holds and no waiting song
+    /// carries any more.
+    fn forget_unheld_answers(&self) {
+        // What was known before looking at what is held: an answer learned meanwhile, for a
+        // list saved meanwhile, is not dropped.
+        let known = self.matcher.known_isrcs();
+        let mut held = self.store.held_isrcs();
+        held.extend(self.queue.open_isrcs());
+        #[cfg(test)]
+        if let Some(hook) = self.after_held_look.lock().take() {
+            hook();
+        }
+        self.matcher.forget_unheld(&known, &held);
+    }
+
+    /// One round of asking about the ISRCs of everyone whose songs wait for answers. An answer
+    /// that names a recording a library file is tagged with matches that person again on the
+    /// next pass. Answers for ISRCs nothing holds any more are forgotten before and after; a
+    /// round stops at the first question the music database cannot answer, and that person goes
+    /// behind everyone else. A person leaves the round's list only once nothing of theirs waits,
+    /// so a round that stops halfway loses nobody.
+    pub async fn learn_once(&self) {
+        self.forget_unheld_answers();
+        let waiting: Vec<String> = self.learning.lock().clone();
+        for user in waiting {
+            let tracks = self.learning_tracks(&user);
+            let learned = self.matcher.learn_isrcs(&tracks).await;
+            if learned.in_library > 0 {
+                self.rematch_later(&user);
+            }
+            if !self.matcher.has_pending_isrcs(&tracks) {
+                self.learning.lock().retain(|u| !eq_ignore_case(u, &user));
+            }
+            // The music database could not answer: the rest wait for the next round, this person
+            // behind them, so an ISRC that never gets an answer keeps nobody else waiting.
+            if learned.failed {
+                let mut learning = self.learning.lock();
+                if let Some(at) = learning.iter().position(|u| eq_ignore_case(u, &user)) {
+                    let me = learning.remove(at);
+                    learning.push(me);
+                }
+                break;
+            }
+        }
+        // An answer that came in for a list removed meanwhile is not kept.
+        self.forget_unheld_answers();
+    }
+
+    /// This person's songs whose ISRCs may wait for an answer: every list's, and the songs the
+    /// trickle still has queued, which may carry an ISRC no list holds any more.
+    fn learning_tracks(&self, user: &str) -> Vec<ImportTrack> {
+        let mut tracks: Vec<ImportTrack> = self
+            .store
+            .lists_of(user)
+            .into_iter()
+            .flat_map(|list| list.tracks)
+            .collect();
+        tracks.extend(
+            self.queue
+                .snapshot(Some(user))
+                .iter()
+                .filter(|job| job.state == import_track_states::QUEUED)
+                .map(TrickleJob::as_track),
+        );
+        tracks
+    }
+
+    /// Waits for the round of learning running now, if there is one.
+    #[cfg(test)]
+    pub async fn drain_learner(&self) {
+        let task = self.learner.lock().take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
     /// One pass of the loop: matches people the trickle brought songs, writes playlists, and
     /// reads stale links again.
     pub async fn loop_once(self: &Arc<Self>) -> anyhow::Result<()> {
         if self.reread_library.swap(false, Ordering::Relaxed) {
             self.matcher.forget();
+        }
+        // An answer the trickle's last look learned for a list removed meanwhile goes too.
+        self.forget_unheld_answers();
+        // The first pass after a start picks up every list that still waits for answers.
+        if !self.learning_seeded.swap(true, Ordering::Relaxed) {
+            for list in self.store.all() {
+                if self.matcher.has_pending_isrcs(&list.tracks) {
+                    self.learn_later(&list.owner);
+                }
+            }
+        }
+        // Learning runs beside the loop: one round at a time, never holding up a pass.
+        let running = self
+            .learner
+            .lock()
+            .as_ref()
+            .is_some_and(|task| !task.is_finished());
+        if !running && !self.learning.lock().is_empty() {
+            let service = Arc::clone(self);
+            *self.learner.lock() = Some(tokio::spawn(async move { service.learn_once().await }));
         }
         let users: Vec<String> = std::mem::take(&mut *self.rematch.lock());
         for user in users {

@@ -33,7 +33,7 @@ use tracing::{debug, info, warn};
 
 use super::ITunesCoverArtLookup;
 use crate::services::charts::AppleMusicPages;
-use crate::services::charts::apple_music_pages::PageError;
+use crate::services::charts::apple_music_pages::{LaneCell, PageError};
 use crate::services::framework::InFlight;
 use crate::services::framework::http::client_builder;
 use crate::services::framework::memory_cache::MemoryCache;
@@ -181,6 +181,15 @@ pub enum RelayFile {
     Media(Url),
 }
 
+/// Forgets a lookup's lane when dropped, with the lookup.
+struct ForgetLane(Arc<AnimatedArt>, String);
+
+impl Drop for ForgetLane {
+    fn drop(&mut self) {
+        self.0.urgent.lock().remove(&self.1);
+    }
+}
+
 pub struct AnimatedArt {
     settings: Arc<SettingsStore>,
     itunes: Arc<ITunesCoverArtLookup>,
@@ -191,6 +200,9 @@ pub struct AnimatedArt {
     tokens: RwLock<HashMap<String, String>>,
     dirty: AtomicBool,
     flights: InFlight<ArtLookup>,
+    /// The lane each running lookup reads in, by album key, so a request that joins a background
+    /// lookup can turn it urgent.
+    urgent: parking_lot::Mutex<HashMap<String, LaneCell>>,
     playlists: MemoryCache<Bytes>,
     relay_client: reqwest::Client,
     /// Tests only: the origin standing in for Apple's video host.
@@ -246,6 +258,7 @@ impl AnimatedArt {
             tokens: RwLock::new(tokens),
             dirty: AtomicBool::new(false),
             flights: InFlight::new(),
+            urgent: parking_lot::Mutex::new(HashMap::new()),
             playlists: MemoryCache::new(PLAYLIST_MEMORY),
             relay_client,
             video_origin: None,
@@ -294,18 +307,33 @@ impl AnimatedArt {
         if let Some(kept) = self.kept.read().get(&key).filter(|k| k.fresh(now())) {
             return kept.cover();
         }
-        drop(self.start(key, artist, album, barcode));
+        drop(self.start(key, artist, album, barcode, &LaneCell::behind()));
         None
     }
 
-    /// The album's artwork, asking Apple when nothing fresh is kept, for at most `wait`. A lookup
-    /// still running then goes on, and its answer is kept.
+    /// [`Self::find_on`] in the background lane.
     pub async fn find(
         self: &Arc<Self>,
         artist: &str,
         album: &str,
         barcode: Option<&str>,
         wait: Duration,
+    ) -> ArtLookup {
+        self.find_on(artist, album, barcode, wait, &LaneCell::behind())
+            .await
+    }
+
+    /// The album's artwork, asking Apple when nothing fresh is kept, for at most `wait`. A lookup
+    /// still running then goes on, and its answer is kept. The Apple reads go in `lane`; asking
+    /// in the interactive lane for an album a background lookup is already reading turns that
+    /// lookup interactive.
+    pub async fn find_on(
+        self: &Arc<Self>,
+        artist: &str,
+        album: &str,
+        barcode: Option<&str>,
+        wait: Duration,
+        lane: &LaneCell,
     ) -> ArtLookup {
         if !self.offered() {
             return ArtLookup::Unavailable;
@@ -317,29 +345,57 @@ impl AnimatedArt {
         if let Some(kept) = self.kept.read().get(&key).filter(|k| k.fresh(now())) {
             return kept.cover().map_or(ArtLookup::None, ArtLookup::Found);
         }
-        let lookup = self.start(key, artist, album, barcode);
+        let lookup = self.start(key, artist, album, barcode, lane);
         tokio::time::timeout(wait, lookup)
             .await
             .unwrap_or(ArtLookup::Unavailable)
     }
 
-    /// The lookup for `key`: the one running, or a new one.
+    /// The lookup for `key`: the one running, or a new one reading in `lane`.
     fn start(
         self: &Arc<Self>,
         key: String,
         artist: &str,
         album: &str,
         barcode: Option<&str>,
+        lane: &LaneCell,
     ) -> futures::future::Shared<futures::future::BoxFuture<'static, ArtLookup>> {
         let this = Arc::clone(self);
         let (artist, album, barcode) = (artist.to_string(), album.to_string(), barcode.map(str::to_string));
         let flight_key = key.clone();
-        self.flights.run(&flight_key, async move {
-            this.ask(&key, &artist, &album, barcode.as_deref()).await
-        })
+        let ask_lane = lane.clone();
+        // The lane is recorded under the same lock that starts the lookup, so one that ends at
+        // once cannot leave its lane behind.
+        let mut urgent = self.urgent.lock();
+        let (running, joined) = self.flights.run_joined(&flight_key, async move {
+            let _forget = ForgetLane(Arc::clone(&this), key.clone());
+            this.ask(&key, &artist, &album, barcode.as_deref(), &ask_lane)
+                .await
+        });
+        if joined {
+            let started = urgent.get(&flight_key).cloned();
+            drop(urgent);
+            if lane.is_now()
+                && let Some(started) = started
+                && started.make_now()
+            {
+                self.pages.gate().wake_behind();
+            }
+        } else {
+            urgent.insert(flight_key, lane.clone());
+            drop(urgent);
+        }
+        running
     }
 
-    async fn ask(&self, key: &str, artist: &str, album: &str, barcode: Option<&str>) -> ArtLookup {
+    async fn ask(
+        &self,
+        key: &str,
+        artist: &str,
+        album: &str,
+        barcode: Option<&str>,
+        lane: &LaneCell,
+    ) -> ArtLookup {
         let id = match self.itunes.album_collection_id(artist, album, barcode).await {
             Ok(Some(id)) => id,
             Ok(None) => {
@@ -353,10 +409,10 @@ impl AnimatedArt {
         };
         let country = self
             .pages
-            .detected_country()
+            .detected_country_on(lane)
             .await
             .unwrap_or_else(|| "us".to_string());
-        let art = match self.pages.album_animated_art(&country, id).await {
+        let art = match self.pages.album_animated_art_on(&country, id, lane).await {
             Ok(art) => LoopsKept::from(art),
             Err(PageError::NoSuchPage) => LoopsKept::default(),
             Err(e) => {

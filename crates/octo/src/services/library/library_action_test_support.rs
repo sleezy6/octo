@@ -47,6 +47,11 @@ pub(crate) fn asked_about(user: &str, navidrome_id: &str) -> Arc<NoticeQueue> {
     Arc::new(queue)
 }
 
+/// A temp folder as the server's paths spell it: forward slashes, which Windows also accepts.
+pub(crate) fn slash_root(dir: &Path) -> String {
+    dir.to_string_lossy().replace('\\', "/")
+}
+
 pub(crate) fn store(settings: AppSettings) -> Arc<SettingsStore> {
     Arc::new(SettingsStore::for_tests(settings))
 }

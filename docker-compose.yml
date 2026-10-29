@@ -179,9 +179,9 @@ services:
       Deezer__CachePath: /app/cache/deezer
       Deezer__CacheMaxGiB: ${DEEZER_CACHE_MAX_GIB:-20}
       Deezer__CacheRetentionDays: ${DEEZER_CACHE_RETENTION_DAYS:-7}
-      # ----- your own SpotiFLAC (optional download source, off by default) -----
-      # Octo includes no SpotiFLAC and no extensions: see the spotiflac service below and
-      # the dashboard's SpotiFLAC page for what to bring. With that service, the address is
+      # ----- your own Mornye, formerly SpotiFLAC (optional download source, off by default) -----
+      # Octo includes no Mornye and no extensions: see the spotiflac service below and
+      # the dashboard's Mornye page for what to bring. With that service, the address is
       # http://spotiflac:8000.
       Spotiflac__Enabled: ${SPOTIFLAC_ENABLED:-false}
       Spotiflac__Url: ${SPOTIFLAC_URL:-}
@@ -328,9 +328,14 @@ services:
       # at most this many a day. Unsure matches and other takes are still asked about.
       LibraryActions__ReviewSweepAutoReplace: ${LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE:-false}
       LibraryActions__ReviewSweepAutoReplacePerDay: ${LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PER_DAY:-10}
+      # Also replace a song AcoustID has never heard when its YouTube Music preview from the same
+      # album clearly does not match it (same daily limit). Off by default.
+      LibraryActions__ReviewSweepAutoReplacePreview: ${LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PREVIEW:-false}
       # Check this many library songs an hour against their audio (0 is off). What disagrees
       # shows in Library health; only stray spaces are taken off by itself.
       LibraryActions__TagCheckPerHour: ${LIBRARY_ACTIONS_TAG_CHECK_PER_HOUR:-60}
+      # Songs an hour the one-time YouTube check compares, once started from the dashboard. 0 is off.
+      LibraryActions__YoutubeCheckPerHour: ${LIBRARY_ACTIONS_YOUTUBE_CHECK_PER_HOUR:-30}
       # Recordings the library holds more than once, side by side, the copy worth keeping first.
       # Octo only points them out; nothing is removed unless you remove it.
       LibraryActions__DuplicatesEnabled: ${LIBRARY_ACTIONS_DUPLICATES:-false}
@@ -586,23 +591,31 @@ services:
       # The same library again, read-only, for sharing.
       - ${DOWNLOAD_PATH:-./downloads}:/share:ro
 
-  # Your own SpotiFLAC, for the optional SpotiFLAC download source. It starts only with
-  # spotiflac in COMPOSE_PROFILES (.env). This is SpotiFLAC's own published image, not
-  # Octo's: Octo includes no SpotiFLAC, no extensions and no places to download from.
-  # SpotiFLAC downloads nothing until you give it the extension registry you choose
-  # (SPOTIFLAC_REGISTRIES) and install an extension on its page, on the port below. It
+  # Your own Mornye (the SpotiFLAC Python module before its rename), for the optional
+  # download source. It starts only with spotiflac in COMPOSE_PROFILES (.env).
+  # Compose builds Mornye here from its own repository at SPOTIFLAC_BUILD_REF (a pinned
+  # commit, so every install runs the same Mornye) and never pulls it: the first build takes
+  # a few minutes and about 2 GB, later ones are cached. Octo includes no Mornye, no
+  # extensions and no places to download from.
+  # Mornye downloads nothing until you give it the extension registry you choose
+  # (SPOTIFLAC_REGISTRIES); it installs every extension the registry lists by itself, when
+  # it starts and again every hour. Its own page is on the port below. It
   # saves into a hidden folder of the music folder Octo uses, mounted at the same path, so
   # Octo checks the file and files it like any download. Then set SPOTIFLAC_ENABLED=true
-  # and SPOTIFLAC_URL=http://spotiflac:8000, or use the dashboard's SpotiFLAC page.
+  # and SPOTIFLAC_URL=http://spotiflac:8000, or use the dashboard's Mornye page.
   spotiflac:
-    image: ghcr.io/bartolomeorusso9/spotiflac:${SPOTIFLAC_IMAGE_TAG:-latest}
+    image: octo-mornye:${SPOTIFLAC_BUILD_REF:-5660533bf12592e9de68508cef506f173f58d14f}
+    pull_policy: never
+    # 5660533b is Mornye 1.0.3. The image is built here and never pulled.
+    build:
+      context: https://github.com/mornyeapp/Mornye-Python.git#${SPOTIFLAC_BUILD_REF:-5660533bf12592e9de68508cef506f173f58d14f}
     container_name: spotiflac
     restart: unless-stopped
     logging: *logging
     profiles: ["spotiflac"]
     command: ["--web", "--host", "0.0.0.0", "--port", "8000"]
-    # SpotiFLAC's own page, where extensions are installed. SPOTIFLAC_WEB_TOKEN keeps it
-    # yours: without one, anyone who reaches the port can use it.
+    # Mornye's own page (it installs the registry's extensions by itself). SPOTIFLAC_WEB_TOKEN
+    # keeps it yours: without one, anyone who reaches the port can use it.
     ports:
       - "${SPOTIFLAC_PORT:-8010}:8000"
     # Starts as root only to hand its data folder to PUID:PGID, then runs as that user.
@@ -614,14 +627,16 @@ services:
       PUID: ${SPOTIFLAC_PUID:-1000}
       PGID: ${SPOTIFLAC_PGID:-1000}
       TZ: ${TZ:-UTC}
-      SPOTIFLAC_REGISTRIES: ${SPOTIFLAC_REGISTRIES:-}
-      SPOTIFLAC_WEB_TOKEN: ${SPOTIFLAC_WEB_TOKEN:-}
-      SPOTIFLAC_DOWNLOAD_DIR: /music/.octo-incoming/spotiflac
-      SPOTIFLAC_DATA_DIR: /home/spotiflac/.spotiflac
-      SPOTIFLAC_PROGRESS_BARS: "0"
+      MORNYE_REGISTRIES: ${SPOTIFLAC_REGISTRIES:-}
+      MORNYE_WEB_TOKEN: ${SPOTIFLAC_WEB_TOKEN:-}
+      MORNYE_DOWNLOAD_DIR: /music/.octo-incoming/spotiflac
+      MORNYE_DATA_DIR: /home/mornye/.mornye
+      MORNYE_PROGRESS_BARS: "0"
     volumes:
       - ${DOWNLOAD_PATH:-./downloads}:/music
-      - ${SPOTIFLAC_DATA_DIR:-./spotiflac-data}:/home/spotiflac/.spotiflac
+      # Mornye's state, in a folder of its own: it reads nothing SpotiFLAC left.
+      - ${SPOTIFLAC_DATA_DIR:-./spotiflac-data}/mornye:/home/mornye/.mornye
+
   # Octo and the sidecars built from this folder instead of pulled: for changes of your own,
   # or a machine that cannot reach ghcr.io. They never run; a build gives the image the name
   # the service above runs, so `docker compose up -d` then uses it:

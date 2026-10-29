@@ -256,6 +256,66 @@ fn entries_survive_a_restart() {
     assert!(reopened.is_queued("alice", "nd1"));
 }
 
+#[test]
+fn a_preview_question_is_kept_under_a_cause_every_release_reads() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("notice-queue.json");
+    {
+        let queue = NoticeQueue::with_path(Some(path.clone()));
+        let preview_says_other = VerificationResult {
+            reason: InconclusiveReason::DiffersFromYouTube,
+            evidence: Some("47% of its bits differ".into()),
+            ..verdict(InconclusiveReason::NoEntry)
+        };
+        queue.add_review_from(
+            "alice",
+            "/music/a.flac",
+            &song(),
+            &preview_says_other,
+            NoticeOrigin::LibrarySweep,
+        );
+        assert!(queue.flush());
+    }
+
+    let reopened = NoticeQueue::with_path(Some(path));
+    let entry = only(&reopened, "alice");
+    assert_eq!(entry.cause, InconclusiveReason::SoundsLikeAnother);
+    assert!(
+        entry.reason.contains("YouTube preview (47% of its bits differ)"),
+        "{}",
+        entry.reason
+    );
+}
+
+/// A link only one person's submissions make is stored as a match AcoustID was unsure of, which
+/// every release reads, with the recording a Keep sends AcoustID a second link to.
+#[test]
+fn a_lone_link_is_kept_under_a_cause_every_release_reads_with_its_candidate() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("notice-queue.json");
+    {
+        let queue = NoticeQueue::with_path(Some(path.clone()));
+        let lone = VerificationResult {
+            matched_artist: Some("Massive Attack".into()),
+            matched_title: Some("Teardrop".into()),
+            recording_id: Some("rec-teardrop".into()),
+            candidate_recording_id: Some("rec-teardrop".into()),
+            ..verdict(InconclusiveReason::LoneLink)
+        };
+        assert!(queue.add_review_from("alice", "/music/a.flac", &song(), &lone, NoticeOrigin::Download,));
+        assert!(queue.flush());
+    }
+
+    let reopened = NoticeQueue::with_path(Some(path));
+    let entry = only(&reopened, "alice");
+    assert_eq!(entry.cause, InconclusiveReason::BelowThreshold);
+    assert_eq!(entry.candidate_recording_id.as_deref(), Some("rec-teardrop"));
+    assert_eq!(
+        entry.reason,
+        "Only one person ever told AcoustID this is 'Massive Attack - Teardrop'"
+    );
+}
+
 /// The file holds what people already answered, so it is set aside, never overwritten.
 #[test]
 fn load_a_corrupt_file_is_kept_aside_and_the_queue_starts_empty() {

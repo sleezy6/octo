@@ -11,6 +11,7 @@ pub mod download_log_keeper;
 pub mod download_picks;
 pub mod external_search_service;
 pub mod heart_acquisition_coordinator;
+pub mod lastfm_country_names;
 pub mod replace_anyway;
 pub mod song_finder;
 pub mod soulseek_hold_resumer;

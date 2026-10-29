@@ -42,6 +42,7 @@ use crate::services::common::base_download_service::BaseDownloadService;
 use crate::services::cover_art::{AlbumCoverQuery, FoundCover, IAlbumCoverFinder};
 use crate::services::fingerprint::DownloadVerificationService;
 use crate::services::local::ILocalLibraryService;
+use crate::services::soulseek::RejectedPeerRegistry;
 
 /// How one edit from an app went. State is one of the libraryAction states.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -137,6 +138,10 @@ pub struct LibraryEditServices {
     /// The music folder's one-writer gate: each change takes a share, so it waits while a job
     /// rewrites the folder.
     pub write_gate: Option<LibraryWriteGate>,
+    /// `RejectedPeerRegistry`: the Soulseek file a Wrong song denied, lifted when it is put back.
+    pub rejected_peers: Option<Arc<RejectedPeerRegistry>>,
+    /// `NoticeQueue`: the library sweep's note of a replacement, reworded when it is put back.
+    pub notices: Option<Arc<super::NoticeQueue>>,
 }
 
 /// A file this service wrote, by Navidrome id: the path and what the file was right after.
@@ -181,6 +186,8 @@ pub const BUSY_TEXT: &str = "Another change to this song is still running, so th
 pub const CHANGED_SINCE_TEXT: &str =
     "The file has changed since it was checked, so it was left as it is. Check it again first.";
 const UNRESOLVED_TEXT: &str = "Could not work out which file this is, so nothing was touched.";
+/// What the journal key of a put back's own entry carries.
+const PUT_BACK_KEY: &str = "putback:";
 
 impl LibraryEditService {
     const COVER_MEMORY: Duration = Duration::from_secs(15 * 60);
@@ -625,7 +632,7 @@ impl LibraryEditService {
             key: LibraryActionJournal::make_key(
                 LibraryAction::BetterQuality,
                 &entry.navidrome_id,
-                &format!("putback:{}", dotnet_ticks(Utc::now())),
+                &format!("{PUT_BACK_KEY}{}", dotnet_ticks(Utc::now())),
             ),
             source_path: Some(now.clone()),
             quarantine_path: Some(newer.clone()),
@@ -637,9 +644,12 @@ impl LibraryEditService {
             username: username.to_string(),
             at_utc: Utc::now(),
             history_kept: None,
+            // The denial is lifted below, once; swapping back again denies nothing.
+            denied_source: None,
             ..entry.clone()
         });
         self.actions.flush();
+        self.undo_replacement_marks(entry);
         self.rescan.soon();
         info!("{username} put back {restored} in place of {now}, which went to {newer}");
         if renamed && let Some(own) = own {
@@ -677,6 +687,36 @@ impl LibraryEditService {
             "applied",
             "Put back your old copy. The one that replaced it is in Recently removed.",
         )
+    }
+
+    /// What a Wrong song or Wrong version left besides the swap, taken back once its original is
+    /// in place again: the Soulseek file it denied as the wrong song (that one denial and no
+    /// other), and the library sweep's note, which then says the original was put back. A swap
+    /// back of a put back lifts no denial; it brings the replacement in again, so the note reads
+    /// as replaced again, and whichever way the files last went, the note says so.
+    fn undo_replacement_marks(&self, entry: &LibraryActionEntry) {
+        if !matches!(
+            entry.action,
+            LibraryAction::WrongSong | LibraryAction::WrongVersion
+        ) {
+            return;
+        }
+        let swapped_back = entry.key.contains(PUT_BACK_KEY);
+        if !swapped_back
+            && let (Some(denied), Some(rejected)) = (&entry.denied_source, &self.services.rejected_peers)
+        {
+            rejected.allow(&denied.username, &denied.filename);
+        }
+        if let Some(notices) = &self.services.notices {
+            let reworded = if swapped_back {
+                notices.mark_replaced_again(&entry.navidrome_id) || notices.mark_put_back(&entry.navidrome_id)
+            } else {
+                notices.mark_put_back(&entry.navidrome_id)
+            };
+            if reworded {
+                notices.flush();
+            }
+        }
     }
 
     /// The songs removed from the apps or the playlists that are still in the trash, newest first.
@@ -1162,8 +1202,13 @@ impl Drop for RescanHold {
 
 /// A Better quality replacement that went in, whose current file is still where it went: what
 /// Put back swaps.
+/// A Better quality, Wrong song or Wrong version that put another file in the song's place,
+/// which is still there.
 fn is_replacement(entry: &LibraryActionEntry) -> bool {
-    entry.action == LibraryAction::BetterQuality && entry.revealed_path.as_deref().is_some_and(file_exists)
+    matches!(
+        entry.action,
+        LibraryAction::BetterQuality | LibraryAction::WrongSong | LibraryAction::WrongVersion
+    ) && entry.revealed_path.as_deref().is_some_and(file_exists)
 }
 
 #[cfg(test)]

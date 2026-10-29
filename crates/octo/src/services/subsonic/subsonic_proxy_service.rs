@@ -336,7 +336,8 @@ impl SubsonicProxyService {
     }
 
     /// Relays a request to the Subsonic server and returns the response: `GET
-    /// {Url}/{endpoint}?{query}` with no forwarded headers and no body. A non-success status is a
+    /// {Url}/{endpoint}?{query}`, one `/` between them however the endpoint is spelled, with no
+    /// forwarded headers and no body. A non-success status is a
     /// [`RelayError::Http`]. Takes the parameter dictionary or, for batch endpoints whose repeated
     /// keys the dictionary cannot hold, a list of pairs.
     pub async fn relay<I, K, V>(&self, endpoint: &str, parameters: I) -> Result<RelayResponse, RelayError>
@@ -347,7 +348,7 @@ impl SubsonicProxyService {
     {
         let base = self.configured_url()?;
         let query = self.build_query(parameters, false);
-        let url = format!("{}/{endpoint}?{query}", base.trim_end_matches('/'));
+        let url = upstream_url(&base, endpoint, &query);
         let target = request_url(&url)?;
 
         let response = self
@@ -392,7 +393,7 @@ impl SubsonicProxyService {
     {
         let base = self.configured_url()?;
         let query = self.build_query(parameters, false);
-        let url = format!("{}/{endpoint}?{query}", base.trim_end_matches('/'));
+        let url = upstream_url(&base, endpoint, &query);
         let target = request_url(&url)?;
 
         let response = self
@@ -925,6 +926,16 @@ fn scheme_of(url: &str) -> Option<String> {
         return Some("file".to_string());
     }
     Some(scheme.to_ascii_lowercase())
+}
+
+/// `{base}/{endpoint}?{query}` with exactly one `/` between the address and the endpoint,
+/// however either is spelled.
+fn upstream_url(base: &str, endpoint: &str, query: &str) -> String {
+    format!(
+        "{}/{}?{query}",
+        base.trim_end_matches('/'),
+        endpoint.trim_start_matches('/')
+    )
 }
 
 /// A request URI string as the HTTP client takes it: an absolute http(s) URL to send, or the

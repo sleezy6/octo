@@ -240,6 +240,10 @@ pub struct CheckedSong {
     pub album: String,
     /// The recording the audio was found to be, and its kind; None when nothing was decided.
     pub recording_id: Option<String>,
+    /// AcoustID confirmed the recording under the rule that one person's submissions confirm
+    /// nothing alone. A confirmation stored before that rule is false, so it is checked again.
+    #[serde(default)]
+    pub confirmed_by_two: bool,
     pub kind: Option<String>,
     /// The kind is known, not only the likeliest pick among takes that share the fingerprint.
     /// Only a known kind is said in words or held against another copy.
@@ -966,6 +970,7 @@ impl LibraryIdentitySweep {
             title: tags.title.clone(),
             album: tags.album.clone(),
             recording_id: heard.as_ref().map(|h| h.identity.recording_id.clone()),
+            confirmed_by_two: heard.is_some() && verdict.verdict == VerificationVerdict::Confirmed,
             kind: heard.as_ref().map(|h| kind_name(h.identity.kind).to_string()),
             kind_certain: heard.as_ref().is_some_and(|h| h.identity.kind_certain),
             sure: found.sure,

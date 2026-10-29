@@ -286,6 +286,7 @@ async fn settings_list_the_sweep_replacing_off_with_ten_a_day() {
         let actions = &document["LibraryActions"];
         assert_eq!(actions["ReviewSweepAutoReplace"], false, "{path}");
         assert_eq!(actions["ReviewSweepAutoReplacePerDay"], 10, "{path}");
+        assert_eq!(actions["ReviewSweepAutoReplacePreview"], false, "{path}");
     }
 }
 
@@ -869,12 +870,14 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // GeneratedPlaylists:Years, :MaxYearPlaylists, :Artists and :ArtistCount, the sweep's
     // replacing two: LibraryActions:ReviewSweepAutoReplace and :ReviewSweepAutoReplacePerDay,
     // then LibraryActions:KeepRatedCopies, Subsonic:DownloadAlbumOnSongStar,
-    // Metadata:AnimatedArt and Subsonic:CoverBadge, listed last; and this fork's seventeen:
-    // Subsonic:StreamSource, Deezer:Arl, :ArlFallback, :Quality and :StreamQuality, the playback
-    // cache's four (Deezer:CacheEnabled, :CachePath, :CacheMaxGiB and :CacheRetentionDays),
-    // YouTube:Enabled, LastFm:EnableStarterRadio, LastFm:LoveFavorites, LastFm:ArtistBanAfter,
-    // RadioSources:SoundsAlikeFrom, :Deezer and :DeezerWeight, and Metadata:ReplaceOthersLyrics.
-    assert_eq!(rows.len(), 221);
+    // Metadata:AnimatedArt and Subsonic:CoverBadge, then LibraryActions:YoutubeCheckPerHour and
+    // the sweep's preview replacing, LibraryActions:ReviewSweepAutoReplacePreview, listed last;
+    // and this fork's seventeen: Subsonic:StreamSource, Deezer:Arl, :ArlFallback, :Quality and
+    // :StreamQuality, the playback cache's four (Deezer:CacheEnabled, :CachePath, :CacheMaxGiB
+    // and :CacheRetentionDays), YouTube:Enabled, LastFm:EnableStarterRadio, LastFm:LoveFavorites,
+    // LastFm:ArtistBanAfter, RadioSources:SoundsAlikeFrom, :Deezer and :DeezerWeight, and
+    // Metadata:ReplaceOthersLyrics.
+    assert_eq!(rows.len(), 223);
     assert!(!rows.iter().any(|r| {
         r["Key"]
             .as_str()
@@ -896,6 +899,16 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     assert_eq!(rows[years + 7]["Key"], "Subsonic:DownloadAlbumOnSongStar");
     assert_eq!(rows[years + 8]["Key"], "Metadata:AnimatedArt");
     assert_eq!(rows[years + 9]["Key"], "Subsonic:CoverBadge");
+    assert_eq!(rows[years + 10]["Key"], "LibraryActions:YoutubeCheckPerHour");
+    assert_eq!(row("LibraryActions:YoutubeCheckPerHour")["IsSecret"], false);
+    assert_eq!(
+        rows[years + 11]["Key"],
+        "LibraryActions:ReviewSweepAutoReplacePreview"
+    );
+    assert_eq!(
+        row("LibraryActions:ReviewSweepAutoReplacePreview")["IsSecret"],
+        false
+    );
     assert_eq!(row("Subsonic:CoverBadge")["IsSecret"], false);
     assert_eq!(row("Subsonic:DownloadAlbumOnSongStar")["IsSecret"], false);
     assert_eq!(

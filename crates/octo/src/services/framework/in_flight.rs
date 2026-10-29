@@ -50,9 +50,18 @@ impl<V: Clone + Default + Send + Sync + 'static> InFlight<V> {
     where
         F: Future<Output = V> + Send + 'static,
     {
+        self.run_joined(key, fetch).0
+    }
+
+    /// [`Self::run`], also saying whether the caller joined a fetch already running for `key`
+    /// (true) or started `fetch` (false).
+    pub fn run_joined<F>(&self, key: &str, fetch: F) -> (Shared<BoxFuture<'static, V>>, bool)
+    where
+        F: Future<Output = V> + Send + 'static,
+    {
         let mut flights = self.flights.lock();
         if let Some(running) = flights.get(key) {
-            return running.clone();
+            return (running.clone(), true);
         }
         let guard = RemoveOnDrop {
             flights: Arc::clone(&self.flights),
@@ -66,7 +75,7 @@ impl<V: Clone + Default + Send + Sync + 'static> InFlight<V> {
         });
         let shared = task.map(Result::unwrap_or_default).boxed().shared();
         flights.insert(key.to_string(), shared.clone());
-        shared
+        (shared, false)
     }
 
     /// Forget every running fetch, as clearing the dictionary did. The fetches run on.

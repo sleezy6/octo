@@ -111,6 +111,31 @@ async fn an_unpinned_song_gets_the_video_a_play_would_pick_and_its_size() {
 }
 
 #[tokio::test]
+async fn the_warmer_leaves_a_refused_video_alone() {
+    let mut shim = FakeShim::default();
+    shim.hits.insert(
+        "Daft Punk Emotion".into(),
+        YouTubeHit {
+            video_id: "vid-b".into(),
+            duration: Some(416),
+            stream: sized(7_000_000),
+            ..Default::default()
+        },
+    );
+    let (registry, _shim, warmer) = warmer_over(shim);
+    let id = registry.register(song("Daft Punk", "Emotion"));
+    assert!(registry.refuse_video(&id, "vid-b"));
+
+    assert_eq!(warmer.warm_one(&id).await, Some(false));
+
+    let r = registry.lookup(&id).expect("known").snapshot();
+    assert_eq!(r.you_tube_id, None);
+    assert_eq!(r.duration, Some(417));
+    assert_eq!(r.shown_duration, None);
+    assert_eq!(registry.stream_facts(&id), None);
+}
+
+#[tokio::test]
 async fn sized_unknown_and_recently_tried_songs_are_not_queued_twice() {
     let (registry, _shim, warmer) = warmer_over(FakeShim::default());
     let id = registry.register(song("Daft Punk", "Emotion"));

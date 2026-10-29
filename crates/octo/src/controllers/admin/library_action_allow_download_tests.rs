@@ -30,6 +30,7 @@ fn removed(id: &str, artist: &str, title: &str, copy: bool) -> LibraryActionEntr
         revealed_path: None,
         copy,
         download_allowed: false,
+        denied_source: None,
     }
 }
 

@@ -46,6 +46,10 @@ pub fn routes() -> RouteSet {
             "/api/admin/review-sweep/recheck-octo",
             post(recheck_octo_downloads),
         )
+        .route("/api/admin/youtube-check", get(get_youtube_check))
+        .route("/api/admin/youtube-check/start", post(start_youtube_check))
+        .route("/api/admin/youtube-check/pause", post(pause_youtube_check))
+        .route("/api/admin/youtube-check/resume", post(resume_youtube_check))
         .route("/api/admin/quality-upgrade", get(get_quality_upgrade))
         .route("/api/admin/library/resolve", get(resolve_library_song))
 }
@@ -356,6 +360,65 @@ async fn recheck_octo_downloads(State(state): State<AppState>) -> Response {
     }
     let files = state.library_review_sweep_worker.recheck_octo().await;
     accepted(&json!({ "ok": true, "files": files }))
+}
+
+/// The one-time YouTube check: how far it has got and why it is waiting. Counts and the name of
+/// whoever is asked, never a file or a song, like the Review sweep.
+async fn get_youtube_check(State(state): State<AppState>) -> Response {
+    let s = state.library_youtube_check.status();
+    ok(&json!({
+        "state": s.state,
+        "reason": s.reason,
+        "running": s.running,
+        "paused": s.paused,
+        "position": s.position,
+        "total": s.total,
+        "done": s.done,
+        "asked": s.asked,
+        "alike": s.alike,
+        "unsure": s.unsure,
+        "noCopy": s.no_copy,
+        "known": s.known,
+        "open": s.open,
+        "keeper": s.keeper,
+        "perHour": s.per_hour,
+        "startedUtc": utc_opt(&s.started_utc),
+        "finishedUtc": utc_opt(&s.finished_utc),
+    }))
+}
+
+/// "Check every song against YouTube": forgets earlier answers and starts one run over the
+/// library. Needs the same things as the Review sweep, and a person to ask.
+async fn start_youtube_check(State(state): State<AppState>) -> Response {
+    let current = state.settings.current();
+    let settings = &current.library_actions;
+    let keeper = crate::services::library::LibraryReviewSweepWorker::keeper(
+        settings,
+        current.subsonic.admin_username.as_deref(),
+    );
+    if !settings.enabled
+        || !settings.review_enabled
+        || settings.effective_youtube_check_per_hour() == 0
+        || keeper.is_none()
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Turn on library actions and Review, set how many songs an hour to check, and put someone on the allowed list, first.",
+        );
+    }
+    state.library_youtube_check.start();
+    accepted(&json!({ "ok": true }))
+}
+
+async fn pause_youtube_check(State(state): State<AppState>) -> Response {
+    state.library_youtube_check.set_paused(true);
+    accepted(&json!({ "ok": true }))
+}
+
+/// Carries on where a pause stopped it, with the answers it has.
+async fn resume_youtube_check(State(state): State<AppState>) -> Response {
+    state.library_youtube_check.set_paused(false);
+    accepted(&json!({ "ok": true }))
 }
 
 /// The weekly upgrade's last run and next one. Times and an outcome only, no file or person, so

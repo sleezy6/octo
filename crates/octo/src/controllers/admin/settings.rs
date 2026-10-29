@@ -460,7 +460,12 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
                 "ReviewSweepAutoReplacePerDay",
                 n_num(actions.review_sweep_auto_replace_per_day),
             ),
+            (
+                "ReviewSweepAutoReplacePreview",
+                Node::Bool(actions.review_sweep_auto_replace_preview),
+            ),
             ("TagCheckPerHour", n_num(actions.tag_check_per_hour)),
+            ("YoutubeCheckPerHour", n_num(actions.youtube_check_per_hour)),
             ("DuplicatesEnabled", Node::Bool(actions.duplicates_enabled)),
             ("DuplicatesPlaylistName", n_str(&actions.duplicates_playlist_name)),
             ("DuplicatesScanHours", n_num(actions.duplicates_scan_hours)),
@@ -1071,6 +1076,18 @@ pub fn validate_discovery_stations(stations: &[Node]) -> Result<Option<String>, 
     Ok(None)
 }
 
+/// The Spotiflac section a save sends: a new web token must be able to travel in a cookie. The
+/// masked placeholder (the token kept as it is) is not a new token. The message to answer with,
+/// or None.
+pub fn validate_spotiflac_token(patch: &JsonObject) -> Option<&'static str> {
+    let key = key_of(patch, "Token")?;
+    let token = string_value(patch.get(&key))?;
+    if token == SECRET_PLACEHOLDER {
+        return None;
+    }
+    SpotiflacSettings::token_problem(token.trim())
+}
+
 /// The Prefetch section a save sends: a scope Octo knows, whole numbers in range for the limits
 /// (each is also clamped at read time), and a folder of its own: never the config folder, the
 /// music folder or any folder inside them, where clearing it would delete what is theirs.
@@ -1235,6 +1252,11 @@ pub async fn save_settings(
     {
         return Ok(error_json(StatusCode::BAD_REQUEST, &message));
     }
+    if let Some(spotiflac_patch) = child(&patch, "Spotiflac")
+        && let Some(message) = validate_spotiflac_token(spotiflac_patch)
+    {
+        return Ok(error_json(StatusCode::BAD_REQUEST, message));
+    }
 
     drop_untouched_answer_actions(&mut patch);
 
@@ -1383,6 +1405,23 @@ mod tests {
 
     fn validate_prefetch_alone(patch: &JsonObject) -> Result<Option<String>, AppError> {
         validate_prefetch(patch, &[], None)
+    }
+
+    #[test]
+    fn a_spotiflac_token_that_cannot_ride_in_a_cookie_is_refused_on_save() {
+        for bad in ["a;b", "a b", "a,b", "é"] {
+            let patch = obj(&format!(r#"{{"Token":"{bad}"}}"#));
+            assert!(
+                validate_spotiflac_token(&patch)
+                    .is_some_and(|m| m.starts_with("The web token travels in a cookie")),
+                "{bad}"
+            );
+        }
+        assert_eq!(validate_spotiflac_token(&obj(r#"{"Token":"abc-123_x.~"}"#)), None);
+        assert_eq!(validate_spotiflac_token(&obj(r#"{"Token":""}"#)), None);
+        assert_eq!(validate_spotiflac_token(&obj(r#"{"Url":"http://x"}"#)), None);
+        let kept = format!(r#"{{"Token":"{SECRET_PLACEHOLDER}"}}"#);
+        assert_eq!(validate_spotiflac_token(&obj(&kept)), None);
     }
 
     #[test]

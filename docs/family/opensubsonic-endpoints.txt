@@ -113,6 +113,8 @@ getUpgrades
 importAction
 libraryAction
 pickFoundSong
+pinChartCountry
+setChartCountry
 setLyricsChoice
 testPing
 

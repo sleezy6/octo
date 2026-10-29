@@ -373,6 +373,8 @@ async fn a_pass_gives_every_song_an_identity_and_keeps_what_disagrees() {
         .read(|s| s.songs.get("b-fine.mp3").cloned())
         .expect("kept");
     assert_eq!(kept.recording_id.as_deref(), Some(SO_WHAT));
+    // A confirmation made under the rule that one person's submissions confirm nothing alone.
+    assert!(kept.confirmed_by_two);
     assert!(kept.findings.is_empty());
     assert_eq!(status.found, 2);
     assert_eq!(status.sure, 2);
@@ -565,6 +567,7 @@ async fn a_lookup_that_fails_is_tried_again_then_left_for_the_next_pass() {
         .expect("kept");
     assert!(kept.retry);
     assert_eq!(kept.recording_id, None);
+    assert!(!kept.confirmed_by_two);
     assert!(sweep.store().read(|s| !s.songs["b.mp3"].retry));
     assert_eq!(sweep.status().checked, 1);
 

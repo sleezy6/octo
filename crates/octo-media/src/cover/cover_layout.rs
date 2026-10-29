@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use super::cover_book::CoverBook;
+use super::cover_book::{CoverBook, TitleNumbers};
 use super::cover_colors::{self, CoverMusic};
 use super::cover_glyph::CoverGlyph;
 use super::text::{eq_ignore_case, is_letter, is_white_space};
@@ -137,49 +137,48 @@ pub fn words(
     let width = s - 2.0 * margin;
     let mut output = Vec::new();
 
-    // The foot line first, so the name knows how far down it may go.
-    let mut floor = s - margin;
-    let footer_text =
-        trimmed_non_empty(spec.footer.as_deref()).filter(|_| side >= layout.footer.show_from_px);
-    if let Some(footer_text) = footer_text {
-        let f = &layout.footer;
-        let look = CoverType {
-            size_px: 0.0,
-            weight: f.weight,
-            tracking: f.tracking,
-            line_height: line_height(script_of(footer_text), f.line_height),
-            max_lines: 1,
-        };
-        let size = f.min_px.max(s * f.size);
-        let fit = fit_text(footer_text, width, s * 0.2, 1, f.min_px, size, &look, setter);
-        let top = s - s * f.bottom - fit.measured.height;
-        output.push(CoverWords {
-            text: footer_text.to_string(),
-            type_: fit.type_,
-            left: margin,
-            top,
-            width,
-            align,
-            ink: cover_colors::alpha(white, f.opacity),
-            measured: fit.measured,
-            role: WordsRole::Footer,
+    // The foot line first, so the name knows how far down it may go. One that does not fit on a
+    // line is left off.
+    let footer = trimmed_non_empty(spec.footer.as_deref())
+        .filter(|_| side >= layout.footer.show_from_px)
+        .and_then(|footer_text| {
+            let f = &layout.footer;
+            let look = CoverType {
+                size_px: 0.0,
+                weight: f.weight,
+                tracking: f.tracking,
+                line_height: line_height(script_of(footer_text), f.line_height),
+                max_lines: 1,
+            };
+            let size = f.min_px.max(s * f.size);
+            let fit = fit_or_null(footer_text, width, s * 0.2, 1, f.min_px, size, &look, setter)?;
+            Some(CoverWords {
+                text: footer_text.to_string(),
+                type_: fit.type_,
+                left: margin,
+                top: s - s * f.bottom - fit.measured.height,
+                width,
+                align,
+                ink: cover_colors::alpha(white, f.opacity),
+                measured: fit.measured,
+                role: WordsRole::Footer,
+            })
         });
-        floor = top - s * 0.04;
-    }
     if name.is_empty() {
-        return output;
+        return footer.into_iter().collect();
     }
 
     let t = &layout.title;
     let title_top = s * t.top;
     let line_text = trimmed_non_empty(spec.line.as_deref())
         .filter(|_| side >= layout.line.show_from_px && !says_what_it_is(name));
-    let line_room = if line_text.is_none() {
-        0.0
-    } else {
-        (s * t.wrap_size).max(t.wrap_min_px) * layout.line.share_of_title * layout.line.line_height
+    let line_room_for = |line: bool| {
+        if line {
+            (s * t.wrap_size).max(t.wrap_min_px) * layout.line.share_of_title * layout.line.line_height
+        } else {
+            0.0
+        }
     };
-    let room = floor - title_top - line_room;
     let title_look = CoverType {
         size_px: 0.0,
         weight: t.weight,
@@ -188,84 +187,110 @@ pub fn words(
         max_lines: 1,
     };
     let min_px = t.min_px.max(s * t.min_size);
-    let one_line_least = min_px.max((s * t.one_line_down_to).max(t.one_line_min_px));
-    let wrap_most = min_px.max((s * t.wrap_size).max(t.wrap_min_px.min(s * t.size)));
-    let title = (if one_line_least <= s * t.size {
-        fit_or_null(
-            name,
-            width,
-            room,
-            1,
-            one_line_least,
-            s * t.size,
-            &title_look,
-            setter,
-        )
-    } else {
-        None
-    })
-    .unwrap_or_else(|| {
-        fit_text(
-            name,
-            width,
-            room,
-            t.max_lines,
-            min_px,
-            wrap_most,
-            &title_look,
-            setter,
-        )
-    });
-    let title_size = title.type_.size_px;
-    let title_height = title.measured.height;
-    output.push(CoverWords {
-        text: name.to_string(),
-        type_: title.type_,
-        left: margin,
-        top: title_top,
-        width,
-        align,
-        ink: white,
-        measured: title.measured,
-        role: WordsRole::Title,
-    });
-
-    if let Some(line_text) = line_text {
-        let l = &layout.line;
-        let line_top = title_top + title_height;
-        let most = l.min_px.max(title_size * l.share_of_title);
-        let line_look = CoverType {
-            size_px: 0.0,
-            weight: l.weight,
-            tracking: l.tracking,
-            line_height: line_height(script_of(line_text), l.line_height),
-            max_lines: 1,
-        };
-        let fit = fit_text(
-            line_text,
-            width,
-            s,
-            1,
-            l.min_px.min(most),
-            most,
-            &line_look,
-            setter,
-        );
-        if line_top + fit.measured.height <= floor {
-            output.push(CoverWords {
-                text: line_text.to_string(),
-                type_: fit.type_,
-                left: margin,
-                top: line_top,
-                width,
-                align,
-                ink: white,
-                measured: fit.measured,
-                role: WordsRole::Line,
-            });
+    let floor_px = t.floor_px.max(s * t.floor_size).min(min_px);
+    // The name has to fit whole. When it does not at its usual smallest, the light line goes,
+    // then the foot line, then the name may be set down to its floor; when it still does not
+    // fit, the cover is its artwork only.
+    let steps = [
+        (footer.is_some(), line_text.is_some(), min_px),
+        (footer.is_some(), false, min_px),
+        (false, false, min_px),
+        (false, false, floor_px),
+    ];
+    let mut tried: Vec<(bool, bool, f32)> = Vec::new();
+    for step in steps {
+        if tried.contains(&step) {
+            continue;
         }
+        tried.push(step);
+        let (with_footer, with_line, least_px) = step;
+        let floor = match (&footer, with_footer) {
+            (Some(footer), true) => footer.top - s * 0.04,
+            _ => s - margin,
+        };
+        let room = floor - title_top - line_room_for(with_line);
+        let Some(title) = fit_title(name, width, room, min_px, least_px, s, &title_look, setter, t) else {
+            continue;
+        };
+        let title_size = title.type_.size_px;
+        let title_height = title.measured.height;
+        if with_footer {
+            output.extend(footer);
+        }
+        output.push(CoverWords {
+            text: name.to_string(),
+            type_: title.type_,
+            left: margin,
+            top: title_top,
+            width,
+            align,
+            ink: white,
+            measured: title.measured,
+            role: WordsRole::Title,
+        });
+        if let Some(line_text) = line_text.filter(|_| with_line) {
+            let l = &layout.line;
+            let line_top = title_top + title_height;
+            let most = l.min_px.max(title_size * l.share_of_title);
+            let line_look = CoverType {
+                size_px: 0.0,
+                weight: l.weight,
+                tracking: l.tracking,
+                line_height: line_height(script_of(line_text), l.line_height),
+                max_lines: 1,
+            };
+            let fit = fit_or_null(
+                line_text,
+                width,
+                s,
+                1,
+                l.min_px.min(most),
+                most,
+                &line_look,
+                setter,
+            );
+            if let Some(fit) = fit.filter(|fit| line_top + fit.measured.height <= floor) {
+                output.push(CoverWords {
+                    text: line_text.to_string(),
+                    type_: fit.type_,
+                    left: margin,
+                    top: line_top,
+                    width,
+                    align,
+                    ink: white,
+                    measured: fit.measured,
+                    role: WordsRole::Line,
+                });
+            }
+        }
+        return output;
     }
-    output
+    Vec::new()
+}
+
+/// The name set whole in the box: on one line at a size down to `t.one_line_down_to` of the
+/// side when that fits, else wrapped on up to `t.max_lines` lines at no less than `least_px`,
+/// with no word broken. None when it does not fit.
+#[allow(clippy::too_many_arguments)]
+fn fit_title(
+    name: &str,
+    width: f32,
+    room: f32,
+    min_px: f32,
+    least_px: f32,
+    side: f32,
+    look: &CoverType,
+    setter: &dyn ICoverTypesetter,
+    t: &TitleNumbers,
+) -> Option<FittedText> {
+    let one_line_least = min_px.max((side * t.one_line_down_to).max(t.one_line_min_px));
+    let wrap_most = min_px.max((side * t.wrap_size).max(t.wrap_min_px.min(side * t.size)));
+    if one_line_least <= side * t.size
+        && let Some(one_line) = fit_or_null(name, width, room, 1, one_line_least, side * t.size, look, setter)
+    {
+        return Some(one_line);
+    }
+    fit_or_null(name, width, room, t.max_lines, least_px, wrap_most, look, setter)
 }
 
 /// The largest whole-pixel size from `min_px` to `max_px` at which the text fits the box in at
@@ -318,35 +343,6 @@ pub fn fit_or_null(
         type_: type_at(low),
         measured: best,
     })
-}
-
-/// As [`fit_or_null`], but when nothing fits: the smallest size, as many lines as the box
-/// holds, the rest cut.
-pub fn fit_text(
-    text: &str,
-    width: f32,
-    height: f32,
-    max_lines: i32,
-    min_px: f32,
-    max_px: f32,
-    look: &CoverType,
-    setter: &dyn ICoverTypesetter,
-) -> FittedText {
-    if let Some(fitted) = fit_or_null(text, width, height, max_lines, min_px, max_px, look, setter) {
-        return fitted;
-    }
-    let size = min_px.floor().max(1.0);
-    let lines = ((height / (size * look.line_height)) as i32).clamp(1, max_lines);
-    let type_ = CoverType {
-        size_px: size,
-        max_lines: lines,
-        ..*look
-    };
-    FittedText {
-        text: text.to_string(),
-        type_,
-        measured: setter.measure(text, &type_, width),
-    }
 }
 
 // ---------------------------------------------------------------- writing

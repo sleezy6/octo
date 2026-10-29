@@ -12,4 +12,4 @@ pub use acoust_id_client::AcoustIdClient;
 pub use acoust_id_rate_limit_handler::AcoustIdRateLimitHandler;
 pub use acoust_id_rate_limiter::AcoustIdRateLimiter;
 pub use download_verification_service::{DownloadVerificationService, RecordingIsrcs};
-pub use music_brainz_client::{MusicBrainzClient, MusicBrainzError};
+pub use music_brainz_client::{IsrcLookup, MusicBrainzClient, MusicBrainzError};

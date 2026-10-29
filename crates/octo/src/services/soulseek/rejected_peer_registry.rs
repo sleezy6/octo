@@ -217,6 +217,27 @@ impl RejectedPeerRegistry {
         false
     }
 
+    /// Lifts the denial of `username`'s `filename`, and only that one: the user's other files
+    /// stay denied. Written at once, as [`Self::clear`] is. True when there was one to lift.
+    pub fn allow(&self, username: &str, filename: &str) -> bool {
+        if username.is_empty() || filename.is_empty() {
+            return false;
+        }
+        let folded = ordinal_ignore_case_key(&Self::make_key(Some(username), Some(filename)));
+        let lifted = {
+            let mut lru = self.lru.lock();
+            let present = lru.by_key.contains_key(&folded);
+            lru.forget(&folded);
+            present
+        };
+        if lifted {
+            self.dirty.store(true, Ordering::SeqCst);
+            self.flush();
+            info!("No longer rejecting {username} -> {filename}");
+        }
+        lifted
+    }
+
     /// The recovery lever for a wrong denial. Flushes synchronously rather than waiting for
     /// the timer: a user who clears the list and immediately restarts the container must not
     /// get every entry back, which is what "cleared" would otherwise mean for ten seconds.

@@ -855,6 +855,7 @@ impl KeepMarks {
             revealed_path: None,
             copy,
             download_allowed: false,
+            denied_source: None,
         }
     }
 

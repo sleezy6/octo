@@ -781,6 +781,8 @@ input[type="number"].set-input { max-width: 160px; }
 .kr-note { margin-top: 0; }
 .set-ctrl { flex-shrink: 0; display: flex; align-items: center; gap: var(--s-m); }
 .set-row.is-disabled .set-info { opacity: 0.5; }
+/* Buttons at the end of a row, side by side and as tall as any other row's. */
+.set-buttons { display: flex; flex-shrink: 0; gap: var(--s-m); }
 .set-inline { display: flex; gap: var(--s-m); }
 .set-inline .set-input { flex: 1 1 auto; min-width: 0; }
 .set-inline .btn, .field-inline .btn { height: auto; min-height: var(--h-field); }
@@ -1534,6 +1536,17 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .imp-card { padding: var(--s-xl); display: flex; flex-direction: column; gap: var(--s-l); }
 .set-card.imp-card > :not([hidden]):not([type="hidden"]) ~ :not([type="hidden"]) { border-top: 0; }
 .imp-card > .set-row { padding: 0; }
+/* The trickle's buttons sit on its title's line however long the line under it runs, so they stay
+ * put from one state to the next. */
+.imp-trickle-head { align-items: flex-start; }
+.imp-trickle-head > .imp-actions { margin-top: -7px; }
+.imp-trickle-head > .imp-actions:not(:has(> :not([hidden]))) { display: none; }
+@media (pointer: coarse) { .imp-trickle-head > .imp-actions { margin-top: -12px; } }
+/* A narrow card puts them under its words, so the line keeps a readable width. */
+@container (max-width: 480px) {
+  .imp-trickle-head { flex-direction: column; align-items: stretch; gap: var(--s-l); }
+  .imp-trickle-head > .imp-actions { margin-top: 0; justify-content: flex-start; }
+}
 .imp-row { grid-template-columns: minmax(0, 2.2fr) minmax(0, 1.6fr) 112px 92px 104px 136px; gap: var(--s-l); align-items: center; }
 .imp-row.picked, .imp-track.picked { background: var(--accent-selected); }
 .imp-row .key, .imp-track .key, .imp-trickle-row .key { font-family: inherit; color: var(--ink); overflow-wrap: anywhere; }
@@ -2479,6 +2492,9 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
   .page-header > .btn { margin-left: 52px; }
   .settings-card, .info-card, .callout { padding: var(--s-xl); }
   .set-row { padding: var(--s-l) 14px; }
+  /* A row with several buttons gives its words the full width and puts the buttons under them. */
+  .set-row:has(> .set-buttons > .btn:not([hidden]) ~ .btn:not([hidden])) { flex-wrap: wrap; gap: var(--s-l); }
+  .set-buttons { margin-left: auto; }
   .form-actions { padding: var(--s-l) 14px; }
   #raw-form .form-actions { margin: var(--s-xl) calc(-1 * var(--s-xl)) calc(-1 * var(--s-xl)); }
 }
@@ -2743,6 +2759,19 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .chart-choice { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; }
 .chart-status { padding: 8px 16px 12px; color: var(--text-muted); font-size: 12px; line-height: 1.6; }
 .chart-status-note { margin-top: 4px; color: var(--text-faint); }
+/* Each person's charts: a label beside each control, every control the same width, and one line
+   kept for "Saved." so nothing below moves when it shows. */
+.charts-people-ctrl { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: center; gap: var(--s-m) var(--s-l); }
+.charts-people-label { color: var(--text-muted); font-size: 13px; }
+.charts-people-ctrl > .set-input, .charts-pins, .charts-pins .set-input { width: 100%; min-width: 0; }
+.charts-pins { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s-m); }
+.charts-people-note { grid-column: 1 / -1; min-height: 20px; }
+.charts-people-note.inline-note { margin: 0; }
+@media (max-width: 640px) {
+  .charts-people-ctrl, .charts-pins { grid-template-columns: minmax(0, 1fr); }
+  .charts-people-ctrl { row-gap: var(--s-s); }
+  .charts-people-ctrl > .set-input, .charts-pins { margin-bottom: var(--s-s); }
+}
 
 /* ── Animated art card ── */
 .art-card { margin-top: var(--s-l); }

@@ -1,4 +1,5 @@
-//! `getAlbumInfo2`/`getAlbumInfo` (L3624) and `getArtistInfo2`/`getArtistInfo` (L3655).
+//! `getAlbumInfo2`/`getAlbumInfo` (one answer for both, `albumInfo`, as Navidrome gives) and
+//! `getArtistInfo2`/`getArtistInfo` (each answers its own element, `artistInfo2`/`artistInfo`).
 
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
@@ -55,7 +56,39 @@ pub async fn get_album_info2(State(state): State<AppState>, req: Request) -> Res
 const SIMILAR_ARTISTS: i32 = 20;
 const MAX_SIMILAR_ARTISTS: i32 = 50;
 
+/// Which of the artist info pair a client called: each answers its own element and asks
+/// Navidrome for its own version.
+#[derive(Debug, Clone, Copy)]
+enum ArtistInfoVersion {
+    V1,
+    V2,
+}
+
+impl ArtistInfoVersion {
+    fn element(self) -> &'static str {
+        match self {
+            ArtistInfoVersion::V1 => "artistInfo",
+            ArtistInfoVersion::V2 => "artistInfo2",
+        }
+    }
+
+    fn upstream(self) -> &'static str {
+        match self {
+            ArtistInfoVersion::V1 => "rest/getArtistInfo",
+            ArtistInfoVersion::V2 => "rest/getArtistInfo2",
+        }
+    }
+}
+
+pub async fn get_artist_info(State(state): State<AppState>, req: Request) -> Response {
+    artist_info(state, req, ArtistInfoVersion::V1).await
+}
+
 pub async fn get_artist_info2(State(state): State<AppState>, req: Request) -> Response {
+    artist_info(state, req, ArtistInfoVersion::V2).await
+}
+
+async fn artist_info(state: AppState, req: Request, version: ArtistInfoVersion) -> Response {
     let call = match SubsonicCall::read(&state, req).await {
         Ok(call) => call,
         Err(response) => return response,
@@ -86,11 +119,10 @@ pub async fn get_artist_info2(State(state): State<AppState>, req: Request) -> Re
                 .get_related_artists(provider, external_id, count),
         );
         let biography = biography.unwrap_or_default();
-        // The v1 request still gets the artistInfo2 element name.
         return builder
             .create_artist_info_response(
                 format,
-                "artistInfo2",
+                version.element(),
                 &[
                     ("biography", &biography),
                     ("smallImageUrl", &url),
@@ -102,12 +134,8 @@ pub async fn get_artist_info2(State(state): State<AppState>, req: Request) -> Re
             .into_response();
     }
 
-    match call
-        .proxy
-        .relay_safe("rest/getArtistInfo2", &call.parameters)
-        .await
-    {
+    match call.proxy.relay_safe(version.upstream(), &call.parameters).await {
         Some(relay) => call.file(&relay.body, relay.content_type.as_deref()),
-        None => builder.create_response(format, "artistInfo2").into_response(),
+        None => builder.create_response(format, version.element()).into_response(),
     }
 }

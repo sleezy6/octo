@@ -10,7 +10,7 @@ use indexmap::IndexMap;
 use octo_core::common::dotnet;
 use octo_core::json::element::{ElementResult, enumerate_array, get_int32, get_string, try_get_property};
 use octo_core::models::domain::Song;
-use octo_core::soulseek::soulseek_metadata_service::RoutingKind;
+use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
 use serde_json::Value;
 use tracing::debug;
 
@@ -171,6 +171,8 @@ impl LastFmRadioTrackResolver {
         // it suggested.
         if let Some(video) = you_tube_id.filter(|video| !video.is_empty()) {
             self.registry.pin_video(&hit.id, video, false);
+            self.registry
+                .remember_pick(&hit.id, video, SoulseekRouting::VIDEO_NAMED);
         }
         // The placeholder is registered under the very artist and title the source gave, so
         // its Deezer id is this song's: kept, a play or a heart skips Deezer's search.

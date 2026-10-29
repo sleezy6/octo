@@ -32,6 +32,10 @@ pub struct TitleNumbers {
     pub wrap_size: f32,
     pub min_size: f32,
     pub min_px: f32,
+    /// The smallest a title is set, in pixels, when it does not fit at its usual minimum.
+    pub floor_px: f32,
+    /// The same as a share of the cover's side; the larger of the two is the floor.
+    pub floor_size: f32,
     pub max_lines: i32,
     pub line_height: f32,
     pub tracking: f32,

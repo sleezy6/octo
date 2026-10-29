@@ -92,6 +92,8 @@ pub struct ListDetail {
 #[serde(rename_all = "camelCase")]
 pub struct TrickleView {
     pub state: String,
+    /// The state in the words a person reads; an app that does not know `state` shows these.
+    pub label: String,
     #[serde(with = "datetime::utc_option")]
     pub next_utc: Option<DateTime<Utc>>,
     pub per_hour: i32,

@@ -1,7 +1,7 @@
 //! Importing songs from a public Spotify link, an exported file or a pasted list. Reading each
 //! list, matching each song against the library, keeping a list as a Navidrome playlist, and the
 //! trickle that fetches the missing songs a few an hour; and what the import keeps on disk
-//! (`imports.json`, `imports-trickle.json`), in the shape existing files already have.
+//! (`imports.json`, `imports-trickle.json`, `imports-isrc.json`), in the shape existing files already have.
 
 pub mod import_file_reader;
 pub mod import_keys;

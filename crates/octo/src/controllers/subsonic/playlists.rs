@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use indexmap::IndexMap;
@@ -20,9 +21,10 @@ use octo_core::library::for_you_lists;
 use octo_core::settings::GeneratedPlaylistSettings;
 use octo_core::settings::NoticeKind;
 use octo_subsonic::SubsonicReply;
+use octo_subsonic::subsonic_request_parser::Parameters;
 use octo_subsonic::subsonic_response_builder::chart_playlist_comment;
 use octo_subsonic::xml::XElement;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::warn;
 
 use super::action_helpers::{
@@ -30,12 +32,14 @@ use super::action_helpers::{
     is_successful_subsonic_response, materialize_station, playlist_names, playlist_stations,
     queue_refresh_if_stale, serve_station_songs, suggested_sources, xml_value,
 };
+use super::caller_checks::listener_name_of;
 use crate::app::AppState;
 use crate::middleware::family_gate::{GateReading, Unverified};
 use crate::services::family::audio_gate::ExplicitMark;
 use crate::services::family::family_playlists::{
-    self, FAMILY_OWNER, NewEntry, PlaylistError, SHARED_SCOPE, Serve, personal_scope,
+    self, FAMILY_OWNER, NewEntry, PlaylistError, SHARED_SCOPE, Serve, ShownEntry, personal_scope,
 };
+use crate::services::family::rules::AnswerContext;
 use crate::services::family::{FamilyCaller, FamilyPlaylist, FamilyPlaylistEntry, family_caller, kid_filter};
 use crate::services::library::library_action_playlist_provisioner::{
     REMOVE_PLAYLIST, REQUEST_FLAC_PLAYLIST, REQUEST_PLAYLIST,
@@ -76,7 +80,7 @@ pub async fn get_playlists(State(state): State<AppState>, req: Request) -> Respo
         }
     };
 
-    let username = call.param_or("u", "").to_string();
+    let username = listener_name_of(&state, &call.parameters, &call.proxy, &call.parts.headers).await;
 
     // This listener's Review and Duplicates playlists carry Octo's glyph cover.
     let notices = notice_titles(&state, &username);
@@ -202,12 +206,19 @@ pub(crate) fn chart_playlist_fields(
     };
     let mut fields = builder.generated_playlist_fields(list, &wide);
     fields.insert("songCount".into(), list.pool_size.into());
-    let chart = chart_settings::chart_from_key(&list.key).unwrap_or_default();
+    let (chart, pinned) = chart_settings::list_from_key(&list.key).unwrap_or_default();
     let kind = chart_settings::kind_word(&chart).unwrap_or("overall");
-    let genre = list.name.strip_prefix("Top ").unwrap_or(&list.name);
-    fields.insert("comment".into(), chart_playlist_comment(kind, genre).into());
+    let mut genre = list.name.strip_prefix("Top ").unwrap_or(&list.name);
+    if pinned.is_some() {
+        genre = genre.rsplit_once(" · ").map_or(genre, |(name, _)| name);
+    }
+    let country = pinned.as_deref().map(chart_settings::country_name);
+    fields.insert(
+        "comment".into(),
+        chart_playlist_comment(kind, genre, country.as_deref()).into(),
+    );
     // octoCoverTitle: the words the Octo apps put on the list's cover in place of its name.
-    if let Some(title) = super::media::chart_cover_title(&chart) {
+    if let Some(title) = super::media::chart_cover_words(&chart, pinned.as_deref(), &list.name) {
         fields.insert("octoCoverTitle".into(), title.into());
     }
     fields
@@ -501,15 +512,18 @@ fn utc_millis(at: &DateTime<Utc>) -> String {
 }
 
 /// A family playlist's cover id: its id, then `_` and a tag that changes with what the cover
-/// shows (its own picture, the painted design, how many songs the viewer is shown and the
-/// newest addition), so an app that keeps covers asks again after a change.
+/// shows (its own picture, the painted design, how many songs the viewer is shown, and the
+/// playlist's change time: a song added, taken out or approved, or a rename), so an app that
+/// keeps covers asks again after a change.
 pub(crate) fn family_cover_id(state: &AppState, playlist: &FamilyPlaylist, count: usize) -> String {
     use sha2::{Digest, Sha256};
+    // The same change time the row shows: a song added, taken out, approved, or a rename.
     let changed = playlist
         .entries
         .iter()
         .map(|entry| entry.added)
         .chain([playlist.created])
+        .chain(playlist.changed)
         .max()
         .unwrap_or(playlist.created);
     let picture = state.family_playlists.cover_stamp(&playlist.id).unwrap_or(0);
@@ -528,7 +542,9 @@ pub(crate) fn family_cover_id(state: &AppState, playlist: &FamilyPlaylist, count
 
 /// One family playlist's row as `viewer` sees it: owned by "Family", public, with the number
 /// of songs this viewer is shown and how long they last. Read-only for a viewer who cannot
-/// change it.
+/// change it. It also carries `octoFamily` (true), `octoFamilyCreatedBy`, and, for this viewer,
+/// `octoFamilyMayRename` and `octoFamilyMayDelete`. `changed` is the newest of when it was made,
+/// when any song was added, and its own change time.
 fn family_playlist_fields(
     playlist: &FamilyPlaylist,
     viewer: &FamilyCaller,
@@ -540,6 +556,7 @@ fn family_playlist_fields(
         .iter()
         .map(|entry| entry.added)
         .chain([playlist.created])
+        .chain(playlist.changed)
         .max()
         .unwrap_or(playlist.created);
     let mut fields = serde_json::Map::new();
@@ -553,6 +570,16 @@ fn family_playlist_fields(
     fields.insert("created".into(), utc_millis(&playlist.created).into());
     fields.insert("changed".into(), utc_millis(&changed).into());
     fields.insert("readonly".into(), (!family_playlists::may_edit(viewer)).into());
+    fields.insert("octoFamily".into(), true.into());
+    fields.insert("octoFamilyCreatedBy".into(), playlist.created_by.clone().into());
+    fields.insert(
+        "octoFamilyMayRename".into(),
+        family_playlists::may_rename(viewer, playlist).into(),
+    );
+    fields.insert(
+        "octoFamilyMayDelete".into(),
+        family_playlists::may_delete(viewer).into(),
+    );
     fields
 }
 
@@ -644,7 +671,7 @@ async fn get_playlist_inner(state: &AppState, req: Request, aborted: &RequestAbo
     let format = call.format.as_str();
     let builder = &state.subsonic_response_builder;
     let id = call.param_or("id", "").to_string();
-    let username = call.param_or("u", "").to_string();
+    let username = listener_name_of(state, &call.parameters, &call.proxy, &call.parts.headers).await;
 
     if id.starts_with("oi") && is_octo_playlist_id(&id, false) {
         if !signed_in(state, &call, format).await {
@@ -1100,6 +1127,7 @@ fn playlist_error(state: &AppState, call: &SubsonicCall, error: PlaylistError) -
         PlaylistError::NotFound => 70,
         PlaylistError::NotAllowed(_) => 50,
         PlaylistError::BlankName => 10,
+        PlaylistError::Changed => 0,
     };
     family_error(state, call, code, error.message())
 }
@@ -1150,23 +1178,12 @@ async fn family_playlist(state: &AppState, call: &SubsonicCall, id: &str) -> Res
     };
 
     let shown = family_playlists::shown_entries(&playlist, caller);
-    let entries: Vec<Value> = futures::stream::iter(shown)
-        .map(|entry| async move {
-            match entry.serve {
-                Serve::Library { id, outside } => match library_song_json(call, &id).await {
-                    Some(song) => Some(song),
-                    None => match outside {
-                        Some(outside) => outside_song_json(state, &outside).await,
-                        None => None,
-                    },
-                },
-                Serve::Outside(outside) => outside_song_json(state, &outside).await,
-            }
-        })
-        .buffered(FAMILY_SONGS_AT_ONCE)
-        .filter_map(|song| async move { song })
-        .collect()
-        .await;
+    let entries: Vec<Value> = served_entries(state, call, shown, false)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, song)| song)
+        .collect();
     // The whole list's count and length; a kid profile's answer rule then takes out the
     // explicit songs and lowers both.
     let seconds = entries
@@ -1187,19 +1204,153 @@ async fn family_playlist(state: &AppState, call: &SubsonicCall, id: &str) -> Res
         .into_response()
 }
 
-/// A library song as Navidrome describes it to the caller, in JSON.
-async fn library_song_json(call: &SubsonicCall, id: &str) -> Option<Value> {
+/// A family playlist's songs as `getPlaylist` answers them to its caller, each with its place in
+/// the stored playlist: the library song (read as the caller) when it is shared or the caller's
+/// own, else its outside version. An entry neither can be read for is left out. With `strict`, an
+/// entry whose library song could not be read because Navidrome did not answer makes the whole
+/// answer `None`, so nothing is decided from a list the caller was never shown.
+async fn served_entries(
+    state: &AppState,
+    call: &SubsonicCall,
+    shown: Vec<ShownEntry>,
+    strict: bool,
+) -> Option<Vec<(usize, Value)>> {
+    let resolved: Vec<Result<Option<(usize, Value)>, ()>> = futures::stream::iter(shown)
+        .map(|entry| async move {
+            let stored = entry.stored;
+            let song = match entry.serve {
+                Serve::Library { id, outside } => match library_song_read(call, &id).await {
+                    LibraryRead::Song(song) => Some(song),
+                    read => {
+                        if strict && matches!(read, LibraryRead::Unreachable) {
+                            return Err(());
+                        }
+                        match outside {
+                            Some(outside) => outside_song_json(state, &outside).await,
+                            None => None,
+                        }
+                    }
+                },
+                Serve::Outside(outside) => outside_song_json(state, &outside).await,
+            };
+            Ok(song.map(|song| (stored, song)))
+        })
+        .buffered(FAMILY_SONGS_AT_ONCE)
+        .collect()
+        .await;
+    let mut served = Vec::new();
+    for entry in resolved {
+        if let Some(song) = entry.ok()? {
+            served.push(song);
+        }
+    }
+    Some(served)
+}
+
+/// The stored places of the songs the caller's `getPlaylist` answer lists, in its order: what
+/// `songIndexToRemove` counts over. `None` when Navidrome could not be reached for a library song.
+async fn served_places(
+    state: &AppState,
+    call: &SubsonicCall,
+    playlist: &FamilyPlaylist,
+    caller: &FamilyCaller,
+) -> Option<Vec<usize>> {
+    let served = served_entries(
+        state,
+        call,
+        family_playlists::shown_entries(playlist, caller),
+        true,
+    )
+    .await?;
+    // The songs getPlaylist's answer lists are the ones left once the answer rules that answer goes
+    // through for this caller have run (a kid profile's explicit songs, the owner's privacy).
+    let body = json!({"subsonic-response": {"status": "ok", "version": "1.16.1", "playlist": {
+        "id": playlist.id,
+        "entry": served.iter().map(|(_, song)| song.clone()).collect::<Vec<Value>>(),
+    }}});
+    let mut parameters = Parameters::new();
+    parameters.insert("f".into(), "json".into());
+    let context = AnswerContext {
+        state,
+        caller,
+        endpoint: "getPlaylist",
+        path: "/rest/getPlaylist",
+        parameters: &parameters,
+        content_type: Some("application/json"),
+    };
+    let mut answer = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
+    for rule in state.family_answer_rules.for_endpoint("getPlaylist") {
+        answer = rule(&context, answer);
+    }
+    let listed: Vec<String> = serde_json::from_slice::<Value>(&answer)
+        .ok()
+        .and_then(|v| v["subsonic-response"]["playlist"]["entry"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|song| song.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    // Each listed song, in order, matched to the served song it came from.
+    let mut places = Vec::new();
+    let mut next = 0;
+    for id in listed {
+        while next < served.len() && served[next].1.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+            next += 1;
+        }
+        if next < served.len() {
+            places.push(served[next].0);
+            next += 1;
+        }
+    }
+    Some(places)
+}
+
+/// What reading a library song as the caller gave.
+enum LibraryRead {
+    Song(Value),
+    /// Navidrome answered that the caller has no such song (error 70).
+    Refused,
+    /// Navidrome did not answer, answered some other error, or answered something that is not a song.
+    Unreachable,
+}
+
+/// Reads a library song as the caller, telling a song the caller does not have from a Navidrome that did not answer.
+async fn library_song_read(call: &SubsonicCall, id: &str) -> LibraryRead {
     let mut request = call.parameters.clone();
     request.insert("id".into(), id.to_string());
     request.insert("f".into(), "json".into());
     request.shift_remove("callback");
-    let relay = call.proxy.relay_safe("rest/getSong", &request).await?;
-    let answer: Value = serde_json::from_slice(&relay.body).ok()?;
-    let response = answer.get("subsonic-response")?;
+    let Some(relay) = call.proxy.relay_safe("rest/getSong", &request).await else {
+        return LibraryRead::Unreachable;
+    };
+    let Ok(answer) = serde_json::from_slice::<Value>(&relay.body) else {
+        return LibraryRead::Unreachable;
+    };
+    let Some(response) = answer.get("subsonic-response") else {
+        return LibraryRead::Unreachable;
+    };
     if response.get("status").and_then(Value::as_str) != Some("ok") {
-        return None;
+        let code = response
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(Value::as_i64);
+        return if code == Some(70) {
+            LibraryRead::Refused
+        } else {
+            LibraryRead::Unreachable
+        };
     }
-    response.get("song").filter(|song| song.is_object()).cloned()
+    match response.get("song").filter(|song| song.is_object()) {
+        Some(song) => LibraryRead::Song(song.clone()),
+        None => LibraryRead::Unreachable,
+    }
+}
+
+/// A library song as Navidrome describes it to the caller, in JSON, when it can be read.
+async fn library_song_json(call: &SubsonicCall, id: &str) -> Option<Value> {
+    match library_song_read(call, id).await {
+        LibraryRead::Song(song) => Some(song),
+        _ => None,
+    }
 }
 
 /// An outside song in the shape every outside song has.
@@ -1271,11 +1422,14 @@ async fn family_mutate(state: &AppState, call: &SubsonicCall, id: &str, change: 
                     ),
                 );
             }
-            if renames
-                && let Some(name) = name
-                && let Err(error) = family_playlists::rename(store, caller, id, name)
-            {
-                return playlist_error(state, call, error);
+            let song_removals = call.incoming.parameter_values("octoSongToRemove");
+            if !song_removals.is_empty() && !call.incoming.parameter_values("songIndexToRemove").is_empty() {
+                return family_error(
+                    state,
+                    call,
+                    10,
+                    "Use octoSongToRemove or songIndexToRemove, not both.",
+                );
             }
             let removals: Vec<usize> = call
                 .incoming
@@ -1283,8 +1437,53 @@ async fn family_mutate(state: &AppState, call: &SubsonicCall, id: &str, change: 
                 .iter()
                 .filter_map(|index| index.trim().parse().ok())
                 .collect();
-            if !removals.is_empty()
-                && let Err(error) = family_playlists::remove_shown(store, caller, id, &removals)
+            // Songs named by id are found in the stored list without reading Navidrome, so the
+            // places cannot drift.
+            let pairs: Vec<(String, usize)> = song_removals
+                .iter()
+                .filter_map(|value| {
+                    let (id, n) = value.trim().rsplit_once('@')?;
+                    let n: usize = n.trim().parse().ok().filter(|n| *n > 0)?;
+                    (!id.is_empty()).then(|| (id.to_string(), n))
+                })
+                .collect();
+            if !pairs.is_empty() {
+                let stored = family_playlists::stored_places_of(&playlist, caller, &pairs);
+                if let Err(error) =
+                    family_playlists::remove_stored(store, caller, id, &playlist.entries, &stored)
+                {
+                    return playlist_error(state, call, error);
+                }
+            }
+            // Places count over the songs the caller's answer lists (see served_places), worked out
+            // and applied before the name changes, so a refused removal changes nothing.
+            let removal_places = if removals.is_empty() {
+                None
+            } else {
+                let Some(places) = served_places(state, call, &playlist, caller).await else {
+                    return family_error(
+                        state,
+                        call,
+                        0,
+                        "Octo can't reach Navidrome to read this playlist's songs, so nothing was taken out.",
+                    );
+                };
+                Some(
+                    removals
+                        .iter()
+                        .filter_map(|at| places.get(*at).copied())
+                        .collect::<Vec<usize>>(),
+                )
+            };
+            if let Some(stored) = removal_places
+                && let Err(error) =
+                    family_playlists::remove_stored(store, caller, id, &playlist.entries, &stored)
+            {
+                return playlist_error(state, call, error);
+            }
+            if renames
+                && let Some(name) = name
+                && let Err(error) = family_playlists::rename(store, caller, id, name)
             {
                 return playlist_error(state, call, error);
             }

@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use octo_core::fingerprint::{InconclusiveReason, VerificationResult, VerificationVerdict};
 use octo_media::audio::AudioFingerprinter;
+use wiremock::matchers::{method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 
@@ -36,6 +38,7 @@ fn request(seconds: Option<i32>) -> PreviewRequest<'static> {
         title: "One Dance",
         seconds,
         video_id: None,
+        background: false,
     }
 }
 
@@ -45,6 +48,7 @@ fn facts(title: &str, artist: Option<&str>, seconds: Option<i32>) -> PreviewFact
         title: Some(title.into()),
         artist: artist.map(str::to_string),
         seconds,
+        album: None,
     }
 }
 
@@ -63,6 +67,13 @@ fn a_sound_acoustid_never_heard_is_always_compared() {
     let no_entry = verdict(VerificationVerdict::Inconclusive, InconclusiveReason::NoEntry);
     assert!(wanted(&no_entry, true));
     assert!(wanted(&no_entry, false));
+}
+
+#[test]
+fn a_lone_link_is_always_compared() {
+    let lone = verdict(VerificationVerdict::Inconclusive, InconclusiveReason::LoneLink);
+    assert!(wanted(&lone, true));
+    assert!(wanted(&lone, false));
 }
 
 #[test]
@@ -394,14 +405,35 @@ struct DownShim {
 
 #[async_trait]
 impl PreviewSource for DownShim {
-    async fn find(&self, _request: &PreviewRequest<'_>) -> Option<PreviewFacts> {
-        Some(facts("One Dance", Some("Drake"), Some(174)))
+    async fn find(&self, _request: &PreviewRequest<'_>) -> Result<Option<PreviewFacts>, Failure> {
+        Ok(Some(facts("One Dance", Some("Drake"), Some(174))))
     }
 
     async fn fetch(&self, _video_id: &str, _dest: &Path) -> bool {
         self.fetches.fetch_add(1, Ordering::Relaxed);
         false
     }
+}
+
+/// A file fpcalc cannot read is its own answer, whatever the shim can send.
+#[tokio::test]
+async fn a_file_fpcalc_cannot_read_is_its_own_answer() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let broken = dir.path().join("broken.flac");
+    std::fs::write(&broken, b"not audio").expect("written");
+    let shim = DownShim {
+        fetches: AtomicUsize::new(0),
+    };
+    let outcome = check(
+        &shim,
+        &AudioFingerprinter::new(),
+        &broken,
+        &request(Some(174)),
+        30,
+    )
+    .await;
+    assert_eq!(outcome, PreviewOutcome::FileUnreadable);
+    assert_eq!(shim.fetches.load(Ordering::Relaxed), 0);
 }
 
 /// A shim that is down changes nothing: the file is judged as it was before.
@@ -416,15 +448,138 @@ async fn a_shim_that_cannot_send_the_preview_leaves_the_file_alone() {
         fetches: AtomicUsize::new(0),
     };
     let outcome = check(&shim, &AudioFingerprinter::new(), &path, &request(Some(174)), 30).await;
-    assert!(matches!(outcome, PreviewOutcome::Unavailable(_)), "{outcome:?}");
+    assert!(matches!(outcome, PreviewOutcome::NotSent(_)), "{outcome:?}");
     assert_eq!(shim.fetches.load(Ordering::Relaxed), 1);
+}
+
+/// A shim that counts which lane its preview was asked for in.
+#[derive(Default)]
+struct CountingShim {
+    fetches: AtomicUsize,
+    background_fetches: AtomicUsize,
+}
+
+#[async_trait]
+impl PreviewSource for CountingShim {
+    async fn find(&self, _request: &PreviewRequest<'_>) -> Result<Option<PreviewFacts>, Failure> {
+        Ok(Some(facts("One Dance", Some("Drake"), Some(174))))
+    }
+
+    async fn fetch(&self, _video_id: &str, _dest: &Path) -> bool {
+        self.fetches.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    async fn fetch_in_background(&self, _video_id: &str, _dest: &Path) -> bool {
+        self.background_fetches.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+/// Work nobody waits on fetches its preview in the shim's background lane, and a play's in the
+/// foreground.
+#[tokio::test]
+async fn the_background_lane_is_used_only_when_asked_for() {
+    let shim = CountingShim::default();
+    let fingerprinter = AudioFingerprinter::new();
+    assert!(
+        fingerprint_preview(&shim, &fingerprinter, "vid", 30, true)
+            .await
+            .is_err()
+    );
+    assert_eq!(shim.background_fetches.load(Ordering::Relaxed), 1);
+    assert_eq!(shim.fetches.load(Ordering::Relaxed), 0);
+    assert!(
+        fingerprint_preview(&shim, &fingerprinter, "vid", 30, false)
+            .await
+            .is_err()
+    );
+    assert_eq!(shim.fetches.load(Ordering::Relaxed), 1);
+}
+
+/// A shim whose fetch writes a few junk bytes and says it sent the video.
+struct JunkShim;
+
+#[async_trait]
+impl PreviewSource for JunkShim {
+    async fn find(&self, _request: &PreviewRequest<'_>) -> Result<Option<PreviewFacts>, Failure> {
+        Ok(Some(facts("One Dance", Some("Drake"), Some(174))))
+    }
+
+    async fn fetch(&self, _video_id: &str, dest: &Path) -> bool {
+        std::fs::write(dest, b"not audio at all").is_ok()
+    }
+}
+
+/// Audio that arrives but cannot be read is a different failure from audio that never arrives.
+#[tokio::test]
+async fn a_preview_that_arrives_but_cannot_be_read_is_unavailable_not_retried() {
+    let fingerprinter = AudioFingerprinter::new();
+    let on_path = std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            dir.join(format!("fpcalc{}", std::env::consts::EXE_SUFFIX))
+                .is_file()
+        })
+    });
+    if !on_path {
+        eprintln!("skipped: fpcalc is not on the PATH");
+        return;
+    }
+    let failure = fingerprint_preview(&JunkShim, &fingerprinter, "vid", 30, false)
+        .await
+        .err();
+    assert_eq!(failure, Some(PreviewFailure::Unreadable));
+}
+
+/// A shim whose lane is full says so with HTTP 503 and `{"error":"busy"}`; any other refusal is
+/// a preview that was not sent. Neither needs fpcalc.
+#[tokio::test]
+async fn a_full_background_lane_is_busy_and_any_other_refusal_is_not_sent() {
+    let shim = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/stream"))
+        .and(query_param("id", "full"))
+        .respond_with(ResponseTemplate::new(503).set_body_string(r#"{"error":"busy"}"#))
+        .mount(&shim)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/stream"))
+        .and(query_param("id", "broken"))
+        .respond_with(ResponseTemplate::new(502).set_body_string(r#"{"error":"ytdlp_failed"}"#))
+        .mount(&shim)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/stream"))
+        .and(query_param("id", "unsaid"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("try later"))
+        .mount(&shim)
+        .await;
+    let resolver = YouTubeResolver::with_base_url(Some(&shim.uri()));
+    let dest = std::env::temp_dir().join(format!("octo-preview-test-{}", std::process::id()));
+    assert_eq!(
+        resolver.fetch_preview("full", &dest, true).await,
+        Err(PreviewFailure::Busy)
+    );
+    assert_eq!(
+        resolver.fetch_preview("broken", &dest, true).await,
+        Err(PreviewFailure::NotSent)
+    );
+    assert_eq!(
+        resolver.fetch_preview("unsaid", &dest, true).await,
+        Err(PreviewFailure::NotSent)
+    );
+    assert!(!dest.exists());
 }
 
 /// 40 seconds of pink noise as FLAC, or None where ffmpeg or fpcalc is missing.
 fn noise_flac(dir: &Path) -> Option<std::path::PathBuf> {
     let on_path = |program: &str| {
-        std::env::var_os("PATH")
-            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                dir.join(format!("{program}{}", std::env::consts::EXE_SUFFIX))
+                    .is_file()
+            })
+        })
     };
     if !on_path("ffmpeg") || !on_path("fpcalc") {
         return None;
@@ -439,12 +594,16 @@ fn noise_flac(dir: &Path) -> Option<std::path::PathBuf> {
     made.then_some(path)
 }
 
-/// The real shim client against an address nothing answers on finds no preview at all.
+/// The real shim client against an address nothing answers on could not be asked, which is not
+/// "no video".
 #[tokio::test]
 async fn an_unreachable_shim_finds_no_preview() {
     let closed = format!("http://{}", crate::services::test_support::refused_address());
     let resolver = YouTubeResolver::with_base_url(Some(&closed));
-    assert_eq!(resolver.find(&request(Some(174))).await, None);
+    assert_eq!(
+        resolver.find(&request(Some(174))).await,
+        Err(Failure::Unreachable)
+    );
     assert!(
         !resolver
             .fetch("ki0Ocze98U8", Path::new("/nonexistent/preview"))
@@ -458,6 +617,96 @@ async fn an_unreachable_shim_finds_no_preview() {
     };
     assert_eq!(
         resolver.find(&pinned).await,
-        Some(PreviewFacts::bare("ki0Ocze98U8"))
+        Ok(Some(PreviewFacts::bare("ki0Ocze98U8")))
+    );
+}
+
+/// A shim with `/ytm/search` and `/search` answering as given.
+async fn lookup_shim(ytm: ResponseTemplate, search: ResponseTemplate) -> MockServer {
+    let shim = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ytm/search"))
+        .respond_with(ytm)
+        .mount(&shim)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(search)
+        .mount(&shim)
+        .await;
+    shim
+}
+
+/// YouTube Music busy and yt-dlp failing: the shim could not be asked, which is never "no video".
+#[tokio::test]
+async fn a_shim_that_cannot_answer_is_an_error_not_no_video() {
+    let shim = lookup_shim(
+        ResponseTemplate::new(503).set_body_string(r#"{"error":"busy"}"#),
+        ResponseTemplate::new(502).set_body_string(r#"{"error":"search_failed"}"#),
+    )
+    .await;
+    let resolver = YouTubeResolver::with_base_url(Some(&shim.uri()));
+    assert_eq!(resolver.find(&request(Some(174))).await, Err(Failure::Busy));
+    let outcome = check(
+        &resolver,
+        &AudioFingerprinter::new(),
+        Path::new("/nonexistent/song.flac"),
+        &request(Some(174)),
+        30,
+    )
+    .await;
+    assert_eq!(outcome, PreviewOutcome::Busy);
+}
+
+/// Neither answering failure is busy: the check says the shim could not be asked.
+#[tokio::test]
+async fn a_shim_that_fails_without_saying_busy_is_not_sent() {
+    let shim = lookup_shim(
+        ResponseTemplate::new(502).set_body_string(r#"{"error":"ytm_failed"}"#),
+        ResponseTemplate::new(502).set_body_string(r#"{"error":"search_failed"}"#),
+    )
+    .await;
+    let resolver = YouTubeResolver::with_base_url(Some(&shim.uri()));
+    assert_eq!(resolver.find(&request(Some(174))).await, Err(Failure::Other));
+    let outcome = check(
+        &resolver,
+        &AudioFingerprinter::new(),
+        Path::new("/nonexistent/song.flac"),
+        &request(Some(174)),
+        30,
+    )
+    .await;
+    assert_eq!(outcome, PreviewOutcome::Unreachable);
+}
+
+/// Each way a lookup fails comes to the outcome the check defines for it.
+#[test]
+fn each_lookup_failure_maps_to_its_preview_outcome() {
+    assert_eq!(outcome_of(Failure::Busy), PreviewOutcome::Busy);
+    assert_eq!(outcome_of(Failure::Unreachable), PreviewOutcome::Unreachable);
+    assert_eq!(outcome_of(Failure::Other), PreviewOutcome::Unreachable);
+}
+
+/// Both lookups answering with nothing is the one case that is "no video".
+#[tokio::test]
+async fn two_lookups_that_answer_with_nothing_are_no_video() {
+    let shim = lookup_shim(
+        ResponseTemplate::new(200).set_body_string(r#"{"tracks":[]}"#),
+        ResponseTemplate::new(404).set_body_string(r#"{"error":"no_hit"}"#),
+    )
+    .await;
+    let resolver = YouTubeResolver::with_base_url(Some(&shim.uri()));
+    assert_eq!(resolver.find(&request(Some(174))).await, Ok(None));
+    let outcome = check(
+        &resolver,
+        &AudioFingerprinter::new(),
+        Path::new("/nonexistent/song.flac"),
+        &request(Some(174)),
+        30,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        PreviewOutcome::Unavailable("no YouTube video for the song".into())
     );
 }

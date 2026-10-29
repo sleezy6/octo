@@ -39,6 +39,20 @@ impl LastFmService {
             .await?;
         read_chart(&doc, "tracks", None)
     }
+
+    /// Last.fm's chart for a country, asked for by the name Last.fm knows it by, most played
+    /// first. None when there is no key, Last.fm did not answer, it has no such country (error
+    /// 6), or the list is empty.
+    pub async fn get_country_chart(&self, country_name: &str, limit: i32) -> Option<Vec<CountedTrack>> {
+        let limit = limit.to_string();
+        let doc = self
+            .get_document(
+                "geo.gettoptracks",
+                &[("country", country_name), ("limit", limit.as_str())],
+            )
+            .await?;
+        read_chart(&doc, "tracks", None).filter(|tracks| !tracks.is_empty())
+    }
 }
 
 /// None for an error document; the list (maybe empty) otherwise.

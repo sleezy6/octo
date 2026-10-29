@@ -147,6 +147,9 @@ pub const REST_ENDPOINTS: &[(&str, EndpointClass)] = &[
     ("importText", LibraryWrite),
     ("libraryAction", LibraryWrite),
     ("pickFoundSong", LibraryWrite),
+    // A listener's own chart countries.
+    ("pinChartCountry", Read),
+    ("setChartCountry", Read),
     ("setLyricsChoice", LibraryWrite),
     ("testPing", Read),
     // Octo Family (`octoFamily`): each checks the caller's own rights.

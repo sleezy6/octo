@@ -936,8 +936,23 @@ impl Respond for LibraryNavidrome {
         let query = query_of(request);
         if path.ends_with("/rest/ping") {
             let ok = query.get("t").map(String::as_str) == Some("good")
-                || query.get("apiKey").map(String::as_str) == Some("goodkey");
+                || matches!(
+                    query.get("apiKey").map(String::as_str),
+                    Some("goodkey" | "bobkey")
+                );
             return if ok { ok_json() } else { wrong_password() };
+        }
+        if path.ends_with("/rest/tokenInfo") {
+            let owner = match query.get("apiKey").map(String::as_str) {
+                Some("goodkey") => "alice",
+                Some("bobkey") => "bob",
+                _ => return wrong_password(),
+            };
+            return navidrome_json(
+                &json!({"subsonic-response": {"status": "ok", "version": "1.16.1",
+                    "tokenInfo": {"username": owner}}})
+                .to_string(),
+            );
         }
         if path.ends_with("/rest/getUser") {
             return navidrome_json(
@@ -1540,7 +1555,7 @@ async fn remove_with_a_wrong_password_is_error40_and_never_reaches_the_executor(
 }
 
 #[tokio::test]
-async fn remove_with_only_an_api_key_is_skipped_because_it_names_nobody() {
+async fn remove_with_only_an_api_key_acts_for_its_listener() {
     let t = LibraryApp::new(|_| {}).await;
 
     let doc = t
@@ -1550,9 +1565,48 @@ async fn remove_with_only_an_api_key_is_skipped_because_it_names_nobody() {
         .await;
 
     let action = action(&doc);
-    assert_eq!(action["state"], "skipped");
-    assert!(action["detail"].as_str().expect("a detail").contains("API key"));
-    assert_eq!(pings(&t.navidrome).await, 1);
+    assert_eq!(action["state"], "applied", "{doc}");
+    assert!(!t.song_file().exists());
+    let journal = t.state.library_action_journal.recent(200);
+    assert_eq!(journal.len(), 1, "{journal:?}");
+    assert_eq!(journal[0].username, "alice");
+    assert_eq!(journal[0].state, LibraryActionState::Applied);
+}
+
+#[tokio::test]
+async fn an_api_key_of_a_listener_off_the_allowlist_is_refused_like_their_sign_in() {
+    let t = LibraryApp::new(|_| {}).await;
+
+    let by_password = t
+        .get_json(&format!(
+            "/rest/libraryAction?{}&id={SONG_ID}&action=remove",
+            lib_auth("bob")
+        ))
+        .await;
+    let by_key = t
+        .get_json(&format!(
+            "/rest/libraryAction?apiKey=bobkey&v=1.16.1&c=octo-android&id={SONG_ID}&action=remove"
+        ))
+        .await;
+
+    assert_eq!(action(&by_key), action(&by_password), "{by_key} vs {by_password}");
+    assert_eq!(action(&by_key)["state"], "skipped");
+    assert_eq!(action(&by_key)["detail"], "bob is not on the allowlist.");
+    t.assert_untouched().await;
+}
+
+#[tokio::test]
+async fn a_bad_api_key_is_refused_and_never_asks_token_info() {
+    let t = LibraryApp::new(|_| {}).await;
+
+    let doc = t
+        .get_json(&format!(
+            "/rest/libraryAction?apiKey=nokey&v=1.16.1&c=octo-android&id={SONG_ID}&action=remove"
+        ))
+        .await;
+
+    assert_failed(&doc, 40);
+    assert_eq!(count(&t.navidrome, |p| p.ends_with("/rest/tokenInfo")).await, 0);
     t.assert_untouched().await;
 }
 

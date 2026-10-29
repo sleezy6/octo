@@ -13,8 +13,11 @@ use octo_core::settings::{
 };
 
 use super::*;
+use crate::services::fingerprint::preview_check::{Comparison, PreviewFacts};
 use crate::services::library::library_action_executor::{LibraryActionOutcome, LibraryActionRequest};
 use crate::services::library::library_action_journal::LibraryActionState;
+use crate::services::library::library_action_test_support::slash_root;
+use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::library::notice_playlist_worker::NoticePlaylistWorker;
 use crate::services::library::notice_queue::{NoticeEntry, NoticeState};
 use crate::services::local::{LocalSongMapping, ParsedExternalId, ParsedSongId};
@@ -28,6 +31,14 @@ struct FakeVerifier {
     /// What an ISRC check answers, and the codes it was asked about.
     isrc_answer: Mutex<Option<bool>>,
     isrcs_asked: Mutex<Vec<String>>,
+    /// What the YouTube preview says of a sound AcoustID never heard (None: no source to ask),
+    /// and how many times it was asked.
+    preview_answer: Mutex<Option<PreviewOutcome>>,
+    /// Answers given first, one per ask, before `preview_answer` takes over.
+    preview_script: Mutex<std::collections::VecDeque<PreviewOutcome>>,
+    previews_asked: AtomicUsize,
+    /// Whether each preview request asked for the shim's background lane.
+    preview_backgrounds: Mutex<Vec<bool>>,
 }
 
 impl FakeVerifier {
@@ -38,7 +49,22 @@ impl FakeVerifier {
             answer: Mutex::new(Box::new(answer)),
             isrc_answer: Mutex::new(None),
             isrcs_asked: Mutex::new(Vec::new()),
+            preview_answer: Mutex::new(None),
+            preview_script: Mutex::new(std::collections::VecDeque::new()),
+            previews_asked: AtomicUsize::new(0),
+            preview_backgrounds: Mutex::new(Vec::new()),
         })
+    }
+
+    /// A sound AcoustID has no entry for, and the preview saying `heard` of it.
+    fn never_heard(preview: Option<PreviewOutcome>) -> Arc<Self> {
+        let verifier = Self::answering(unknown);
+        *verifier.preview_answer.lock() = preview;
+        verifier
+    }
+
+    fn previews_asked(&self) -> usize {
+        self.previews_asked.load(Ordering::SeqCst)
     }
 
     /// The same, with the ISRC check answering `isrc`.
@@ -76,6 +102,23 @@ impl IReviewSweepVerifier for FakeVerifier {
     async fn isrc_agrees(&self, _: &VerificationResult, isrc: &str) -> Option<bool> {
         self.isrcs_asked.lock().push(isrc.to_string());
         *self.isrc_answer.lock()
+    }
+
+    async fn hear_preview(
+        &self,
+        _: &str,
+        request: &PreviewRequest<'_>,
+        _: &VerificationResult,
+    ) -> PreviewOutcome {
+        self.preview_backgrounds.lock().push(request.background);
+        self.previews_asked.fetch_add(1, Ordering::SeqCst);
+        if let Some(scripted) = self.preview_script.lock().pop_front() {
+            return scripted;
+        }
+        self.preview_answer
+            .lock()
+            .clone()
+            .unwrap_or(PreviewOutcome::NotAsked)
     }
 }
 
@@ -196,6 +239,9 @@ fn settings_of(per_hour: i32) -> LibraryActionSettings {
     }
 }
 
+/// The album every tagged test file carries.
+const TAGGED_ALBUM: &str = "Mezzanine";
+
 /// The test setup: a music root, the state file beside it, and every store built so far.
 struct Sweep {
     root: tempfile::TempDir,
@@ -211,6 +257,8 @@ struct Options {
     clock: Option<Clock>,
     while_listing: Option<Box<dyn Fn(&LibraryReviewSweepWorker) + Send + Sync>>,
     replacer: Option<Arc<FakeReplacer>>,
+    /// The download source; Soulseek when none.
+    source: Option<DownloadSource>,
 }
 
 impl Sweep {
@@ -222,7 +270,7 @@ impl Sweep {
     }
 
     fn root(&self) -> String {
-        self.root.path().to_string_lossy().into_owned()
+        slash_root(self.root.path())
     }
 
     fn state_path(&self) -> PathBuf {
@@ -232,7 +280,7 @@ impl Sweep {
     fn song(&self, name: &str) -> String {
         let path = self.root.path().join(name);
         std::fs::write(&path, "x").expect("written");
-        path.to_string_lossy().into_owned()
+        slash_root(&path)
     }
 
     /// A FLAC tagged with `artist` and `title`, and `isrc` when given.
@@ -242,11 +290,12 @@ impl Sweep {
         let mut file = TagFile::open(&path).expect("opens");
         file.set_performers(&[artist.to_string()]);
         file.set_title(Some(title));
+        file.set_album(Some(TAGGED_ALBUM));
         if let Some(isrc) = isrc {
             tag_writer_extras::set_text(&mut file, TagFields::ISRC, Some(isrc));
         }
         file.save().expect("saved");
-        path.to_string_lossy().into_owned()
+        slash_root(&path)
     }
 
     /// Massive Attack's Teardrop, tagged, which the tests hear as Portishead.
@@ -270,6 +319,12 @@ impl Sweep {
             library_actions: options.settings.unwrap_or_else(|| settings_of(60)),
             subsonic: SubsonicSettings {
                 admin_username: Some("bob".into()),
+                download_source: options.source.unwrap_or_default(),
+                ..Default::default()
+            },
+            soulseek: SoulseekSettings {
+                enabled: true,
+                base_url: Some("http://slskd.test".into()),
                 ..Default::default()
             },
             ..Default::default()
@@ -922,6 +977,10 @@ struct FakeReplacer {
     marked: Option<bool>,
     state: Mutex<LibraryActionState>,
     requests: Mutex<Vec<(LibraryAction, String, String)>>,
+    /// The `only_source` of each request.
+    sources: Mutex<Vec<Option<DownloadSource>>>,
+    /// The code every outcome carries.
+    code: Option<&'static str>,
 }
 
 impl FakeReplacer {
@@ -931,6 +990,20 @@ impl FakeReplacer {
             marked: Some(false),
             state: Mutex::new(state),
             requests: Mutex::new(Vec::new()),
+            sources: Mutex::new(Vec::new()),
+            code: None,
+        })
+    }
+
+    /// Wrong song that finds Soulseek out: it fails with the code that makes a sweep wait.
+    fn soulseek_out() -> Arc<Self> {
+        Arc::new(FakeReplacer {
+            shown: true,
+            marked: Some(false),
+            state: Mutex::new(LibraryActionState::Failed),
+            requests: Mutex::new(Vec::new()),
+            sources: Mutex::new(Vec::new()),
+            code: Some(LibraryActionCodes::SOULSEEK_OFFLINE),
         })
     }
 
@@ -941,11 +1014,17 @@ impl FakeReplacer {
             marked,
             state: Mutex::new(LibraryActionState::Applied),
             requests: Mutex::new(Vec::new()),
+            sources: Mutex::new(Vec::new()),
+            code: None,
         })
     }
 
     fn requests(&self) -> Vec<(LibraryAction, String, String)> {
         self.requests.lock().clone()
+    }
+
+    fn sources(&self) -> Vec<Option<DownloadSource>> {
+        self.sources.lock().clone()
     }
 }
 
@@ -961,10 +1040,17 @@ impl SweepReplacer for FakeReplacer {
     }
 
     async fn replace(&self, request: LibraryActionRequest) -> anyhow::Result<LibraryActionOutcome> {
+        self.sources.lock().push(request.only_source);
         self.requests
             .lock()
             .push((request.action, request.navidrome_id, request.username));
-        Ok(LibraryActionOutcome::new(*self.state.lock(), Some("done".into())))
+        Ok(match self.code {
+            Some(code) => LibraryActionOutcome {
+                code: Some(code.to_string()),
+                ..LibraryActionOutcome::new(*self.state.lock(), Some("done".into()))
+            },
+            None => LibraryActionOutcome::new(*self.state.lock(), Some("done".into())),
+        })
     }
 }
 
@@ -983,8 +1069,17 @@ fn replacing(per_hour: i32) -> LibraryActionSettings {
     }
 }
 
-/// AcoustID hears the file as Portishead's `title`, `score` sure.
+/// AcoustID hears the file as Portishead's `title`, `score` sure, through two submissions.
 fn heard_as(title: &str, score: f64) -> VerificationResult {
+    heard_as_by(title, score, 2)
+}
+
+/// [`heard_as`] with `sources` submissions behind the recording.
+fn heard_as_by(title: &str, score: f64, sources: i32) -> VerificationResult {
+    let named = AcoustIdRecording {
+        sources,
+        ..AcoustIdRecording::new("rec-roads", title, vec!["Portishead".to_string()], None, None)
+    };
     VerificationResult {
         verdict: VerificationVerdict::Mismatch,
         score,
@@ -993,6 +1088,11 @@ fn heard_as(title: &str, score: f64) -> VerificationResult {
         recording_id: Some("rec-roads".into()),
         duration_seconds: 305,
         threshold: 0.85,
+        lookup: Some(octo_core::fingerprint::AcoustIdLookup::new(
+            true,
+            None,
+            vec![octo_core::fingerprint::AcoustIdResult::new(score, vec![named])],
+        )),
         ..Default::default()
     }
 }
@@ -1028,7 +1128,14 @@ fn classify_then_decide_replaces_only_a_confident_other_song() {
     let decide = |verdict: VerificationResult, title: &str| {
         let (outcome, question) = LibraryReviewSweepWorker::classify(verdict);
         assert_eq!(outcome, Outcome::Ask);
-        LibraryReviewSweepWorker::decide(&question, &file_titled(title), &settings, "bob", Today::default())
+        LibraryReviewSweepWorker::decide(
+            &question,
+            &file_titled(title),
+            &settings,
+            "bob",
+            Today::default(),
+            None,
+        )
     };
     assert_eq!(decide(heard_as("Roads", 0.97), "Teardrop"), AutoReplace::Replace);
     // Another take, a remaster or a guest credit of the same song stays a question.
@@ -1059,6 +1166,132 @@ fn classify_then_decide_replaces_only_a_confident_other_song() {
     assert_eq!(decide(unsure, "Teardrop"), AutoReplace::Ask);
 }
 
+/// A file the preview says is another song, replaced with the preview's replacing on and every
+/// other gate open, unless `change` closes one.
+fn decide_by_preview(change: impl FnOnce(&mut AppSettings)) -> AutoReplace {
+    let mut settings = app_settings(replacing_by_preview(60));
+    settings.soulseek = SoulseekSettings {
+        enabled: true,
+        base_url: Some("http://slskd.test".into()),
+        ..Default::default()
+    };
+    change(&mut settings);
+    let question = VerificationResult {
+        verdict: VerificationVerdict::Inconclusive,
+        reason: InconclusiveReason::DiffersFromYouTube,
+        ..Default::default()
+    };
+    LibraryReviewSweepWorker::decide(
+        &question,
+        &file_titled("Teardrop"),
+        &settings,
+        "bob",
+        Today::default(),
+        Some(PreviewWitness {
+            bit_error: 0.5,
+            album_agrees: true,
+        }),
+    )
+}
+
+#[test]
+fn the_preview_replaces_only_with_a_source_it_checks_and_the_original_kept() {
+    assert_eq!(decide_by_preview(|_| {}), AutoReplace::Replace);
+    for source in [
+        DownloadSource::Soulseek,
+        DownloadSource::SoulseekThenYouTube,
+        DownloadSource::Lidarr,
+    ] {
+        assert_eq!(
+            decide_by_preview(|s| s.subsonic.download_source = source),
+            AutoReplace::Replace,
+            "{source:?}"
+        );
+    }
+    // A YouTube download is the preview itself, so it vouches for nothing.
+    assert_eq!(
+        decide_by_preview(|s| s.subsonic.download_source = DownloadSource::YouTube),
+        AutoReplace::Ask
+    );
+    assert_eq!(
+        decide_by_preview(|s| s.library_actions.keep_replaced_originals = false),
+        AutoReplace::Ask
+    );
+}
+
+/// Neither Soulseek nor SpotiFLAC on leaves a replacement nothing to fetch from.
+#[test]
+fn the_preview_replaces_nothing_without_a_lossless_source_switched_on() {
+    let neither = |s: &mut AppSettings| s.soulseek.enabled = false;
+    assert_eq!(decide_by_preview(neither), AutoReplace::Ask);
+    let spotiflac = |s: &mut AppSettings| {
+        s.soulseek.enabled = false;
+        s.spotiflac.enabled = true;
+        s.spotiflac.url = "http://spotiflac:8000".into();
+    };
+    assert_eq!(decide_by_preview(spotiflac), AutoReplace::Replace);
+}
+
+/// The sweep builds the request for a replacement it holds to the preview: Soulseek alone under
+/// Soulseek then YouTube, no restriction under Soulseek or Lidarr.
+#[tokio::test]
+async fn the_preview_replacement_never_takes_the_youtube_fallback() {
+    for (source, expected) in [
+        (
+            DownloadSource::SoulseekThenYouTube,
+            Some(DownloadSource::Soulseek),
+        ),
+        (DownloadSource::Soulseek, None),
+        (DownloadSource::Lidarr, None),
+    ] {
+        let sweep = Sweep::new();
+        sweep.teardrop("a.flac");
+        let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+        let worker = sweep.worker(
+            FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5))),
+            Options {
+                settings: Some(replacing_by_preview(60)),
+                replacer: Some(replacer.clone()),
+                source: Some(source),
+                ..Default::default()
+            },
+        );
+        worker.tick().await;
+        worker.tick().await;
+
+        assert_eq!(replacer.sources(), [expected], "{source:?}");
+    }
+}
+
+/// Soulseek out with the replacement bound to it: no breaker count, no question, and the song is
+/// tried again once Soulseek is back.
+#[tokio::test]
+async fn a_replacement_that_finds_soulseek_out_waits_without_counting() {
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let queue = Arc::new(NoticeQueue::new());
+    let replacer = FakeReplacer::soulseek_out();
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5))),
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(replacing_by_preview(60)),
+            replacer: Some(replacer.clone()),
+            source: Some(DownloadSource::SoulseekThenYouTube),
+            ..Default::default()
+        },
+    );
+
+    worker.tick().await;
+    worker.tick().await;
+
+    assert_eq!(replacer.requests().len(), 2, "tried again, not given up on");
+    assert_eq!(worker.status().today.failed, 0);
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+    assert_eq!(worker.status().found, 0);
+    assert_eq!(worker.status().fine, 0);
+}
+
 /// Off, a dry run, a keeper off the allowlist, Wrong song off, the day's cap and the breaker each
 /// keep it a question.
 #[test]
@@ -1066,7 +1299,7 @@ fn decide_keeps_to_the_switch_dry_run_allowlist_and_the_day() {
     let (_, question) = LibraryReviewSweepWorker::classify(heard_as("Roads", 0.97));
     let file = file_titled("Teardrop");
     let decide = |actions: LibraryActionSettings, keeper: &str, today: Today| {
-        LibraryReviewSweepWorker::decide(&question, &file, &app_settings(actions), keeper, today)
+        LibraryReviewSweepWorker::decide(&question, &file, &app_settings(actions), keeper, today, None)
     };
     assert_eq!(
         decide(replacing(60), "bob", Today::default()),
@@ -1144,7 +1377,7 @@ async fn a_confident_other_song_is_replaced_and_leaves_a_note() {
     assert_eq!(note.state, NoticeState::Acted);
     assert_eq!(note.cause, InconclusiveReason::SoundsLikeAnother);
     assert_eq!(note.origin, NoticeOrigin::LibrarySweep);
-    assert_eq!(note.local_path, path);
+    assert_eq!(note.local_path, get_full_path(&path));
     assert_eq!(note.navidrome_id.as_deref(), Some("nd-a.flac"));
     assert_eq!(
         note.reason,
@@ -1353,7 +1586,10 @@ async fn any_recording_by_the_files_artist_in_the_heard_result_is_asked_about() 
     use octo_core::fingerprint::{AcoustIdLookup, AcoustIdResult};
     let sweep = Sweep::new();
     sweep.teardrop("a.flac");
-    let named = AcoustIdRecording::new("rec-roads", "Roads", vec!["Portishead".to_string()], None, None);
+    let named = AcoustIdRecording {
+        sources: 2,
+        ..AcoustIdRecording::new("rec-roads", "Roads", vec!["Portishead".to_string()], None, None)
+    };
     let own = AcoustIdRecording::new(
         "rec-teardrop-jp",
         "\u{30c6}\u{30a3}\u{30a2}\u{30c9}\u{30ed}\u{30c3}\u{30d7}",
@@ -1542,6 +1778,8 @@ async fn a_file_navidrome_does_not_show_is_asked_about() {
         marked: Some(false),
         state: Mutex::new(LibraryActionState::Applied),
         requests: Mutex::new(Vec::new()),
+        sources: Mutex::new(Vec::new()),
+        code: None,
     });
     sweep
         .worker(
@@ -1671,6 +1909,37 @@ async fn the_recheck_replaces_and_asks_like_the_sweep() {
     assert_eq!((recheck.replaced, recheck.found, recheck.checked), (1, 0, 1));
     assert_eq!((status.found, status.replaced), (0, 0));
     assert_eq!(replacer.requests().len(), 1);
+}
+
+/// A preview that says a download is another song is only asked about on the re-check, even with
+/// the preview's replacing on.
+#[tokio::test]
+async fn the_recheck_of_octo_s_downloads_asks_and_never_replaces_by_preview() {
+    let sweep = Sweep::new();
+    let mine = sweep.teardrop("a.flac");
+    let queue = Arc::new(NoticeQueue::new());
+    let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5))),
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(replacing_by_preview(60)),
+            octo_downloads: vec![mine],
+            replacer: Some(replacer.clone()),
+            ..Default::default()
+        },
+    );
+    worker.recheck_octo().await;
+    worker.tick().await;
+    worker.tick().await;
+
+    assert!(replacer.requests().is_empty());
+    let open = queue
+        .for_user("bob", NoticeKind::Review)
+        .iter()
+        .filter(|entry| entry.state == NoticeState::Waiting)
+        .count();
+    assert_eq!(open, 1);
 }
 
 /// The Verify card offers a re-check once MinMatchScore differs from the last re-check's (85
@@ -2075,4 +2344,753 @@ mod other_listeners {
         member_song(&n, "teen", MemberSong::Plain).await;
         assert_eq!(n.replacer.marked("nd-1").await, None);
     }
+}
+
+// ---- A sound AcoustID has never heard, put to its song's YouTube preview ------------------
+
+fn compared(heard: Heard, bit_error: f64) -> PreviewOutcome {
+    compared_from(heard, bit_error, Some(TAGGED_ALBUM))
+}
+
+/// [`compared`] against a preview filed under `album`, as a YouTube Music row is.
+fn compared_from(heard: Heard, bit_error: f64, album: Option<&str>) -> PreviewOutcome {
+    PreviewOutcome::Compared {
+        heard,
+        comparison: Comparison {
+            bit_error,
+            offset_seconds: 0.0,
+        },
+        trusted: heard != Heard::Unclear,
+        preview: PreviewFacts {
+            album: album.map(str::to_string),
+            ..PreviewFacts::bare("vid")
+        },
+    }
+}
+
+/// [`compared`] against a preview that may not be the song.
+fn compared_untrusted(heard: Heard, bit_error: f64) -> PreviewOutcome {
+    PreviewOutcome::Compared {
+        heard,
+        comparison: Comparison {
+            bit_error,
+            offset_seconds: 0.0,
+        },
+        trusted: false,
+        preview: PreviewFacts::bare("vid"),
+    }
+}
+
+/// One tagged song, checked, with the questions it raised.
+async fn never_heard_song(
+    verifier: Arc<FakeVerifier>,
+    settings: LibraryActionSettings,
+) -> (Sweep, Arc<LibraryReviewSweepWorker>, Arc<NoticeQueue>) {
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let queue = Arc::new(NoticeQueue::new());
+    let worker = sweep.worker(
+        verifier,
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(settings),
+            ..Default::default()
+        },
+    );
+    worker.tick().await;
+    // The Sweep owns the music root: it lives as long as the test holds it.
+    (sweep, worker, queue)
+}
+
+#[tokio::test]
+async fn a_never_heard_sound_that_sounds_like_its_preview_is_settled_without_a_question() {
+    let verifier = FakeVerifier::never_heard(Some(compared(Heard::Match, 0.04)));
+
+    let (_sweep, worker, queue) = never_heard_song(verifier.clone(), settings_of(60)).await;
+
+    assert_eq!(verifier.previews_asked(), 1);
+    assert_eq!(*verifier.preview_backgrounds.lock(), vec![true]);
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+    let status = worker.status();
+    assert_eq!((status.found, status.fine), (0, 1));
+}
+
+#[tokio::test]
+async fn a_never_heard_sound_that_sounds_nothing_like_its_preview_is_asked_about_in_the_previews_words() {
+    let verifier = FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.47)));
+
+    let (_sweep, worker, queue) = never_heard_song(verifier, settings_of(60)).await;
+
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].cause, InconclusiveReason::SoundsLikeAnother);
+    assert_eq!(entries[0].state, NoticeState::Waiting);
+    assert!(
+        entries[0].reason.contains("YouTube preview"),
+        "{}",
+        entries[0].reason
+    );
+    assert!(
+        entries[0].reason.contains("47% of its bits differ"),
+        "{}",
+        entries[0].reason
+    );
+    assert_eq!(worker.status().found, 1);
+}
+
+#[tokio::test]
+async fn a_preview_that_cannot_say_leaves_the_question_to_a_person_as_before() {
+    for preview in [Some(compared(Heard::Unclear, 0.3)), None] {
+        let verifier = FakeVerifier::never_heard(preview);
+
+        let (_sweep, _, queue) = never_heard_song(verifier, settings_of(60)).await;
+
+        let entries = queue.for_user("bob", NoticeKind::Review);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cause, InconclusiveReason::NoEntry);
+    }
+}
+
+#[tokio::test]
+async fn a_preview_the_shim_did_not_send_is_tried_again_then_asked_about() {
+    let verifier = FakeVerifier::never_heard(Some(PreviewOutcome::NotSent("shim".into())));
+
+    let (_sweep, worker, queue) = never_heard_song(verifier.clone(), settings_of(60)).await;
+
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+    let status = worker.status();
+    assert_eq!((status.found, status.fine), (0, 0));
+    assert_eq!(status.state, "Waiting");
+    assert!(
+        status
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("YouTube shim")),
+        "{status:?}"
+    );
+    worker.tick().await;
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+    worker.tick().await;
+    assert_eq!(verifier.previews_asked(), 3);
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].cause, InconclusiveReason::NoEntry);
+    assert_eq!(worker.status().found, 1);
+    // Checked now: the next look moves on.
+    worker.tick().await;
+    assert_eq!(verifier.previews_asked(), 3);
+}
+
+#[tokio::test]
+async fn a_busy_shim_is_waited_out_without_spending_a_try() {
+    let verifier = FakeVerifier::never_heard(Some(PreviewOutcome::NotSent("shim".into())));
+    *verifier.preview_script.lock() = std::iter::repeat_n(PreviewOutcome::Busy, 3).collect();
+
+    let (_sweep, worker, queue) = never_heard_song(verifier.clone(), settings_of(60)).await;
+    for _ in 0..2 {
+        assert_eq!(worker.status().state, "Waiting");
+        assert!(
+            worker
+                .status()
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("busy with plays")),
+            "{:?}",
+            worker.status()
+        );
+        worker.tick().await;
+    }
+    // Three busy answers spent no try: nothing is asked, and the song is still unchecked.
+    assert_eq!(verifier.previews_asked(), 3);
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+    assert_eq!(worker.status().found, 0);
+
+    // The shim then sends nothing three times: only now do the three tries run out.
+    worker.tick().await;
+    worker.tick().await;
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+    worker.tick().await;
+    assert_eq!(verifier.previews_asked(), 6);
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].cause, InconclusiveReason::NoEntry);
+}
+
+#[tokio::test]
+async fn a_shim_that_cannot_be_asked_is_waited_out_without_spending_a_try() {
+    let verifier = FakeVerifier::never_heard(Some(PreviewOutcome::Unreachable));
+
+    let (_sweep, worker, queue) = never_heard_song(verifier.clone(), settings_of(60)).await;
+    for _ in 0..5 {
+        worker.tick().await;
+    }
+
+    assert_eq!(verifier.previews_asked(), 6);
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+    let status = worker.status();
+    assert_eq!(status.state, "Waiting");
+    assert!(
+        status
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("not answering")),
+        "{status:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_library_file_the_preview_check_could_not_read_is_tried_three_times_then_asked_about() {
+    let verifier = FakeVerifier::never_heard(Some(PreviewOutcome::FileUnreadable));
+
+    let (_sweep, worker, queue) = never_heard_song(verifier.clone(), settings_of(60)).await;
+    worker.tick().await;
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+    worker.tick().await;
+
+    assert_eq!(verifier.previews_asked(), 3);
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].cause, InconclusiveReason::NoEntry);
+}
+
+#[tokio::test]
+async fn a_song_with_no_preview_to_compare_is_asked_about_at_once() {
+    let verifier = FakeVerifier::never_heard(Some(PreviewOutcome::Unavailable(
+        "no YouTube video for the song".into(),
+    )));
+
+    let (_sweep, worker, queue) = never_heard_song(verifier.clone(), settings_of(60)).await;
+
+    assert_eq!(verifier.previews_asked(), 1);
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].cause, InconclusiveReason::NoEntry);
+    assert_eq!(worker.status().found, 1);
+}
+
+#[tokio::test]
+async fn a_match_with_a_preview_that_may_not_be_the_song_settles_nothing() {
+    let verifier = FakeVerifier::never_heard(Some(compared_untrusted(Heard::Match, 0.04)));
+
+    let (_sweep, worker, queue) = never_heard_song(verifier, settings_of(60)).await;
+
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].cause, InconclusiveReason::NoEntry);
+    assert_eq!(worker.status().fine, 0);
+}
+
+/// A believed match from a row of `album`, against a file tagged "Mezzanine": whether it was
+/// counted fine, and the questions it left.
+async fn believed_match_from(album: Option<&str>) -> (i32, Vec<InconclusiveReason>) {
+    let verifier = FakeVerifier::never_heard(Some(compared_from(Heard::Match, 0.04, album)));
+    let (_sweep, worker, queue) = never_heard_song(verifier, settings_of(60)).await;
+    let asked = queue
+        .for_user("bob", NoticeKind::Review)
+        .iter()
+        .map(|entry| entry.cause)
+        .collect();
+    (worker.status().fine, asked)
+}
+
+#[tokio::test]
+async fn a_believed_match_from_another_album_is_asked_about() {
+    assert_eq!(
+        believed_match_from(Some("Collected")).await,
+        (0, vec![InconclusiveReason::NoEntry])
+    );
+}
+
+#[tokio::test]
+async fn a_believed_match_from_a_row_with_no_album_or_a_live_one_is_asked_about() {
+    for album in [None, Some("Mezzanine (Live at the Roundhouse)")] {
+        assert_eq!(
+            believed_match_from(album).await,
+            (0, vec![InconclusiveReason::NoEntry]),
+            "{album:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_believed_match_from_the_file_s_own_album_settles_it() {
+    assert_eq!(believed_match_from(Some("Mezzanine")).await, (1, Vec::new()));
+}
+
+/// The shim not sending the preview twice, then sending it: AcoustID is asked about the file
+/// once, and the preview three times.
+#[tokio::test]
+async fn a_preview_retry_does_not_ask_acoust_id_again() {
+    let verifier = FakeVerifier::never_heard(Some(compared(Heard::Match, 0.04)));
+    *verifier.preview_script.lock() =
+        std::iter::repeat_n(PreviewOutcome::NotSent("shim".into()), 2).collect();
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let queue = Arc::new(NoticeQueue::new());
+    let worker = sweep.worker(
+        verifier.clone(),
+        Options {
+            queue: Some(queue.clone()),
+            ..Default::default()
+        },
+    );
+
+    for _ in 0..3 {
+        worker.tick().await;
+    }
+
+    assert_eq!(verifier.asked().len(), 1, "{:?}", verifier.asked());
+    assert_eq!(verifier.previews_asked(), 3);
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+    assert_eq!(worker.status().fine, 1);
+}
+
+#[tokio::test]
+async fn the_preview_is_asked_only_of_a_sound_acoust_id_never_heard_and_of_a_tagged_song() {
+    // AcoustID confirmed it, or heard it as another song: its word stands.
+    for answer in [confirmed(200, Some(200)), heard_as("Roads", 0.97)] {
+        let verifier = FakeVerifier::answering(move || answer.clone());
+        *verifier.preview_answer.lock() = Some(compared(Heard::Match, 0.04));
+
+        let _kept = never_heard_song(verifier.clone(), settings_of(60)).await;
+
+        assert_eq!(verifier.previews_asked(), 0);
+    }
+    // A song with no tags has no names to look a preview up by.
+    let sweep = Sweep::new();
+    sweep.song("nameless.flac");
+    let verifier = FakeVerifier::never_heard(Some(compared(Heard::Match, 0.04)));
+    let worker = sweep.worker(verifier.clone(), Options::default());
+    worker.tick().await;
+    assert_eq!(verifier.previews_asked(), 0);
+}
+
+#[tokio::test]
+async fn a_preview_that_disagrees_never_replaces_a_file_even_with_replacing_on() {
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let queue = Arc::new(NoticeQueue::new());
+    let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+    let verifier = FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5)));
+    let worker = sweep.worker(
+        verifier,
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(replacing(60)),
+            replacer: Some(replacer.clone()),
+            ..Default::default()
+        },
+    );
+
+    worker.tick().await;
+
+    assert!(replacer.requests().is_empty());
+    assert_eq!(queue.for_user("bob", NoticeKind::Review).len(), 1);
+}
+
+// ---- Replacing what the preview says is another song ---------------------------------------
+
+/// Library actions and Review on, Wrong song on, no dry run, and replacing switched on for the
+/// preview only (not for what AcoustID names).
+fn replacing_by_preview(per_hour: i32) -> LibraryActionSettings {
+    LibraryActionSettings {
+        review_sweep_auto_replace: false,
+        review_sweep_auto_replace_preview: true,
+        ..replacing(per_hour)
+    }
+}
+
+/// `names` tagged as Teardrop, each heard as never heard and clearly not its preview, checked
+/// with `settings` and `replacer`.
+async fn preview_says_wrong(
+    names: &[&str],
+    settings: LibraryActionSettings,
+    replacer: Arc<FakeReplacer>,
+    isrc: Option<&str>,
+    bit_error: f64,
+) -> (Sweep, Arc<LibraryReviewSweepWorker>, Arc<NoticeQueue>) {
+    let sweep = Sweep::new();
+    for name in names {
+        sweep.tagged(name, "Massive Attack", "Teardrop", isrc);
+    }
+    let queue = Arc::new(NoticeQueue::new());
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared(Heard::Mismatch, bit_error))),
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(settings),
+            replacer: Some(replacer),
+            ..Default::default()
+        },
+    );
+    for _ in 0..names.len() + 1 {
+        worker.tick().await;
+    }
+    (sweep, worker, queue)
+}
+
+#[tokio::test]
+async fn a_song_the_preview_says_is_another_is_replaced_and_leaves_a_note_when_switched_on() {
+    let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+
+    let (_sweep, _, queue) =
+        preview_says_wrong(&["a.flac"], replacing_by_preview(60), replacer.clone(), None, 0.5).await;
+
+    assert_eq!(
+        replacer.requests(),
+        [(
+            LibraryAction::WrongSong,
+            "nd-a.flac".to_string(),
+            "bob".to_string()
+        )]
+    );
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].state, NoticeState::Acted);
+    assert_eq!(entries[0].cause, InconclusiveReason::SoundsLikeAnother);
+    assert!(
+        entries[0].reason.contains("YouTube preview"),
+        "{}",
+        entries[0].reason
+    );
+    assert!(
+        entries[0].reason.contains("50% of its bits differ"),
+        "{}",
+        entries[0].reason
+    );
+}
+
+#[tokio::test]
+async fn a_file_asked_about_while_the_sweep_looked_is_not_replaced() {
+    let sweep = Sweep::new();
+    let full = crate::services::library::navidrome_song_path_resolver::get_full_path(&sweep.tagged(
+        "a.flac",
+        "Massive Attack",
+        "Teardrop",
+        None,
+    ));
+    let queue = Arc::new(NoticeQueue::new());
+    let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+    let verifier = FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5)));
+    // Someone is asked about the file while the check is still listening to it.
+    let asking = queue.clone();
+    *verifier.answer.lock() = Box::new(move || {
+        asking.add_library_question(
+            "bob",
+            &full,
+            &Song {
+                artist: "Massive Attack".into(),
+                title: "Teardrop".into(),
+                ..Default::default()
+            },
+            "asked elsewhere",
+        );
+        unknown()
+    });
+    let worker = sweep.worker(
+        verifier,
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(replacing_by_preview(60)),
+            replacer: Some(replacer.clone()),
+            ..Default::default()
+        },
+    );
+
+    worker.tick().await;
+    worker.tick().await;
+
+    assert!(replacer.requests().is_empty());
+    assert_eq!(queue.for_user("bob", NoticeKind::Review).len(), 1);
+}
+
+/// One tagged song the preview `album` says is another song, with the preview's replacing on:
+/// whether anything was asked to replace it, and its open questions.
+async fn preview_from_album_says_wrong(album: Option<&str>) -> (usize, usize) {
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let queue = Arc::new(NoticeQueue::new());
+    let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared_from(Heard::Mismatch, 0.5, album))),
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(replacing_by_preview(60)),
+            replacer: Some(replacer.clone()),
+            ..Default::default()
+        },
+    );
+    worker.tick().await;
+    worker.tick().await;
+    let open = queue
+        .for_user("bob", NoticeKind::Review)
+        .iter()
+        .filter(|entry| entry.state == NoticeState::Waiting)
+        .count();
+    (replacer.requests().len(), open)
+}
+
+#[tokio::test]
+async fn a_preview_from_another_album_is_asked_about_not_replaced() {
+    assert_eq!(preview_from_album_says_wrong(Some("Collected")).await, (0, 1));
+}
+
+#[tokio::test]
+async fn a_yt_dlp_preview_never_replaces() {
+    assert_eq!(preview_from_album_says_wrong(None).await, (0, 1));
+}
+
+#[test]
+fn a_row_from_the_file_s_own_album_agrees_and_others_do_not() {
+    let agrees = LibraryReviewSweepWorker::preview_album_agrees;
+    assert!(agrees(Some("Mezzanine"), "Mezzanine"));
+    assert!(agrees(Some("mezzanine "), "Mezzanine"));
+    assert!(!agrees(Some("Mezzanine (Live at the Roundhouse)"), "Mezzanine"));
+    assert!(!agrees(Some("Live in Paris"), "Live in Paris"));
+    assert!(!agrees(Some("Collected"), "Mezzanine"));
+    assert!(!agrees(None, "Mezzanine"));
+    assert!(!agrees(Some("Mezzanine"), ""));
+}
+
+#[tokio::test]
+async fn the_preview_replaces_nothing_with_its_own_switch_off_or_in_a_dry_run() {
+    let off = LibraryActionSettings {
+        review_sweep_auto_replace_preview: false,
+        ..replacing_by_preview(60)
+    };
+    let dry = LibraryActionSettings {
+        dry_run: true,
+        ..replacing_by_preview(60)
+    };
+    for settings in [off, dry] {
+        let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+
+        let (_sweep, _, queue) = preview_says_wrong(&["a.flac"], settings, replacer.clone(), None, 0.5).await;
+
+        assert!(replacer.requests().is_empty());
+        let entries = queue.for_user("bob", NoticeKind::Review);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].state, NoticeState::Waiting);
+        assert_eq!(entries[0].cause, InconclusiveReason::SoundsLikeAnother);
+    }
+}
+
+#[tokio::test]
+async fn a_starred_song_one_with_unreadable_marks_and_one_with_an_isrc_stay_questions() {
+    for (replacer, isrc) in [
+        (FakeReplacer::marked(Some(true)), None),
+        (FakeReplacer::marked(None), None),
+        (FakeReplacer::marked(Some(false)), Some("GBAAA0000001")),
+    ] {
+        let (_sweep, _, queue) =
+            preview_says_wrong(&["a.flac"], replacing_by_preview(60), replacer.clone(), isrc, 0.5).await;
+
+        assert!(replacer.requests().is_empty());
+        assert_eq!(queue.for_user("bob", NoticeKind::Review).len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn the_preview_shares_the_days_limit_and_a_failed_replacement_stays_a_question() {
+    let one_a_day = LibraryActionSettings {
+        review_sweep_auto_replace_per_day: 1,
+        ..replacing_by_preview(60)
+    };
+    let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+
+    let (_sweep, _, queue) =
+        preview_says_wrong(&["a.flac", "b.flac"], one_a_day, replacer.clone(), None, 0.5).await;
+
+    assert_eq!(replacer.requests().len(), 1);
+    let open = queue
+        .for_user("bob", NoticeKind::Review)
+        .iter()
+        .filter(|entry| entry.is_open())
+        .count();
+    assert_eq!(open, 1);
+
+    let failing = FakeReplacer::ending(LibraryActionState::Failed);
+    let (_sweep, _, queue) =
+        preview_says_wrong(&["a.flac"], replacing_by_preview(60), failing.clone(), None, 0.5).await;
+    assert_eq!(failing.requests().len(), 1);
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].state, NoticeState::Waiting);
+}
+
+#[tokio::test]
+async fn a_preview_just_over_its_line_is_asked_about_and_one_clearly_over_is_replaced() {
+    let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+    let (_sweep, _, queue) = preview_says_wrong(
+        &["a.flac"],
+        replacing_by_preview(60),
+        replacer.clone(),
+        None,
+        0.40,
+    )
+    .await;
+    assert!(replacer.requests().is_empty());
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].state, NoticeState::Waiting);
+
+    let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+    let (_sweep, _, _queue) = preview_says_wrong(
+        &["a.flac"],
+        replacing_by_preview(60),
+        replacer.clone(),
+        None,
+        0.42,
+    )
+    .await;
+    assert_eq!(replacer.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn an_unclear_preview_is_never_replaced_on() {
+    let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let queue = Arc::new(NoticeQueue::new());
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared(Heard::Unclear, 0.3))),
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(replacing_by_preview(60)),
+            replacer: Some(replacer.clone()),
+            ..Default::default()
+        },
+    );
+
+    worker.tick().await;
+
+    assert!(replacer.requests().is_empty());
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries[0].cause, InconclusiveReason::NoEntry);
+}
+
+// ---- A link one person's submissions make ---------------------------------------------------
+
+/// AcoustID ties the file to its own song, Teardrop, through one submission.
+fn lone_link() -> VerificationResult {
+    VerificationResult {
+        reason: InconclusiveReason::LoneLink,
+        score: 0.97,
+        matched_artist: Some("Massive Attack".into()),
+        matched_title: Some("Teardrop".into()),
+        recording_id: Some("rec".into()),
+        candidate_recording_id: Some("rec".into()),
+        fingerprint: Some("AQADtEqk".into()),
+        duration_seconds: 330,
+        threshold: 0.85,
+        ..Default::default()
+    }
+}
+
+/// A lone link, and the preview saying `preview` of it.
+fn lone_linked(preview: PreviewOutcome) -> Arc<FakeVerifier> {
+    let verifier = FakeVerifier::answering(lone_link);
+    *verifier.preview_answer.lock() = Some(preview);
+    verifier
+}
+
+#[test]
+fn a_lone_link_is_a_question() {
+    assert!(lone_link().needs_review());
+    assert_eq!(LibraryReviewSweepWorker::classify(lone_link()).0, Outcome::Ask);
+}
+
+#[tokio::test]
+async fn a_lone_link_is_put_to_the_preview_like_a_sound_never_heard() {
+    let verifier = lone_linked(compared(Heard::Match, 0.04));
+
+    let (_sweep, worker, queue) = never_heard_song(verifier.clone(), settings_of(60)).await;
+
+    assert_eq!(verifier.previews_asked(), 1);
+    assert_eq!(*verifier.preview_backgrounds.lock(), vec![true]);
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+    let status = worker.status();
+    assert_eq!((status.found, status.fine), (0, 1));
+}
+
+#[tokio::test]
+async fn a_lone_link_its_preview_calls_another_song_is_asked_never_replaced() {
+    let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let queue = Arc::new(NoticeQueue::new());
+    let worker = sweep.worker(
+        lone_linked(compared(Heard::Mismatch, 0.5)),
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(LibraryActionSettings {
+                review_sweep_auto_replace: true,
+                ..replacing_by_preview(60)
+            }),
+            replacer: Some(replacer.clone()),
+            ..Default::default()
+        },
+    );
+
+    worker.tick().await;
+
+    assert!(replacer.requests().is_empty());
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].state, NoticeState::Waiting);
+    assert_eq!(entries[0].cause, InconclusiveReason::BelowThreshold);
+    assert_eq!(
+        entries[0].reason,
+        "Only one person ever told AcoustID this is 'Massive Attack - Teardrop', and 50% of its bits differ from its YouTube preview"
+    );
+}
+
+/// AcoustID's replacing needs two submissions behind the song it heard.
+#[test]
+fn a_song_one_submission_names_is_never_clearly_another() {
+    let settings = app_settings(replacing(60));
+    let decide = |question: &VerificationResult| {
+        LibraryReviewSweepWorker::decide(
+            question,
+            &file_titled("Teardrop"),
+            &settings,
+            "bob",
+            Today::default(),
+            None,
+        )
+    };
+    let (_, two) = LibraryReviewSweepWorker::classify(heard_as_by("Roads", 0.97, 2));
+    assert_eq!(decide(&two), AutoReplace::Replace);
+    let (_, one) = LibraryReviewSweepWorker::classify(heard_as_by("Roads", 0.97, 1));
+    assert_eq!(decide(&one), AutoReplace::Ask);
+    let unanswered = VerificationResult {
+        lookup: None,
+        ..two.clone()
+    };
+    assert_eq!(decide(&unanswered), AutoReplace::Ask);
+    assert_eq!(LibraryReviewSweepWorker::submissions_for_named(&two), 2);
+}
+
+/// AcoustID's replacing needs the original kept, so Put back can undo it.
+#[test]
+fn acoust_id_replaces_only_with_the_original_kept() {
+    let (_, question) = LibraryReviewSweepWorker::classify(heard_as("Roads", 0.97));
+    let decide = |actions: LibraryActionSettings| {
+        LibraryReviewSweepWorker::decide(
+            &question,
+            &file_titled("Teardrop"),
+            &app_settings(actions),
+            "bob",
+            Today::default(),
+            None,
+        )
+    };
+    assert_eq!(decide(replacing(60)), AutoReplace::Replace);
+    assert_eq!(
+        decide(LibraryActionSettings {
+            keep_replaced_originals: false,
+            ..replacing(60)
+        }),
+        AutoReplace::Ask
+    );
 }

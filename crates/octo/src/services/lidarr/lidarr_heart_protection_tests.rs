@@ -427,6 +427,7 @@ async fn a_removed_song_stays_removed() {
         revealed_path: None,
         copy: false,
         download_allowed: false,
+        denied_source: None,
     });
 
     // Removed means not wanted: the album is not short of anything the next source should fetch.

@@ -88,3 +88,46 @@ async fn an_artists_chart_names_the_artist_when_a_row_does_not() {
     assert_eq!(top[0].artist, "Daft Punk");
     assert!(service.get_artist_chart("  ", 20).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_country_chart_is_asked_by_name() {
+    let (server, service) = last_fm("key").await;
+    Mock::given(method("GET"))
+        .and(query_param("method", "geo.gettoptracks"))
+        .and(query_param("country", "South Korea"))
+        .and(query_param("limit", "25"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(CHART))
+        .mount(&server)
+        .await;
+
+    let chart = service.get_country_chart("South Korea", 25).await.unwrap();
+
+    assert_eq!(chart.len(), 2);
+    assert_eq!(chart[0].title, "Dracula");
+}
+
+#[tokio::test]
+async fn geo_error_6_gives_none() {
+    let (server, service) = last_fm("key").await;
+    Mock::given(method("GET"))
+        .and(query_param("method", "geo.gettoptracks"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"error":6,"message":"country param invalid"}"#),
+        )
+        .mount(&server)
+        .await;
+
+    assert!(service.get_country_chart("Nowhere", 25).await.is_none());
+}
+
+#[tokio::test]
+async fn an_empty_country_chart_gives_none() {
+    let (server, service) = last_fm("key").await;
+    Mock::given(method("GET"))
+        .and(query_param("method", "geo.gettoptracks"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"tracks":{"track":[]}}"#))
+        .mount(&server)
+        .await;
+
+    assert!(service.get_country_chart("Japan", 25).await.is_none());
+}

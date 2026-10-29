@@ -69,7 +69,7 @@ async fn a_test_with_no_address_says_to_type_one() {
     assert!(!report.ok);
     assert_eq!(
         report.message,
-        "No address yet. Type the address of your SpotiFLAC server, for example http://spotiflac:8000."
+        "No address yet. Type the address of your Mornye server, for example http://spotiflac:8000."
     );
 }
 
@@ -88,10 +88,36 @@ async fn a_test_that_reaches_nothing_says_where_it_looked() {
     assert!(
         report
             .message
-            .starts_with("Octo could not reach SpotiFLAC at http://127.0.0.1:1."),
+            .starts_with("Octo could not reach Mornye at http://127.0.0.1:1."),
         "{}",
         report.message
     );
+}
+
+#[tokio::test]
+async fn a_token_that_cannot_travel_in_a_cookie_is_refused_before_any_call() {
+    let server = MockServer::builder().start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let music = tempfile::tempdir().expect("a folder");
+    let report = client(SpotiflacSettings::default())
+        .test(
+            &connection(&server.uri(), "bad token"),
+            true,
+            None,
+            &music.path().to_string_lossy(),
+        )
+        .await;
+    assert!(!report.ok);
+    assert!(
+        report.message.starts_with("The web token travels in a cookie"),
+        "{}",
+        report.message
+    );
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -136,7 +162,7 @@ async fn an_address_that_is_not_spotiflac_is_named() {
         .await;
     assert!(!report.ok);
     assert!(
-        report.message.contains("answers, but not as SpotiFLAC's web API"),
+        report.message.contains("answers, but not as Mornye's web API"),
         "{}",
         report.message
     );
@@ -156,9 +182,7 @@ async fn no_extensions_says_what_to_bring() {
         .await;
     assert!(!report.ok);
     assert!(
-        report
-            .message
-            .starts_with("SpotiFLAC has no extensions installed"),
+        report.message.starts_with("Mornye has no extensions installed"),
         "{}",
         report.message
     );
@@ -194,17 +218,57 @@ async fn a_multi_user_spotiflac_is_refused() {
 }
 
 #[tokio::test]
+async fn a_mornye_answers_by_its_own_name() {
+    let server = MockServer::builder().start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/info"))
+        .and(header("cookie", "mornye_web_token=s3cret; spotiflac_web_token=s3cret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "Mornye", "version": "1.0.3", "api_version": "v1", "multiuser": false, "authenticated": true
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/extensions"))
+        .and(header(
+            "cookie",
+            "mornye_web_token=s3cret; spotiflac_web_token=s3cret",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(two_extensions()))
+        .mount(&server)
+        .await;
+    let music = tempfile::tempdir().expect("a folder");
+    let root = music.path().to_string_lossy().into_owned();
+    let report = client(SpotiflacSettings::default())
+        .test(&connection(&server.uri(), "s3cret"), true, None, &root)
+        .await;
+    assert!(report.ok, "{:?}", report.checks);
+    assert_eq!(report.version.as_deref(), Some("1.0.3"));
+    assert!(
+        texts(&report, "ok")
+            .iter()
+            .any(|text| text.starts_with("Mornye 1.0.3 answers at"))
+    );
+}
+
+#[tokio::test]
 async fn a_ready_spotiflac_passes_and_the_folder_is_made() {
     let server = MockServer::builder().start().await;
     Mock::given(method("GET"))
         .and(path("/api/v1/info"))
-        .and(header("cookie", "spotiflac_web_token=s3cret"))
+        .and(header(
+            "cookie",
+            "mornye_web_token=s3cret; spotiflac_web_token=s3cret",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(info(true, false)))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/extensions"))
-        .and(header("cookie", "spotiflac_web_token=s3cret"))
+        .and(header(
+            "cookie",
+            "mornye_web_token=s3cret; spotiflac_web_token=s3cret",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(two_extensions()))
         .mount(&server)
         .await;
@@ -219,14 +283,14 @@ async fn a_ready_spotiflac_passes_and_the_folder_is_made() {
         )
         .await;
     assert!(report.ok, "{:?}", report.checks);
-    assert_eq!(report.message, "SpotiFLAC is ready.");
+    assert_eq!(report.message, "Mornye is ready.");
     assert_eq!(report.version.as_deref(), Some("5.0.5"));
     assert_eq!(report.extensions, Some(2));
     assert!(music.path().join(SPOTIFLAC_FOLDER).is_dir());
     assert!(
         texts(&report, "ok")
             .iter()
-            .any(|text| text.contains("/downloads/.octo-incoming/spotiflac on SpotiFLAC's side")),
+            .any(|text| text.contains("/downloads/.octo-incoming/spotiflac on Mornye's side")),
         "{:?}",
         report.checks
     );
@@ -245,7 +309,7 @@ async fn a_ready_spotiflac_with_the_switch_off_says_so() {
         )
         .await;
     assert!(report.ok);
-    assert_eq!(report.message, "SpotiFLAC is ready, with a warning below.");
+    assert_eq!(report.message, "Mornye is ready, with a warning below.");
     assert!(
         texts(&report, "warn")
             .iter()
@@ -308,7 +372,7 @@ async fn spotiflacs_own_error_words_come_through() {
         .expect_err("refused");
     assert_eq!(
         error.to_string(),
-        "SpotiFLAC said: Too many downloads already queued. 50 queued, limit 50."
+        "Mornye said: Too many downloads already queued. 50 queued, limit 50."
     );
 }
 

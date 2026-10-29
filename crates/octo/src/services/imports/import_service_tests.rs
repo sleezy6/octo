@@ -3,11 +3,13 @@
 //! playlist, and a fetched song finding its place.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use octo_core::settings::AppSettings;
 use wiremock::matchers::path;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use super::super::import_matcher::{IsrcRecording, IsrcRecordings};
 use super::super::import_playlists::PlaylistNavidrome;
 use super::super::spotify_link_reader::tests::embed_page;
 use super::super::test_support::{FakeNavidrome, row};
@@ -115,6 +117,18 @@ async fn rig() -> Rig {
 }
 
 async fn rig_over(store: Arc<ImportStore>) -> Rig {
+    rig_with(store, None).await
+}
+
+async fn rig_with(store: Arc<ImportStore>, ask: Option<IsrcRecordings>) -> Rig {
+    rig_with_file(store, ask, None).await
+}
+
+async fn rig_with_file(
+    store: Arc<ImportStore>,
+    ask: Option<IsrcRecordings>,
+    isrc_file: Option<std::path::PathBuf>,
+) -> Rig {
     let server = MockServer::builder().start().await;
     Mock::given(path(format!("/embed/playlist/{THEIRS}")))
         .respond_with(ResponseTemplate::new(200).set_body_raw(embed_page(3, "Today's hits"), "text/html"))
@@ -138,7 +152,7 @@ async fn rig_over(store: Arc<ImportStore>) -> Rig {
         row("nd-halo", "Beyonce", "Halo", Some(261), None, "mp3", 320),
     ]));
     let pages = library.clone();
-    let matcher = Arc::new(ImportMatcher::with_pages(Arc::new(move |start, count| {
+    let matcher = ImportMatcher::with_pages(Arc::new(move |start, count| {
         let page: Vec<LibrarySongRow> = pages
             .lock()
             .iter()
@@ -148,7 +162,12 @@ async fn rig_over(store: Arc<ImportStore>) -> Rig {
             .collect();
         let n = page.len();
         Box::pin(async move { Some((page, n)) })
-    })));
+    }));
+    let matcher = match ask {
+        Some(ask) => matcher.with_isrc_recordings(ask),
+        None => matcher,
+    };
+    let matcher = Arc::new(matcher.with_isrc_file(isrc_file));
     let navidrome = Arc::new(FakeNavidrome::default());
     *navidrome.admin.lock() = "alice".into();
     let service = ImportService::new(ImportParts {
@@ -664,4 +683,421 @@ async fn the_overview_says_who_approves_only_when_a_member_waits_for_approval() 
     world.settings.set(off);
     let alice = serde_json::to_value(rig.service.overview("alice")).expect("json");
     assert!(alice.get("approval").is_none(), "{alice}");
+}
+
+/// How many songs of one person the queue holds.
+fn queued_count(rig: &Rig, owner: &str) -> usize {
+    rig.queue.snapshot(Some(owner)).len()
+}
+
+/// A rig whose library holds Portishead's "Roads" only under a number, tagged with its
+/// recording: only the ISRC's recordings can find it.
+async fn coded_rig(answer: Option<Vec<IsrcRecording>>, asked: Arc<AtomicUsize>) -> Rig {
+    let ask: IsrcRecordings = Arc::new(move |_isrc: String| {
+        asked.fetch_add(1, Ordering::SeqCst);
+        let answer = answer.clone();
+        Box::pin(async move { answer })
+    });
+    let rig = rig_with(Arc::new(ImportStore::default()), Some(ask)).await;
+    let mut tagged = row(
+        "nd-roads",
+        "Portishead",
+        "Track 05",
+        Some(305),
+        Some("Dummy"),
+        "flac",
+        900,
+    );
+    tagged.recording_id = Some("rec-roads".into());
+    rig.library.lock().push(tagged);
+    rig
+}
+
+fn coded_list(rig: &Rig, owner: &str, isrc: &str) -> String {
+    let mut roads = song("k-roads", "Roads", "Portishead", 305);
+    roads.isrc = Some(isrc.into());
+    rig.store
+        .save(ImportList {
+            id: format!("{owner}-coded"),
+            owner: owner.into(),
+            tracks: vec![roads],
+            ..Default::default()
+        })
+        .id
+}
+
+#[tokio::test]
+async fn a_learning_round_finds_a_copy_only_the_isrc_names_and_matches_again() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = coded_rig(
+        Some(vec![IsrcRecording {
+            id: "rec-roads".into(),
+            title: "Roads".into(),
+            seconds: Some(305),
+        }]),
+        asked.clone(),
+    )
+    .await;
+    let id = coded_list(&rig, "alice", "GBAAA9400010");
+    rig.service.match_and_follow("alice").await;
+    assert_eq!(asked.load(Ordering::SeqCst), 0, "a match never asks");
+    rig.service.learn_once().await;
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    assert_eq!(*rig.service.rematch.lock(), ["alice"]);
+    rig.service.match_and_follow("alice").await;
+    let list = rig.store.get("alice", &id).expect("the list");
+    assert_eq!(list.tracks[0].library_id.as_deref(), Some("nd-roads"));
+}
+
+#[tokio::test]
+async fn an_answer_naming_no_library_file_matches_nobody_again() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = coded_rig(
+        Some(vec![IsrcRecording {
+            id: "rec-elsewhere".into(),
+            title: "Roads".into(),
+            seconds: Some(305),
+        }]),
+        asked.clone(),
+    )
+    .await;
+    coded_list(&rig, "alice", "GBAAA9400010");
+    rig.service.match_and_follow("alice").await;
+    rig.service.learn_once().await;
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    assert!(rig.service.rematch.lock().is_empty());
+}
+
+#[tokio::test]
+async fn a_busy_music_database_matches_nobody_again_and_is_asked_next_round() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = coded_rig(None, asked.clone()).await;
+    coded_list(&rig, "alice", "GBAAA9400010");
+    rig.service.match_and_follow("alice").await;
+    rig.service.learn_once().await;
+    rig.service.learn_once().await;
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    assert!(rig.service.rematch.lock().is_empty());
+}
+
+#[tokio::test]
+async fn everyone_waiting_is_asked_in_one_round() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = coded_rig(Some(Vec::new()), asked.clone()).await;
+    coded_list(&rig, "alice", "GBAAA9400010");
+    coded_list(&rig, "bob", "GBAAA9400011");
+    rig.service.match_and_follow("alice").await;
+    rig.service.match_and_follow("bob").await;
+    rig.service.learn_once().await;
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn learning_never_holds_up_the_loop() {
+    let ask: IsrcRecordings =
+        Arc::new(|_isrc: String| Box::pin(futures::future::pending::<Option<Vec<IsrcRecording>>>()));
+    let rig = rig_with(Arc::new(ImportStore::default()), Some(ask)).await;
+    coded_list(&rig, "alice", "GBAAA9400010");
+    rig.service.match_and_follow("alice").await;
+    let pass = tokio::time::timeout(std::time::Duration::from_secs(1), rig.service.loop_once()).await;
+    assert!(
+        matches!(pass, Ok(Ok(()))),
+        "the pass finished while the music database said nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_loop_runs_one_learning_round_at_a_time() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (counted, held) = (asked.clone(), gate.clone());
+    let ask: IsrcRecordings = Arc::new(move |_isrc: String| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        let held = held.clone();
+        Box::pin(async move {
+            held.notified().await;
+            Some(Vec::new())
+        })
+    });
+    let rig = rig_with(Arc::new(ImportStore::default()), Some(ask)).await;
+    coded_list(&rig, "alice", "GBAAA9400010");
+    rig.service.match_and_follow("alice").await;
+    rig.service.loop_once().await.expect("a pass");
+    rig.service.loop_once().await.expect("a pass");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "one round at a time");
+    gate.notify_waiters();
+    rig.service.drain_learner().await;
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn learning_picks_up_after_a_restart() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = coded_rig(Some(Vec::new()), asked.clone()).await;
+    coded_list(&rig, "alice", "GBAAA9400010");
+    // No match since the start: the first pass finds the waiting list by itself.
+    rig.service.loop_once().await.expect("a pass");
+    rig.service.drain_learner().await;
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn removing_a_list_forgets_its_isrc_answers() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = coded_rig(
+        Some(vec![IsrcRecording {
+            id: "rec-roads".into(),
+            title: "Roads".into(),
+            seconds: Some(305),
+        }]),
+        asked.clone(),
+    )
+    .await;
+    let id = coded_list(&rig, "alice", "GBAAA9400010");
+    rig.service.match_and_follow("alice").await;
+    rig.service.learn_once().await;
+    assert!(rig.service.matcher().knows_isrc_for_tests("GBAAA9400010"));
+    rig.service.remove("alice", &id);
+    assert!(
+        !rig.service.matcher().knows_isrc_for_tests("GBAAA9400010"),
+        "its answer is gone"
+    );
+}
+
+#[tokio::test]
+async fn a_round_that_stops_halfway_keeps_everyone_waiting() {
+    let ask: IsrcRecordings = Arc::new(|isrc: String| {
+        Box::pin(async move {
+            if isrc == "GBAAA9400011" {
+                futures::future::pending::<()>().await;
+            }
+            Some(Vec::new())
+        })
+    });
+    let rig = rig_with(Arc::new(ImportStore::default()), Some(ask)).await;
+    coded_list(&rig, "alice", "GBAAA9400010");
+    coded_list(&rig, "bob", "GBAAA9400011");
+    rig.service.match_and_follow("alice").await;
+    rig.service.match_and_follow("bob").await;
+    let service = Arc::clone(&rig.service);
+    let round = tokio::spawn(async move { service.learn_once().await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    round.abort();
+    let waiting = rig.service.learning.lock().clone();
+    assert!(waiting.iter().any(|u| u == "bob"), "{waiting:?}");
+}
+
+#[tokio::test]
+async fn getting_the_missing_songs_never_waits_for_the_music_database() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = coded_rig(None, asked.clone()).await;
+    let id = coded_list(&rig, "alice", "GBAAA9400010");
+    rig.service.match_and_follow("alice").await;
+    rig.service.set_get_missing("alice", &id, true);
+    assert_eq!(queued_count(&rig, "alice"), 1);
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_isrc_that_never_gets_an_answer_keeps_nobody_else_waiting() {
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = asked.clone();
+    let ask: IsrcRecordings = Arc::new(move |isrc: String| {
+        seen.lock().push(isrc.clone());
+        Box::pin(async move { (isrc != "GBAAA9400010").then(Vec::new) })
+    });
+    let rig = rig_with(Arc::new(ImportStore::default()), Some(ask)).await;
+    coded_list(&rig, "alice", "GBAAA9400010");
+    coded_list(&rig, "bob", "GBAAA9400011");
+    rig.service.match_and_follow("alice").await;
+    rig.service.match_and_follow("bob").await;
+    rig.service.learn_once().await;
+    assert_eq!(
+        *asked.lock(),
+        ["GBAAA9400010"],
+        "the round stops at the first question with no answer"
+    );
+    rig.service.learn_once().await;
+    assert_eq!(
+        asked.lock().get(1).map(String::as_str),
+        Some("GBAAA9400011"),
+        "bob goes first in the next round"
+    );
+}
+
+#[tokio::test]
+async fn a_song_held_for_musicbrainz_puts_its_owner_in_the_next_learning_round() {
+    let rig = rig().await;
+    rig.trickle.configure(|seams| {
+        seams.held = Arc::new(|jobs| {
+            let places: std::collections::HashSet<usize> = (0..jobs.len()).collect();
+            Box::pin(async move { places })
+        });
+    });
+    rig.queue
+        .add("carol", &[song("k-roads", "Roads", "Portishead", 305)]);
+    rig.trickle.tick().await;
+    rig.trickle.drain().await;
+    assert_eq!(*rig.service.learning.lock(), ["carol"]);
+}
+
+#[tokio::test]
+async fn a_waiting_song_whose_isrc_no_list_holds_is_still_asked_about_and_its_answer_kept() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = coded_rig(
+        Some(vec![IsrcRecording {
+            id: "rec-roads".into(),
+            title: "Roads".into(),
+            seconds: Some(305),
+        }]),
+        asked.clone(),
+    )
+    .await;
+    let mut roads = song("k-roads", "Roads", "Portishead", 305);
+    roads.isrc = Some("GBAAA9400010".into());
+    rig.queue.add("alice", &[roads]);
+    rig.service.learn_later("alice");
+    rig.service.learn_once().await;
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    assert!(
+        rig.service.matcher().knows_isrc_for_tests("GBAAA9400010"),
+        "kept while the song waits"
+    );
+}
+
+#[tokio::test]
+async fn adding_a_link_or_a_list_forgets_answers_no_list_holds() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = coded_rig(
+        Some(vec![IsrcRecording {
+            id: "rec-roads".into(),
+            title: "Roads".into(),
+            seconds: Some(305),
+        }]),
+        asked,
+    )
+    .await;
+    let id = coded_list(&rig, "alice", "GBAAA9400010");
+    rig.service.match_and_follow("alice").await;
+    rig.service.learn_once().await;
+    assert!(rig.service.matcher().knows_isrc_for_tests("GBAAA9400010"));
+    rig.store.remove("alice", &id);
+    rig.service
+        .add_link("alice", &format!("https://open.spotify.com/playlist/{THEIRS}"))
+        .await
+        .expect("the link");
+    assert!(
+        !rig.service.matcher().knows_isrc_for_tests("GBAAA9400010"),
+        "adding a link forgets it"
+    );
+
+    let id = coded_list(&rig, "alice", "GBAAA9400010");
+    rig.service.match_and_follow("alice").await;
+    rig.service.learn_once().await;
+    assert!(rig.service.matcher().knows_isrc_for_tests("GBAAA9400010"));
+    rig.store.remove("alice", &id);
+    assert!(
+        rig.service
+            .add_text("alice", Some("Notes"), "Massive Attack - Teardrop")
+            .await
+            .ok
+    );
+    assert!(
+        !rig.service.matcher().knows_isrc_for_tests("GBAAA9400010"),
+        "saving a list forgets it"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_list_takes_its_answers_out_of_the_answers_file() {
+    let dir = tempfile::tempdir().expect("a folder");
+    let file = dir.path().join("imports-isrc.json");
+    let ask: IsrcRecordings = Arc::new(|_isrc: String| {
+        Box::pin(async {
+            Some(vec![IsrcRecording {
+                id: "rec-roads".into(),
+                title: "Roads".into(),
+                seconds: Some(305),
+            }])
+        })
+    });
+    let rig = rig_with_file(Arc::new(ImportStore::default()), Some(ask), Some(file.clone())).await;
+    let id = coded_list(&rig, "alice", "GBAAA9400010");
+    rig.service.match_and_follow("alice").await;
+    rig.service.learn_once().await;
+    let kept = std::fs::read_to_string(&file).expect("the answers file");
+    assert!(kept.contains("GBAAA9400010"), "{kept}");
+    rig.service.remove("alice", &id);
+    let kept = std::fs::read_to_string(&file).expect("the answers file");
+    assert!(!kept.contains("GBAAA9400010"), "{kept}");
+}
+
+#[tokio::test]
+async fn a_loop_pass_forgets_an_answer_nothing_holds_any_more() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = coded_rig(
+        Some(vec![IsrcRecording {
+            id: "rec-roads".into(),
+            title: "Roads".into(),
+            seconds: Some(305),
+        }]),
+        asked,
+    )
+    .await;
+    let mut roads = song("k-roads", "Roads", "Portishead", 305);
+    roads.isrc = Some("GBAAA9400010".into());
+    rig.queue.add("alice", &[roads]);
+    rig.service.learn_later("alice");
+    rig.service.learn_once().await;
+    assert!(rig.service.matcher().knows_isrc_for_tests("GBAAA9400010"));
+    rig.queue.update("alice", "k-roads", |job| {
+        job.state = import_track_states::DONE.to_string()
+    });
+    assert!(rig.service.learning.lock().is_empty(), "no learning round runs");
+    rig.service.loop_once().await.expect("a pass");
+    assert!(
+        !rig.service.matcher().knows_isrc_for_tests("GBAAA9400010"),
+        "the pass forgot it"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_learned_while_the_forget_looks_is_kept() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = coded_rig(Some(Vec::new()), asked).await;
+    let (store, matcher) = (rig.store.clone(), Arc::clone(rig.service.matcher()));
+    // Between the look at what is held and the forget, a list holding the ISRC is saved and
+    // the ISRC answered.
+    *rig.service.after_held_look.lock() = Some(Box::new(move || {
+        let mut roads = song("k-roads", "Roads", "Portishead", 305);
+        roads.isrc = Some("GBAAA9400010".into());
+        store.save(ImportList {
+            id: "alice-coded".into(),
+            owner: "alice".into(),
+            tracks: vec![roads],
+            ..Default::default()
+        });
+        matcher.answer_for_tests(
+            "GBAAA9400010",
+            vec![IsrcRecording {
+                id: "rec-roads".into(),
+                title: "Roads".into(),
+                seconds: Some(305),
+            }],
+        );
+    }));
+    rig.service.forget_unheld_answers();
+    assert!(
+        rig.service.matcher().knows_isrc_for_tests("GBAAA9400010"),
+        "the answer learned meanwhile stays"
+    );
+}
+
+#[tokio::test]
+async fn the_trickle_names_its_state_in_words() {
+    let rig = rig().await;
+    let view = serde_json::to_value(rig.service.overview("alice")).expect("json");
+    assert_eq!(view["trickle"]["state"], "idle");
+    assert_eq!(view["trickle"]["label"], "Nothing to fetch");
 }

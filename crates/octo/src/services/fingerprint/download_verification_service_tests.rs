@@ -17,8 +17,12 @@ fn result(score: f64, recordings: Vec<AcoustIdRecording>) -> AcoustIdResult {
     AcoustIdResult::new(score, recordings)
 }
 
+/// A recording two submissions tie the sound to, enough to confirm on its own.
 fn recording(title: &str, artist: &str, album: Option<&str>, year: Option<i32>) -> AcoustIdRecording {
-    AcoustIdRecording::new(format!("mbid-{title}"), title, [artist], album, year)
+    AcoustIdRecording {
+        sources: 2,
+        ..AcoustIdRecording::new(format!("mbid-{title}"), title, [artist], album, year)
+    }
 }
 
 fn decide(lookup: &AcoustIdLookup, artist: &str, title: &str, authoritative: bool) -> VerificationResult {
@@ -357,6 +361,7 @@ fn apply_tags_to_confirmed_with_tagging_off_still_records_the_recording_id() {
         Some(title),
         Some(2023),
     );
+    found.sources = 2;
     found.credits = vec![
         AcoustIdCredit::new("Bizarrap", Some("a1"), " & "),
         AcoustIdCredit::new("Rauw Alejandro", Some("a2"), ""),
@@ -405,6 +410,7 @@ fn apply_tags_to_confirmed_and_tagging_on_takes_the_releases_track_and_album_art
         Some("Mezzanine"),
         Some(1998),
     );
+    found.sources = 2;
     found.release = Some(AcoustIdRelease::new(
         Some("rel-1".into()),
         Some("rg-1".into()),
@@ -437,11 +443,22 @@ const ISRC: &str = "JPU901901234";
 /// The fingerprint confidently names the song in its own script, and the request was made in its
 /// romanised name: by the text alone, a mismatch.
 fn native_script() -> AcoustIdLookup {
+    native_script_with(2)
+}
+
+/// [`native_script`] with this many submissions behind each recording.
+fn native_script_with(sources: i32) -> AcoustIdLookup {
     ok(vec![result(
         0.97,
         vec![
-            AcoustIdRecording::new("mbid-gurenge", "紅蓮華", ["LiSA"], None, None),
-            AcoustIdRecording::new("mbid-other", "紅蓮華 (TV Size)", ["LiSA"], None, None),
+            AcoustIdRecording {
+                sources,
+                ..AcoustIdRecording::new("mbid-gurenge", "紅蓮華", ["LiSA"], None, None)
+            },
+            AcoustIdRecording {
+                sources,
+                ..AcoustIdRecording::new("mbid-other", "紅蓮華 (TV Size)", ["LiSA"], None, None)
+            },
         ],
     )])
 }
@@ -684,6 +701,7 @@ fn live_recording(id: &str, albums: &[(&str, &[&str])]) -> AcoustIdRecording {
         albums.first().map(|(group, _)| *group),
         Some(2010),
     );
+    found.sources = 2;
     found.releases = albums
         .iter()
         .map(|(group, types)| {
@@ -984,7 +1002,7 @@ fn a_stray_link_with_an_off_length_is_still_a_mismatch() {
 }
 
 #[test]
-fn a_lone_small_link_still_confirms() {
+fn a_lone_small_link_needs_the_preview() {
     let lookup = ok(vec![result(
         0.97,
         vec![sized("my boy", "Billie Eilish", 1, Some(171))],
@@ -992,7 +1010,239 @@ fn a_lone_small_link_still_confirms() {
 
     let verdict = decide_at(&lookup, "Billie Eilish", "my boy", 172);
 
+    assert_eq!(verdict.verdict, VerificationVerdict::Inconclusive);
+    assert_eq!(verdict.reason, InconclusiveReason::LoneLink);
+    assert!(verdict.needs_review());
+    assert_eq!(verdict.recording_id.as_deref(), Some("mbid-my boy"));
+    assert_eq!(verdict.candidate_recording_id.as_deref(), Some("mbid-my boy"));
+    assert_eq!(
+        verdict.r#match.as_ref().map(|m| m.recording_id.as_str()),
+        Some("mbid-my boy")
+    );
+    assert_eq!(verdict.matched_title.as_deref(), Some("my boy"));
+    assert!((verdict.score - 0.97).abs() < 0.0005);
+    assert_eq!(verdict.deny_reason, "");
+}
+
+#[test]
+fn a_link_two_people_made_confirms_on_its_own() {
+    let lookup = ok(vec![result(
+        0.97,
+        vec![sized("my boy", "Billie Eilish", 2, Some(171))],
+    )]);
+
+    let verdict = decide_at(&lookup, "Billie Eilish", "my boy", 172);
+
     assert_eq!(verdict.verdict, VerificationVerdict::Confirmed);
+    assert_eq!(verdict.reason, InconclusiveReason::None);
+}
+
+/// The same audio on an album and a compilation, one submission each: two people in all.
+#[test]
+fn two_recordings_of_one_submission_each_confirm() {
+    let mut album = sized("my boy", "Billie Eilish", 1, Some(171));
+    album.recording_id = "mbid-album".into();
+    let mut compilation = sized("my boy", "Billie Eilish", 1, Some(171));
+    compilation.recording_id = "mbid-compilation".into();
+    let lookup = ok(vec![result(0.97, vec![album, compilation])]);
+
+    let verdict = decide_at(&lookup, "Billie Eilish", "my boy", 172);
+
+    assert_eq!(verdict.verdict, VerificationVerdict::Confirmed);
+}
+
+/// One submission naming another song is one person's word: never a refusal on its own, and it
+/// names no recording to tag the file from or to send AcoustID.
+#[test]
+fn a_lone_link_to_another_song_is_a_question_not_a_mismatch() {
+    let lookup = ok(vec![result(
+        0.96,
+        vec![sized("Picture to Burn", "Taylor Swift", 1, None)],
+    )]);
+
+    let verdict = decide_at(&lookup, "Taylor Swift", "Cruel Summer", 0);
+
+    assert_eq!(verdict.verdict, VerificationVerdict::Inconclusive);
+    assert_eq!(verdict.reason, InconclusiveReason::LoneLink);
+    assert_eq!(verdict.deny_reason, "");
+    assert_eq!(verdict.recording_id, None);
+    assert_eq!(verdict.r#match, None);
+    assert_eq!(verdict.candidate_recording_id, None);
+    assert_eq!(verdict.describe(), "'Taylor Swift - Picture to Burn'");
+    assert!((verdict.score - 0.96).abs() < 0.0005);
+}
+
+/// A take one person's submissions name is not refused on that alone either.
+#[test]
+fn a_lone_link_to_a_refused_take_is_a_question() {
+    let mut live = live_only();
+    live.sources = 1;
+    let verdict = decide_live(&live_lookup(vec![live]), true);
+
+    assert_eq!(verdict.verdict, VerificationVerdict::Inconclusive);
+    assert_eq!(verdict.reason, InconclusiveReason::LoneLink);
+    assert_eq!(verdict.deny_reason, "");
+    assert_eq!(verdict.recording_id, None);
+}
+
+#[test]
+fn a_tagged_isrc_leaves_a_lone_link_alone() {
+    let lookup = ok(vec![result(
+        0.97,
+        vec![sized("my boy", "Billie Eilish", 1, Some(171))],
+    )]);
+    let lone = decide_at(&lookup, "Billie Eilish", "my boy", 172);
+    assert_eq!(lone.reason, InconclusiveReason::LoneLink);
+
+    assert_eq!(
+        DownloadVerificationService::with_tagged_isrc(lone.clone(), Some(ISRC), true),
+        lone
+    );
+
+    let elsewhere = decide_at(
+        &ok(vec![result(
+            0.96,
+            vec![sized("Picture to Burn", "Taylor Swift", 1, None)],
+        )]),
+        "Taylor Swift",
+        "Cruel Summer",
+        0,
+    );
+    assert_eq!(
+        DownloadVerificationService::with_tagged_isrc(elsewhere.clone(), Some(ISRC), true),
+        elsewhere
+    );
+}
+
+/// The ISRC names the song in its own script, but one person's submissions alone tie the sound
+/// to it: the recording is carried for the preview to settle, never confirmed yet.
+#[test]
+fn settle_by_isrc_with_only_lone_recordings_gives_a_lone_link() {
+    let isrcs = isrcs(&[("mbid-gurenge", &[ISRC]), ("mbid-other", &[])]);
+
+    // One submission each: the text alone is a lone link to another song.
+    let lone = native_script_with(1);
+    let before = VerificationResult {
+        fingerprint: Some("AQAD".into()),
+        duration_seconds: 239,
+        ..decide(&lone, "LiSA", "Gurenge", false)
+    };
+    assert_eq!(before.reason, InconclusiveReason::LoneLink);
+    assert_eq!(before.recording_id, None);
+    let settled =
+        DownloadVerificationService::settle_by_isrc(before, &lone, THRESHOLD, true, ISRC, &isrcs, false);
+    assert_eq!(settled.verdict, VerificationVerdict::Inconclusive);
+    assert_eq!(settled.reason, InconclusiveReason::LoneLink);
+    assert_eq!(settled.recording_id.as_deref(), Some("mbid-gurenge"));
+    assert_eq!(settled.candidate_recording_id.as_deref(), Some("mbid-gurenge"));
+    assert_eq!(settled.fingerprint.as_deref(), Some("AQAD"));
+    assert!(settled.tags_authoritative);
+
+    // A believed mismatch whose ISRC recording only one person tied to the sound.
+    let mut gurenge = AcoustIdRecording::new("mbid-gurenge", "紅蓮華", ["LiSA"], None, None);
+    gurenge.sources = 1;
+    let mut other = AcoustIdRecording::new("mbid-catch", "Catch the Moment", ["LiSA"], None, None);
+    other.sources = 5;
+    let mixed = ok(vec![result(0.97, vec![gurenge, other])]);
+    let mismatch = decide(&mixed, "LiSA", "Gurenge", false);
+    assert_eq!(mismatch.verdict, VerificationVerdict::Mismatch);
+    let settled =
+        DownloadVerificationService::settle_by_isrc(mismatch, &mixed, THRESHOLD, false, ISRC, &isrcs, false);
+    assert_eq!(settled.verdict, VerificationVerdict::Inconclusive);
+    assert_eq!(settled.reason, InconclusiveReason::LoneLink);
+    assert_eq!(settled.recording_id.as_deref(), Some("mbid-gurenge"));
+}
+
+/// A lone link to the remix asked for, in a file whose tags name another remix: two single words
+/// that disagree, so a question and never a refusal.
+#[test]
+fn a_lone_link_whose_tags_name_another_version_is_asked_not_refused() {
+    use octo_core::fingerprint::recording_identity::RecordingFacts;
+    let mut bear_face = g_eazy(
+        "3f839c1f-10a7-4640-a9b3-2d100acdae37",
+        "Let's Get Lost (Bear//Face remix)",
+        242_202,
+    );
+    bear_face.sources = 1;
+    let lone = decide_download(&ok(vec![result(0.99, vec![bear_face])]), BEAR_FACE_ASKED, 242_202);
+    assert_eq!(lone.reason, InconclusiveReason::LoneLink);
+    let teklife = RecordingFacts {
+        recording_id: "5a584600-24a3-47a0-8f9d-d15e58bfa694".to_string(),
+        title: "Let's Get Lost (Teklife remix)".to_string(),
+        ..Default::default()
+    };
+
+    let verdict = DownloadVerificationService::settle_by_tagged_recording(lone, BEAR_FACE_ASKED, &teklife);
+
+    assert_eq!(verdict.verdict, VerificationVerdict::Inconclusive);
+    assert_eq!(verdict.reason, InconclusiveReason::SourceDisagreed);
+    assert!(verdict.needs_review());
+    assert_eq!(verdict.deny_reason, "");
+    assert_eq!(
+        verdict.recording_id.as_deref(),
+        Some("3f839c1f-10a7-4640-a9b3-2d100acdae37")
+    );
+}
+
+#[test]
+fn confirmed_by_preview_turns_a_lone_link_into_a_confirmation_and_leaves_the_rest() {
+    let lone = decide_at(
+        &ok(vec![result(
+            0.97,
+            vec![sized("my boy", "Billie Eilish", 1, Some(171))],
+        )]),
+        "Billie Eilish",
+        "my boy",
+        172,
+    );
+    let confirmed = DownloadVerificationService::confirmed_by_preview(lone.clone());
+    assert_eq!(confirmed.verdict, VerificationVerdict::Confirmed);
+    assert_eq!(confirmed.reason, InconclusiveReason::None);
+    assert_eq!(confirmed.recording_id, lone.recording_id);
+    assert_eq!(confirmed.r#match, lone.r#match);
+    assert_eq!(
+        confirmed.evidence.as_deref(),
+        Some("the song's YouTube preview agrees")
+    );
+    assert!(!confirmed.needs_review());
+
+    // A lone link to another song names no recording to confirm the file as.
+    let elsewhere = decide_at(
+        &ok(vec![result(
+            0.96,
+            vec![sized("Picture to Burn", "Taylor Swift", 1, None)],
+        )]),
+        "Taylor Swift",
+        "Cruel Summer",
+        0,
+    );
+    assert_eq!(
+        DownloadVerificationService::confirmed_by_preview(elsewhere.clone()),
+        elsewhere
+    );
+
+    // Every other verdict is left as it was.
+    for other in [
+        VerificationResult {
+            reason: InconclusiveReason::NoEntry,
+            ..Default::default()
+        },
+        VerificationResult {
+            verdict: VerificationVerdict::Mismatch,
+            recording_id: Some("rec".into()),
+            ..Default::default()
+        },
+        VerificationResult {
+            reason: InconclusiveReason::LengthOff,
+            recording_id: Some("rec".into()),
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            DownloadVerificationService::confirmed_by_preview(other.clone()),
+            other
+        );
+    }
 }
 
 #[test]
@@ -1580,6 +1830,7 @@ fn g_eazy(id: &str, title: &str, ms: i64) -> AcoustIdRecording {
     AcoustIdRecording {
         duration_ms: Some(ms),
         duration_seconds: Some(((ms + 500) / 1000) as i32),
+        sources: 2,
         ..AcoustIdRecording::new(
             id,
             title,
@@ -1780,6 +2031,7 @@ fn another_artists_song_of_the_same_name_and_another_length_is_doubted_not_refus
     let superstar = AcoustIdRecording {
         duration_ms: Some(235_800),
         duration_seconds: Some(236),
+        sources: 2,
         ..AcoustIdRecording::new(
             "76a71dbe-3b16-4bb3-a7db-cb860d3bbee4",
             "Let's Get Lost",

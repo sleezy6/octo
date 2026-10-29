@@ -31,6 +31,7 @@ fn entry(
         revealed_path: None,
         copy: false,
         download_allowed: false,
+        denied_source: None,
     }
 }
 
@@ -451,6 +452,48 @@ fn the_fixture_round_trips_byte_for_byte() {
     assert!(journal.flush());
     assert_eq!(std::fs::read_to_string(&path).expect("written"), original);
     assert!(!state_file::tmp_path(&path).exists());
+}
+
+/// The fixture's entries name no denied Soulseek file and still load; one that does keeps it
+/// across a write, and one that does not writes no field for it.
+#[test]
+fn a_denied_source_is_optional_and_kept_when_there_is_one() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("library-actions.json");
+    std::fs::copy(fixture(), &path).expect("copied");
+    let journal = LibraryActionJournal::with_path(Some(path.clone()));
+    assert_eq!(journal.recent(10).len(), 5);
+    assert!(journal.recent(10).iter().all(|e| e.denied_source.is_none()));
+
+    journal.record(plain(
+        LibraryAction::WrongSong,
+        "song-a",
+        LibraryActionState::Pending,
+    ));
+    journal.set_denied_source(
+        "WrongSong|song-a|1:2",
+        DeniedSource {
+            username: "peer".into(),
+            filename: "Music\\a.flac".into(),
+        },
+    );
+    assert!(journal.flush());
+    let text = std::fs::read_to_string(&path).expect("written");
+    assert_eq!(text.matches("\"DeniedSource\"").count(), 1, "{text}");
+
+    let again = LibraryActionJournal::with_path(Some(path));
+    let entry = again
+        .recent(10)
+        .into_iter()
+        .find(|e| e.navidrome_id == "song-a")
+        .expect("the Wrong song");
+    assert_eq!(
+        entry.denied_source,
+        Some(DeniedSource {
+            username: "peer".into(),
+            filename: "Music\\a.flac".into(),
+        })
+    );
 }
 
 /// Entries with an empty key are skipped, and a file that is not JSON leaves the journal empty.

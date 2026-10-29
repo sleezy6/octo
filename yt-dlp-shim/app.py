@@ -38,11 +38,12 @@ import sqlite3
 import subprocess
 import threading
 import time
+import unicodedata
 from typing import Optional
 
 import requests
 from requests.adapters import HTTPAdapter
-from flask import Flask, Response, abort, jsonify, request, stream_with_context
+from flask import Flask, Response, abort, has_request_context, jsonify, request, stream_with_context
 
 import ytm
 
@@ -115,7 +116,7 @@ _last_cache_purge = 0.0
 # In-memory LRU cache of search-query -> json result. Cuts repeat searches
 # from a 3-8s yt-dlp invocation to a dict lookup. Bounded so we never grow
 # without limit. The cache is best-effort; restarts wipe it.
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 _SEARCH_CACHE_LOCK = threading.Lock()
 _SEARCH_CACHE: "OrderedDict[str, dict]" = OrderedDict()
 _SEARCH_CACHE_MAX = int(os.environ.get("SEARCH_CACHE_MAX", "1024"))
@@ -329,13 +330,25 @@ log.info(
 )
 
 
+class GateFull(Exception):
+    """The yt-dlp gate dropped a request: no slot came free in time."""
+
+
+@app.errorhandler(GateFull)
+def _gate_full(_error):
+    return jsonify(error="busy"), 503
+
+
 def _run(args: list[str], timeout: int = 20, label: str = "ytdlp",
          bg: bool = False, capture: bool = False):
     """Run yt-dlp with a hard timeout. Returns stdout or None on any failure.
 
     With capture=True the CompletedProcess is returned instead, so a caller can
     read stderr and tell a 403 apart from an unavailable video. Still None when
-    the gate is full or the run times out, since there is no process to report.
+    the run times out, since there is no process to report.
+
+    A full gate is None too, except inside a request: there GateFull is raised, which the
+    handler answers as 503 {"error":"busy"}, apart from the 502 of a failed run.
 
     Logs gate-wait and wall time so a real box can show whether interactive
     resolves are queuing behind background prewarm (grep `gate_wait_ms`), and
@@ -346,6 +359,8 @@ def _run(args: list[str], timeout: int = 20, label: str = "ytdlp",
     if not _GATE.acquire(bg, wait):
         log.warning("yt-dlp gate full after %ds (bg=%d), dropping: %s",
                     wait, int(bg), " ".join(args))
+        if has_request_context():
+            raise GateFull()
         return None
     gate_ms = (time.monotonic() - t_acquire) * 1000.0
     try:
@@ -409,6 +424,10 @@ def _is_bg() -> bool:
     return request.args.get("bg") == "1"
 
 
+# The version of the ranking, sent with every ranked answer so Octo knows which picks to look at again.
+_RANK = 3
+
+
 @app.get("/search")
 def search():
     q = request.args.get("q", "").strip()
@@ -418,19 +437,29 @@ def search():
     hint_str = request.args.get("duration", "").strip()
     duration_hint = int(hint_str) if hint_str.isdigit() else None
     bg = _is_bg()
+    skip = tuple(s for s in request.args.get("skip", "").split(",") if s)
 
-    cache_key = f"{q.lower()}|{duration_hint or ''}"
-    cached = _cache_get(cache_key)
+    resolve = request.args.get("resolve") != "0"
+    # Rank-only background work neither reads nor fills the caches.
+    uncached = bg and not resolve
+
+    cache_key = f"{q.lower()}|{duration_hint or ''}|{','.join(sorted(skip))}"
+    cached = None if uncached else _cache_get(cache_key)
     if cached is not None:
         return jsonify(**cached)
 
-    payload = _search_with_hint(q, duration_hint, bg) if duration_hint is not None else _search_single(q, bg)
+    if duration_hint is not None or skip or not resolve:
+        payload = _search_with_hint(q, duration_hint, bg, skip, resolve=resolve)
+    else:
+        payload = _search_single(q, bg)
     if payload is None:
         return jsonify(error="search_failed"), 502
     if not payload.get("video_id"):
         return jsonify(error="no_hit"), 404
 
-    _cache_put(cache_key, payload)
+    payload = {**payload, "rank": _RANK}
+    if not uncached:
+        _cache_put(cache_key, payload)
     return jsonify(**payload)
 
 
@@ -468,6 +497,11 @@ def _search_single(q: str, bg: bool = False) -> Optional[dict]:
     except json.JSONDecodeError as e:
         log.warning("search: bad json from yt-dlp: %s", e)
         return None
+    # YouTube's first hit is kept only when it names the song and is no other take; otherwise the
+    # five are ranked.
+    core, extra = _query_words(q)
+    if _rank_key(data, core, extra, _takes(q), None)[:3] != (0, 0, 0):
+        return _search_with_hint(q, None, bg)
     payload = _payload_from(data)
     if payload.get("video_id") and stream_url:
         # Warm the URL cache from the SAME extraction. This used to be a second
@@ -478,26 +512,129 @@ def _search_single(q: str, bg: bool = False) -> Optional[dict]:
     return _with_facts(payload)
 
 
-_LIVE = re.compile(r"\b(live|unplugged|in concert|concert|bootleg)\b", re.IGNORECASE)
+# Words that make a video another take of a song than the plain studio one.
+_TAKE = re.compile(
+    r"\b(live|unplugged|in concert|concert|bootleg|remix(?:ed)?|rmx|sped[\s-]*up|speed[\s-]*up|slowed|"
+    r"nightcore|daycore|reverb|8d|karaoke|instrumental|cover|acapella|a cappella|acoustic|demo|mashup|"
+    r"bass boosted|lo[\s-]?fi|\d+\s*hours?)\b",
+    re.IGNORECASE,
+)
+# Spellings of one take word that count as the same word.
+_TAKE_SPELLINGS = {"remixed": "remix", "rmx": "remix", "speedup": "spedup", "acappella": "acapella",
+                   "inconcert": "concert"}
+# A bracketed clause: "(feat. Drake)", "[Official Video]", "(Radio Edit)".
+_BRACKETED = re.compile(r"[(\[][^)\]]*[)\]]")
+# Words a video's title may leave out without being another song.
+_FILLER = {"feat", "ft", "featuring", "with", "x", "and", "the", "a", "an", "of", "vs",
+           "official", "video", "audio", "lyrics", "lyric", "music", "topic", "prod"}
 
 
-def _rank_by_length(candidates: list, q: str, duration_hint: int) -> list:
-    """Closest length first, but a live take never beats a studio one unless the query asks
-    for live itself. A live video of a song is usually within seconds of the studio length,
-    so length alone picked it as often as not. All of them live: the closest still plays."""
-    wants_live = bool(_LIVE.search(q))
-
-    def key(r: dict):
-        live = 0 if wants_live or not _LIVE.search(r.get("title") or "") else 1
-        length = abs((r.get("duration") or 0) - duration_hint) if r.get("duration") else float("inf")
-        return (live, length)
-
-    return sorted(candidates, key=key)
+_SCRIPT_FOLD = {"HIRAGANA", "KATAKANA", "BOPOMOFO", "CJK", "IDEOGRAPHIC", "KATAKANA-HIRAGANA"}
 
 
-def _search_with_hint(q: str, duration_hint: int, bg: bool = False) -> Optional[dict]:
-    """Duration hint present: pick the closest-length of 5 flat candidates
-    (cheap, no per-video extraction), then resolve the winner's URL once.
+def _script_of(ch: str) -> Optional[str]:
+    """The script one letter is written in, or None for a letter that joins any script."""
+    if not ch.isalpha():
+        return None
+    first = unicodedata.name(ch, "").split(" ", 1)[0]
+    if not first or first == "MODIFIER":
+        return None
+    return "HAN" if first in _SCRIPT_FOLD else first
+
+
+def _scripts(text: str) -> set:
+    """The scripts a text's letters are written in, with Japanese kana and Chinese characters
+    counted as one."""
+    return {s for s in map(_script_of, text) if s}
+
+
+def _words(text: str) -> set:
+    """The words of a title or a query, in lower case, accents and punctuation gone. A run of
+    letters changing script splits into one word per script."""
+    plain = unicodedata.normalize("NFKD", text or "")
+    plain = "".join(c for c in plain if not unicodedata.combining(c))
+    found = set()
+    for run in re.findall(r"\w+", plain.casefold()):
+        start, current = 0, None
+        for i, ch in enumerate(run):
+            s = _script_of(ch)
+            if s is None:
+                continue
+            if current is not None and s != current:
+                found.add(run[start:i])
+                start = i
+            current = s
+        found.add(run[start:])
+    return found
+
+
+def _takes(text: str) -> Counter:
+    """The other-take words a title or a query carries, each spelling counted as one word."""
+    found = Counter()
+    for match in _TAKE.finditer(text or ""):
+        word = re.sub(r"[\s-]+", "", match.group(1).casefold())
+        if word.endswith(("hour", "hours")):
+            word = "hours"
+        found[_TAKE_SPELLINGS.get(word, word)] += 1
+    return found
+
+
+def _query_words(q: str) -> tuple:
+    """The query's core words (bracketed clauses and any " - " tail taken off) and its extra
+    words (the rest), filler left out of both."""
+    core_text = re.split(r"\s+-\s+", _BRACKETED.sub(" ", q), maxsplit=1)[0]
+    core = _words(core_text) - _FILLER
+    return core, _words(q) - _FILLER - core
+
+
+def _rank_by_length(candidates: list, q: str, duration_hint: Optional[int]) -> list:
+    """Ranks search candidates for the query, best first: the video whose title and channel name
+    the query's core words (artist and title), then the one that is no other take than the query
+    asks for (live, remix, sped up, cover...), then the one naming its extra words (a featured
+    artist, an edit), then the closest length.
+
+    Take words are counted, so a title that holds one ("Live Forever") is not held against a
+    video saying it once. A word no video has adds the same to every key, so a title in another
+    script leaves the order to the rest. Without a length hint, ties keep YouTube's order.
+    Candidates without a duration sort last.
+
+    A query word in another script than the words the candidate's own title adds is not held
+    against an upload whose channel names the song, so a native-script title on the artist's
+    channel wins over a translated fan upload."""
+    core, extra = _query_words(q)
+    asked = _takes(q)
+    return sorted(candidates, key=lambda r: _rank_key(r, core, extra, asked, duration_hint))
+
+
+def _rank_key(r: dict, core: set, extra: set, asked: Counter, duration_hint: Optional[int]) -> tuple:
+    """The sort key of one candidate: core words it does not name, other takes it holds, extra
+    words it does not name, then its distance in length from the hint."""
+    tw, cw = _words(r.get("title") or ""), _words(r.get("channel") or "")
+    named = tw | cw
+    loose = tw - core - extra - _FILLER
+    foreign = set().union(*map(_scripts, loose)) if loose else set()
+    vouched = bool(core & cw)  # the channel names the song: the artist's own or Topic upload
+
+    def judged(w):
+        s = _scripts(w)
+        return not (vouched and s and (foreign - s))
+
+    missing = sum(1 for w in core - named if judged(w))
+    other = sum((_takes(r.get("title") or "") - asked).values())
+    if not r.get("duration"):
+        length = float("inf")
+    elif duration_hint is None:
+        length = 0
+    else:
+        length = abs(r["duration"] - duration_hint)
+    return (missing, other, len(extra - named), length)
+
+
+def _search_with_hint(q: str, duration_hint: Optional[int], bg: bool = False, skip: tuple = (),
+                      resolve: bool = True) -> Optional[dict]:
+    """Five flat candidates for the query, ranked by `_rank_by_length` (named words, other
+    takes, then length), then the winner's URL resolved once unless `resolve` is false.
+    Videos in `skip` are left out.
 
     Note this path costs TWO gated yt-dlp runs per track (search5 then resolve),
     where the no-hint path gets both from one extraction.
@@ -523,15 +660,20 @@ def _search_with_hint(q: str, duration_hint: int, bg: bool = False) -> Optional[
             candidates.append(json.loads(ln))
         except json.JSONDecodeError:
             pass
+    candidates = [c for c in candidates if c.get("id") not in skip]
     if not candidates:
         return {}
-    # Closest duration wins, live takes last; candidates without a duration sort
-    # last so a hint never drags us onto an entry we can't length-match.
+    # Ranked by the words they name, then other takes, then length; candidates without a duration
+    # sort last so a hint never drags us onto an entry we can't length-match.
     candidates = _rank_by_length(candidates, q, duration_hint)
     payload = _payload_from(candidates[0])
-    if payload.get("video_id"):
-        # Warm the URL cache for the coming /stream (single-flight + cached).
-        _resolve_url(payload["video_id"], bg)
+    if payload.get("video_id") and resolve:
+        # Warm the URL cache for the coming /stream (single-flight + cached). A full gate leaves
+        # it cold; the search itself still answers.
+        try:
+            _resolve_url(payload["video_id"], bg)
+        except GateFull:
+            pass
     return _with_facts(payload)
 
 
@@ -608,8 +750,8 @@ _meta_db_init()
 @app.get("/meta")
 def meta():
     """Fast metadata-only lookup (flat search, NO url solve) for an accurate
-    duration on search rows. With a duration hint it picks the closest-length of
-    5 candidates (avoids long-form/compilation uploads); otherwise the top result.
+    duration on search rows. With a duration hint it ranks 5 candidates by
+    `_rank_by_length` (named words, other takes, then length) (avoids long-form/compilation uploads); otherwise the top result.
     Cached, so repeat searches are a dict lookup."""
     q = request.args.get("q", "").strip()
     if not q:
@@ -618,23 +760,42 @@ def meta():
     duration_hint = int(hint_str) if hint_str.isdigit() else None
     bg = _is_bg()
 
-    key = _norm_q(q)
+    # The ranking's version leads the key, so a lookup answered by an older ranking is searched again.
+    key = "v3|" + _norm_q(q)
     # Hot front: exact repeat within this process.
     with _META_CACHE_LOCK:
         c = _META_CACHE.get(key)
         if c is not None:
             _META_CACHE.move_to_end(key)
-            return jsonify(**c)
+            return jsonify(**c, rank=_RANK)
     # Durable backing: resolved in a past search/warm, possibly a past process.
     persisted = _meta_db_get(key)
     if persisted is not None:
         with _META_CACHE_LOCK:
             _META_CACHE[key] = persisted
             _META_CACHE.move_to_end(key)
-        return jsonify(**persisted)
+        return jsonify(**persisted, rank=_RANK)
 
-    if duration_hint is not None:
-        out = _run([f"ytsearch5:{q}", "--flat-playlist", "--print", "%(.{id,title,duration})j"],
+    data = None
+    if duration_hint is None:
+        out = _run([f"ytsearch1:{q}", "--flat-playlist", "--print", "%(.{id,title,duration,channel})j"],
+                   timeout=15, label="meta", bg=bg)
+        if out is None:
+            return jsonify(error="search_failed"), 502
+        line = next((ln.strip() for ln in out.strip().split("\n") if ln.strip()), "")
+        if not line:
+            return jsonify(error="no_hit"), 404
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            return jsonify(error="bad_yt_response"), 502
+        # YouTube's first hit is kept only when it names the song and is no other take; otherwise the
+        # five are ranked.
+        core, extra = _query_words(q)
+        if _rank_key(data, core, extra, _takes(q), None)[:3] != (0, 0, 0):
+            data = None
+    if data is None:
+        out = _run([f"ytsearch5:{q}", "--flat-playlist", "--print", "%(.{id,title,duration,channel})j"],
                    timeout=20, label="meta5", bg=bg)
         cands = []
         for ln in (out or "").strip().split("\n"):
@@ -647,18 +808,6 @@ def meta():
         if not cands:
             return jsonify(error="no_hit"), 404
         data = _rank_by_length(cands, q, duration_hint)[0]
-    else:
-        out = _run([f"ytsearch1:{q}", "--flat-playlist", "--print", "%(.{id,title,duration})j"],
-                   timeout=15, label="meta", bg=bg)
-        if out is None:
-            return jsonify(error="search_failed"), 502
-        line = next((ln.strip() for ln in out.strip().split("\n") if ln.strip()), "")
-        if not line:
-            return jsonify(error="no_hit"), 404
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            return jsonify(error="bad_yt_response"), 502
 
     payload = {"video_id": data.get("id"), "title": data.get("title"), "duration": data.get("duration")}
     if payload["video_id"]:
@@ -668,7 +817,7 @@ def meta():
             while len(_META_CACHE) > _SEARCH_CACHE_MAX:
                 _META_CACHE.popitem(last=False)
         _meta_db_put(key, payload)  # persist so it survives restarts, for both modes
-    return jsonify(**payload)
+    return jsonify(**payload, rank=_RANK)
 
 
 def _resolve_url(video_id: str, bg: bool = False) -> Optional[str]:
@@ -796,7 +945,10 @@ def _seed_writable_ytdlp() -> None:
 
 
 def _ytdlp_version() -> str:
-    out = _run(["--version"], timeout=30, label="version", bg=False)
+    try:
+        out = _run(["--version"], timeout=30, label="version", bg=False)
+    except GateFull:
+        out = None
     return (out or "").strip()
 
 
@@ -821,7 +973,10 @@ def _maybe_self_update(reason: str) -> bool:
 
     before = _ytdlp_version()
     log.warning("%s: attempting yt-dlp self-update (current %s)", reason, before or "unknown")
-    _run(["-U"], timeout=180, label="self-update", bg=True)
+    try:
+        _run(["-U"], timeout=180, label="self-update", bg=True)
+    except GateFull:
+        log.warning("%s: the gate was full, so yt-dlp was not updated", reason)
     after = _ytdlp_version()
     if after and after != before:
         # The old player cache belongs to the old binary; keep them together.
@@ -935,7 +1090,11 @@ def _pieced_answer(video_id, url, upstream_headers, first, wanted, total, synthe
             # The signed URL ran out partway through a long song: one fresh URL, then on.
             piece.close()
             _url_cache_evict_if(video_id, current["url"])
-            current["url"] = _resolve_url(video_id)
+            try:
+                current["url"] = _resolve_url(video_id)
+            except GateFull:
+                # Mid-answer there is no way to say busy: the piece simply fails.
+                current["url"] = None
             piece = _open_upstream(current["url"], headers, video_id) if current["url"] else None
         if piece is None or piece.status_code != 206:
             if piece is not None:
@@ -1017,6 +1176,8 @@ _YTM_GATE = threading.BoundedSemaphore(int(os.environ.get("YTM_MAX_CONCURRENT", 
 # Octo gives a radio source 8 s; a request still queued past this has no one waiting for it, and
 # would only hold a gunicorn thread that playback needs.
 _YTM_GATE_WAIT = float(os.environ.get("YTM_GATE_WAIT_SEC", "5"))
+# Background searches share one slot, so they never crowd out a radio someone is waiting on.
+_YTM_BG_GATE = threading.BoundedSemaphore(1)
 # One cache per kind, so a burst of radios never pushes the searches out.
 _YTM_CACHE: "dict[str, OrderedDict]" = {"search": OrderedDict(), "radio": OrderedDict(), "artist": OrderedDict()}
 _YTM_LIMIT = {"search": 2000, "radio": 500, "artist": 500}
@@ -1031,20 +1192,25 @@ def _arg_int(name, default, low, high):
         return default
 
 
-def _ytm_cached(kind, key, load):
-    """A cached answer, else load() under the gate; None when the gate stays full."""
+def _ytm_cached(kind, key, load, bg=False):
+    """A cached answer, else load() under the gate; None when the gate stays full.
+    Background work has its own one-slot gate that never waits, and never fills the cache."""
     cache = _YTM_CACHE[kind]
     with _YTM_LOCK:
         hit = cache.get(key)
         if hit and time.time() - hit[0] < _YTM_TTL[kind]:
             cache.move_to_end(key)
             return hit[1]
-    if not _YTM_GATE.acquire(timeout=_YTM_GATE_WAIT):
+    gate = _YTM_BG_GATE if bg else _YTM_GATE
+    taken = gate.acquire(blocking=False) if bg else gate.acquire(timeout=_YTM_GATE_WAIT)
+    if not taken:
         return None
     try:
         value = load()
     finally:
-        _YTM_GATE.release()
+        gate.release()
+    if bg:
+        return value
     with _YTM_LOCK:
         cache[key] = (time.time(), value)
         while len(cache) > _YTM_LIMIT[kind]:
@@ -1062,7 +1228,8 @@ def ytm_search():
         abort(400, "filter must be songs or videos")
     limit = _arg_int("limit", 10, 1, 20)
     try:
-        rows = _ytm_cached("search", (q.lower(), filter_name, limit), lambda: ytm.search(q, filter_name, limit))
+        rows = _ytm_cached("search", (q.lower(), filter_name, limit), lambda: ytm.search(q, filter_name, limit),
+                           bg=_is_bg())
     except Exception as e:  # ytmusicapi raises plain exceptions when YouTube Music changes its pages
         log.warning("ytm search failed for %r: %s", q, e)
         return jsonify(error="ytm_failed"), 502
@@ -1139,7 +1306,10 @@ def stream():
         abort(400, "missing id")
     t_enter = time.monotonic()
 
-    url = _resolve_url(video_id)
+    # Work nobody waits on (bg=1, such as Octo's library check) resolves in the background
+    # lane, so a play never queues behind it.
+    bg = _is_bg()
+    url = _resolve_url(video_id, bg)
     if not url:
         return jsonify(error="no_audio_url"), 502
 
@@ -1196,7 +1366,7 @@ def stream():
         )
         upstream.close()
         _url_cache_evict_if(video_id, url)
-        url = _resolve_url(video_id)
+        url = _resolve_url(video_id, bg)
         upstream = _open_upstream(url, upstream_headers, video_id) if url else None
         # A freshly resolved URL that is refused again is not an expiry; the
         # most common remaining cause is a stale cached player.
@@ -1208,7 +1378,7 @@ def stream():
             if _maybe_self_update(f"stream {video_id}: 403 survived a cache purge"):
                 upstream.close()
                 _url_cache_evict_if(video_id, url)
-                url = _resolve_url(video_id)
+                url = _resolve_url(video_id, bg)
                 upstream = _open_upstream(url, upstream_headers, video_id) if url else None
 
     # A range past the end is the caller's mistake, not an upstream failure: pass the 416 and
@@ -1359,7 +1529,10 @@ def download():
         # Background on purpose, regardless of what triggered it: this holds its
         # slot for up to five minutes, and a single star-triggered download must
         # never be able to sit in a slot a play is waiting for.
-        return _run(ytdlp_args, timeout=300, label="download", bg=True, capture=True)
+        try:
+            return _run(ytdlp_args, timeout=300, label="download", bg=True, capture=True)
+        except GateFull:
+            return None
 
     cp = _attempt()
     if cp is None or cp.returncode != 0 or not os.path.exists(path):

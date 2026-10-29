@@ -23,6 +23,7 @@ use super::action_helpers::{
     queue_refresh_if_stale, visible_stations,
 };
 use super::album_ownership::{judge_albums, scope_of, settle_search_albums};
+use super::caller_checks::listener_name_of;
 use super::media::draws_its_own_marks_in;
 use crate::app::AppState;
 use crate::http::error::AppError;
@@ -681,7 +682,7 @@ async fn sync_walk_page(
         return Ok(unchanged());
     }
 
-    let username = call.param_or("u", "").to_string();
+    let username = listener_name_of(state, &call.parameters, &call.proxy, &call.parts.headers).await;
     let mut stations = visible_stations(state, &username);
     // The chart lists ride along as stations, so a syncing client holds their outside songs
     // under the ids the playlists list.

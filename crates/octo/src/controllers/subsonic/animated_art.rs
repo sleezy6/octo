@@ -30,6 +30,7 @@ use super::family::octo_reply;
 use crate::app::AppState;
 use crate::http::error::AppResult;
 use crate::http::routes::RouteSet;
+use crate::services::charts::apple_music_pages::LaneCell;
 use crate::services::common::star_on_arrival::StarOnArrival;
 use crate::services::cover_art::ArtLookup;
 use crate::services::cover_art::animated_art::{FoundArtwork, RELAY_ROOT, RelayFile};
@@ -139,7 +140,7 @@ pub async fn get_animated_art(State(state): State<AppState>, req: Request) -> Ap
     }
     match state
         .animated_art
-        .find(&artist, &album, barcode.as_deref(), ASK_WAIT)
+        .find_on(&artist, &album, barcode.as_deref(), ASK_WAIT, &LaneCell::now())
         .await
     {
         ArtLookup::Found(cover) => Ok(reply_with(&state, &format, &cover)),

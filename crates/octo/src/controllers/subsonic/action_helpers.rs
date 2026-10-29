@@ -84,6 +84,12 @@ impl SubsonicCall {
         request_path(&self.parts)
     }
 
+    /// The request's endpoint as the client spelled it, without its first `/`: the form a relay
+    /// to Navidrome names (`rest/getSimilarSongs2.view`).
+    pub fn endpoint(&self) -> String {
+        request_endpoint(&self.parts)
+    }
+
     /// The request's scheme, after forwarded headers are applied.
     pub fn scheme(&self) -> String {
         request_scheme(&self.parts)
@@ -102,11 +108,17 @@ impl SubsonicCall {
 
 /// The request's path, for a request the pipeline may have re-spelled onto a route template.
 pub fn request_path(parts: &Parts) -> String {
+    format!("/{}", request_endpoint(parts))
+}
+
+/// The request's path without its first `/`, for a request the pipeline may have re-spelled
+/// onto a route template.
+pub fn request_endpoint(parts: &Parts) -> String {
     let path = parts
         .extensions
         .get::<OriginalUri>()
         .map_or_else(|| parts.uri.path().to_string(), |uri| uri.0.path().to_string());
-    format!("/{}", endpoint_of(&path))
+    endpoint_of(&path)
 }
 
 pub fn request_scheme(parts: &Parts) -> String {

@@ -63,6 +63,17 @@ fn release(server: &str, username: &str, title: &str) {
     PENDING.lock().remove(&pending_key(server, username, title));
 }
 
+/// Forgets every claim on `server`, so a test's fresh Navidrome starts with none.
+#[cfg(test)]
+pub(crate) fn forget_claims(server: &str) {
+    let prefix = {
+        let mut key = dotnet::ordinal_ignore_case_key(server.trim());
+        key.push('\n');
+        key
+    };
+    PENDING.lock().retain(|key, _| !key.starts_with(&prefix));
+}
+
 /// Makes sure an allowed user has a playlist for each enabled action.
 ///
 /// Created PER USER with THEIR credentials, so the playlists are theirs and private. An
@@ -265,6 +276,7 @@ mod tests {
     #[tokio::test]
     async fn the_missing_playlists_are_created_once_as_the_user() {
         let navidrome = MockServer::builder().start().await;
+        forget_claims(&navidrome.uri());
         Mock::given(path("/rest/createPlaylist"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -348,7 +360,8 @@ mod tests {
     /// missing. Only one creates it, and a listing started a moment later still does not.
     #[tokio::test]
     async fn overlapping_listings_create_a_missing_playlist_once() {
-        let navidrome = MockServer::start().await;
+        let navidrome = MockServer::builder().start().await;
+        forget_claims(&navidrome.uri());
         Mock::given(path("/rest/createPlaylist"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -381,7 +394,8 @@ mod tests {
     /// A create Navidrome refused gives the title back, so the next listing tries again.
     #[tokio::test]
     async fn a_failed_create_is_tried_again_by_the_next_listing() {
-        let navidrome = MockServer::start().await;
+        let navidrome = MockServer::builder().start().await;
+        forget_claims(&navidrome.uri());
         Mock::given(path("/rest/createPlaylist"))
             .respond_with(ResponseTemplate::new(500))
             .up_to_n_times(1)
@@ -442,7 +456,8 @@ mod family_tests {
     use crate::services::family::test_support::member;
 
     async fn created_for(user: &str, family_on: bool) -> Vec<String> {
-        let navidrome = MockServer::start().await;
+        let navidrome = MockServer::builder().start().await;
+        forget_claims(&navidrome.uri());
         Mock::given(path("/rest/createPlaylist"))
             .respond_with(
                 ResponseTemplate::new(200)

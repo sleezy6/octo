@@ -120,16 +120,45 @@ fn a_genre_is_top_its_name() {
 }
 
 #[test]
-fn a_known_genre_is_named_in_english_an_unknown_one_by_apple() {
+fn a_known_genre_is_named_in_english_whatever_the_menu_says() {
     let menu = vec![
         genre("18", "ヒップホップ／ラップ"),
         genre("29", "アニメ"),
         genre("27", "J-Pop"),
     ];
     assert_eq!(genre_name(&menu, "18").as_deref(), Some("Hip-Hop/Rap"));
-    assert_eq!(genre_name(&menu, "29").as_deref(), Some("アニメ"));
+    assert_eq!(genre_name(&menu, "29").as_deref(), Some("Anime"));
     assert_eq!(genre_name(&menu, "27").as_deref(), Some("J-Pop"));
     assert_eq!(genre_name(&menu, "999"), None);
+}
+
+#[test]
+fn the_table_is_sorted_and_unique() {
+    let numbers: Vec<u64> = APPLE_GENRE_NAMES
+        .iter()
+        .map(|(id, _)| id.parse().expect("a numeric id"))
+        .collect();
+    assert!(numbers.windows(2).all(|w| w[0] < w[1]));
+    assert!(APPLE_GENRE_NAMES.iter().all(|(_, n)| is_latin_script(n)));
+}
+
+#[test]
+fn every_japan_only_genre_has_an_english_name() {
+    for (id, name) in [
+        ("27", "J-Pop"),
+        ("28", "Enka"),
+        ("29", "Anime"),
+        ("30", "Kayokyoku"),
+    ] {
+        assert_eq!(table_genre_name(id), Some(name), "{id}");
+    }
+}
+
+#[test]
+fn a_latin_menu_name_is_kept() {
+    let menu = vec![genre("99998", "Música Mexicana"), genre("99999", "ロック")];
+    assert_eq!(genre_name(&menu, "99998").as_deref(), Some("Música Mexicana"));
+    assert_eq!(genre_name(&menu, "99999"), None);
 }
 
 #[test]
@@ -145,6 +174,67 @@ fn english_menu_starts_with_all_genres() {
     let menu = english_menu();
     assert_eq!(menu.len(), 22);
     assert_eq!(menu[0], genre("34", "All Genres"));
+}
+
+#[test]
+fn list_ids_round_trip() {
+    assert_eq!(split_list(&list_id("34", Some("jp"))), ("34", Some("jp")));
+    assert_eq!(list_id("34", None), "34");
+    assert_eq!(split_list("34"), ("34", None));
+    assert_eq!(split_list("34@"), ("34@", None));
+}
+
+#[test]
+fn pinned_keys_keep_the_home_key_first() {
+    assert_eq!(list_key("34@jp"), "chart:popular@jp");
+    assert_eq!(list_key("new@br"), "chart:new@br");
+    assert_eq!(list_key("18"), "chart:genre:18");
+    assert_eq!(list_key("34"), "chart:popular");
+}
+
+#[test]
+fn list_keys_round_trip() {
+    assert_eq!(
+        list_from_key(&list_key("18@jp")),
+        Some(("18".into(), Some("jp".into())))
+    );
+    assert_eq!(list_from_key(&list_key("34")), Some(("34".into(), None)));
+    assert_eq!(list_from_key("chart:genre:pop@jp"), None);
+}
+
+#[test]
+fn pinned_names_say_the_country() {
+    assert_eq!(pinned_name("Top Pop", "jp"), "Top Pop · Japan");
+    assert_eq!(
+        pinned_name("Popular right now", "ae"),
+        "Popular right now · United Arab Emirates"
+    );
+    assert_eq!(
+        pinned_name("Popular right now", "xk"),
+        "Popular right now · Kosovo"
+    );
+    assert_eq!(country_name("zz"), "ZZ");
+}
+
+#[test]
+fn pins_parse() {
+    assert_eq!(parse_pins(["br, jp,BR"], Some("jp")), Ok(vec!["br".to_string()]));
+    assert_eq!(
+        parse_pins(["br", "kr"], None),
+        Ok(vec!["br".to_string(), "kr".to_string()])
+    );
+    assert_eq!(
+        parse_pins(["usa"], None),
+        Err(PinsError::NotACountry("usa".to_string()))
+    );
+    assert_eq!(parse_pins(["br,jp,kr,de"], None), Err(PinsError::TooMany));
+    assert_eq!(
+        parse_pins(["br", "jp", "kr", "x1"], None),
+        Err(PinsError::NotACountry("x1".to_string())),
+        "a part that is no country is named, however many were sent"
+    );
+    assert_eq!(parse_pins([""], None), Ok(Vec::new()));
+    assert_eq!(parse_pins([], None), Ok(Vec::new()));
 }
 
 #[test]

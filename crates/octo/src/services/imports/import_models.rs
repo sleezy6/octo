@@ -197,3 +197,18 @@ impl Default for TrickleJob {
         }
     }
 }
+
+impl TrickleJob {
+    /// The job's song, as the matcher reads one.
+    pub fn as_track(&self) -> ImportTrack {
+        ImportTrack {
+            key: self.key.clone(),
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            album: self.album.clone(),
+            seconds: self.seconds,
+            isrc: self.isrc.clone(),
+            library_id: None,
+        }
+    }
+}

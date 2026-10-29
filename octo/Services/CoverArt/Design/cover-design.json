@@ -24,6 +24,8 @@
       "wrapMinPx": 13,
       "minSize": 0.07,
       "minPx": 9,
+      "floorPx": 7,
+      "floorSize": 0.05,
       "maxLines": 3,
       "lineHeight": 1.08,
       "tracking": 0

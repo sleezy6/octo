@@ -316,3 +316,214 @@ async fn the_gate_spaces_requests_a_second() {
     gate.wait().await;
     assert_eq!(Instant::now() - start, Duration::from_secs(2));
 }
+
+type Log = Arc<Mutex<Vec<(String, Duration)>>>;
+
+/// A read waiting at `gate` in `lane`; when it is granted its label and the time since `start`
+/// are logged.
+fn read(
+    gate: &Arc<Gate>,
+    log: &Log,
+    start: Instant,
+    label: &str,
+    lane: LaneCell,
+) -> tokio::task::JoinHandle<()> {
+    let (gate, log, label) = (gate.clone(), log.clone(), label.to_string());
+    tokio::spawn(async move {
+        if gate.wait_in(&lane, || false).await {
+            log.lock().push((label, start.elapsed()));
+        }
+    })
+}
+
+/// Lets the reads spawned so far reach their wait.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(1)).await;
+}
+
+fn order(log: &Log) -> Vec<String> {
+    log.lock().iter().map(|(label, _)| label.clone()).collect()
+}
+
+fn granted_at(log: &Log, label: &str) -> Duration {
+    log.lock()
+        .iter()
+        .find(|(name, _)| name == label)
+        .map(|(_, at)| *at)
+        .unwrap_or_else(|| panic!("{label} was never granted"))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_now_read_goes_before_queued_behind_reads() {
+    let gate = Arc::new(Gate::new(Duration::from_secs(1)));
+    let log = Log::default();
+    let start = Instant::now();
+    for i in 1..=5 {
+        read(&gate, &log, start, &format!("b{i}"), LaneCell::behind());
+        settle().await;
+    }
+    read(&gate, &log, start, "n", LaneCell::now());
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    assert_eq!(order(&log), ["b1", "b2", "n", "b3", "b4", "b5"]);
+    assert!(granted_at(&log, "n") <= Duration::from_secs(2));
+}
+
+#[tokio::test(start_paused = true)]
+async fn behind_reads_still_flow_when_nothing_is_urgent() {
+    let gate = Arc::new(Gate::new(Duration::from_secs(1)));
+    let log = Log::default();
+    let start = Instant::now();
+    for i in 1..=5 {
+        read(&gate, &log, start, &format!("b{i}"), LaneCell::behind());
+        settle().await;
+    }
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    assert_eq!(order(&log), ["b1", "b2", "b3", "b4", "b5"]);
+    for (i, label) in ["b1", "b2", "b3", "b4", "b5"].iter().enumerate() {
+        assert_eq!(granted_at(&log, label), Duration::from_secs(i as u64));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn behind_reads_progress_under_steady_now_load() {
+    let gate = Arc::new(Gate::new(Duration::from_secs(1)));
+    let log = Log::default();
+    let start = Instant::now();
+    // Interactive reads arrive twice as fast as the gate serves them, forever.
+    let load = {
+        let (gate, log) = (gate.clone(), log.clone());
+        tokio::spawn(async move {
+            let mut i = 0;
+            loop {
+                read(&gate, &log, start, &format!("n{i}"), LaneCell::now());
+                i += 1;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let arrived = start.elapsed();
+    for i in 1..=3 {
+        read(&gate, &log, start, &format!("b{i}"), LaneCell::behind());
+        settle().await;
+    }
+
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    load.abort();
+
+    let mut before = arrived;
+    for label in ["b1", "b2", "b3"] {
+        let at = granted_at(&log, label);
+        assert!(
+            at - before <= Duration::from_secs(6),
+            "{label} waited {:?} past {before:?}",
+            at - before
+        );
+        before = at;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_now_wait_frees_behind_reads() {
+    let gate = Arc::new(Gate::new(Duration::from_secs(1)));
+    let log = Log::default();
+    let start = Instant::now();
+    read(&gate, &log, start, "h", LaneCell::behind());
+    settle().await;
+    let now = read(&gate, &log, start, "n", LaneCell::now());
+    settle().await;
+    read(&gate, &log, start, "b", LaneCell::behind());
+    settle().await;
+    assert_eq!(gate.waiting_now.load(Ordering::SeqCst), 1);
+
+    now.abort();
+    settle().await;
+
+    assert_eq!(gate.waiting_now.load(Ordering::SeqCst), 0);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(order(&log), ["h", "b"]);
+    assert!(granted_at(&log, "b") <= Duration::from_millis(1100));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_that_turns_urgent_while_waiting_goes_first() {
+    let gate = Arc::new(Gate::new(Duration::from_secs(1)));
+    let log = Log::default();
+    let start = Instant::now();
+    for i in 1..=3 {
+        read(&gate, &log, start, &format!("old{i}"), LaneCell::behind());
+        settle().await;
+    }
+    let lane = LaneCell::behind();
+    read(&gate, &log, start, "late", lane.clone());
+    settle().await;
+
+    assert!(lane.make_now());
+    assert!(!lane.make_now(), "already urgent");
+    gate.wake_behind();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    assert_eq!(order(&log), ["old1", "old2", "late", "old3"]);
+}
+
+#[tokio::test]
+async fn a_page_fetched_meanwhile_costs_no_slot() {
+    let server = MockServer::builder().start().await;
+    let pages = AppleMusicPages::with_base_url(&server.uri(), Duration::from_millis(300));
+    Mock::given(method("GET"))
+        .and(path("/us/new/top-charts/songs/"))
+        .and(query_param("genreId", "18"))
+        .respond_with(html(fixture!("us_18")))
+        .mount(&server)
+        .await;
+
+    // The third read comes up for its turn after the first has stored the page.
+    let (first, second, third) = tokio::join!(
+        pages.chart(Some("us"), "18"),
+        pages.chart(Some("us"), "18"),
+        pages.chart(Some("us"), "18"),
+    );
+
+    let titles: Vec<_> = [first, second, third]
+        .into_iter()
+        .map(|page| page.unwrap().title.clone())
+        .collect();
+    assert_eq!(titles, ["Top Hip-Hop/Rap Songs"; 3]);
+    assert_eq!(asked(&server).await, 2);
+}
+
+#[tokio::test]
+async fn a_genre_english_name_is_read_from_the_genre_list() {
+    let (_server, pages) = apple().await;
+    let genres = MockServer::builder().start().await;
+    Mock::given(method("GET"))
+        .and(path("/WebObjects/MZStoreServices.woa/ws/genres"))
+        .and(query_param("id", "99999"))
+        .and(query_param("cc", "us"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"99999":{"name":"Rock Test","id":"99999"}}"#),
+        )
+        .mount(&genres)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/WebObjects/MZStoreServices.woa/ws/genres"))
+        .and(query_param("id", "88888"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"88888":{"name":"ロック","id":"88888"}}"#),
+        )
+        .mount(&genres)
+        .await;
+    let pages = pages.with_genres_base_url(&genres.uri());
+
+    assert_eq!(
+        pages.genre_english_name("99999").await.as_deref(),
+        Some("Rock Test")
+    );
+    assert_eq!(pages.genre_english_name("88888").await, None);
+    assert_eq!(pages.genre_english_name("77777").await, None);
+    assert_eq!(pages.genre_english_name("../x").await, None);
+}

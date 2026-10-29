@@ -16,7 +16,8 @@ failures=0
 # FAKE_OCTO=build is an override that builds Octo from the folder, DOCKER_FAIL makes one
 # compose verb fail, FAKE_NO_IMAGE names services whose pull fails (no network to ghcr.io),
 # FAKE_NO_SONIC leaves octo-sonic out, and FAKE_BAD_VERSION is a release whose container
-# never stays up.
+# never stays up. FAKE_SPOTIFLAC=1 turns on the optional spotiflac service (Mornye),
+# FAKE_NO_BUILD names services whose build fails, and FAKE_NO_LOCAL=1 has no image here.
 cat > "$work/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 echo "docker $*" >> "$FAKE_LOG"
@@ -33,7 +34,11 @@ if [ "$1" = compose ]; then
       if [ "${2:-}" = --services ]; then
         printf 'octo\n'
         [ -n "${FAKE_NO_SONIC:-}" ] || echo octo-sonic
-        printf 'slskd\nunrelated\nyt-dlp-shim\n'
+        printf 'slskd\n'
+        [ -z "${FAKE_SPOTIFLAC:-}" ] || echo spotiflac
+        printf 'unrelated\nyt-dlp-shim\n'
+      elif [ "${2:-}" = --images ]; then
+        [ "${3:-}" = spotiflac ] && echo ghcr.io/mornyeapp/mornye-python:latest
       else
         # As docker compose config prints it: services in name order, octo-sonic's image
         # quoted and the shim's not, slskd someone else's image, a volume list after. The
@@ -56,8 +61,17 @@ if [ "$1" = compose ]; then
         [ "$2" = "$service" ] && { echo "Error response from daemon: $service: denied"; exit 1; }
       done
       if [ "${DOCKER_FAIL:-}" = pull ]; then echo "boom: pull failed"; exit 1; fi ;;
+    build)
+      for service in ${FAKE_NO_BUILD:-}; do
+        [ "${2:-}" = "$service" ] && { echo "failed to build $service"; exit 1; }
+      done
+      if [ "${DOCKER_FAIL:-}" = build ]; then echo "boom: build failed"; exit 1; fi ;;
     *) if [ "${DOCKER_FAIL:-}" = "$1" ]; then echo "boom: $1 failed"; exit 1; fi ;;
   esac
+  exit 0
+fi
+if [ "$1" = image ] && [ "${2:-}" = inspect ]; then
+  [ -z "${FAKE_NO_LOCAL:-}" ] || { echo "No such image: $3"; exit 1; }
   exit 0
 fi
 if [ "$1" = inspect ]; then
@@ -148,6 +162,28 @@ check "updates to a newer release" "done" 2026.10.04 ""
 expect "describes itself as version 2 in a clone" test "$(helper_says version) $(helper_says mode)" = "2 git"
 expect_compose "pulls Octo and its sidecars, builds nothing, then restarts" "pull octo|pull yt-dlp-shim|pull octo-sonic|up -d"
 expect "says what it now runs" test "$(status_of step)" = "Octo now runs 2026.10.04"
+expect "without the spotiflac profile nothing about Mornye runs" never 'spotiflac|image inspect'
+
+# ----- Mornye (the optional spotiflac service) never holds Octo back -----
+
+fresh; request 2026.10.04
+FAKE_SPOTIFLAC=1 check "Mornye built before the restart" "done" 2026.10.04 ""
+expect_compose "builds Mornye from its repository, then restarts everything" "pull octo|pull yt-dlp-shim|pull octo-sonic|build spotiflac|up -d"
+expect "a Mornye built here is not called Octo's build" test "$(status_of step)" = "Octo now runs 2026.10.04"
+
+fresh; request 2026.10.04
+FAKE_SPOTIFLAC=1 FAKE_NO_BUILD=spotiflac check "Mornye keeps the image it has" "done" 2026.10.04 ""
+expect_compose "restarts everything with Mornye's old image" "pull octo|pull yt-dlp-shim|pull octo-sonic|build spotiflac|up -d"
+expect "the log says Mornye kept its image" in_log 'spotiflac could not be built, so it keeps the image it has'
+
+fresh; request 2026.10.04
+FAKE_SPOTIFLAC=1 FAKE_NO_BUILD=spotiflac FAKE_NO_LOCAL=1 check "Octo updates without a Mornye it cannot get" "done" 2026.10.04 ""
+expect_compose "starts every service but Mornye" "pull octo|pull yt-dlp-shim|pull octo-sonic|build spotiflac|up -d octo octo-sonic slskd unrelated yt-dlp-shim"
+expect "the dashboard says Mornye was left as it was" test "$(status_of step)" = "Octo now runs 2026.10.04. Mornye (the spotiflac service) could not be built, so it was left as it was"
+
+fresh; request 2026.10.04
+FAKE_SPOTIFLAC=1 FAKE_NO_BUILD=spotiflac FAKE_NO_LOCAL=1 FAKE_BAD_VERSION=2026.10.04 check "going back leaves Mornye out too" failed 2026.10.01 "which is running again"
+expect_compose "rebuilds and restarts the old release without Mornye" "pull octo|pull yt-dlp-shim|pull octo-sonic|build spotiflac|up -d octo octo-sonic slskd unrelated yt-dlp-shim|build octo octo-sonic slskd unrelated yt-dlp-shim|up -d octo octo-sonic slskd unrelated yt-dlp-shim"
 
 fresh; request 2026.10.04
 FAKE_NO_IMAGE=octo check "Octo that will not pull is built from the folder" "done" 2026.10.04 ""

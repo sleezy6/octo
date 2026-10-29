@@ -92,7 +92,7 @@ impl UpgradeSources {
 
     /// The sources in words, for "Looking for a higher quality copy on X": the ones that are set
     /// up, or, when none is, the ones the setting asks for. The Soulseek step is named for what
-    /// it asks: Soulseek, SpotiFLAC, or both.
+    /// it asks: Soulseek, Mornye (SpotiFLAC before its rename), or both.
     pub fn name(&self) -> String {
         let plan = self.plan();
         let sources = if plan.is_empty() { self.wanted() } else { plan };
@@ -102,8 +102,8 @@ impl UpgradeSources {
         let mut words: Vec<&str> = Vec::new();
         for source in sources {
             let word = match source {
-                DownloadSource::Soulseek if spotiflac && soulseek => "Soulseek or SpotiFLAC",
-                DownloadSource::Soulseek if spotiflac => "SpotiFLAC",
+                DownloadSource::Soulseek if spotiflac && soulseek => "Soulseek or Mornye",
+                DownloadSource::Soulseek if spotiflac => "Mornye",
                 other => Self::word(other),
             };
             if !words.contains(&word) {
@@ -458,9 +458,9 @@ mod tests {
         );
         assert_eq!(alone.plan(), [DownloadSource::Soulseek]);
         assert_eq!(alone.available().await, [DownloadSource::Soulseek]);
-        assert_eq!(alone.name(), "SpotiFLAC");
+        assert_eq!(alone.name(), "Mornye");
         let both = UpgradeSources::new(settings(Some(slskd())), None);
-        assert_eq!(both.name(), "Soulseek or SpotiFLAC");
+        assert_eq!(both.name(), "Soulseek or Mornye");
     }
 
     /// With slskd not logged in, the lossless step is there only while SpotiFLAC answers: a

@@ -36,7 +36,7 @@ fn test_token(
             if typed_url.eq_ignore_ascii_case(saved_url) {
                 Ok(saved.trim().to_string())
             } else {
-                Err("Retype the SpotiFLAC web token for the new address.")
+                Err("Retype the Mornye web token for the new address.")
             }
         }
         Some(token) => Ok(token.trim().to_string()),
@@ -119,7 +119,7 @@ mod tests {
                 "saved",
                 "http://spotiflac:8000"
             ),
-            Err("Retype the SpotiFLAC web token for the new address.")
+            Err("Retype the Mornye web token for the new address.")
         );
         assert_eq!(
             test_token(

@@ -17,7 +17,9 @@ use octo_subsonic::subsonic_response_builder::{
 use serde_json::Value;
 use tracing::info;
 
-use super::caller_checks::{SubsonicCall, check_caller, is_successful_subsonic_response, signed_in_user};
+use super::caller_checks::{
+    SubsonicCall, check_caller, is_successful_subsonic_response, listener_name, signed_in_user,
+};
 use crate::app::AppState;
 use crate::http::error::{AppError, AppResult};
 use crate::http::routes::RouteSet;
@@ -164,12 +166,13 @@ pub async fn get_library_actions(State(state): State<AppState>, req: Request) ->
     if let Some(refused) = check_caller(&state, &call).await {
         return refused;
     }
-    let admin = is_caller_admin(&call).await;
+    let name = listener_name(&state, &call).await;
+    let admin = is_caller_admin(&call, &name).await;
     state
         .subsonic_response_builder
         .create_library_actions_response(
             &state.settings.current().library_actions,
-            call.param_opt("u"),
+            named(&name),
             state.download_concurrency.current(),
             upgrade_ready(&state),
             &upgrade_source_name(&state),
@@ -192,8 +195,9 @@ pub async fn get_library_trash(State(state): State<AppState>, req: Request) -> R
     if let Some(refused) = check_caller(&state, &call).await {
         return refused;
     }
-    let admin = is_caller_admin(&call).await;
-    let allowed = state.library_edits.refusal(call.param_opt("u"), admin).is_none();
+    let name = listener_name(&state, &call).await;
+    let admin = is_caller_admin(&call, &name).await;
+    let allowed = state.library_edits.refusal(named(&name), admin).is_none();
     let songs = if allowed {
         state.library_edits.trash()
     } else {
@@ -222,9 +226,10 @@ pub async fn get_upgrades(State(state): State<AppState>, req: Request) -> Respon
     if let Some(refused) = check_caller(&state, &call).await {
         return refused;
     }
-    let jobs = match call.param_opt("u") {
-        Some(username) if !is_blank(username) => state.upgrade_queue.snapshot_for(Some(username)),
-        _ => Vec::new(),
+    let name = listener_name(&state, &call).await;
+    let jobs = match named(&name) {
+        Some(username) => state.upgrade_queue.snapshot_for(Some(username)),
+        None => Vec::new(),
     };
     let mut progress: HashMap<String, Option<f64>> = HashMap::new();
     for row in state.acquisition_tracker.all() {
@@ -279,7 +284,8 @@ pub async fn apply_library_action(State(state): State<AppState>, req: Request) -
         return Ok(member_library_action(&state, &member.user, &id, &action).await);
     }
     if dotnet::eq_ignore_case(&action, UPGRADE_ACTION) {
-        return Ok(queue_upgrade(&state, &id, call.param_opt("u")));
+        let name = listener_name(&state, &call).await;
+        return Ok(queue_upgrade(&state, &id, named(&name)));
     }
     if let Some(edit) = EDIT_ACTIONS
         .iter()
@@ -310,9 +316,10 @@ pub async fn apply_library_action(State(state): State<AppState>, req: Request) -
             .into_response());
     }
 
-    // The name the ping just checked. An API key alone names nobody here, so it cannot be on
-    // the allowlist, and the executor is not asked at all.
-    let Some(username) = call.param_opt("u").filter(|u| !is_blank(u)).map(str::to_string) else {
+    // The listener the accepted credential belongs to: the sign-in name, or its API key's owner.
+    // When nobody can be named the executor is not asked at all.
+    let name = listener_name(&state, &call).await;
+    let Some(username) = named(&name).map(str::to_string) else {
         return Ok(builder
             .create_library_action_outcome_response(
                 &id,
@@ -329,7 +336,7 @@ pub async fn apply_library_action(State(state): State<AppState>, req: Request) -
     };
 
     // Taking a file off the disk is for the server's admins, whatever the allowed list says.
-    if !is_caller_admin(&call).await {
+    if !is_caller_admin(&call, &username).await {
         return Ok(builder
             .create_library_action_outcome_response(
                 &id,
@@ -377,7 +384,8 @@ async fn apply_song_answer(
     name: &str,
 ) -> AppResult {
     let builder = &state.subsonic_response_builder;
-    let Some(username) = call.param_opt("u").filter(|u| !is_blank(u)).map(str::to_string) else {
+    let listener = listener_name(state, call).await;
+    let Some(username) = named(&listener).map(str::to_string) else {
         return Ok(builder
             .create_library_action_outcome_response(
                 id,
@@ -473,9 +481,10 @@ async fn member_library_action(state: &AppState, user: &str, id: &str, action: &
 /// admin on the allowed list; a dry run rehearses.
 async fn apply_library_edit(state: &AppState, call: &SubsonicCall, id: &str, action: &str) -> Response {
     let builder = &state.subsonic_response_builder;
-    let username = call.param_opt("u").map(str::to_string);
+    let name = listener_name(state, call).await;
+    let username = named(&name).map(str::to_string);
     let edits = Arc::clone(&state.library_edits);
-    let admin = is_caller_admin(call).await;
+    let admin = is_caller_admin(call, &name).await;
     if let Some(refusal) = edits.refusal(username.as_deref(), admin) {
         return if action == LOOKUP_ACTION {
             builder
@@ -533,13 +542,18 @@ async fn apply_library_edit(state: &AppState, call: &SubsonicCall, id: &str, act
         .into_response()
 }
 
+/// The listener name when one is known, else None.
+fn named(name: &str) -> Option<&str> {
+    Some(name).filter(|name| !is_blank(name))
+}
+
 /// Whether the caller is one of Navidrome's admins, asked with their own sign-in. False when
 /// Navidrome cannot say, so a change to the library's files is never allowed by an outage. Asked
 /// every time: a role taken away counts at once, and it is one call to Navidrome.
-async fn is_caller_admin(call: &SubsonicCall) -> bool {
-    let Some(username) = call.param_opt("u").filter(|u| !is_blank(u)) else {
+async fn is_caller_admin(call: &SubsonicCall, username: &str) -> bool {
+    if is_blank(username) {
         return false;
-    };
+    }
     let mut auth = call.parameters.clone();
     auth.insert("f".into(), "json".into());
     auth.insert("username".into(), username.to_string());

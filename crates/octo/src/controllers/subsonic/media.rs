@@ -872,7 +872,8 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
     // Generated radio IDs already resolve through the per-user state store,
     // so station artwork follows the current station name without creating
     // a parallel metadata record or exposing that name in the cover ID.
-    if let Some(station) = state.last_fm_radio_state.find_station(call.param("u"), &id) {
+    let owner = cover_owner(&state, &call, &id).await;
+    if let Some(station) = state.last_fm_radio_state.find_station(&owner, &id) {
         let seeds = station_cover_seeds(&state, &station);
         let list = ListCover {
             name: station.name.clone(),
@@ -908,7 +909,7 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
     }
 
     // Liked Songs: Octo's painted cover with a heart, picked by its name.
-    let cover_user = call.param("u").to_string();
+    let cover_user = owner.clone();
     if !cover_user.is_empty() && list_id == state.generated_playlists.liked_id(&cover_user) {
         let name = state
             .settings
@@ -964,7 +965,7 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
 
     // A chart list's cover, drawn like a mix's from its first songs' covers. It is only ever
     // drawn from a list already made: drawing it never makes one.
-    if let Some(chart) = state.chart_playlists.cover(call.param("u"), list_id) {
+    if let Some(chart) = state.chart_playlists.cover(&owner, list_id) {
         let song_count = Some(i32::try_from(chart.entries.len()).unwrap_or(i32::MAX));
         let kind = match octo_core::charts::chart_settings::kind(&chart.chart) {
             Some(octo_core::charts::chart_settings::ChartKind::NewSongs) => list_kinds::NEW_SONGS,
@@ -981,7 +982,7 @@ pub async fn get_cover_art(State(state): State<AppState>, req: Request) -> AppRe
                 async move { Ok(seeds) }.boxed()
             })),
             song_count,
-            cover_title: chart_cover_title(&chart.chart).map(str::to_string),
+            cover_title: chart_cover_words(&chart.chart, chart.country.as_deref(), &chart.name),
             glyph: None,
         };
         let bytes = state
@@ -1148,6 +1149,28 @@ fn without_navidrome_kind(state: &AppState, id: &str) -> String {
         .to_string()
 }
 
+/// Whose generated covers a cover request asks for: `u` when sent, else, for a station or
+/// made-list id only, the API key's owner once Navidrome accepts the key. A refused or unsigned
+/// request never asks for the key's owner, and any other id has no owner.
+async fn cover_owner(state: &AppState, call: &SubsonicCall, id: &str) -> String {
+    let named = call.param("u");
+    if !named.is_empty() {
+        return named.to_string();
+    }
+    if !(id.starts_with("or") || id.starts_with("og")) || call.param("apiKey").is_empty() {
+        return String::new();
+    }
+    let credential = SubsonicCredential::from(&call.parameters);
+    match state
+        .credential_check
+        .check(credential.as_ref(), &call.proxy)
+        .await
+    {
+        Ok(CredentialVerdict::Accepted) => super::caller_checks::listener_name(state, call).await,
+        _ => String::new(),
+    }
+}
+
 /// A library cover from the cover cache, for a request with a size and no `square`, from a
 /// caller Navidrome accepts. The sign-in is checked here because a kept cover never reaches
 /// Navidrome, which would otherwise be the one to check it. Anything else, a refused or
@@ -1243,6 +1266,19 @@ pub(crate) fn chart_cover_title(chart: &str) -> Option<&'static str> {
         Some(octo_core::charts::chart_settings::ChartKind::Overall)
     )
     .then_some(octo_core::charts::chart_settings::OVERALL_COVER_TITLE)
+}
+
+/// The words a chart list's cover shows in place of its name, when they differ: Popular right
+/// now says "Popular", and a pinned country's list adds its country ("Popular · Japan", or the
+/// list's own name, "Top Pop · Japan"). The server's covers and the Octo apps' say the same.
+pub(crate) fn chart_cover_words(chart: &str, pinned: Option<&str>, name: &str) -> Option<String> {
+    match pinned {
+        None => chart_cover_title(chart).map(str::to_string),
+        Some(country) => Some(match chart_cover_title(chart) {
+            Some(words) => octo_core::charts::chart_settings::pinned_name(words, country),
+            None => name.to_string(),
+        }),
+    }
 }
 
 /// The size a client asked a cover at, if it asked.

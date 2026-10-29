@@ -1,24 +1,30 @@
 //! getArtistTopSongs and getTopChart (octoTopSongs, for the Octo apps), the standard getTopSongs
-//! (every Subsonic app), and getCharts (octoTopSongs v2: the charts the server's country has).
+//! (every Subsonic app), getCharts (octoTopSongs v2: the charts a country has), and
+//! setChartCountry and pinChartCountry (v3: a listener's own chart country and pinned ones).
 
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use octo_core::charts::chart_settings::{self, ChartKind, OVERALL};
+use octo_core::charts::chart_settings::{self, ChartKind, MAX_PINNED, OVERALL, list_id};
 use octo_core::charts::top_songs::MAX_ROWS;
 use octo_core::common::skipped_takes;
 use octo_core::models::domain::Song;
 use octo_core::soulseek::soulseek_metadata_service::RoutingKind;
 use octo_subsonic::subsonic_request_parser::Parameters;
-use octo_subsonic::subsonic_response_builder::{ChartChoiceRow, RankedRow, TopSongRow, TopSongsHeader};
+use octo_subsonic::subsonic_response_builder::{
+    ChartChoiceRow, ChartsHeader, RankedRow, TopSongRow, TopSongsHeader,
+};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
-use super::caller_checks::{SubsonicCall, refuse_unless_signed_in, signed_in_user};
+use super::caller_checks::{SubsonicCall, listener_name, refuse_unless_signed_in, signed_in_user};
 use super::native::has_external_id;
 use crate::app::AppState;
-use crate::http::error::AppResult;
+use crate::http::error::{AppError, AppResult};
 use crate::http::routes::RouteSet;
+use crate::services::charts::apple_music_pages::LaneCell;
+use crate::services::common::top_songs_service::OtherWork;
 use crate::services::common::{TopList, TopSongsService};
 use crate::services::subsonic::SubsonicProxyService;
 
@@ -35,7 +41,109 @@ pub fn routes() -> RouteSet {
         )
         .subsonic("getTopChart", get(get_top_chart).post(get_top_chart))
         .subsonic("getCharts", get(get_charts).post(get_charts))
+        .subsonic("setChartCountry", get(set_chart_country).post(set_chart_country))
+        .subsonic("pinChartCountry", get(pin_chart_country).post(pin_chart_country))
         .subsonic("getTopSongs", get(get_top_songs).post(get_top_songs))
+}
+
+/// The answer to a call Octo refuses, always JSON.
+fn refuse(state: &AppState, code: i32, message: &str) -> Response {
+    state
+        .subsonic_response_builder
+        .create_error("json", code, message)
+        .into_response()
+}
+
+const STILL_LOADING_COUNTRIES: &str = "Still loading your other countries. Try again in a moment.";
+
+/// Who a country load counts for: the lowercased user, or when the call names nobody, a
+/// fingerprint of its credential (the API key, else the token and salt).
+fn counted_who(username: &str, call: &SubsonicCall) -> String {
+    who_of(
+        username,
+        call.param_opt("apiKey"),
+        call.param("t"),
+        call.param("s"),
+    )
+}
+
+/// [`counted_who`] from the credential's parts.
+fn who_of(username: &str, api_key: Option<&str>, token: &str, salt: &str) -> String {
+    let name = username.trim().to_lowercase();
+    if !name.is_empty() {
+        return name;
+    }
+    let mut credential = Sha256::new();
+    match api_key.filter(|key| !key.is_empty()) {
+        Some(key) => credential.update(key.as_bytes()),
+        None => {
+            credential.update(token.as_bytes());
+            credential.update(salt.as_bytes());
+        }
+    }
+    credential.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The country a chart call asks for: `country` when sent (Apple must have it, and the listener
+/// must not have two other countries loading already), else the caller's own, as for `auto`.
+/// With it, what loading it counts as: kept by the work that call starts. `for_menu` says the
+/// call loads the country's genre menu rather than one chart. Err holds the answer for one that
+/// is refused.
+#[allow(clippy::result_large_err)] // the error is the answer itself, sent at once
+async fn asked_country(
+    state: &AppState,
+    call: &SubsonicCall,
+    service: &TopSongsService,
+    username: &str,
+    chart: &str,
+    for_menu: bool,
+) -> Result<(Option<String>, OtherWork), Response> {
+    let Some(sent) = call
+        .param_opt("country")
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("auto"))
+    else {
+        return Ok((service.country_of(username).await, OtherWork::Free));
+    };
+    let code = sent.to_ascii_lowercase();
+    if !service.has_country(&code) {
+        return Err(refuse(state, 10, "Unknown country."));
+    }
+    let key = if for_menu {
+        TopSongsService::menu_work(&code)
+    } else {
+        TopSongsService::chart_work(&code, chart)
+    };
+    let Some(work) = service.begin_other_work(&counted_who(username, call), &code, &key) else {
+        return Err(refuse(state, 0, STILL_LOADING_COUNTRIES));
+    };
+    Ok((Some(code), work))
+}
+
+/// The signed-in listener a save is for, or the answer when there is none.
+async fn listener(state: &AppState, call: &SubsonicCall) -> Result<Result<String, Response>, AppError> {
+    let username = signed_in_user(state, call).await?;
+    if username.trim().is_empty() {
+        return Ok(Err(refuse(
+            state,
+            10,
+            "Sign in as a listener to choose chart countries.",
+        )));
+    }
+    Ok(Ok(username))
+}
+
+/// The `country` a save names, lowercase, or the answer when it is missing.
+#[allow(clippy::result_large_err)] // the error is the answer itself, sent at once
+fn sent_country(state: &AppState, call: &SubsonicCall) -> Result<String, Response> {
+    call.param_opt("country")
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| refuse(state, 10, "Required parameter is missing: country"))
 }
 
 /// The service, while search discovery is on: its lists are outside songs.
@@ -75,7 +183,8 @@ pub async fn get_artist_top_songs(State(state): State<AppState>, req: Request) -
 }
 
 /// octoTopSongs: a chart, ranked and marked like getArtistTopSongs. `chart` (v2) is `34` (the
-/// default, Popular right now), `new`, `trending` or an Apple genre id. Always JSON.
+/// default, Popular right now), `new`, `trending` or an Apple genre id; `country` (v3) any Apple
+/// Music country, the caller's own when not sent. Always JSON.
 pub async fn get_top_chart(State(state): State<AppState>, req: Request) -> AppResult {
     let call = match SubsonicCall::read(&state, req).await {
         Ok(call) => call,
@@ -99,14 +208,22 @@ pub async fn get_top_chart(State(state): State<AppState>, req: Request) -> AppRe
     let Some(service) = top_songs(&state) else {
         return Ok(empty_answer(&state));
     };
-    let list = service.chart(&chart).await;
+    let username = signed_in_user(&state, &call).await?;
+    let (country, work) = match asked_country(&state, &call, service, &username, &chart, false).await {
+        Ok(asked) => asked,
+        Err(refused) => return Ok(refused),
+    };
+    let list = service
+        .chart_in_counted(country, &chart, &LaneCell::now(), work)
+        .await;
     let count = count(&call, TOP_SONGS_DEFAULT_COUNT, chart_settings::max_songs(&chart));
     Ok(answer(&state, &call, &list, count).await)
 }
 
-/// octoTopSongs v2: the charts the server's country has, Popular right now first, then Best New
-/// Songs and Trending Songs, then the genres in Apple's order, each with whether it is a
-/// playlist for everyone and, while it is one, this listener's playlist id. Always JSON.
+/// octoTopSongs v2: the charts a country has, Popular right now first, then Best New Songs and
+/// Trending Songs, then the genres in Apple's order, each with whether it is a playlist for
+/// everyone and, while it is one, this listener's playlist id. `country` (v3) is any Apple Music
+/// country, the caller's own when not sent. Always JSON.
 pub async fn get_charts(State(state): State<AppState>, req: Request) -> AppResult {
     let call = match SubsonicCall::read(&state, req).await {
         Ok(call) => call,
@@ -116,13 +233,193 @@ pub async fn get_charts(State(state): State<AppState>, req: Request) -> AppResul
         return Ok(refused);
     }
     let Some(service) = top_songs(&state) else {
-        return Ok(state
-            .subsonic_response_builder
-            .create_charts_response(None, &[])
-            .into_response());
+        return Ok(no_charts(&state));
     };
     let username = signed_in_user(&state, &call).await?;
-    let (country, menu) = service.menu().await;
+    let (country, work) = match asked_country(&state, &call, service, &username, OVERALL, true).await {
+        Ok(asked) => asked,
+        Err(refused) => return Ok(refused),
+    };
+    Ok(charts_answer(&state, service, &username, country, work).await)
+}
+
+/// getCharts while search discovery is off: no charts.
+fn no_charts(state: &AppState) -> Response {
+    state
+        .subsonic_response_builder
+        .create_charts_response(
+            &ChartsHeader {
+                setting: "auto",
+                ..Default::default()
+            },
+            &[],
+        )
+        .into_response()
+}
+
+/// octoTopSongs v3: saves the caller's own chart country (`country`, any Apple Music country, or
+/// `auto` to follow the server's) and answers like getCharts. A pinned country that is now their
+/// own is no longer pinned.
+pub async fn set_chart_country(State(state): State<AppState>, req: Request) -> AppResult {
+    let call = match SubsonicCall::read(&state, req).await {
+        Ok(call) => call,
+        Err(response) => return Ok(response),
+    };
+    if let Some(refused) = refuse_unless_signed_in(&state, &call, "json").await? {
+        return Ok(refused);
+    }
+    let username = match listener(&state, &call).await? {
+        Ok(username) => username,
+        Err(refused) => return Ok(refused),
+    };
+    let code = match sent_country(&state, &call) {
+        Ok(code) => code,
+        Err(refused) => return Ok(refused),
+    };
+    let service = &state.top_songs;
+    let mut work = OtherWork::Free;
+    let home = if code == "auto" {
+        service.country().await
+    } else {
+        if !service.has_country(&code) {
+            return Ok(refuse(&state, 10, "Unknown country."));
+        }
+        match service.begin_other_work(
+            &counted_who(&username, &call),
+            &code,
+            &TopSongsService::menu_work(&code),
+        ) {
+            Some(started) => work = started,
+            None => return Ok(refuse(&state, 0, STILL_LOADING_COUNTRIES)),
+        }
+        Some(code.clone())
+    };
+    let _ = service.listeners().update(&username, |mine| {
+        mine.country = if code == "auto" {
+            String::new()
+        } else {
+            code.clone()
+        };
+        mine.pinned.retain(|pin| Some(pin) != home.as_ref());
+        Ok::<(), ()>(())
+    });
+    info!("Chart country for {username}: {code}");
+    Ok(match top_songs(&state) {
+        Some(service) => charts_answer(&state, service, &username, None, work).await,
+        None => no_charts(&state),
+    })
+}
+
+/// octoTopSongs v3: pins one more country for the caller (`country`, `pinned=true`), whose charts
+/// they then get as playlists too, or unpins it (`pinned=false`), on the list as it is now, so
+/// two apps pinning at once never undo each other. Answers like getCharts.
+pub async fn pin_chart_country(State(state): State<AppState>, req: Request) -> AppResult {
+    let call = match SubsonicCall::read(&state, req).await {
+        Ok(call) => call,
+        Err(response) => return Ok(response),
+    };
+    if let Some(refused) = refuse_unless_signed_in(&state, &call, "json").await? {
+        return Ok(refused);
+    }
+    let username = match listener(&state, &call).await? {
+        Ok(username) => username,
+        Err(refused) => return Ok(refused),
+    };
+    let code = match sent_country(&state, &call) {
+        Ok(code) => code,
+        Err(refused) => return Ok(refused),
+    };
+    let pin = match call.param_opt("pinned").map(|p| p.trim().to_ascii_lowercase()) {
+        Some(p) if p == "true" || p == "1" => true,
+        Some(p) if p == "false" || p == "0" => false,
+        Some(_) => return Ok(refuse(&state, 10, "pinned is true or false.")),
+        None => return Ok(refuse(&state, 10, "Required parameter is missing: pinned")),
+    };
+    let service = &state.top_songs;
+    let mut work = OtherWork::Free;
+    if pin {
+        if !service.has_country(&code) {
+            return Ok(refuse(&state, 10, "Unknown country."));
+        }
+        let home = service.country_of(&username).await;
+        if home.as_deref() == Some(code.as_str()) {
+            return Ok(refuse(&state, 10, "That is already your chart country."));
+        }
+        let mine = service.listeners().get(&username);
+        if !mine.pinned.contains(&code) {
+            if mine.pinned.len() >= MAX_PINNED {
+                return Ok(refuse(
+                    &state,
+                    10,
+                    &format!("You can pin at most {MAX_PINNED} countries."),
+                ));
+            }
+            match service.begin_other_work(
+                &counted_who(&username, &call),
+                &code,
+                &TopSongsService::menu_work(&code),
+            ) {
+                Some(started) => work = started,
+                None => return Ok(refuse(&state, 0, STILL_LOADING_COUNTRIES)),
+            }
+        }
+    }
+    let saved = service.listeners().update(&username, |mine| {
+        if !pin {
+            mine.pinned.retain(|p| *p != code);
+        } else if !mine.pinned.contains(&code) {
+            if mine.pinned.len() >= MAX_PINNED {
+                return Err(());
+            }
+            mine.pinned.push(code.clone());
+        }
+        Ok(())
+    });
+    let Ok(saved) = saved else {
+        return Ok(refuse(
+            &state,
+            10,
+            &format!("You can pin at most {MAX_PINNED} countries."),
+        ));
+    };
+    info!(
+        "Chart countries pinned for {username}: {}",
+        if saved.pinned.is_empty() {
+            "none".to_string()
+        } else {
+            saved.pinned.join(", ")
+        }
+    );
+    // A country just pinned starts loading its genre menu, counted until that ends.
+    if pin {
+        service.menu_in_counted(Some(code.clone()), work).await;
+    }
+    Ok(match top_songs(&state) {
+        Some(service) => charts_answer(&state, service, &username, None, OtherWork::Free).await,
+        None => no_charts(&state),
+    })
+}
+
+/// getCharts' answer for a country (None: the listener's own). A chart that is on is this
+/// listener's playlist when the country is their own or one they pinned. `work` is what loading
+/// the country's menu counts as.
+async fn charts_answer(
+    state: &AppState,
+    service: &TopSongsService,
+    username: &str,
+    asked: Option<String>,
+    work: OtherWork,
+) -> Response {
+    let own = service.country_of(username).await;
+    let mine = service.listeners().get(username);
+    let asked = asked.or_else(|| own.clone());
+    // Whose lists these charts are: the listener's own, a pinned country's, or none.
+    let pinned = asked
+        .as_deref()
+        .filter(|c| asked != own && mine.pinned.iter().any(|p| p == c))
+        .map(str::to_string);
+    let theirs = asked == own || pinned.is_some();
+    let (country, menu) = service.menu_in_counted(asked, work).await;
     let lists = state.settings.current().generated_playlists.clone();
     let on: Vec<String> = lists.chart_ids();
     let mut ids: Vec<String> = vec![
@@ -151,17 +448,36 @@ pub async fn get_charts(State(state): State<AppState>, req: Request) -> AppResul
                 name,
                 label,
                 kind,
-                playlist: is_on
-                    .then(|| state.chart_playlists.listed_id(&username, id))
+                playlist: (is_on && theirs)
+                    .then(|| {
+                        state
+                            .chart_playlists
+                            .listed_id(username, &list_id(id, pinned.as_deref()))
+                    })
                     .flatten(),
                 on: is_on,
             })
         })
         .collect();
-    Ok(state
+    let setting = if mine.country.is_empty() {
+        "auto"
+    } else {
+        mine.country.as_str()
+    };
+    let server = service.country().await;
+    let countries = service.apple().countries();
+    let header = ChartsHeader {
+        country: country.as_deref(),
+        setting,
+        pinned: &mine.pinned,
+        server: server.as_deref(),
+        countries: &countries,
+        max_pinned: MAX_PINNED,
+    };
+    state
         .subsonic_response_builder
-        .create_charts_response(country.as_deref(), &rows)
-        .into_response())
+        .create_charts_response(&header, &rows)
+        .into_response()
 }
 
 /// The standard getTopSongs (`artist` by name, `count`), for every Subsonic client, and by the
@@ -209,16 +525,22 @@ pub async fn get_top_songs(State(state): State<AppState>, req: Request) -> AppRe
     } else {
         list.songs.clone()
     };
+    let username = listener_name(&state, &call).await;
     let library = if candidates.is_empty() {
         Vec::new()
     } else {
-        TopSongsService::match_library(&candidates, |query| {
-            library_songs_matching(&call.proxy, &call.parameters, query)
-        })
+        let session = state
+            .library_matches
+            .session(&call.proxy, &call.parameters, &username)
+            .await;
+        TopSongsService::match_library_with(
+            &candidates,
+            |query| library_songs_matching(&call.proxy, &call.parameters, query),
+            &session,
+        )
         .await
     };
 
-    let username = call.param_opt("u").unwrap_or("").to_string();
     let mut rows: Vec<TopSongRow> = Vec::new();
     for (i, top) in candidates.iter().enumerate() {
         if rows.len() >= count {
@@ -317,9 +639,16 @@ fn synced_song(state: &AppState, username: &str, song: &Song) -> Song {
 async fn answer(state: &AppState, call: &SubsonicCall, list: &TopList, count: usize) -> Response {
     let skip_covers_and_instrumentals = state.settings.current().soulseek.skip_covers_and_instrumentals;
     let candidates = TopSongsService::rows_to_match(&list.songs, count, skip_covers_and_instrumentals);
-    let library = TopSongsService::match_library(&candidates, |query| {
-        library_songs_matching(&call.proxy, &call.parameters, query)
-    })
+    let username = listener_name(state, call).await;
+    let session = state
+        .library_matches
+        .session(&call.proxy, &call.parameters, &username)
+        .await;
+    let library = TopSongsService::match_library_with(
+        &candidates,
+        |query| library_songs_matching(&call.proxy, &call.parameters, query),
+        &session,
+    )
     .await;
     let (shown, library) =
         TopSongsService::shown_rows(candidates, library, count, skip_covers_and_instrumentals);

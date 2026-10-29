@@ -266,6 +266,17 @@ pub struct LibraryActionSettings {
     /// after three replacements fail in a day, the rest of the day's matches are asked about.
     /// Environment variable: LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PER_DAY
     pub review_sweep_auto_replace_per_day: i32,
+
+    /// Let the sweep also replace a song AcoustID has never heard when its YouTube preview, a
+    /// YouTube Music row with the song's title, artist and length from the file's own album, clearly
+    /// sounds nothing like the file, through Wrong song, instead of asking. Off by default. Counts
+    /// toward the same daily limit and breaker as the replacing above, and needs the same (DryRun
+    /// off, Wrong song on, the keeper on the allowlist), plus KeepReplacedOriginals on and a download
+    /// source other than YouTube alone (with Soulseek then YouTube, the replacement comes from
+    /// Soulseek only). A song with an ISRC tag, or that anyone starred or rated, is still asked
+    /// about.
+    /// Environment variable: LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PREVIEW
+    pub review_sweep_auto_replace_preview: bool,
     /// How many library songs an hour have their tags checked against their audio: each is
     /// fingerprinted in AcoustID's spare lane, and what disagrees shows in Library health under
     /// "Tags that disagree with the audio". 0 is off. Only while nothing is downloading. Stray
@@ -273,6 +284,14 @@ pub struct LibraryActionSettings {
     /// waits for a person.
     /// Environment variable: LIBRARY_ACTIONS_TAG_CHECK_PER_HOUR
     pub tag_check_per_hour: i32,
+
+    /// How many library songs an hour the one-time YouTube check compares with their YouTube
+    /// preview, once a person starts it from the dashboard (Library actions, "Check every song
+    /// against YouTube"). Like a new download, a song AcoustID vouches for is passed over quickly;
+    /// one that sounds nothing like a preview that can be believed becomes a Review question, and
+    /// nothing is ever changed or removed. 0 is off. Only while nothing is downloading.
+    /// Environment variable: LIBRARY_ACTIONS_YOUTUBE_CHECK_PER_HOUR
+    pub youtube_check_per_hour: i32,
 
     /// A "Duplicates" playlist per allowed user: recordings the library holds more than once,
     /// side by side, the copy worth keeping first. Octo only points them out; nothing is removed
@@ -338,7 +357,9 @@ impl Default for LibraryActionSettings {
             review_sweep_octo_downloads: false,
             review_sweep_auto_replace: false,
             review_sweep_auto_replace_per_day: 10,
+            review_sweep_auto_replace_preview: false,
             tag_check_per_hour: 60,
+            youtube_check_per_hour: 30,
             duplicates_enabled: false,
             duplicates_playlist_name: "Duplicates".to_string(),
             duplicates_scan_hours: 24,
@@ -378,6 +399,11 @@ impl LibraryActionSettings {
     /// 0 is off; the same ceiling as the Review sweep, one file every ten seconds.
     pub fn effective_tag_check_per_hour(&self) -> i32 {
         self.tag_check_per_hour.clamp(0, 360)
+    }
+
+    /// 0 is off; the same ceiling as the other sweeps, one song every ten seconds.
+    pub fn effective_youtube_check_per_hour(&self) -> i32 {
+        self.youtube_check_per_hour.clamp(0, 360)
     }
 
     pub fn effective_duplicates_scan_interval(&self) -> Duration {

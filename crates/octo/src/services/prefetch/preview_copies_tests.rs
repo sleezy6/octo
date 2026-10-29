@@ -352,6 +352,35 @@ async fn the_sweep_drops_unused_copies_then_the_oldest_over_the_cap_but_never_a_
 }
 
 #[tokio::test]
+async fn dropping_a_copy_removes_it_and_its_file_but_never_one_a_playlist_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (clock, now) = clock();
+    let copies = copies(&dir, Arc::new(FakeSource::new(data(1_000))), clock, 10_000);
+    *now.lock() = at(0);
+    for id in ["aaaaaaaaaaa", "bbbbbbbbbbb"] {
+        copies.start(id, None);
+        wait_ready(&copies, id).await;
+    }
+    copies.keep("bbbbbbbbbbb", at(60));
+
+    copies.drop_copy("aaaaaaaaaaa");
+    assert!(!copies.is_ready("aaaaaaaaaaa"));
+    assert!(!dir.path().join("previews").join("aaaaaaaaaaa.preview").exists());
+    assert!(dir.path().join("previews").join("bbbbbbbbbbb.preview").exists());
+    assert_eq!(copies.sizes(), (1, 1_000));
+
+    copies.drop_copy("bbbbbbbbbbb");
+    assert!(copies.is_ready("bbbbbbbbbbb"), "held by a playlist");
+    copies.drop_copy("ccccccccccc");
+    assert_eq!(copies.sizes(), (1, 1_000));
+
+    // Once the hold has ended the copy can go.
+    *now.lock() = at(61);
+    copies.drop_copy("bbbbbbbbbbb");
+    assert_eq!(copies.sizes(), (0, 0));
+}
+
+#[tokio::test]
 async fn kept_copies_stop_starting_once_they_fill_their_room() {
     let dir = tempfile::tempdir().unwrap();
     let (clock, _) = clock();

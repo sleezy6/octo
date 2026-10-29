@@ -9,6 +9,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::YouTubeResolver;
+use super::you_tube_resolver::Failure;
 
 /// One row of YouTube Music, as the shim reads it through ytmusicapi.
 ///
@@ -61,23 +62,63 @@ impl YouTubeMusicClient {
     /// could not answer, so a caller never keeps that as "nothing found". `Err` when the shim is
     /// unreachable, or for an answer that is not its JSON.
     pub async fn search(&self, query: &str, filter: &str) -> anyhow::Result<Option<Vec<YtmRow>>> {
-        self.search_limited(query, filter, 10).await
+        Ok(match self.search_limited(query, filter, 10).await? {
+            YtmAnswer::Rows(rows) => Some(rows),
+            YtmAnswer::Busy | YtmAnswer::Failed => None,
+        })
     }
 
-    /// [`Self::search`] for at most `limit` rows.
-    pub async fn search_limited(
+    /// [`Self::search`] for at most `limit` rows, telling a shim that said it is busy (HTTP 503
+    /// with `{"error":"busy"}`) from any other failure to answer.
+    pub async fn search_limited(&self, query: &str, filter: &str, limit: i32) -> anyhow::Result<YtmAnswer> {
+        self.get_answer(&format!(
+            "/ytm/search?q={}&filter={filter}&limit={limit}",
+            dotnet::escape_data_string(query)
+        ))
+        .await
+        .map(|answer| match answer {
+            Answer::Rows(_, rows) => YtmAnswer::Rows(rows),
+            Answer::Busy => YtmAnswer::Busy,
+            Answer::Failed => YtmAnswer::Failed,
+        })
+    }
+
+    /// [`Self::search_limited`] as background work: the shim runs it on its own one-slot gate,
+    /// never fills its cache, and answers busy while the slot is taken. The rows, or why the
+    /// shim could not answer.
+    pub async fn search_limited_background(
         &self,
         query: &str,
         filter: &str,
         limit: i32,
-    ) -> anyhow::Result<Option<Vec<YtmRow>>> {
-        Ok(self
-            .get_rows(&format!(
-                "/ytm/search?q={}&filter={filter}&limit={limit}",
-                dotnet::escape_data_string(query)
-            ))
-            .await?
-            .map(|(_, rows)| rows))
+    ) -> Result<Vec<YtmRow>, Failure> {
+        let Some(shim) = self.shim_url.as_deref().filter(|url| !url.is_empty()) else {
+            return Err(Failure::Other);
+        };
+        let url = format!(
+            "{shim}/ytm/search?q={}&filter={filter}&limit={limit}&bg=1",
+            dotnet::escape_data_string(query)
+        );
+        let response = self.http.get(url).send().await.map_err(|e| {
+            if e.is_connect() {
+                Failure::Unreachable
+            } else {
+                Failure::Other
+            }
+        })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|_| Failure::Other)?;
+        let root: Option<Value> = serde_json::from_str(&body).ok();
+        if status.as_u16() == 503
+            && root.as_ref().and_then(|r| r.get("error")).and_then(Value::as_str) == Some("busy")
+        {
+            return Err(Failure::Busy);
+        }
+        if !status.is_success() {
+            debug!("YouTube Music background search answered {}", status.as_u16());
+            return Err(Failure::Other);
+        }
+        rows(&root.ok_or(Failure::Other)?).map_err(|_| Failure::Other)
     }
 
     pub async fn radio(&self, video_id: &str, limit: i32) -> anyhow::Result<Vec<YtmRow>> {
@@ -116,22 +157,54 @@ impl YouTubeMusicClient {
     }
 
     async fn get_rows(&self, path_and_query: &str) -> anyhow::Result<Option<(Value, Vec<YtmRow>)>> {
+        Ok(match self.get_answer(path_and_query).await? {
+            Answer::Rows(root, rows) => Some((root, rows)),
+            Answer::Busy | Answer::Failed => None,
+        })
+    }
+
+    async fn get_answer(&self, path_and_query: &str) -> anyhow::Result<Answer> {
         let Some(shim) = self.shim_url.as_deref().filter(|url| !url.is_empty()) else {
-            return Ok(None);
+            return Ok(Answer::Failed);
         };
         let response = self.http.get(format!("{shim}{path_and_query}")).send().await?;
-        if !response.status().is_success() {
+        let status = response.status();
+        if !status.is_success() {
             debug!(
                 "YouTube Music {} answered {}",
                 path_and_query.split('?').next().unwrap_or(""),
-                response.status().as_u16()
+                status.as_u16()
             );
-            return Ok(None);
+            let busy = status.as_u16() == 503
+                && response
+                    .text()
+                    .await
+                    .ok()
+                    .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+                    .is_some_and(|root| root.get("error").and_then(Value::as_str) == Some("busy"));
+            return Ok(if busy { Answer::Busy } else { Answer::Failed });
         }
         let root: Value = serde_json::from_str(&response.text().await?)?;
         let rows = rows(&root)?;
-        Ok(Some((root, rows)))
+        Ok(Answer::Rows(root, rows))
     }
+}
+
+/// What the shim's YouTube Music search came to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum YtmAnswer {
+    /// It answered; the rows may be none.
+    Rows(Vec<YtmRow>),
+    /// It said it is busy (HTTP 503 with `{"error":"busy"}`).
+    Busy,
+    /// It could not answer: no address, or a non-2xx.
+    Failed,
+}
+
+enum Answer {
+    Rows(Value, Vec<YtmRow>),
+    Busy,
+    Failed,
 }
 
 /// The `tracks` of an answer, each with a video id and a title.

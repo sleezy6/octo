@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use indexmap::IndexMap;
 use octo_core::common::SongIdentity;
 use octo_core::soulseek::{LengthSource, RoutingKind, SongLength, SoulseekRouting, StreamFacts};
 use parking_lot::{Mutex, MutexGuard};
@@ -92,6 +93,24 @@ pub struct ExternalIdRegistry {
     dirty: AtomicBool,
     flush_lock: Mutex<()>,
     recovery: Mutex<Option<RoutingRecovery>>,
+    /// The videos found to be another recording than a song, by [`Self::song_key`], newest last:
+    /// at most [`Self::MAX_REFUSED_PER_SONG`] a song and [`Self::MAX_REFUSED_SONGS`] songs, the
+    /// oldest song going first. Written to `refused-videos.json` beside the registry's file.
+    ///
+    /// Lock order: a routing's lock may be held when this is taken; this is never held while
+    /// taking a routing's lock.
+    refused: Mutex<IndexMap<String, Vec<String>>>,
+    refused_dirty: AtomicBool,
+}
+
+/// One line of `refused-videos.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct PersistedRefusal {
+    #[serde(deserialize_with = "state_file::null_as_default")]
+    song: String,
+    #[serde(deserialize_with = "state_file::null_as_default")]
+    videos: Vec<String>,
 }
 
 /// A durable source of song routings that outlives the registry's bounded cache.
@@ -147,6 +166,12 @@ const ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn
 impl ExternalIdRegistry {
     pub const MAX_ENTRIES: usize = 10_000;
 
+    /// How many refused videos a song keeps.
+    pub const MAX_REFUSED_PER_SONG: usize = SoulseekRouting::MAX_REFUSED_VIDEOS;
+
+    /// How many songs keep refused videos.
+    pub const MAX_REFUSED_SONGS: usize = 20_000;
+
     /// A search registers well over a hundred routings, so flushing per write
     /// would turn one search into a hundred file writes. Coalesce instead: the window is
     /// short next to the restarts this exists to survive.
@@ -169,8 +194,11 @@ impl ExternalIdRegistry {
             dirty: AtomicBool::new(false),
             flush_lock: Mutex::new(()),
             recovery: Mutex::new(None),
+            refused: Mutex::new(IndexMap::new()),
+            refused_dirty: AtomicBool::new(false),
         };
         if registry.path.is_some() {
+            registry.load_refused();
             registry.load();
         }
         registry
@@ -179,9 +207,21 @@ impl ExternalIdRegistry {
     pub fn register(&self, routing: impl Into<SharedRouting>) -> String {
         let routing = routing.into();
         let id = Self::make_short_id(&routing.lock());
-        let previous = self.lru.lock().by_id.get(&id).map(|(r, _)| r.clone());
+        let existing = self.lru.lock().by_id.get(&id).map(|(r, _)| r.clone());
+        let registered_already = existing.as_ref().is_some_and(|p| p.ptr_eq(&routing));
+        let previous = existing.filter(|p| !p.ptr_eq(&routing));
 
-        if let Some(previous) = previous.filter(|p| !p.ptr_eq(&routing)) {
+        {
+            let mut r = routing.lock();
+            // A video a routing arrives with was named by whoever minted it, not picked by a
+            // ranking.
+            if !registered_already && r.has_you_tube() && r.video_pick == 0 {
+                r.video_pick = SoulseekRouting::VIDEO_NAMED;
+            }
+            self.apply_refusals(&mut r);
+        }
+
+        if let Some(previous) = previous {
             // Read the earlier routing under its own lock, then let it go before taking the
             // new one's, so two registrations never hold both.
             let (prev_album_id, (seconds, source), prev_isrc, prev_artist_id, prev_explicit, prev_album) = {
@@ -195,12 +235,14 @@ impl ExternalIdRegistry {
                     p.album.clone(),
                 )
             };
-            let (prev_video, prev_stream, prev_deezer) = {
+            let (prev_video, prev_stream, prev_deezer, prev_refused, prev_pick) = {
                 let p = previous.lock();
                 (
                     p.you_tube_id.clone().filter(|v| !v.is_empty()),
                     p.stream_facts(),
                     p.deezer_track_id.clone(),
+                    p.refused_videos.clone(),
+                    p.video_pick,
                 )
             };
             let mut r = routing.lock();
@@ -249,17 +291,26 @@ impl ExternalIdRegistry {
             {
                 r.album = prev_album;
             }
+            // And the videos found to be another song: a fresh mint must not take one again.
+            if !prev_refused.is_empty() {
+                r.keep_refused_videos(&prev_refused);
+            }
             // And the video a play or a lookup pinned, with what is known of its stream: a
             // search mints the song again with no video, and the size a client was told has to
             // stay the size of the video that plays.
             if let Some(prev_video) = prev_video {
                 match r.you_tube_id.as_deref().filter(|v| !v.is_empty()) {
                     None => {
-                        r.pin_video(&prev_video);
+                        if r.pin_video(&prev_video) {
+                            r.video_pick = prev_pick;
+                        }
                         r.merge_stream_facts(&prev_stream);
                     }
-                    Some(video) if video == prev_video && r.stream_facts().is_empty() => {
-                        r.merge_stream_facts(&prev_stream);
+                    Some(video) if video == prev_video => {
+                        r.video_pick = prev_pick;
+                        if r.stream_facts().is_empty() {
+                            r.merge_stream_facts(&prev_stream);
+                        }
                     }
                     Some(_) => {}
                 }
@@ -435,7 +486,8 @@ impl ExternalIdRegistry {
 
     /// Pins `video` for playback on the song under `short_id`, written down at the next flush.
     /// `replace` false keeps a different video that is already pinned. Pinning another video
-    /// forgets the old one's stream facts. True when the song now plays `video`.
+    /// forgets the old one's stream facts. True when the song now plays `video`. False for a
+    /// video the song refuses.
     pub fn pin_video(&self, short_id: &str, video: &str, replace: bool) -> bool {
         if short_id.is_empty() || video.is_empty() {
             return false;
@@ -445,6 +497,9 @@ impl ExternalIdRegistry {
         };
         let changed = {
             let mut r = routing.lock();
+            if r.refuses_video(video) {
+                return false;
+            }
             if !replace
                 && r.you_tube_id
                     .as_deref()
@@ -458,6 +513,208 @@ impl ExternalIdRegistry {
             self.dirty.store(true, Ordering::SeqCst);
         }
         true
+    }
+
+    /// Records that the pinned `video` on the song under `short_id` was chosen by ranking
+    /// `pick`, but only while the song still plays `video`. True when the record changed.
+    pub fn remember_pick(&self, short_id: &str, video: &str, pick: u8) -> bool {
+        if short_id.is_empty() || video.is_empty() {
+            return false;
+        }
+        let Some(routing) = self.lru.lock().by_id.get(short_id).map(|(r, _)| r.clone()) else {
+            return false;
+        };
+        let changed = {
+            let mut r = routing.lock();
+            if r.you_tube_id.as_deref() != Some(video) || r.video_pick == pick {
+                false
+            } else {
+                r.video_pick = pick;
+                true
+            }
+        };
+        if changed {
+            self.dirty.store(true, Ordering::SeqCst);
+        }
+        changed
+    }
+
+    /// The ids of the songs whose video an older ranking picked, most recently used first: song
+    /// routings with a video, an artist and a title whose `video_pick` is below
+    /// [`SoulseekRouting::VIDEO_PICK`]. A video the song was named by is never listed.
+    pub fn stale_pins(&self) -> Vec<String> {
+        let entries: Vec<(String, SharedRouting)> = {
+            let lru = self.lru.lock();
+            lru.ids()
+                .into_iter()
+                .filter_map(|id| lru.by_id.get(&id).map(|(r, _)| (id, r.clone())))
+                .collect()
+        };
+        entries
+            .into_iter()
+            .filter(|(_, routing)| {
+                let r = routing.lock();
+                r.kind == RoutingKind::Song
+                    && r.has_you_tube()
+                    && r.has_artist_title()
+                    && r.video_pick < SoulseekRouting::VIDEO_PICK
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Marks the video the song under `short_id` plays as picked by the current ranking, but
+    /// only while it still plays `video`. True when the record changed.
+    pub fn stamp_pick(&self, short_id: &str, video: &str) -> bool {
+        self.remember_pick(short_id, video, SoulseekRouting::VIDEO_PICK)
+    }
+
+    /// Sets `better` as the video the song under `short_id` switches to at a play's first byte,
+    /// but only while the song still plays `current` and does not refuse `better`. True when it
+    /// was set.
+    pub fn set_pending_video(&self, short_id: &str, current: &str, better: &str) -> bool {
+        if short_id.is_empty() || current.is_empty() || better.is_empty() || current == better {
+            return false;
+        }
+        let Some(routing) = self.lru.lock().by_id.get(short_id).map(|(r, _)| r.clone()) else {
+            return false;
+        };
+        let mut r = routing.lock();
+        if r.you_tube_id.as_deref() != Some(current) || r.refuses_video(better) {
+            return false;
+        }
+        r.pending_video = Some(better.to_string());
+        true
+    }
+
+    /// Switches `routing` to the video waiting in its `pending_video`, taking the old video's
+    /// stream facts and a length learned from it with it, and marks the current ranking as its
+    /// picker. Returns the video it left when no other routing pins that video any more, so its
+    /// copy can go. None when nothing was waiting (or the waiting video is refused or already
+    /// playing), or when another routing still pins the old video.
+    pub fn apply_pending_video(&self, routing: &SharedRouting) -> Option<String> {
+        let old = {
+            let mut r = routing.lock();
+            let better = r.pending_video.take()?;
+            let old = r.you_tube_id.clone();
+            if r.refuses_video(&better) || old.as_deref() == Some(better.as_str()) {
+                return None;
+            }
+            if let Some(old) = &old {
+                r.unpin_video(old);
+            }
+            r.pin_video(&better);
+            r.video_pick = SoulseekRouting::VIDEO_PICK;
+            old
+        };
+        self.dirty.store(true, Ordering::SeqCst);
+        let old = old?;
+        let all: Vec<SharedRouting> = self.lru.lock().by_id.values().map(|(r, _)| r.clone()).collect();
+        let pinned_elsewhere = all
+            .into_iter()
+            .filter(|other| !other.ptr_eq(routing))
+            .any(|other| other.lock().you_tube_id.as_deref() == Some(old.as_str()));
+        (!pinned_elsewhere).then_some(old)
+    }
+
+    /// The key a song's refused videos are filed under: its artist and title with case, accents
+    /// and punctuation set aside. None when either is empty, so a song with no name records
+    /// nothing.
+    pub fn song_key(artist: &str, title: &str) -> Option<String> {
+        let artist = SongIdentity::loose_key(artist);
+        let title = SongIdentity::loose_key(title);
+        if artist.is_empty() || title.is_empty() {
+            return None;
+        }
+        Some(format!("{artist}\n{title}"))
+    }
+
+    fn key_of(routing: &SoulseekRouting) -> Option<String> {
+        Self::song_key(
+            routing.artist.as_deref().unwrap_or(""),
+            routing.title.as_deref().unwrap_or(""),
+        )
+    }
+
+    /// The videos refused for the song `routing` names, oldest first.
+    pub fn refusals_for(&self, routing: &SoulseekRouting) -> Vec<String> {
+        if routing.kind != RoutingKind::Song {
+            return Vec::new();
+        }
+        Self::key_of(routing)
+            .and_then(|key| self.refused.lock().get(&key).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Adds the videos refused for the song `routing` names to its own refused videos.
+    pub fn apply_refusals(&self, routing: &mut SoulseekRouting) {
+        let refused = self.refusals_for(routing);
+        if !refused.is_empty() {
+            routing.keep_refused_videos(&refused);
+        }
+    }
+
+    /// Records `video` as another recording than `artist - title`, for every routing of the song
+    /// now and later. True when it was not recorded yet.
+    pub fn refuse_song_video(&self, artist: &str, title: &str, video: &str) -> bool {
+        let Some(key) = Self::song_key(artist, title) else {
+            return false;
+        };
+        if video.is_empty() {
+            return false;
+        }
+        let mut refused = self.refused.lock();
+        let videos = refused.entry(key).or_default();
+        if videos.iter().any(|v| v == video) {
+            return false;
+        }
+        videos.push(video.to_string());
+        if videos.len() > Self::MAX_REFUSED_PER_SONG {
+            videos.remove(0);
+        }
+        if refused.len() > Self::MAX_REFUSED_SONGS {
+            refused.shift_remove_index(0);
+        }
+        drop(refused);
+        self.refused_dirty.store(true, Ordering::SeqCst);
+        true
+    }
+
+    /// Refuses `video` for the song under `short_id`: unpinned with what was learned from it, and
+    /// never pinned for it again, by that id or by any other routing of the same song. True when
+    /// anything changed.
+    pub fn refuse_video(&self, short_id: &str, video: &str) -> bool {
+        if short_id.is_empty() || video.is_empty() {
+            return false;
+        }
+        let Some(routing) = self.lru.lock().by_id.get(short_id).map(|(r, _)| r.clone()) else {
+            return false;
+        };
+        let (mut changed, artist, title, is_song) = {
+            let mut r = routing.lock();
+            (
+                r.refuse_video(video),
+                r.artist.clone().unwrap_or_default(),
+                r.title.clone().unwrap_or_default(),
+                r.kind == RoutingKind::Song,
+            )
+        };
+        if is_song && let Some(key) = Self::song_key(&artist, &title) {
+            changed |= self.refuse_song_video(&artist, &title, video);
+            // Collect the routings with the cache locked, then lock each one after letting the
+            // cache go.
+            let all: Vec<SharedRouting> = self.lru.lock().by_id.values().map(|(r, _)| r.clone()).collect();
+            for other in all.into_iter().filter(|o| !o.ptr_eq(&routing)) {
+                let mut o = other.lock();
+                if o.kind == RoutingKind::Song && Self::key_of(&o).as_deref() == Some(key.as_str()) {
+                    changed |= o.refuse_video(video);
+                }
+            }
+        }
+        if changed {
+            self.dirty.store(true, Ordering::SeqCst);
+        }
+        changed
     }
 
     /// Pins `video` on the song under `short_id`, replacing any other pin.
@@ -570,10 +827,11 @@ impl ExternalIdRegistry {
             let mut lru = self.lru.lock();
             let mut stamp = entries.len() as u64;
             for e in entries {
-                let Some(routing) = e.routing else { continue };
+                let Some(mut routing) = e.routing else { continue };
                 if e.id.is_empty() {
                     continue;
                 }
+                self.apply_refusals(&mut routing);
                 match lru.by_id.get_mut(&e.id) {
                     // A duplicate id: the later routing wins, as `_byId[e.Id] = ...` did, at
                     // the earlier (more recent) place.
@@ -599,10 +857,65 @@ impl ExternalIdRegistry {
         }
     }
 
+    /// The file the refused videos are kept in, beside the registry's own.
+    fn refused_path(&self) -> Option<PathBuf> {
+        self.path
+            .as_ref()
+            .map(|path| path.with_file_name("refused-videos.json"))
+    }
+
+    fn load_refused(&self) {
+        let Some(path) = self.refused_path() else { return };
+        let result = (|| -> anyhow::Result<()> {
+            let Some(text) = state_file::read_text(&path)? else {
+                return Ok(());
+            };
+            let entries: Option<Vec<PersistedRefusal>> = serde_json::from_str(&text)?;
+            let mut refused = self.refused.lock();
+            for e in entries.unwrap_or_default() {
+                if e.song.is_empty() || e.videos.is_empty() {
+                    continue;
+                }
+                let mut videos = e.videos;
+                let excess = videos.len().saturating_sub(Self::MAX_REFUSED_PER_SONG);
+                videos.drain(..excess);
+                refused.insert(e.song, videos);
+            }
+            while refused.len() > Self::MAX_REFUSED_SONGS {
+                refused.shift_remove_index(0);
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            warn!("refused videos could not be read: {e}");
+        }
+    }
+
+    fn flush_refused(&self) {
+        let Some(path) = self.refused_path() else { return };
+        if !self.refused_dirty.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let entries: Vec<PersistedRefusal> = self
+            .refused
+            .lock()
+            .iter()
+            .map(|(song, videos)| PersistedRefusal {
+                song: song.clone(),
+                videos: videos.clone(),
+            })
+            .collect();
+        if let Err(e) = state_file::save_atomic(&path, &octo_core::json::to_string(&entries)) {
+            self.refused_dirty.store(true, Ordering::SeqCst);
+            warn!("refused videos could not be written: {e}");
+        }
+    }
+
     /// Writes the registry when anything changed since the last write.
     pub fn flush(&self) {
         let Some(path) = &self.path else { return };
         let _flushing = self.flush_lock.lock();
+        self.flush_refused();
         if !self.dirty.swap(false, Ordering::SeqCst) {
             return;
         }

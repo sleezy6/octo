@@ -18,7 +18,9 @@ use octo_media::audio::{AudioFingerprinter, RawFingerprint};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
-use crate::services::you_tube::you_tube_resolver::{YouTubeHit, YouTubeResolver};
+use crate::services::you_tube::you_tube_resolver::{
+    Failure, Lookup, ShimRefused, ShimStream, YouTubeHit, YouTubeResolver,
+};
 
 /// Seconds one chromaprint item covers: a frame every 1365 samples at 11025 Hz.
 pub const ITEM_SECONDS: f64 = 4096.0 / 3.0 / 11025.0;
@@ -90,6 +92,8 @@ pub struct PreviewFacts {
     /// Who the row credits, or the channel that posted the video.
     pub artist: Option<String>,
     pub seconds: Option<i32>,
+    /// The album of the YouTube Music row the preview is. None for any other video.
+    pub album: Option<String>,
 }
 
 impl PreviewFacts {
@@ -107,6 +111,7 @@ impl PreviewFacts {
             title: hit.title,
             artist,
             seconds: hit.duration,
+            album: hit.album,
         }
     }
 }
@@ -120,6 +125,8 @@ pub struct PreviewRequest<'a> {
     pub seconds: Option<i32>,
     /// The video the song plays as, when one is pinned on it.
     pub video_id: Option<&'a str>,
+    /// Work nobody waits on: its YouTube Music lookup goes in the shim's background lane.
+    pub background: bool,
 }
 
 /// What the check came to.
@@ -127,9 +134,19 @@ pub struct PreviewRequest<'a> {
 pub enum PreviewOutcome {
     /// The verdict did not leave the question to the preview, or Octo is not checking downloads.
     NotAsked,
-    /// Nothing to compare with: no video, the shim did not send it, or fpcalc could not read one
-    /// of the two. The download is judged as it was before.
+    /// Nothing to compare with: no video, or fpcalc could not read one of the two. The download is judged
+    /// as it was before.
     Unavailable(String),
+    /// The song's video was found but the shim did not send it. Nothing is said about the file;
+    /// asking again later may get it.
+    NotSent(String),
+    /// The shim's background lane was full, so the preview was not fetched now. Asked again later.
+    Busy,
+    /// The shim could not be asked for the song's video at all. Asked again later, and never the
+    /// song's fault.
+    Unreachable,
+    /// fpcalc could not read the file being checked.
+    FileUnreadable,
     Compared {
         heard: Heard,
         comparison: Comparison,
@@ -139,93 +156,182 @@ pub enum PreviewOutcome {
     },
 }
 
+/// Why a preview's fingerprint could not be had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewFailure {
+    /// The shim did not send the video's audio.
+    NotSent,
+    /// The audio arrived but fpcalc could not read it.
+    Unreadable,
+    /// The shim's background lane was full, so the video was not fetched now.
+    Busy,
+}
+
 /// Where previews come from: the yt-dlp shim.
 #[async_trait]
 pub trait PreviewSource: Send + Sync {
     /// The preview to compare with: the pinned video, with what a lookup says it is when one
-    /// names it, or else the video a play would pick. None when there is none.
-    async fn find(&self, request: &PreviewRequest<'_>) -> Option<PreviewFacts>;
+    /// names it, or else the video a play would pick. `Ok(None)` only when YouTube Music and
+    /// yt-dlp both answered and neither had the song; `Err` when either could not answer and the
+    /// other did not find it.
+    async fn find(&self, request: &PreviewRequest<'_>) -> Result<Option<PreviewFacts>, Failure>;
 
     /// Saves the video's audio at `dest`. False when the shim could not send it.
     async fn fetch(&self, video_id: &str, dest: &Path) -> bool;
+
+    /// [`Self::fetch`] for work nobody waits on, in the shim's background lane where it has one.
+    async fn fetch_in_background(&self, video_id: &str, dest: &Path) -> bool {
+        self.fetch(video_id, dest).await
+    }
+
+    /// Saves the video's audio at `dest`, in the shim's background lane when `background` is
+    /// true. [`PreviewFailure::Busy`] when the shim said its lane is full, else
+    /// [`PreviewFailure::NotSent`].
+    async fn fetch_preview(
+        &self,
+        video_id: &str,
+        dest: &Path,
+        background: bool,
+    ) -> Result<(), PreviewFailure> {
+        let fetched = if background {
+            self.fetch_in_background(video_id, dest).await
+        } else {
+            self.fetch(video_id, dest).await
+        };
+        if fetched {
+            Ok(())
+        } else {
+            Err(PreviewFailure::NotSent)
+        }
+    }
 }
 
 #[async_trait]
 impl PreviewSource for YouTubeResolver {
-    async fn find(&self, request: &PreviewRequest<'_>) -> Option<PreviewFacts> {
+    async fn find(&self, request: &PreviewRequest<'_>) -> Result<Option<PreviewFacts>, Failure> {
         let pinned = request.video_id.filter(|id| !id.trim().is_empty());
         let is_pinned = |hit: &YouTubeHit| pinned.is_none_or(|id| id == hit.video_id);
         // The order a play picks in: YouTube Music's row for the song, then yt-dlp's search.
         // A row is the song by its title and artists, so it credits the artist asked for.
-        if let Some(row) = self
-            .music_song(request.artist, request.title, request.seconds)
-            .await
-            .filter(is_pinned)
-        {
-            return Some(PreviewFacts::from_hit(row, Some(request.artist.to_string())));
+        let music = self
+            .music_song_lookup(request.artist, request.title, request.seconds, request.background)
+            .await;
+        let mut failure: Option<Failure> = None;
+        match music {
+            Lookup::Found(row) if is_pinned(&row) => {
+                return Ok(Some(PreviewFacts::from_hit(
+                    row,
+                    Some(request.artist.to_string()),
+                )));
+            }
+            Lookup::Failed(why) => failure = Some(why),
+            _ => {}
         }
         let query = format!("{} {}", request.artist, request.title);
-        if let Some(hit) = self
-            .search(&query, request.seconds, true)
-            .await
-            .filter(|hit| !hit.video_id.is_empty())
-            .filter(is_pinned)
-        {
-            let channel = hit.channel.clone();
-            return Some(PreviewFacts::from_hit(hit, channel));
+        match self.search_lookup(&query, request.seconds, true, &[]).await {
+            Lookup::Found(hit) if !hit.video_id.is_empty() && is_pinned(&hit) => {
+                let channel = hit.channel.clone();
+                return Ok(Some(PreviewFacts::from_hit(hit, channel)));
+            }
+            Lookup::Failed(why) => {
+                // A busy answer from either lookup is the one reported.
+                failure = Some(if failure == Some(Failure::Busy) {
+                    Failure::Busy
+                } else {
+                    why
+                });
+            }
+            _ => {}
         }
-        pinned.map(PreviewFacts::bare)
+        // A pinned video is the preview, known by its id alone, whatever the lookups said.
+        if let Some(id) = pinned {
+            return Ok(Some(PreviewFacts::bare(id)));
+        }
+        failure.map_or(Ok(None), Err)
     }
 
     async fn fetch(&self, video_id: &str, dest: &Path) -> bool {
-        let Some(opened) = self.open_stream(video_id, None).await else {
-            return false;
+        self.fetch_preview(video_id, dest, false).await.is_ok()
+    }
+
+    async fn fetch_in_background(&self, video_id: &str, dest: &Path) -> bool {
+        self.fetch_preview(video_id, dest, true).await.is_ok()
+    }
+
+    async fn fetch_preview(
+        &self,
+        video_id: &str,
+        dest: &Path,
+        background: bool,
+    ) -> Result<(), PreviewFailure> {
+        let opened = if background {
+            self.try_open_stream_in_background(video_id).await
+        } else {
+            self.try_open_stream(video_id).await
         };
-        if opened.status_code != 200 {
-            debug!(
-                "shim /stream answered {} for preview {video_id}",
-                opened.status_code
-            );
-            return false;
+        save_preview(opened, video_id, dest).await
+    }
+}
+
+/// Writes an opened preview to `dest`, at most [`MAX_PREVIEW_BYTES`] within [`FETCH_TIMEOUT`].
+/// [`PreviewFailure::Busy`] when the shim said its lane is full; any other failure to open,
+/// receive or finish is [`PreviewFailure::NotSent`].
+async fn save_preview(
+    opened: Result<ShimStream, ShimRefused>,
+    video_id: &str,
+    dest: &Path,
+) -> Result<(), PreviewFailure> {
+    let opened = match opened {
+        Ok(opened) => opened,
+        Err(ShimRefused { busy: true }) => return Err(PreviewFailure::Busy),
+        Err(_) => return Err(PreviewFailure::NotSent),
+    };
+    if opened.status_code != 200 {
+        debug!(
+            "shim /stream answered {} for preview {video_id}",
+            opened.status_code
+        );
+        return Err(PreviewFailure::NotSent);
+    }
+    let read = async {
+        let mut file = tokio::fs::File::create(dest).await?;
+        let mut body = opened.response.bytes_stream();
+        let mut written = 0usize;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            let room = MAX_PREVIEW_BYTES.saturating_sub(written);
+            file.write_all(&chunk[..chunk.len().min(room)]).await?;
+            written += chunk.len().min(room);
+            if written >= MAX_PREVIEW_BYTES {
+                break;
+            }
         }
-        let read = async {
-            let mut file = tokio::fs::File::create(dest).await?;
-            let mut body = opened.response.bytes_stream();
-            let mut written = 0usize;
-            while let Some(chunk) = body.next().await {
-                let chunk = chunk?;
-                let room = MAX_PREVIEW_BYTES.saturating_sub(written);
-                file.write_all(&chunk[..chunk.len().min(room)]).await?;
-                written += chunk.len().min(room);
-                if written >= MAX_PREVIEW_BYTES {
-                    break;
-                }
-            }
-            file.flush().await?;
-            anyhow::Ok(written)
-        };
-        match tokio::time::timeout(FETCH_TIMEOUT, read).await {
-            Ok(Ok(written)) => written > 0,
-            Ok(Err(error)) => {
-                warn!("could not read preview {video_id} from the shim: {error}");
-                false
-            }
-            Err(_) => {
-                warn!("preview {video_id} took longer than {FETCH_TIMEOUT:?} to read from the shim");
-                false
-            }
+        file.flush().await?;
+        anyhow::Ok(written)
+    };
+    match tokio::time::timeout(FETCH_TIMEOUT, read).await {
+        Ok(Ok(written)) if written > 0 => Ok(()),
+        Ok(Ok(_)) => Err(PreviewFailure::NotSent),
+        Ok(Err(error)) => {
+            warn!("could not read preview {video_id} from the shim: {error}");
+            Err(PreviewFailure::NotSent)
+        }
+        Err(_) => {
+            warn!("preview {video_id} took longer than {FETCH_TIMEOUT:?} to read from the shim");
+            Err(PreviewFailure::NotSent)
         }
     }
 }
 
 /// Whether a verdict leaves the question to the preview: AcoustID has no entry for the sound, or
+/// ties it to a song through one person's submissions only, or
 /// the length that would have caught a wrong file is unknown and AcoustID named nothing that
 /// settles it. A verdict that names the song (a confirmation, a doubted length, a source that
 /// disagreed) is never second-guessed.
 pub fn wanted(verdict: &VerificationResult, length_known: bool) -> bool {
     verdict.verdict == VerificationVerdict::Inconclusive
         && match verdict.reason {
-            InconclusiveReason::NoEntry => true,
+            InconclusiveReason::NoEntry | InconclusiveReason::LoneLink => true,
             InconclusiveReason::SourceDisagreed | InconclusiveReason::LengthOff => false,
             _ => !length_known,
         }
@@ -362,8 +468,19 @@ pub fn judge(comparison: &Comparison, trusted: bool) -> Heard {
     }
 }
 
-/// Compares the download at `path` with the song's preview. Every failure is
-/// [`PreviewOutcome::Unavailable`], which changes nothing about the file.
+/// What a lookup that could not answer comes to: a busy shim is waited out, any other failure
+/// says the shim could not be asked.
+fn outcome_of(failure: Failure) -> PreviewOutcome {
+    match failure {
+        Failure::Busy => PreviewOutcome::Busy,
+        Failure::Unreachable | Failure::Other => PreviewOutcome::Unreachable,
+    }
+}
+
+/// Compares the download at `path` with the song's preview, fetched in the shim's background lane
+/// when the request is `background`. Every failure is [`PreviewOutcome::Unavailable`],
+/// [`PreviewOutcome::NotSent`], [`PreviewOutcome::Busy`], [`PreviewOutcome::Unreachable`] or
+/// [`PreviewOutcome::FileUnreadable`], which change nothing about the file.
 pub async fn check(
     source: &dyn PreviewSource,
     fingerprinter: &AudioFingerprinter,
@@ -371,18 +488,35 @@ pub async fn check(
     request: &PreviewRequest<'_>,
     timeout_seconds: i32,
 ) -> PreviewOutcome {
-    let Some(mut preview) = source.find(request).await else {
-        return PreviewOutcome::Unavailable("no YouTube video for the song".into());
+    let background = request.background;
+    let mut preview = match source.find(request).await {
+        Ok(Some(preview)) => preview,
+        Ok(None) => return PreviewOutcome::Unavailable("no YouTube video for the song".into()),
+        Err(why) => return outcome_of(why),
     };
     let Some(file) = fingerprinter
         .raw_fingerprint(path, FILE_SECONDS, timeout_seconds)
         .await
     else {
-        return PreviewOutcome::Unavailable("the download could not be fingerprinted".into());
+        return PreviewOutcome::FileUnreadable;
     };
-    let Some(heard) = fingerprint_preview(source, fingerprinter, &preview.video_id, timeout_seconds).await
-    else {
-        return PreviewOutcome::Unavailable(format!("the shim did not send preview {}", preview.video_id));
+    let heard = match fingerprint_preview(
+        source,
+        fingerprinter,
+        &preview.video_id,
+        timeout_seconds,
+        background,
+    )
+    .await
+    {
+        Ok(heard) => heard,
+        Err(PreviewFailure::NotSent) => {
+            return PreviewOutcome::NotSent(format!("preview {} was not sent", preview.video_id));
+        }
+        Err(PreviewFailure::Unreadable) => {
+            return PreviewOutcome::Unavailable(format!("preview {} could not be read", preview.video_id));
+        }
+        Err(PreviewFailure::Busy) => return PreviewOutcome::Busy,
     };
     if preview.seconds.is_none_or(|s| s <= 0) {
         preview.seconds = Some(heard.seconds.round() as i32);
@@ -400,19 +534,23 @@ pub async fn check(
 }
 
 /// The preview's raw fingerprint, read through a temporary file that is removed afterwards.
-async fn fingerprint_preview(
+/// `background` fetches it in the shim's background lane. [`PreviewFailure::NotSent`] and
+/// [`PreviewFailure::Busy`] when the fetch failed, [`PreviewFailure::Unreadable`] when fpcalc could
+/// not read what was fetched.
+pub(crate) async fn fingerprint_preview(
     source: &dyn PreviewSource,
     fingerprinter: &AudioFingerprinter,
     video_id: &str,
     timeout_seconds: i32,
-) -> Option<RawFingerprint> {
+    background: bool,
+) -> Result<RawFingerprint, PreviewFailure> {
     let dest = preview_path();
-    let print = if source.fetch(video_id, &dest).await {
-        fingerprinter
+    let print = match source.fetch_preview(video_id, &dest, background).await {
+        Ok(()) => fingerprinter
             .raw_fingerprint(&dest, PREVIEW_SECONDS, timeout_seconds)
             .await
-    } else {
-        None
+            .ok_or(PreviewFailure::Unreadable),
+        Err(failure) => Err(failure),
     };
     let _ = std::fs::remove_file(&dest);
     print

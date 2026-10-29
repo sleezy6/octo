@@ -162,6 +162,49 @@ published_services() {
 # and this list lacks is still pulled, by `up -d`, because it is missing.
 IMAGES=(octo yt-dlp-shim octo-sonic)
 
+# Optional services that are not Octo's own: today only spotiflac (Mornye, built here), present
+# only when its profile is on. Each is made ready before Octo restarts: built from its pinned
+# build: section (cached after the first time), else kept as the image already here. One that is none of these is left as
+# it was, so it never holds Octo back. Without the profile none of this runs.
+OPTIONAL=(spotiflac)
+left_out=()
+
+# Makes each active optional service ready; the ones that cannot be go into left_out.
+ready_optional() {
+  local services service image
+  services=" $({ docker compose config --services 2>/dev/null || true; } | tr '\n' ' ') "
+  for service in "${OPTIONAL[@]}"; do
+    [[ "$services" == *" $service "* ]] || continue
+    write_status building "Getting $service ready"
+    run docker compose build "$service" && continue
+    image="$({ docker compose config --images "$service" 2>/dev/null || true; } | head -n 1)"
+    if [ -n "$image" ] && run docker image inspect "$image"; then
+      log "$service could not be built, so it keeps the image it has"
+      continue
+    fi
+    log "$service could not be built, so it is left as it was and Octo starts without it"
+    left_out+=("$service")
+  done
+}
+
+# Every active service but the optional ones left out.
+services_but_left_out() {
+  local service
+  for service in $({ docker compose config --services 2>/dev/null || true; }); do
+    [[ " ${left_out[*]} " == *" $service "* ]] || echo "$service"
+  done
+}
+
+# docker compose up -d, or build, for every active service but the optional ones left out.
+# With none left out it is the plain command it always was.
+compose_all() {
+  local keep=()
+  if [ "${#left_out[@]}" -gt 0 ]; then
+    read -r -a keep <<< "$(services_but_left_out | tr '\n' ' ')"
+  fi
+  run docker compose "$@" "${keep[@]}"
+}
+
 # Pulls each image the checked out release runs, and prints the -source service to build for
 # every one that could not be pulled (no network to ghcr.io, or not published yet). Octo is
 # skipped when an override builds it from the folder ($octo_builds); the caller builds it.
@@ -336,13 +379,18 @@ if [ "${#build[@]}" -gt 0 ]; then
   fi
 fi
 
+ready_optional
+if [ "${#left_out[@]}" -gt 0 ]; then
+  built="$built. Mornye (the ${left_out[*]} service) could not be built, so it was left as it was"
+fi
+
 write_status restarting "Restarting Octo"
-if ! run docker compose up -d || ! wait_until_running; then
+if ! compose_all up -d || ! wait_until_running; then
   # The new release will not run here, so the one that did goes back in: its images are still
   # here, and a plain build builds only what that release built from the folder, if anything.
   log "Octo $tag did not stay running; going back to ${from:-$previous}"
   write_status restarting "Octo $tag did not stay running; going back to ${from:-the old version}"
-  if run git_in_clone checkout --quiet "$previous" && run docker compose build && run docker compose up -d && wait_until_running; then
+  if run git_in_clone checkout --quiet "$previous" && compose_all build && compose_all up -d && wait_until_running; then
     fail "Octo $tag did not stay running, so the helper went back to ${from:-the old version}, which is running again. The log has the details." "Restarting Octo"
   fi
   fail "Octo $tag did not stay running, and going back to ${from:-the old version} failed too. 'docker compose logs octo' on the host says why." "Restarting Octo"
