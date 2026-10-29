@@ -3203,7 +3203,9 @@ fn an_unbelieved_link_is_kept_and_asked_about() {
 async fn a_refused_video_is_not_taken_again() {
     let root = Root::new("octo-stream-");
     let walk = build(&root, false, |_| Arc::new(|_: &str| Vec::new())).await;
-    let song = walk.songs[0].clone();
+    // "Started", 180 s: the length of the fake search's video, so the song's own length lets it
+    // play (a video more than ten seconds off it never does).
+    let song = walk.songs[3].clone();
     let id = song.external_id.clone().expect("an id");
     let length = walk.registry.lookup(&id).expect("known").snapshot().duration;
     // YouTube Music would hand back the refused video.
