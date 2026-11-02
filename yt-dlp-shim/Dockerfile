@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 ARG YTDLP_VERSION=latest
 ARG DENO_VERSION=latest
